@@ -41,6 +41,8 @@ def generate_key(namespace: str) -> tuple[str, str]:
 
 
 class KeyStore:
+    FORCE_REFRESH_S = 5.0  # bounded staleness window for same-tick swaps
+
     def __init__(self, path: str, admin_key: str | None = None):
         self.path = path
         self._lock = threading.Lock()
@@ -54,6 +56,9 @@ class KeyStore:
         # timestamp tick, which made peers skip reloads and clobber fresher
         # files with stale state.
         self._sig: str | None = None
+        # fast-path stat signature + last full read (see _load)
+        self._stat_sig: tuple | None = None
+        self._last_full_read: float = 0.0
         self._load()
         if admin_key:
             self._register_full(admin_key, "admin", namespace="*", scope_override=True)
@@ -80,13 +85,25 @@ class KeyStore:
             return None
 
     def _load(self) -> None:
-        """Reload when the file CONTENT changed (fingerprint, not mtime). On
-        corrupt/unreadable JSON keep the last-known-good in-memory map: a
-        broken keys file must degrade to stale-but-working auth, never brick
-        every request."""
+        """Reload when the file CONTENT changed. Fast path: one os.stat()
+        (metadata only) per call - the previous formulation read + SHA-256'd
+        the whole keys file on EVERY authenticate(), a constant disk hit on
+        the hottest request path. Full read happens when the stat signature
+        moves, or at least every FORCE_REFRESH_S so same-tick content swaps
+        (mtime collisions) can never hide past a bounded window."""
+        try:
+            st = os.stat(self.path)
+            stat_sig = (st.st_mtime_ns, st.st_size, st.st_ino)
+            force_due = (time.monotonic() - self._last_full_read) >= self.FORCE_REFRESH_S
+            if stat_sig == self._stat_sig and not force_due:
+                return
+        except OSError:
+            return  # no file yet / transiently gone: keep last-known-good map
         kept = self._read_kept()
         if kept is None:
             return
+        self._stat_sig = stat_sig
+        self._last_full_read = time.monotonic()
         recs, self._sig = kept
         for rec in recs:
             kid = rec["key_id"]
@@ -123,6 +140,14 @@ class KeyStore:
                     f.write(blob)
                 os.replace(tmp, self.path)
                 self._sig = hashlib.sha256(blob).hexdigest()
+                # adopt our own write into the fast-path signature so the
+                # next authenticate() doesn't re-read what we just wrote
+                try:
+                    _st = os.stat(self.path)
+                    self._stat_sig = (_st.st_mtime_ns, _st.st_size, _st.st_ino)
+                    self._last_full_read = time.monotonic()
+                except OSError:
+                    pass
                 try:
                     os.chmod(self.path, 0o600)  # key ids/namespaces are sensitive-ish
                 except OSError:

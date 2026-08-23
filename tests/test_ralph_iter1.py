@@ -148,8 +148,8 @@ class _GateEmbedder(Embedder):
 def test_embed_worker_backlog_is_bounded():
     emb = _GateEmbedder()
     applied = []
-    w = _EmbedWorker(emb, lambda ids, vecs: applied.extend(ids), batch_size=4, max_queue=8)
-    accepted = sum(w.submit(f"r{i}", f"text {i}") for i in range(100))
+    w = _EmbedWorker(emb, lambda ns, ids, vecs: applied.extend(ids), batch_size=4, max_queue=8)
+    accepted = sum(w.submit("default", f"r{i}", f"text {i}") for i in range(100))
     dropped = 100 - accepted
     assert w.q.qsize() <= 8, "queue grew past its bound"
     assert dropped > 0, "expected overflow drops under burst"

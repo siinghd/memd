@@ -127,6 +127,15 @@ def _guard_input(content: str, meta: dict[str, Any] | None) -> None:
             raise ValueError(f"serialized meta exceeds {MAX_META_BYTES} byte cap")
 
 
+def _guard_kind(kind: str) -> str:
+    """Schema-integrity guard at the engine boundary (all three doors):
+    an unvalidated kind string would silently break every kind-keyed
+    behavior downstream (planner lane filters, packing bonuses, stats)."""
+    if kind not in Kind.ALL:
+        raise ValueError(f"unknown kind {kind!r}; expected one of {list(Kind.ALL)}")
+    return kind
+
+
 class _EmbedWorker:
     """Async batched embedder: write ack never waits on embeddings.
 
@@ -139,9 +148,9 @@ class _EmbedWorker:
     def __init__(self, embedder: Embedder, apply_fn, batch_size: int = 32, flush_s: float = 0.5,
                  max_retries: int = 3, max_queue: int = 5_000):
         self.embedder = embedder
-        self.apply_fn = apply_fn
-        self.q: "queue.Queue[tuple[str, str]]" = queue.Queue(maxsize=max(1, max_queue))
-        self.retries: dict[str, int] = {}
+        self.apply_fn = apply_fn  # callable(ns_name, ids, vecs)
+        self.q: "queue.Queue[tuple[str, str, str]]" = queue.Queue(maxsize=max(1, max_queue))
+        self.retries: dict[tuple[str, str], int] = {}
         self.max_retries = max_retries
         self.batch_size = batch_size
         self.flush_s = flush_s
@@ -149,11 +158,11 @@ class _EmbedWorker:
         self._thread = threading.Thread(target=self._run, daemon=True, name="memd-embed")
         self._thread.start()
 
-    def submit(self, record_id: str, text: str) -> bool:
+    def submit(self, ns_name: str, record_id: str, text: str) -> bool:
         """Enqueue embedding work; False when dropped (queue full) - callers
         treat that as 'vector lane deferred', never an error."""
         try:
-            self.q.put_nowait((record_id, text))
+            self.q.put_nowait((ns_name, record_id, text))
         except queue.Full:
             METRICS.inc("memd_embed_backlog_dropped_total", help="embeddings dropped: backlog over capacity")
             return False
@@ -162,54 +171,61 @@ class _EmbedWorker:
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            batch: dict[str, str] = {}
             try:
-                rid, text = self.q.get(timeout=self.flush_s)
-                batch[rid] = text
-                while len(batch) < self.batch_size:
-                    try:
-                        rid, text = self.q.get_nowait()
-                        batch[rid] = text
-                    except queue.Empty:
-                        break
+                ns_name, rid, text = self.q.get(timeout=self.flush_s)
             except queue.Empty:
                 continue
+            # batch PER NAMESPACE: vectors belong to the namespace that owns
+            # the record - a shared cross-namespace batch would misfile them.
+            # Common case is one bucket; batching efficiency is unchanged.
+            batches: dict[str, dict[str, str]] = {ns_name: {rid: text}}
+            while sum(len(b) for b in batches.values()) < self.batch_size:
+                try:
+                    ns_name, rid, text = self.q.get_nowait()
+                except queue.Empty:
+                    break
+                batches.setdefault(ns_name, {})[rid] = text
             METRICS.set_gauge("memd_embed_queue_depth", self.q.qsize())
-            t0 = time.monotonic()
-            try:
-                vecs = self.embedder.embed(list(batch.values()))
-                self.apply_fn(list(batch.keys()), vecs)
-                METRICS.observe("memd_embed_batch_size", len(batch),
-                                help="texts per embedding batch",
-                                buckets=(1, 4, 8, 16, 32, 64, 128))
-                METRICS.observe("memd_embed_apply_ms", (time.monotonic() - t0) * 1000,
-                                help="embed + index apply duration (ms)")
-                for rid in batch:
-                    self.retries.pop(rid, None)
-            except Exception:
-                METRICS.inc("memd_embed_failures_total")
-                # bounded retries: a poison text must not loop forever
-                for rid in batch:
-                    n = self.retries.get(rid, 0) + 1
-                    if n <= self.max_retries:
-                        self.retries[rid] = n
-                        try:
-                            self.q.put_nowait((rid, batch[rid]))
-                            METRICS.inc("memd_embed_retries_total")
-                        except queue.Full:
-                            # backlog full: give up on this retry (dead letter);
-                            # reembed() heals the vector lane later
-                            self.retries.pop(rid, None)
-                            METRICS.inc("memd_embed_dead_letters_total")
-                    else:
-                        self.retries.pop(rid, None)
+            for ns_bucket, batch in batches.items():
+                self._embed_one(ns_bucket, batch)
+
+    def _embed_one(self, ns_name: str, batch: dict[str, str]) -> None:
+        t0 = time.monotonic()
+        try:
+            vecs = self.embedder.embed(list(batch.values()))
+            self.apply_fn(ns_name, list(batch.keys()), vecs)
+            METRICS.observe("memd_embed_batch_size", len(batch),
+                            help="texts per embedding batch",
+                            buckets=(1, 4, 8, 16, 32, 64, 128))
+            METRICS.observe("memd_embed_apply_ms", (time.monotonic() - t0) * 1000,
+                            help="embed + index apply duration (ms)")
+            for rid in batch:
+                self.retries.pop((ns_name, rid), None)
+        except Exception:
+            METRICS.inc("memd_embed_failures_total")
+            # bounded retries: a poison text must not loop forever
+            for rid in batch:
+                key = (ns_name, rid)
+                n = self.retries.get(key, 0) + 1
+                if n <= self.max_retries:
+                    self.retries[key] = n
+                    try:
+                        self.q.put_nowait((ns_name, rid, batch[rid]))
+                        METRICS.inc("memd_embed_retries_total")
+                    except queue.Full:
+                        # backlog full: give up on this retry (dead letter);
+                        # reembed() heals the vector lane later
+                        self.retries.pop(key, None)
                         METRICS.inc("memd_embed_dead_letters_total")
+                else:
+                    self.retries.pop(key, None)
+                    METRICS.inc("memd_embed_dead_letters_total")
 
     def drain(self, timeout_s: float = 30.0) -> int:
         """Block until queue empty (used by close/flush paths)."""
         waited = 0.0
         while not self.q.empty() and waited < timeout_s:
-            threading.Event().wait(0.05)
+            time.sleep(0.05)
             waited += 0.05
         return self.q.qsize()
 
@@ -221,7 +237,14 @@ class _EmbedWorker:
 class _SearchCache:
     """Tiny LRU for identical repeat queries (agents re-ask similar prompts).
     Keyed by (ns, query, scope, budget, as_of, kinds); entries die on any
-    write via an epoch counter - O(1) hit/miss, zero staleness."""
+    write via an epoch counter - O(1) hit/miss, zero staleness.
+
+    Bounded by BYTES, not just entries: a caller may legally request
+    budget_tokens up to 128K, so one entry can approach ~0.5MB. Entry-count
+    caps alone let 256 such entries pin >100MB of RAM."""
+
+    MAX_ENTRY_BYTES = 262_144   # don't cache oversized packed contexts at all
+    MAX_TOTAL_BYTES = 32 * 1024 * 1024
 
     def __init__(self, capacity: int = 256):
         import threading
@@ -229,6 +252,15 @@ class _SearchCache:
         self.capacity = capacity
         self._lock = threading.Lock()
         self._map: "OrderedDict[tuple, Any]" = OrderedDict()
+        self._bytes = 0
+
+    @staticmethod
+    def _size(value) -> int:
+        try:
+            n = len(value.packed_context) + sum(len(i.content) for i in value.items)
+        except Exception:
+            return 0
+        return n or 1
 
     def get(self, key):
         import threading
@@ -241,13 +273,25 @@ class _SearchCache:
 
     def put(self, key, value) -> None:
         with self._lock:
+            n = self._size(value)
+            if n > self.MAX_ENTRY_BYTES:
+                return  # oversized context: serve once, don't pin RAM
+            while self._map and self._bytes + n > self.MAX_TOTAL_BYTES:
+                _, old = self._map.popitem(last=False)
+                self._bytes -= self._size(old)
+            if key in self._map:  # replace: subtract old footprint first
+                self._bytes -= self._size(self._map[key])
+                del self._map[key]
             self._map[key] = value
+            self._bytes += n
             while len(self._map) > self.capacity:
-                self._map.popitem(last=False)
+                _, old = self._map.popitem(last=False)
+                self._bytes -= self._size(old)
 
     def clear(self) -> None:
         with self._lock:
             self._map.clear()
+            self._bytes = 0
 
 
 MAX_QUERY_CHARS = 64 * 1024  # embedder-cost guard for engine-side queries
@@ -285,6 +329,9 @@ class Memory:
         self.engine = StorageEngine(os.path.join(path, "store"), envelope=envelope)
         self.namespace_name = namespace
         self.ns = self.engine.namespace(namespace)
+        # the facade holds a direct reference to this store for its lifetime:
+        # pin it so LRU churn of other namespaces can't close it underneath us
+        self.engine.pin_namespace(namespace)
         self.audit = BufferedAuditLog(
             self.engine.store, f"ns/{namespace}/audit", envelope,
             flush_every=int(cfg.get("audit_flush_every", 32)),
@@ -304,7 +351,7 @@ class Memory:
         self._purge_deadline_ms = int(cfg.get("hard_delete_deadline_ms", HARD_DELETE_PURGE_MS))
         self._taints = TaintStore(max_sessions=int(cfg.get("max_tracked_sessions", 10_000)))
         self._metrics_dumper = auto_dumper_from_env()  # MEMD_METRICS_PATH opt-in
-        preset_core(METRICS, ns=namespace)
+        preset_core(METRICS, ns=namespace)  # single registration: series exist from t=0
         self._qcache = _SearchCache()
         self._qepochs: dict[str, int] = {}
         self._embed_worker = _EmbedWorker(
@@ -342,6 +389,7 @@ class Memory:
                             source=source, actor_id=actor_id, t_event=t_event,
                             meta=meta, namespace=namespace)
         _guard_input(content, meta)
+        _guard_kind(kind)
         ns = self._ns_for(namespace)
         src = self._resolve_source(source, role)
         org_id, agent_id = org_id or None, agent_id or None
@@ -374,7 +422,7 @@ class Memory:
         if v.quarantined:
             ns.index.mark_quarantined(rec.id, True)
         else:
-            self._embed_worker.submit(rec.id, rec.content)
+            self._embed_worker.submit(ns.namespace, rec.id, rec.content)
         if session_id:
             self._taint(session_id).observe(int(src))
         self.audit.append(actor=actor_id or role, action="add", target=rec.id, detail={"kind": kind, "source": src.name})
@@ -399,6 +447,7 @@ class Memory:
         taint_updates: list[tuple[str, int]] = []
         for e in events:
             _guard_input(e["content"], e.get("meta"))
+            _guard_kind(e.get("kind", Kind.RAW_EVENT))
             src = self._resolve_source(e.get("source"), e.get("role", "user"))
             session_id = e.get("session_id") or None
             user_id = e.get("user_id") or None
@@ -438,7 +487,7 @@ class Memory:
             if rec.id in quarantined_flags:
                 ns.index.mark_quarantined(rec.id, True)
             else:
-                self._embed_worker.submit(rec.id, rec.content)
+                self._embed_worker.submit(ns.namespace, rec.id, rec.content)
         for sid, tier in taint_updates:
             self._taint(sid).observe(tier)
         self.audit.append(
@@ -473,6 +522,7 @@ class Memory:
                                  actor_id=actor_id, t_event=t_event,
                                  valid_from=valid_from, namespace=namespace)
         _guard_input(content, None)
+        _guard_kind(kind)
         ns = self._ns_for(namespace)
         src = source if isinstance(source, Source) else Source.parse(source)
         if session_id:
@@ -504,7 +554,7 @@ class Memory:
         self._apply_supersedence(ns, pairs)
         METRICS.inc("memd_writes_total", help="raw/explicit lane writes", ns=ns.namespace, kind=kind, source=src.name.lower())
         METRICS.inc("memd_remembers_total", ns=ns.namespace)
-        self._embed_worker.submit(rec.id, rec.content)
+        self._embed_worker.submit(ns.namespace, rec.id, rec.content)
         self.audit.append(actor=actor_id or "explicit", action="remember", target=rec.id, detail={"entity_keys": ekeys})
         return rec.id
 
@@ -648,6 +698,11 @@ class Memory:
         for lane_name, lane_fn in (
             ("bm25", lambda: ns.index.search_bm25(query, filt, limit=plan.candidate_k)),
             ("entity", lambda: ns.index.search_by_entity_tokens(tokens, filt, limit=20)),
+            # the documented third fan-out (D3 architecture: time/entity btree
+            # scan): planner weights a "time" lane but nothing produced one -
+            # temporal queries had NO recency-proximate candidates and relied
+            # on lexical similarity surfacing fresh records by luck
+            ("time", lambda: ns.index.search_time_lane(filt, limit=plan.candidate_k)),
         ):
             _lt0 = time.monotonic()
             lane_hits[lane_name] = lane_fn()
@@ -919,7 +974,7 @@ class Memory:
         if kept_recs:
             ns.append(kept_recs)
             for r in kept_recs:
-                self._embed_worker.submit(r.id, r.content)
+                self._embed_worker.submit(ns.namespace, r.id, r.content)
         return written, ConsolidationResult(
             superseded_pairs=[p for res in results for p in res.superseded_pairs],
             dropped_dupes=sum(res.dropped_dupes for res in results),
@@ -1118,17 +1173,49 @@ class Memory:
         self.audit.append(actor=actor, action="destroy_namespace", target=name)
         return ok
 
+    def export_jsonl_iter(self, namespace: str | None = None):
+        """Streaming export (embedded mode): NDJSON lines, O(1) line-sized
+        buffers. Hosted mode has no streaming REST surface yet; callers there
+        fall back to the buffered blob."""
+        impl = self._hosted()
+        if impl is not None:
+            yield impl.export_jsonl(namespace=namespace)
+            return
+        name = namespace or self.namespace_name
+        t0 = time.monotonic()
+        n = 0
+        for line in self.engine.namespace(name).export_jsonl_iter():
+            n += 1
+            yield line
+        METRICS.observe("memd_export_seconds", time.monotonic() - t0,
+                        help="export duration (s)", ns=name)
+        METRICS.inc("memd_exports_total", ns=name)
+        METRICS.inc("memd_export_records_total", n, ns=name,
+                    help="records streamed by exports")
+        self.audit.append(actor="export", action="export", target=name,
+                          detail={"records": n})
+
     def export_jsonl(self, namespace: str | None = None) -> bytes:
+        """Buffered variant (CLI/SDK convenience). Emits its own metrics +
+        one audit record; prefer export_jsonl_iter() on streaming surfaces."""
         impl = self._hosted()
         if impl is not None:
             return impl.export_jsonl(namespace=namespace)
         name = namespace or self.namespace_name
         t0 = time.monotonic()
-        data = self.engine.namespace(name).export_jsonl()
+        buf = bytearray()
+        n = 0
+        for line in self.engine.namespace(name).export_jsonl_iter():
+            n += 1
+            buf += line
+        data = bytes(buf)
         METRICS.observe("memd_export_seconds", time.monotonic() - t0,
                         help="export duration (s)", ns=name)
         METRICS.inc("memd_exports_total", ns=name)
-        self.audit.append(actor="export", action="export", target=name, detail={"bytes": len(data)})
+        METRICS.inc("memd_export_records_total", n, ns=name,
+                    help="records streamed by exports")
+        self.audit.append(actor="export", action="export", target=name,
+                          detail={"bytes": len(data), "records": n})
         return data
 
     def compact(self, force: bool = False, namespace: str | None = None) -> dict:
@@ -1202,9 +1289,20 @@ class Memory:
             return source if isinstance(source, Source) else Source.parse(source)
         return {"user": Source.USER, "assistant": Source.AGENT, "agent": Source.AGENT}.get(role, Source.TOOL)
 
-    def _apply_vectors(self, ids: list[str], vecs: np.ndarray) -> None:
+    def _apply_vectors(self, ns_name: str, ids: list[str], vecs: np.ndarray) -> None:
+        # resolve the OWNING namespace's index: vectors are per-namespace
+        # derived state; writing them into the facade default misfiled every
+        # non-default namespace's lane (orphan rows there, dead lane here).
+        # peek, never materialize: a namespace destroyed between submit and
+        # apply must stay destroyed (re-materializing it by name raced the
+        # teardown and resurrected shredded records into a ghost index).
+        ns = self.engine.peek_namespace(ns_name)
+        if ns is None:
+            METRICS.inc("memd_embed_target_missing_total",
+                        help="embeddings dropped because the target namespace is gone")
+            return
         for i, rid in enumerate(ids):
-            self.ns.index.set_vector(rid, vecs[i], self.embedder.name)
+            ns.index.set_vector(rid, vecs[i], self.embedder.name)
 
     def reembed(self, *, namespace: str | None = None, batch_size: int = 256) -> dict:
         """Batch re-embedding job (ADR-8): rebuild the vector lane from raw.

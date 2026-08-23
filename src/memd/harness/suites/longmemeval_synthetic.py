@@ -34,7 +34,13 @@ def generate_cases(seed: int = 42, users: int = 8) -> tuple[list[dict], list[dic
 
     for u in range(users):
         uid = f"u{u}"
-        name, city, tool, editor = names[u], cities[u % len(cities)], tools[u % len(tools)], editors[u % len(editors)]
+        # pools cycle so --users beyond len(names) works (the CLI exposes
+        # users as free-form; an IndexError here bricked the whole harness).
+        # Uniqueness comes from uid-scoped session ids and per-user queries.
+        name, city, tool, editor = (
+            names[u % len(names)], cities[u % len(cities)],
+            tools[u % len(tools)], editors[u % len(editors)],
+        )
         base = T0 + u * DAY
 
         def ev(day: int, content: str):

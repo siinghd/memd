@@ -208,17 +208,54 @@ Rules:
 - If nothing qualifies, return [].
 prompt_version={PROMPT_VERSION}"""
 
-    def __init__(self, model: str, api_key: str, base_url: str = "https://api.openai.com/v1"):
+    def __init__(self, model: str, api_key: str, base_url: str = "https://api.openai.com/v1",
+                 chunk_records: int = 40, chunk_chars: int = 24_000):
         import httpx
 
         self.model = model
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
+        self.chunk_records = max(1, int(chunk_records))
+        self.chunk_chars = max(1000, int(chunk_chars))
+        self.chunks_sent = 0
         self._client = httpx.Client(timeout=60)
 
+    def _chunks(self, records: list[MemoryRecord]):
+        """Bounded request chunks: a session can carry up to 1000 rows x
+        multi-KB contents - sending that as ONE completion explodes token
+        cost and gets rejected by every provider. Chunks stop growing at
+        whichever bound hits first (rows or serialized chars)."""
+        buf: list[MemoryRecord] = []
+        chars = 0
+        for r in records:
+            n = len(r.content) + len(r.id) + 4
+            if buf and (len(buf) >= self.chunk_records or chars + n > self.chunk_chars):
+                yield buf
+                buf, chars = [], 0
+            buf.append(r)
+            chars += n
+        if buf:
+            yield buf
+
     def extract(self, records: list[MemoryRecord]) -> list[ExtractedFact]:
+        """Chunked extraction with per-chunk failure isolation: one bad
+        chunk (provider hiccup, malformed output) degrades THIS chunk only -
+        previously a single failure discarded every fact of the session."""
+        from memd.metrics import METRICS
+
         if not records:
             return []
+        out: list[ExtractedFact] = []
+        for chunk in self._chunks(records):
+            self.chunks_sent += 1
+            try:
+                out.extend(self._extract_chunk(chunk))
+            except Exception:
+                METRICS.inc("memd_extraction_chunks_failed_total", model=self.model,
+                            help="extraction chunks lost to provider errors")
+        return out
+
+    def _extract_chunk(self, records: list[MemoryRecord]) -> list[ExtractedFact]:
         lines = [f"[{r.id}] {r.content}" for r in records]
         user_msg = "Segment:\n" + "\n".join(lines)
         resp = self._client.post(

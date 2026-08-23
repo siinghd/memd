@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import secrets
+from collections import OrderedDict
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -53,6 +54,12 @@ class LocalKeyEnvelope(KeyEnvelope):
     def __init__(self, dir_path: str, root_key: bytes | None = None):
         self.dir = dir_path
         os.makedirs(dir_path, exist_ok=True)
+        # unwrapped per-namespace data keys, LRU-bounded. Caching is sound:
+        # every encrypt/decrypt needs the raw key in process memory anyway.
+        # Without this, each WAL append/replay frame paid a file read +
+        # AESGCM unwrap for the SAME namespace key.
+        self._cache: "OrderedDict[str, bytes]" = OrderedDict()
+        self.CACHE_MAX = 1024  # namespaces; matches hosted per-node open set
         rk_path = os.path.join(dir_path, "root.key")
         if root_key is not None:
             self._root = root_key
@@ -83,24 +90,35 @@ class LocalKeyEnvelope(KeyEnvelope):
         return os.path.join(self.dir, f"ns-{safe}.key")
 
     def data_key(self, namespace: str) -> bytes:
+        cached = self._cache.get(namespace)
+        if cached is not None:
+            self._cache.move_to_end(namespace)
+            return cached
         p = self._key_path(namespace)
         if os.path.exists(p):
             wrapped = self._read_secret(p)
             nonce, ct = wrapped[:12], wrapped[12:]
-            return AESGCM(self._root).decrypt(nonce, ct, namespace.encode())
-        dk = secrets.token_bytes(KEY_LEN)
-        nonce = secrets.token_bytes(12)
-        wrapped = nonce + AESGCM(self._root).encrypt(nonce, dk, namespace.encode())
-        try:
-            self._write_secret(p, wrapped)
-            return dk
-        except FileExistsError:
-            # concurrent creator won; use their key deterministically
-            wrapped2 = self._read_secret(p)
-            n2, c2 = wrapped2[:12], wrapped2[12:]
-            return AESGCM(self._root).decrypt(n2, c2, namespace.encode())
+            dk = AESGCM(self._root).decrypt(nonce, ct, namespace.encode())
+        else:
+            dk = secrets.token_bytes(KEY_LEN)
+            nonce = secrets.token_bytes(12)
+            wrapped = nonce + AESGCM(self._root).encrypt(nonce, dk, namespace.encode())
+            try:
+                self._write_secret(p, wrapped)
+            except FileExistsError:
+                # concurrent creator won; use their key deterministically
+                wrapped2 = self._read_secret(p)
+                n2, c2 = wrapped2[:12], wrapped2[12:]
+                dk = AESGCM(self._root).decrypt(n2, c2, namespace.encode())
+        self._cache[namespace] = dk
+        if len(self._cache) > self.CACHE_MAX:
+            self._cache.popitem(last=False)
+        return dk
 
     def destroy(self, namespace: str) -> bool:
+        # shred order matters: drop the cached copy BEFORE the file so no
+        # encrypt() can re-adopt a destroyed namespace's key from RAM
+        had_cached = self._cache.pop(namespace, None) is not None
         p = self._key_path(namespace)
         if os.path.exists(p):
             # overwrite before unlink so shred survives lazy fs behavior
@@ -111,7 +129,7 @@ class LocalKeyEnvelope(KeyEnvelope):
                 os.fsync(f.fileno())
             os.unlink(p)
             return True
-        return False
+        return had_cached
 
 
 class NullKeyEnvelope(KeyEnvelope):

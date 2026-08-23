@@ -13,6 +13,14 @@ import tempfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+from memd.metrics import METRICS
+
+
+def _count_op(op: str) -> None:
+    """I/O round-trip counting per store operation class - request-level I/O
+    budgets are only auditable if the ops themselves are visible."""
+    METRICS.inc("memd_store_ops_total", op=op, help="object-store operations by type")
+
 
 @dataclass(frozen=True)
 class ObjectMeta:
@@ -135,6 +143,7 @@ class LocalObjectStore(ObjectStore):
             pass
 
     def put(self, key: str, data: bytes) -> None:
+        _count_op("put")
         path = self._path(key)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
@@ -151,6 +160,7 @@ class LocalObjectStore(ObjectStore):
             raise
 
     def get(self, key: str) -> bytes | None:
+        _count_op("get")
         try:
             with open(self._path(key), "rb") as f:
                 return f.read()
@@ -158,15 +168,18 @@ class LocalObjectStore(ObjectStore):
             return None
 
     def delete(self, key: str) -> None:
+        _count_op("delete")
         try:
             os.unlink(self._path(key))
         except FileNotFoundError:
             pass
 
     def exists(self, key: str) -> bool:
+        _count_op("exists")
         return os.path.exists(self._path(key))
 
     def list(self, prefix: str) -> list[str]:
+        _count_op("list")
         base = self._path(prefix) if prefix else self.root
         if not os.path.isdir(base):
             # prefix may point at files directly
@@ -188,6 +201,7 @@ class LocalObjectStore(ObjectStore):
         return sorted(out)
 
     def append(self, key: str, data: bytes) -> int:
+        _count_op("append")
         path = self._path(key)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "ab") as f:
@@ -197,12 +211,14 @@ class LocalObjectStore(ObjectStore):
             return f.tell()
 
     def size(self, key: str) -> int:
+        _count_op("size")
         try:
             return os.path.getsize(self._path(key))
         except FileNotFoundError:
             return 0
 
     def truncate(self, key: str, size: int) -> None:
+        _count_op("truncate")
         path = self._path(key)
         with open(path, "r+b") as f:
             f.truncate(size)

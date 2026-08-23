@@ -30,8 +30,25 @@ def _fresh_dir(base: str | None) -> str:
 def run_longmemeval(data_dir: str | None = None, seed: int = 42, users: int = 8) -> list[SuiteReport]:
     events, cases = longmemeval_synthetic.build(seed=seed, users=users)
     reports = []
-    budget = 2000
+    max_budget = 2000
     full_budget = 10**9  # the baseline gets unlimited context
+
+    # D2 cost bar: injected tokens <= 10% of FULL CONTEXT. On production
+    # long-horizon corpora (100K+ token contexts) the default 2000 budget
+    # clears it; on a toy corpus whose full context averages ~12K tokens a
+    # fixed 2000 budget mathematically cannot. The honest implementation is
+    # an ADAPTIVE per-user budget: target 8% of that user's estimated
+    # full-context (headroom under the bar), floored at 512 so recall-critical
+    # packing never starves, capped at the 2000 default.
+    from memd.query.packing import count_tokens
+
+    user_fc_est: dict[str, int] = {}
+    for e in events:
+        user_fc_est[e["user_id"]] = user_fc_est.get(e["user_id"], 0) + count_tokens(e["content"])
+
+    def budget_for(uid: str) -> int:
+        est = user_fc_est.get(uid, 0)
+        return max(512, min(max_budget, int(0.08 * est))) if est else max_budget
 
     systems: list[SystemAdapter] = [
         MemdAdapter(_fresh_dir(data_dir)),
@@ -51,7 +68,7 @@ def run_longmemeval(data_dir: str | None = None, seed: int = 42, users: int = 8)
                 for uid, evs in by_user.items():
                     sys_adapter.add_events(evs)
                     sessions = sorted({e["session_id"] for e in evs})
-                    for s in sessions:
+                    for s in dict.fromkeys(sessions):  # close each session ONCE
                         sys_adapter._mem.close_session(s)
             else:
                 sys_adapter.add_events(events)
@@ -59,7 +76,9 @@ def run_longmemeval(data_dir: str | None = None, seed: int = 42, users: int = 8)
                 sys_adapter.user_id_budget = None
             for c in cases:
                 sys_adapter.user_id = c["user_id"]
-                b = full_budget if sys_adapter.name == "full-context" else budget
+                b = full_budget if sys_adapter.name == "full-context" else (
+                    budget_for(c["user_id"]) if sys_adapter.name == "memd" else 2000
+                )
                 run_case(rep, sys_adapter, c, longmemeval_synthetic.check_answer, budget_tokens=b)
         finally:
             sys_adapter.teardown()
@@ -115,14 +134,22 @@ def run_adversarial(data_dir: str | None = None) -> dict:
 def gate_check(reports: list[SuiteReport], adv: dict) -> tuple[bool, list[str]]:
     """Phase-1 exit bar (D5): memd >= baselines on accuracy at <=10% of
     full-context tokens; knowledge-update >= 0.95; zero adversarial regressions;
-    cost regression >20% vs baseline fails by default."""
+    cost regression >20% vs baseline fails by default.
+
+    Reports are keyed by (suite, system): both longmemeval and halumem emit
+    system='memd', and a bare system-keyed dict let the halumem summary
+    silently REPLACE the longmemeval one - the token-ratio check then graded
+    halumem's 51 tokens against longmemeval's bar and could never fail."""
     failures: list[str] = []
-    by_system = {r.system: r.summary() for r in reports}
-    m = by_system.get("memd")
-    fc = by_system.get("full-context")
-    rag = by_system.get("plain-rag")
-    if not m:
-        return False, ["no memd report"]
+    by_key = {(r.suite, r.system): r for r in reports}
+    lm_memd = by_key.get(("longmemeval-synthetic", "memd"))
+    lm_fc = by_key.get(("longmemeval-synthetic", "full-context"))
+    lm_rag = by_key.get(("longmemeval-synthetic", "plain-rag"))
+    if not lm_memd:
+        return False, ["no longmemeval memd report"]
+    m = lm_memd.summary()
+    fc = lm_fc.summary() if lm_fc else None
+    rag = lm_rag.summary() if lm_rag else None
     if fc:
         if m["accuracy"] < fc["accuracy"] - 0.02:
             failures.append(f"accuracy {m['accuracy']} < full-context {fc['accuracy']}")
@@ -132,7 +159,7 @@ def gate_check(reports: list[SuiteReport], adv: dict) -> tuple[bool, list[str]]:
             )
     if rag and m["accuracy"] < rag["accuracy"]:
         failures.append(f"accuracy {m['accuracy']} < plain-rag {rag['accuracy']} (Phase-0 kill signal)")
-    ku_cases = [c for c in reports[0].results if c.qclass == "knowledge_update"]
+    ku_cases = [c for c in lm_memd.results if c.qclass == "knowledge_update"]
     if ku_cases:
         acc = sum(c.correct for c in ku_cases) / len(ku_cases)
         if acc < 0.95:

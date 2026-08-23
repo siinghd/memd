@@ -164,6 +164,9 @@ def create_app(
         msg = str(exc)
         if "destroyed" in msg:
             return JSONResponse(status_code=410, content={"detail": "namespace destroyed"})
+        if "evicted" in msg:
+            return JSONResponse(status_code=503,
+                                content={"detail": "namespace re-opening; retry"})
         METRICS.inc("memd_http_errors_total", route=request.url.path)
         return JSONResponse(status_code=500, content={"detail": "internal error"})
 
@@ -345,12 +348,13 @@ def create_app(
     @app.post("/v1/ns/{ns}/export")
     def export_ns(ns: str, p: Principal = Depends(auth)):
         heavy(ns, "export", p)
-        data = engine.export_jsonl(namespace=ns)
-        return Response(
-            content=data,
-            media_type="application/x-ndjson",
-            headers={"Content-Disposition": f'attachment; filename="{ns}-export.jsonl"'},
-        )
+        # streaming NDJSON: first byte leaves before the namespace is
+        # materialized - bulk egress must not buffer O(namespace) bytes in RAM
+        from fastapi.responses import StreamingResponse
+
+        gen = engine.export_jsonl_iter(namespace=ns)
+        headers = {"Content-Disposition": f'attachment; filename="{ns}-export.jsonl"'}
+        return StreamingResponse(gen, media_type="application/x-ndjson", headers=headers)
 
     @app.get("/v1/ns/{ns}/stats")
     def stats(ns: str, p: Principal = Depends(auth)):

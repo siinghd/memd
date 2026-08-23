@@ -7,3 +7,4 @@ memd-data/
 harness-results/*.json.tmp
 .ralph/ralph-loop.state.json
 .ralph/ralph-history.json
+harness-results/

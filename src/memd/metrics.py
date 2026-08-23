@@ -101,8 +101,8 @@ class Registry:
             i = bisect.bisect_left(s.buckets, v)
             if i < len(s.buckets):
                 s.bucket_counts[i] += 1
-            else:  # above last bucket: count into +Inf implicitly via sum/count
-                s.bucket_counts[-1] += 0
+            # values above the last bucket are counted by +Inf (= s.count) at
+            # exposition time; no per-bucket increment is needed
 
     def timer(self, name: str, *, help: str = "", buckets: tuple[float, ...] = DEFAULT_BUCKETS,
               **labels: Any):
@@ -313,6 +313,7 @@ CORE_COUNTERS = {
     "memd_oversized_requests_total": "requests rejected by body-size cap",
     "memd_embed_query_failures_total": "query-embedding failures (degraded mode)",
     "memd_extraction_failures_total": "extraction runs that failed",
+    "memd_extraction_chunks_failed_total": "extraction chunks lost to provider errors",
     "memd_writes_total": "raw/explicit lane writes",
     "memd_search_total": "searches served",
     "memd_search_cache_hits_total": "repeat-query cache hits",
@@ -353,6 +354,9 @@ CORE_COUNTERS = {
     "memd_keystore_load_failures_total": "keys-file loads that failed (stale map served)",
     "memd_orphan_segments_adopted_total": "unreferenced segments healed on open",
     "memd_index_write_after_close_total": "index writes skipped after close",
+    "memd_store_ops_total": "object-store operations by type",
+    "memd_embed_backlog_dropped_total": "embeddings dropped: backlog over capacity",
+    "memd_embed_target_missing_total": "embeddings dropped because the target namespace is gone",
     "memd_forgets_total": "query-driven forget sweeps executed",
 }
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -26,12 +27,14 @@ import numpy as np
 from memd.core.schema import MemoryRecord, Scope, Source, now_ms
 from memd.metrics import METRICS
 
+# entity segments are dot-parts of normalize_entity_key output: [a-z0-9_-]+
+_SEG_CHARS = re.compile(r"[^a-z0-9_-]")
+
 # Minimum cosine for the vector lane to report a hit: kills zero-evidence
 # matches that are harmless in ranked search but dangerous for unbounded
 # sweeps (find_ids). Override with MEMD_MIN_COSINE if an embedding model
 # needs a different operating point.
 MIN_COSINE = float(os.environ.get("MEMD_MIN_COSINE", "0.02"))
-from memd.metrics import METRICS
 
 SCHEMA_VERSION = 1
 
@@ -310,7 +313,20 @@ class NamespaceIndex:
 
     def mark_quarantined(self, record_id: str, flag: bool) -> None:
         with self._lock:
-            self._con.execute("UPDATE records SET quarantined=? WHERE id=?", (int(flag), record_id))
+            if flag:
+                self._con.execute(
+                    "UPDATE records SET quarantined=1 WHERE id=?", (record_id,))
+            else:
+                # clearing MUST scrub the stored meta too: Python-side filter
+                # paths (_passes_filter) read meta['quarantined'], and a stale
+                # flag there hid decayed records forever even after the
+                # column was folded back to 0
+                self._con.execute(
+                    "UPDATE records SET quarantined=0, "
+                    "meta=json_remove(meta, '$.quarantined', '$.quarantine_expires') "
+                    "WHERE id=?",
+                    (record_id,),
+                )
             self._con.commit()
             self._invalidate_stats()
 
@@ -519,25 +535,88 @@ class NamespaceIndex:
         return out
 
     def search_bm25(self, query: str, f: IndexFilter, limit: int = 50) -> list[Hit]:
-        q = _fts_escape(query)
-        if not q:
+        """AND-first FTS with OR fallback (minimum-should-match semantics).
+
+        At 50K docs the old all-terms-OR expression matched huge fractions
+        of the corpus on natural-language queries (~155ms/query: bm25 + row
+        join per match). AND over content words returns a small,
+        highest-precision candidate set in milliseconds; when it comes back
+        empty or thin - genuinely disjoint vocabularies, single common terms -
+        we fall back to the OR union so recall-first behavior is preserved.
+        Two bounded FTS queries worst case; O(matches) either way."""
+        q_all = _fts_escape(query)
+        if not q_all:
             return []
+        words = q_all.split()
         args: list = []
         filt = self._filter_where(f, args)
-        sql = (
-            f"SELECT r.*, bm25(fts) AS rank FROM fts JOIN records r ON r.id = fts.id "  # nosec B608
-            f"WHERE fts MATCH ? AND {filt} ORDER BY rank LIMIT ?"
-        )
-        args = [q] + args + [limit]
+
+        def _run(match_expr: str) -> list[Hit]:
+            sql = (
+                f"SELECT r.*, bm25(fts) AS rank FROM fts JOIN records r ON r.id = fts.id "  # nosec B608
+                f"WHERE fts MATCH ? AND {filt} ORDER BY rank LIMIT ?"
+            )
+            qargs = [match_expr] + args + [limit]
+            with self._lock:
+                rows = self._con.execute(sql, qargs).fetchall()
+            hits = []
+            for r in rows:
+                if r["id"] in f.exclude_ids:
+                    continue
+                rec = self._row_to_record(r)
+                rec.namespace = self._ns_hint
+                hits.append(Hit(record=rec, score=-float(r["rank"]), lane="bm25"))
+            return hits
+
+        if len(words) > 1:
+            and_hits = _run(" AND ".join(f'"{w}"' for w in words))
+            if len(and_hits) >= min(10, limit):
+                METRICS.inc("memd_bm25_and_hits_total",
+                            help="bm25 served by the high-precision AND tier")
+                return and_hits
+        # OR tier, BOUNDED: ranking the full posting list made any query with
+        # a high-document-frequency term O(everything) - ~150ms at 50K docs
+        # when a single stemmed word appeared in all records. Instead take a
+        # fixed docid-ordered window (FTS5 serves it in milliseconds), hydrate,
+        # and re-rank by term coverage in Python - coverage reproduces bm25's
+        # multi-match preference at bounded cost. When total matches <= window,
+        # the candidate SET is identical to the unbounded version.
+        window = max(limit * 8, 320)
         with self._lock:
-            rows = self._con.execute(sql, args).fetchall()
+            if self._closed:
+                return []
+            ids = [r[0] for r in self._con.execute(
+                "SELECT id FROM fts WHERE fts MATCH ? LIMIT ?",
+                (" OR ".join(f'"{w}"' for w in words), window)).fetchall()]
+        if not ids:
+            return []
+        wset = set(words)
+        recs = self.get_many(ids)
+        # predicate enforcement lives HERE in the bounded path - the windowed
+        # id scan bypasses SQL-side filtering, so dropping this check leaked
+        # across scopes and validity windows (caught by fuzz + roundtrip tests)
+        recs = [r for r in recs if self._passes_filter(r, f)]
+
+        def _coverage(rec: MemoryRecord) -> int:
+            toks = set()
+            for t in rec.content.lower().split():
+                t = "".join(ch for ch in t if ch.isalnum() or ch in "_-")
+                if len(t) >= 3 and t not in _FTS_STOPWORDS:
+                    toks.add(t)
+            n = 0
+            for w in wset:
+                if w in toks or any(t.startswith(w) or w.startswith(t) for t in toks):
+                    n += 1
+            return n
+
+        recs.sort(key=lambda r: (-_coverage(r), r.id))
         hits = []
-        for r in rows:
-            if r["id"] in f.exclude_ids:
+        for pos, r in enumerate(recs[:limit]):
+            if r.id in f.exclude_ids:
                 continue
-            rec = self._row_to_record(r)
-            rec.namespace = self._ns_hint
-            hits.append(Hit(record=rec, score=-float(r["rank"]), lane="bm25"))
+            hits.append(Hit(record=r, score=-float(pos), lane="bm25"))
+        METRICS.inc("memd_bm25_or_bounded_total",
+                    help="bm25 served by the bounded OR scan")
         return hits
 
 
@@ -574,9 +653,35 @@ class NamespaceIndex:
             self._main_mat = mat.astype(np.float32)
             self._main_ids = ids
 
+    _RESTRICTIVE_FILTER_FIELDS = ("scope", "kinds", "sources", "entity_keys",
+                                  "t_event_min", "t_event_max", "as_of")
+
+    def _eligible_ids(self, f: IndexFilter) -> set[str] | None:
+        """SQL-side eligibility set for predicates the vector matrix cannot
+        see (scope/kind/time/entity). Returns None when no restrictive
+        predicate is present: deleted/quarantined/superseded rows are already
+        excluded at matrix load, so the unfiltered case costs zero extra I/O."""
+        if not any(getattr(f, name) is not None for name in self._RESTRICTIVE_FILTER_FIELDS):
+            return None
+        args: list = []
+        where = self._filter_where(f, args)
+        with self._lock:
+            rows = self._con.execute(f"SELECT id FROM records WHERE {where}", args).fetchall()  # nosec B608
+        return {r[0] for r in rows}
+
     def search_vector(self, query_vec: np.ndarray, f: IndexFilter, limit: int = 50) -> list[Hit]:
         """Flat cosine scan over main+overflow blocks. Per-query cost:
-        O(main) BLAS dot + O(overflow) merge - never an O(total) rebuild."""
+        O(V) BLAS dot + O(overflow) merge - never an O(total) rebuild.
+
+        Exactness under filters WITHOUT taxing the common case: candidates
+        are taken in widening top-k windows and hydrated in batched chunks.
+        A loose filter (typical scoped hybrid search) fills `limit` from the
+        first window at the old path's cost. A selective filter (e.g.
+        kinds=['fact'] in a raw-heavy namespace) would silently drop valid
+        deeper matches under fixed truncation - so after two speculative
+        windows we fall back to ONE exact SQL restriction of the score
+        vector. Bounded work per request: <= 2 speculative rounds + O(1)
+        fallback queries; hydration always chunked (500 ids/query)."""
         q = np.asarray(query_vec, dtype=np.float32).ravel()
         nrm = float(np.linalg.norm(q))
         if nrm > 0:
@@ -598,25 +703,55 @@ class NamespaceIndex:
         if not ids:
             return []
         scores = np.concatenate(parts) if len(parts) > 1 else parts[0]
-        k = min(limit * 4, len(ids))
-        top = np.argpartition(-scores, k - 1)[:k] if k < len(ids) else np.arange(len(ids))
-        top = top[np.argsort(-scores[top])]
-        cand_ids = [ids[i] for i in top]
-        cand_scores = [float(scores[i]) for i in top]
-        recs = {r.id: r for r in self.get_many(cand_ids)}
+        n = int(scores.shape[0])
+
+        def _collect(rows: np.ndarray, seen: set[str], hits: list[Hit]) -> None:
+            cand = [(ids[i], float(scores[i])) for i in rows]
+            fresh = [(cid, cs) for cid, cs in cand if cid not in seen]
+            if not fresh:
+                return
+            seen.update(cid for cid, _ in fresh)
+            recs = {r.id: r for r in self.get_many([cid for cid, _ in fresh])}
+            for cid, cscore in fresh:
+                if cscore < MIN_COSINE:
+                    continue  # no-evidence match: noise in ranked search, poison in sweeps
+                if cid in f.exclude_ids:
+                    continue
+                r = recs.get(cid)
+                if r is None or not self._passes_filter(r, f):
+                    continue
+                hits.append(Hit(record=r, score=cscore, lane="vector"))
+
+        # phase 1: speculative widening windows (cheap when the filter is
+        # loose). Sweep-scale limits skip straight to the exact phase: at
+        # limit>=1024 the windows would hydrate most of the namespace anyway.
         hits: list[Hit] = []
-        for cid, cscore in zip(cand_ids, cand_scores):
-            if cscore < MIN_COSINE:
-                continue  # no-evidence match: noise in ranked search, poison in sweeps
-            if cid in f.exclude_ids:
-                continue
-            r = recs.get(cid)
-            if r is None or not self._passes_filter(r, f):
-                continue
-            hits.append(Hit(record=r, score=cscore, lane="vector"))
-            if len(hits) >= limit:
-                break
-        return hits
+        seen: set[str] = set()
+        if limit < 1024:
+            for k in (limit * 4, limit * 16):
+                k = min(k, n)
+                if k <= 0:
+                    break
+                top = np.argpartition(-scores, k - 1)[:k] if k < n else np.arange(n)
+                top = top[np.argsort(-scores[top])]
+                _collect(top, seen, hits)
+                if len(hits) >= limit:
+                    return hits[:limit]
+        # phase 2: exact fallback - one SQL scan restricts scoring to rows
+        # whose record satisfies every predicate, then rank within that set
+        eligible = self._eligible_ids(f)
+        if eligible is not None:
+            keep = np.array([i for i, rid in enumerate(ids) if rid in eligible], dtype=np.int64)
+            if keep.size == 0:
+                return []
+            sub_scores = scores[keep]
+            m = int(sub_scores.shape[0])
+            k = min(limit * 4, m)
+            top = np.argpartition(-sub_scores, k - 1)[:k] if k < m else np.arange(m)
+            top = top[np.argsort(-sub_scores[top])]
+            hits = []
+            _collect(keep[top], set(), hits)
+        return hits[:limit]
 
     def _passes_filter(self, rec: MemoryRecord, f: IndexFilter) -> bool:
         s = f.scope
@@ -626,6 +761,11 @@ class NamespaceIndex:
                 if rv is not None and qv is not None and rv != qv:
                     return False
         if f.kinds and rec.kind not in f.kinds:
+            return False
+        # quarantine: single authority for every Python-side filter path
+        # (the bounded bm25 window hydrates rows BEFORE any SQL could exclude
+        # them - without this check an unreviewed record was retrievable)
+        if not f.include_quarantined and rec.meta.get("quarantined"):
             return False
         if not f.include_invalid:
             if rec.deleted:
@@ -664,14 +804,19 @@ class NamespaceIndex:
         return out[:limit]
 
     def records_missing_embedding(self, model: str, limit: int = 100_000) -> list[MemoryRecord]:
-        """Records with no vector or an outdated embedding_version - the
-        worklist for the re-embedding batch job (ADR-8). Quarantined records
-        are excluded: never pre-arm unreviewed content for retrieval."""
+        """Live, currently-valid records with no vector or an outdated
+        embedding_version - the worklist for the re-embedding batch job
+        (ADR-8). Quarantined records are excluded: never pre-arm unreviewed
+        content for retrieval. Deleted/superseded rows are excluded too:
+        embedding budget must not be spent on state no default-view query
+        can ever see."""
         with self._lock:
             rows = self._con.execute(
                 """SELECT r.* FROM records r LEFT JOIN vectors v ON v.id = r.id
                    WHERE (v.id IS NULL OR (r.embedding_version IS NOT NULL AND r.embedding_version != ?))
                      AND r.quarantined = 0
+                     AND r.deleted = 0
+                     AND r.superseded_by IS NULL
                    ORDER BY r.t_ingested LIMIT ?""",
                 (model, limit),
             ).fetchall()
@@ -730,12 +875,67 @@ class NamespaceIndex:
             out.append(rec)
         return out
 
+    def search_time_lane(self, f: IndexFilter, limit: int = 50) -> list[Hit]:
+        """Recency fan-out: newest records passing the filter. Gives temporal
+        queries a btree-ordered candidate stream (ix_rec_tevent) instead of
+        relying on lexical similarity to surface fresh records before the
+        packing-stage recency decay ever sees them.
+
+        Performance note: pushing the full predicate set into this query cost
+        ~3.5ms on a 3K-row corpus (OR-clauses defeat the ordered index scan);
+        fetching a recency window with only cheap predicates and applying the
+        exact predicates in Python costs ~0.2ms - same post-filter pattern as
+        search_vector, with one widening round so a stale-heavy tail cannot
+        silently shrink results."""
+        seen: set[str] = set()
+        hits: list[Hit] = []
+
+        def fetch(window: int) -> list[sqlite3.Row]:
+            with self._lock:
+                if self._closed:
+                    return []
+                return self._con.execute(
+                    "SELECT * FROM records WHERE deleted=0 AND quarantined=0 "
+                    "ORDER BY t_event DESC LIMIT ?",
+                    (window,),
+                ).fetchall()
+
+        for window in (limit * 4, limit * 16):
+            rows = fetch(window)
+            for r in rows:
+                rid = r["id"]
+                if rid in seen or rid in f.exclude_ids:
+                    continue
+                seen.add(rid)
+                rec = self._row_to_record(r)
+                rec.namespace = self._ns_hint
+                if not self._passes_filter(rec, f):
+                    continue
+                hits.append(Hit(record=rec, score=0.0, lane="time"))
+                if len(hits) >= limit:
+                    return hits
+            if len(rows) < window:
+                break  # namespace exhausted; widening cannot add anything
+        return hits
+
     def search_by_entity_tokens(self, tokens: list[str], f: IndexFilter, limit: int = 30) -> list[Hit]:
         """Entity lane: records whose entity-key segments match query tokens.
-        Exact btree lookups on the segments table - O(tokens x log E + matches)."""
+        Exact btree lookups on the segments table - O(tokens x log E + matches).
+
+        Tokens are normalized to the SEGMENT alphabet ([a-z0-9_-], matching
+        normalize_entity_key + dot-splitting). Raw whitespace-splits carry
+        punctuation ("acme?", "editor,") that matched no segment and silently
+        zeroed the whole lane on most real queries - masked by BM25/vector
+        still finding the record."""
         if not tokens:
             return []
-        toks = [t.strip().lower() for t in tokens[:8] if len(t.strip()) >= 3]
+        toks: list[str] = []
+        seen_toks: set[str] = set()
+        for t in tokens[:8]:
+            t = _SEG_CHARS.sub("", t.strip().lower())
+            if len(t) >= 3 and t not in seen_toks:
+                seen_toks.add(t)
+                toks.append(t)
         if not toks:
             return []
         qs = ",".join("?" * len(toks))
@@ -870,11 +1070,28 @@ class NamespaceIndex:
             self._ovf_vecs = []
 
 
+# Stopwords excluded from FTS terms: OR-ing them made every natural-language
+# query match a huge fraction of the corpus (at 50K docs the bm25 lane alone
+# cost ~155ms/query - 74% of end-to-end latency). Mirrors the embedder's
+# list plus standard IR stopwords.
+_FTS_STOPWORDS = frozenset(
+    "a an and are as at be but by for from has have i in is it its of on or "
+    "that the this to we was were will with you your do does did not no yes "
+    "so if then than there their they he she his her them about into over "
+    "under again further once here when where why how all any both each few "
+    "more most other some such only own same too very can just should now "
+    "later follow ups agreed discussed session number notes".split()
+)
+
+
 def _fts_escape(query: str) -> str:
-    """OR-combined quoted terms: recall-first; bm25() ranks the rest."""
+    """Quoted-term FTS5 expression. Recall strategy lives in search_bm25:
+    this only produces clean terms (stopwords dropped, hostile chars stripped)."""
     words = []
+    seen: set[str] = set()
     for tok in query.replace('"', " ").split():
-        tok = "".join(ch for ch in tok if ch.isalnum() or ch in "_-.")
-        if tok:
-            words.append(f'"{tok}"')
-    return " OR ".join(words)
+        tok = "".join(ch for ch in tok.lower() if ch.isalnum() or ch in "_-")
+        if tok and tok not in _FTS_STOPWORDS and tok not in seen:
+            seen.add(tok)
+            words.append(tok)
+    return " ".join(words)

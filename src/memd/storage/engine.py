@@ -22,6 +22,7 @@ import json
 import os
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 
 from memd.core.schema import MemoryRecord, now_ms, records_from_jsonl, records_to_jsonl, ulid_new
@@ -189,8 +190,8 @@ class NamespaceStore:
         self._wal_writer = None
         self._log_gen = 0  # bumped on rotate: old-log offsets become void
         self.manifest = Manifest()
-        self.manifest = Manifest()
         self._manifest_dirty = False
+        self._evicted = False
         self._closed = False
         # scheduled physical purges: [(record_id, deadline_ms)] + id set - the
         # D7 hard-delete deadline is only a guarantee if something can SEE when
@@ -230,11 +231,20 @@ class NamespaceStore:
             max_fold = max(max_fold, fold)
             if fold <= applied and applied > 0:
                 continue  # already reflected in this index
+            # NOTE: _segment_records returns a (records, fold_seq) TUPLE.
+            # This site used to iterate the tuple directly, so every segment
+            # replay raised AttributeError, was silently swallowed below, and
+            # fresh-cache recovery recovered NOTHING from segments - node
+            # loss silently reduced the namespace to its WAL tail. Unpack
+            # explicitly; parse failures degrade per-segment, never crash.
             try:
-                for rec in self._segment_records(data):
+                recs, _fold_seq = self._segment_records(data)
+                for rec in recs:
                     seg_records[rec.id] = rec
-            except Exception:
-                METRICS.inc("memd_storage_parse_errors_total", where="segment-replay", ns=namespace)
+            except Exception as ex:  # noqa: BLE001 - corrupt segment: skip, count, survive
+                METRICS.inc("memd_storage_parse_errors_total",
+                            where="segment-replay", ns=self.namespace,
+                            detail=type(ex).__name__)
                 continue
         max_fold = self._adopt_orphan_segments(seg_records, applied, max_fold)
         pending_ops = [o for o in ops if o.get("seq", 0) > max(applied, max((s.get("fold_seq", 0) for s in self.manifest.segments), default=0))]
@@ -415,6 +425,10 @@ class NamespaceStore:
 
     def _ensure_open(self) -> None:
         if self._closed:
+            if getattr(self, "_evicted", False):
+                raise RuntimeError(
+                    f"namespace {self.namespace!r} was evicted from the open cache; "
+                    "re-resolve it via the engine")
             raise RuntimeError(f"namespace {self.namespace!r} destroyed")
 
     def mark_destroyed(self) -> None:
@@ -448,7 +462,7 @@ class NamespaceStore:
         Writer handle acquired under the write lock: rotation seals the old
         handle under the same lock, so a write can never target a closed fd."""
         with self._wlock:
-            if not hasattr(self.store, "open_log"):
+            if not self._has_log_writer():
                 # store has no persistent-handle log: durable append per batch
                 size = self.store.append(self.wal_key, frame)
                 METRICS.inc("memd_wal_frames_total", ns=self.namespace)
@@ -462,8 +476,16 @@ class NamespaceStore:
             METRICS.inc("memd_wal_bytes_total", len(frame), ns=self.namespace)
         return end, gen
 
+    def _has_log_writer(self) -> bool:
+        """True when the store OVERRIDES open_log (real group-commit support).
+        A bare hasattr() is useless here: the ABC defines open_log, so every
+        subclass 'has' it and taking that path raised NotImplementedError
+        inside append() - breaking writes on any store without a
+        persistent-handle log."""
+        return getattr(type(self.store), "open_log", None) is not ObjectStore.open_log
+
     def _writer(self):
-        if getattr(self.store, "open_log", None) is None:
+        if not self._has_log_writer():
             raise NotImplementedError
         if self._wal_writer is None:
             self._wal_writer = self.store.open_log(self.wal_key)
@@ -480,6 +502,12 @@ class NamespaceStore:
         whoever holds the sync lock fsyncs up to the latest written pos).
         If the log was rotated meanwhile, our frame was folded into an
         immutable segment written via atomic put() - already durable."""
+        if getattr(self.store, "open_log", None) is None or not self._has_log_writer():
+            # no persistent-handle log: _wal_write used append(), whose
+            # contract is durable-on-return - there is nothing to wait for.
+            # (Reaching _writer() here raised NotImplementedError and broke
+            # every append on such stores.)
+            return
         while True:
             if self._log_gen != my_gen:
                 return  # folded into a segment; put() is atomic+durable
@@ -741,13 +769,27 @@ class NamespaceStore:
 
     # ------------------------------------------------------------------ exports / stats
 
-    def export_jsonl(self) -> bytes:
-        # lock: a concurrent rotate/compact must not delete segments mid-read
-        # (anti-lock-in export must be complete)
+    def export_jsonl_iter(self):
+        """Streaming anti-lock-in export: yields one NDJSON line at a time.
+
+        Why streaming: the previous formulation built the ENTIRE namespace
+        as a single bytes blob before the first byte left the process -
+        O(namespace) memory on a request path, gigabytes at hosted scale.
+        This generator holds O(live records) as objects and O(1) line-sized
+        serialization buffers (the residual object residency is inherent to
+        in-process fold state; an external sort would be needed to go lower).
+        Lock held only for the segment read phase - same completeness
+        guarantee as before (a concurrent rotate/compact cannot delete
+        segments mid-read), never across caller consumption."""
         with self._lock:
             recs, _ = self.load_all_records()
         recs.sort(key=lambda r: (r.time.t_ingested, r.id))
-        return records_to_jsonl(recs)
+        for r in recs:
+            yield json.dumps(r.to_dict(), separators=(",", ":")).encode() + b"\n"
+
+    def export_jsonl(self) -> bytes:
+        # buffered variant for CLI/SDK callers that want one blob
+        return b"".join(self.export_jsonl_iter())
 
     def stats(self) -> dict:
         st = self.index.stats()
@@ -789,23 +831,99 @@ class StorageEngine:
         store: ObjectStore | None = None,
         cache_dir: str | None = None,
         wal_rotate_bytes: int = DEFAULT_WAL_ROTATE_BYTES,
+        max_open_namespaces: int = 64,
     ):
         self.root = root
         self.store = store or LocalObjectStore(root)
         self.envelope = envelope
         self.cache_dir = cache_dir or os.path.join(root, "_cache")
         self.wal_rotate_bytes = wal_rotate_bytes
-        self._namespaces: dict[str, NamespaceStore] = {}
+        # LRU-bounded open-namespace table. Every open NamespaceStore pins a
+        # SQLite connection + WAL handle + manifest; the tenant mix is
+        # "many tiny, heavy tail, mostly idle" (D2), so an unbounded table
+        # leaks fds/RAM in proportion to tenants EVER touched, not tenants
+        # ACTIVE. Idle stores close cleanly: all state is durable blobs +
+        # manifest; reopen replays the tail. Pinned namespaces (the facade's
+        # default) are never evicted.
+        self._namespaces: "OrderedDict[str, NamespaceStore]" = OrderedDict()
+        self._pinned: set[str] = set()
+        self.max_open_namespaces = max(1, int(max_open_namespaces))
         self._lock = threading.RLock()
+
+    def pin_namespace(self, ns: str) -> None:
+        """Mark a namespace as process-resident (never LRU-evicted). The
+        Memory facade pins its default because it holds a direct reference
+        that must stay valid across unrelated namespace churn."""
+        ns = _validate_ns(ns)
+        with self._lock:
+            self._pinned.add(ns)
+            if ns in self._namespaces:
+                self._namespaces.move_to_end(ns)
+
+    def _evict_locked(self) -> None:
+        """Close + drop least-recently-used stores past the cap. A store
+        whose ns-lock cannot be taken without blocking has an operation in
+        flight - skip it this round rather than yank its index out from
+        under the caller."""
+        while len(self._namespaces) > self.max_open_namespaces:
+            evicted_any = False
+            for name in list(self._namespaces):  # oldest first (LRU order)
+                if len(self._namespaces) <= self.max_open_namespaces:
+                    return
+                if name in self._pinned:
+                    continue  # process-resident: never evicted
+                victim = self._namespaces[name]
+                if not victim._lock.acquire(blocking=False):
+                    continue  # in-flight op on this store; retry next pass
+                try:
+                    # write-close BEFORE close(): a straggler holding an old
+                    # reference must fail fast instead of appending alongside
+                    # the store's reopened successor (forked WAL/seq state)
+                    victim._closed = True
+                    victim._evicted = True
+                    try:
+                        victim.close()  # flushes manifest + index watermark durably
+                    except Exception:
+                        METRICS.inc("memd_ns_evict_close_errors_total",
+                                    help="errors while closing an evicted namespace store")
+                finally:
+                    victim._lock.release()
+                del self._namespaces[name]
+                METRICS.inc("memd_ns_evictions_total",
+                            help="open namespace stores closed by the LRU cap")
+                evicted_any = True
+            if not evicted_any:
+                return  # everything pinned or busy: cap exceeded by design
 
     def namespace(self, ns: str) -> NamespaceStore:
         ns = _validate_ns(ns)
         with self._lock:
-            if ns not in self._namespaces:
-                self._namespaces[ns] = NamespaceStore(
+            nstore = self._namespaces.get(ns)
+            if nstore is None:
+                nstore = NamespaceStore(
                     ns, self.store, self.cache_dir, self.envelope, self.wal_rotate_bytes
                 )
-            return self._namespaces[ns]
+                self._namespaces[ns] = nstore
+                self._evict_locked()
+            else:
+                self._namespaces.move_to_end(ns)
+            return nstore
+
+    def peek_namespace(self, ns: str) -> "NamespaceStore | None":
+        """Existing open store, or None - NEVER materializes one.
+
+        Derived-lane writers (background embedding) must use this instead of
+        namespace(): a by-name lookup that re-creates a popped store can
+        resurrect a namespace mid-destroy and replay its not-yet-deleted WAL
+        into a ghost index. If the target is gone (destroyed OR LRU-evicted),
+        the work is dropped - the vector lane heals via reembed(), records
+        were shredded on purpose."""
+        ns = _validate_ns(ns)
+        with self._lock:
+            nstore = self._namespaces.get(ns)
+            if nstore is not None:
+                self._namespaces.move_to_end(ns)
+            return nstore
 
     def list_namespaces(self) -> list[str]:
         out = []
