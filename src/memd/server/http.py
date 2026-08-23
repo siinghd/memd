@@ -76,6 +76,22 @@ class FindIn(BaseModel):
     confirm: bool = False  # forget only: two-phase like the MCP tool
 
 
+def _route_label(path: str) -> str:
+    """Bucket dynamic path segments for metric labels.
+
+    Namespace names and record ids are UNBOUNDED cardinality (scales with
+    tenants and rows); a raw value in a Prometheus label multiplies every
+    http series by both. At registry cap the eviction guard starts silently
+    dropping unrelated series - so labels carry only the route SHAPE:
+    /v1/ns/{ns}/memories/{id} -> /v1/ns/:ns/memories/:id."""
+    parts = path.split("/")
+    if len(parts) >= 4 and parts[1] == "v1" and parts[2] == "ns":
+        rest = parts[4:]
+        tail = [":id" if i >= 1 else p for i, p in enumerate(rest)]
+        return "/".join(["/v1/ns/:ns"] + tail)
+    return path
+
+
 def create_app(
     data_dir: str = "./memd-data",
     keys_path: str | None = None,
@@ -108,14 +124,9 @@ def create_app(
 
     @app.middleware("http")
     async def instrument_requests(request: Request, call_next):
-        path = request.url.path
-        # bucket paths: /v1/ns/{ns}/... -> /v1/ns/:ns/... (label cardinality guard)
-        parts = path.split("/")
-        if len(parts) > 4 and parts[1] == "v1" and parts[2] == "ns":
-            safe = ["/".join(parts[:4])] + [":id" if i >= 5 else p for i, p in enumerate(parts[4:], start=5)]
-            route_label = "/".join(safe)
-        else:
-            route_label = path
+        # bucket paths: /v1/ns/{ns}/memories/{id} -> /v1/ns/:ns/memories/:id
+        # (label cardinality guard - see _route_label)
+        route_label = _route_label(request.url.path)
         cl = request.headers.get("content-length")
         if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
             METRICS.inc("memd_oversized_requests_total", route=route_label)

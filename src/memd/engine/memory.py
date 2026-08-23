@@ -128,13 +128,19 @@ def _guard_input(content: str, meta: dict[str, Any] | None) -> None:
 
 
 class _EmbedWorker:
-    """Async batched embedder: write ack never waits on embeddings."""
+    """Async batched embedder: write ack never waits on embeddings.
+
+    The queue is BOUNDED (max_queue texts). When the embedder falls behind a
+    write burst (e.g. BYO API outage), submit() drops the embedding work for
+    the overflow instead of buffering unbounded content strings in RAM - the
+    record stays fully searchable via BM25/entity lanes and the vector lane
+    heals via reembed() (the ADR-8 degradation story, now memory-safe)."""
 
     def __init__(self, embedder: Embedder, apply_fn, batch_size: int = 32, flush_s: float = 0.5,
-                 max_retries: int = 3):
+                 max_retries: int = 3, max_queue: int = 5_000):
         self.embedder = embedder
         self.apply_fn = apply_fn
-        self.q: queue.Queue[tuple[str, str]] = queue.Queue()
+        self.q: "queue.Queue[tuple[str, str]]" = queue.Queue(maxsize=max(1, max_queue))
         self.retries: dict[str, int] = {}
         self.max_retries = max_retries
         self.batch_size = batch_size
@@ -143,9 +149,16 @@ class _EmbedWorker:
         self._thread = threading.Thread(target=self._run, daemon=True, name="memd-embed")
         self._thread.start()
 
-    def submit(self, record_id: str, text: str) -> None:
-        self.q.put((record_id, text))
+    def submit(self, record_id: str, text: str) -> bool:
+        """Enqueue embedding work; False when dropped (queue full) - callers
+        treat that as 'vector lane deferred', never an error."""
+        try:
+            self.q.put_nowait((record_id, text))
+        except queue.Full:
+            METRICS.inc("memd_embed_backlog_dropped_total", help="embeddings dropped: backlog over capacity")
+            return False
         METRICS.set_gauge("memd_embed_queue_depth", self.q.qsize(), help="pending embedding texts")
+        return True
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -180,8 +193,14 @@ class _EmbedWorker:
                     n = self.retries.get(rid, 0) + 1
                     if n <= self.max_retries:
                         self.retries[rid] = n
-                        self.q.put((rid, batch[rid]))
-                        METRICS.inc("memd_embed_retries_total")
+                        try:
+                            self.q.put_nowait((rid, batch[rid]))
+                            METRICS.inc("memd_embed_retries_total")
+                        except queue.Full:
+                            # backlog full: give up on this retry (dead letter);
+                            # reembed() heals the vector lane later
+                            self.retries.pop(rid, None)
+                            METRICS.inc("memd_embed_dead_letters_total")
                     else:
                         self.retries.pop(rid, None)
                         METRICS.inc("memd_embed_dead_letters_total")
@@ -288,11 +307,11 @@ class Memory:
         preset_core(METRICS, ns=namespace)
         self._qcache = _SearchCache()
         self._qepochs: dict[str, int] = {}
-        preset_core(METRICS, ns=namespace)
         self._embed_worker = _EmbedWorker(
             self.embedder,
             self._apply_vectors,
             batch_size=int(cfg.get("embed_batch", 32)),
+            max_queue=int(cfg.get("embed_max_queue", 5_000)),
         )
         self.audit.append(actor="system", action="open", target=namespace, detail={"embedder": self.embedder.name})
 
@@ -482,9 +501,7 @@ class Memory:
         METRICS.observe("memd_write_ack_seconds", (time.monotonic() - t0) * 1000,
                         help="durable write ack latency (ms)", ns=ns.namespace)
         self._bump_epoch(ns.namespace)
-        for old_id, new_id in pairs:
-            ns.append_op({"op": "supersede", "old": old_id, "new": new_id, "at": now_ms()})
-            ns.index.mark_superseded(old_id, new_id, now_ms())
+        self._apply_supersedence(ns, pairs)
         METRICS.inc("memd_writes_total", help="raw/explicit lane writes", ns=ns.namespace, kind=kind, source=src.name.lower())
         METRICS.inc("memd_remembers_total", ns=ns.namespace)
         self._embed_worker.submit(rec.id, rec.content)
@@ -512,6 +529,16 @@ class Memory:
             demoted.add(old_id)
             rec.meta["demotes"] = sorted(set(rec.meta.get("demotes", [])) | demoted)
         return res.superseded_pairs
+
+    def _apply_supersedence(self, ns, pairs: list[tuple[str, str]]) -> None:
+        """Persist + index supersedence pairs in one durable append and one
+        index transaction (previously an fsync'd append + commit PER pair)."""
+        if not pairs:
+            return
+        at = now_ms()
+        ops = [{"op": "supersede", "old": old_id, "new": new_id, "at": at} for old_id, new_id in pairs]
+        ns.append_ops(ops)
+        ns.index.apply_ops_batch(ops)
 
     def observe(
         self,
@@ -869,6 +896,9 @@ class Memory:
         # fact's raw lineage in meta.demotes - packing then skips that stale
         # raw evidence (demotion, not deletion; D3 §3.6)
         superseded_all = [p for res in results for p in res.superseded_pairs]
+        # lineage demotion: a fact that supersedes another carries the old
+        # fact's raw lineage in meta.demotes - packing then skips that stale
+        # raw evidence (demotion, not deletion; D3 §3.6)
         old_fact_cache: dict[str, MemoryRecord | None] = {}
         for r in kept_recs:
             demoted: set[str] = set()
@@ -883,9 +913,7 @@ class Memory:
                     demoted.add(old_id)
             if demoted:
                 r.meta["demotes"] = sorted(demoted)
-        for old_id, new_id in superseded_all:
-            ns.append_op({"op": "supersede", "old": old_id, "new": new_id, "at": now_ms()})
-            ns.index.mark_superseded(old_id, new_id, now_ms())
+        self._apply_supersedence(ns, superseded_all)
         written = len(kept_recs)
         # persist kept facts in one durable batch (after demote annotation)
         if kept_recs:
@@ -916,6 +944,47 @@ class Memory:
         if hard:
             self._enforce_purge_deadlines(ns)
         return ok
+
+    def delete_many(
+        self,
+        record_ids: list[str],
+        *,
+        hard: bool = False,
+        actor: str = "api",
+        namespace: str | None = None,
+    ) -> int:
+        """Batched deletion (embedded mode): ONE durable op-append (one fsync)
+        + ONE index transaction for the whole set.
+
+        The destructive-sweep path previously called delete() per id - two
+        fsync'd appends and two index commits per record (O(n) round trips on
+        a request path). Complexity here: O(n) arithmetic, O(1) fsyncs,
+        O(1) commits. Single-id delete() is unchanged."""
+        impl = self._hosted()
+        if impl is not None:
+            # hosted door has no batch endpoint yet: keep correctness, accept
+            # the per-id cost server-side
+            return sum(1 for rid in record_ids if impl.delete(rid, hard=hard, namespace=namespace))
+        ids = [rid for rid in record_ids if rid]
+        if not ids:
+            return 0
+        ns = self._ns_for(namespace)
+        now = now_ms()
+        ops: list[dict] = [{"op": "tombstone", "id": rid, "at": now} for rid in ids]
+        if hard:
+            deadline = now + self._purge_deadline_ms
+            ops.extend({"op": "hard_delete", "id": rid, "deadline": deadline} for rid in ids)
+        ns.append_ops(ops)
+        ns.index.apply_ops_batch(ops)
+        METRICS.inc("memd_deletes_total", len(ids), hard=hard, ns=ns.namespace, batched="true")
+        self._bump_epoch(ns.namespace)
+        self.audit.append(
+            actor=actor, action="hard_delete_batch" if hard else "delete_batch",
+            target=f"{len(ids)} records", detail={"count": len(ids), "hard": hard},
+        )
+        if hard:
+            self._enforce_purge_deadlines(ns)
+        return len(ids)
 
     def _enforce_purge_deadlines(self, ns) -> bool:
         """Self-enforce the physical-purge guarantee (D7 #8): when a scheduled
@@ -1019,8 +1088,9 @@ class Memory:
             query, user_id=user_id, session_id=session_id, agent_id=agent_id,
             org_id=org_id, namespace=namespace,
         )
-        for rid in ids:
-            self.delete(rid, actor=actor, namespace=namespace)
+        # one durable batch for the whole sweep (delete_many), not an
+        # fsync-per-id loop
+        self.delete_many(ids, actor=actor, namespace=namespace)
         self.audit.append(actor=actor, action="forget",
                           target=self._audit_target_for_query(query), detail={"deleted": len(ids)})
         return ids

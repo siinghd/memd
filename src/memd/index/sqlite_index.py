@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from memd.core.schema import MemoryRecord, Scope, Source
+from memd.core.schema import MemoryRecord, Scope, Source, now_ms
 from memd.metrics import METRICS
 
 # Minimum cosine for the vector lane to report a hit: kills zero-evidence
@@ -328,18 +328,79 @@ class NamespaceIndex:
         """Physical removal inside the index (compaction deadline path)."""
         with self._lock:
             cur = self._con.execute("DELETE FROM records WHERE id=?", (record_id,))
-            self._con.execute("DELETE FROM fts WHERE id=?", (record_id,))
-            self._con.execute("DELETE FROM vectors WHERE id=?", (record_id,))
-            self._con.execute(
-                "DELETE FROM entity_segments WHERE entity_key IN "
-                "(SELECT entity_key FROM entities WHERE record_id=?)",
-                (record_id,),
-            )
-            self._con.execute("DELETE FROM entities WHERE record_id=?", (record_id,))
-            self._con.execute("DELETE FROM links WHERE src=? OR dst=?", (record_id, record_id))
+            self._hard_delete_rows(self._con, record_id)
             self._con.commit()
             self._invalidate_stats()
             return cur.rowcount > 0
+
+    @staticmethod
+    def _hard_delete_rows(c: sqlite3.Connection, record_id: str) -> None:
+        """Row removals for a hard delete, no commit (shared by the single-id
+        path and apply_ops_batch)."""
+        c.execute("DELETE FROM fts WHERE id=?", (record_id,))
+        c.execute("DELETE FROM vectors WHERE id=?", (record_id,))
+        c.execute(
+            "DELETE FROM entity_segments WHERE entity_key IN "
+            "(SELECT entity_key FROM entities WHERE record_id=?)",
+            (record_id,),
+        )
+        c.execute("DELETE FROM entities WHERE record_id=?", (record_id,))
+        c.execute("DELETE FROM links WHERE src=? OR dst=?", (record_id, record_id))
+
+    def apply_ops_batch(self, ops: list[dict]) -> None:
+        """Apply mutation ops for many records in ONE transaction: one commit,
+        one stats invalidation. The batched counterpart of calling
+        tombstone()/mark_superseded()/mark_quarantined()/hard_delete() in a
+        loop - the destructive-sweep path previously paid a commit per op
+        (O(n) fsyncs on the request path). Op semantics match append_op's
+        index application exactly; self-supersede is ignored (inert)."""
+        if not ops:
+            return
+        with self._lock:
+            if self._closed:
+                return
+            c = self._con
+            try:
+                for op in ops:
+                    kind = op.get("op")
+                    rid = op.get("id") or op.get("old")
+                    if not rid:
+                        continue
+                    if kind == "tombstone":
+                        c.execute(
+                            "UPDATE records SET deleted=1, invalidated_at=COALESCE(invalidated_at,?) WHERE id=?",
+                            (op.get("at", now_ms()), rid),
+                        )
+                    elif kind == "supersede":
+                        new = op.get("new")
+                        if new == rid or not new:
+                            continue  # malformed/self-supersede would brick the record
+                        c.execute(
+                            "UPDATE records SET invalidated_at=?, superseded_by=? WHERE id=?",
+                            (op.get("at", now_ms()), new, rid),
+                        )
+                    elif kind == "quarantine":
+                        c.execute(
+                            "UPDATE records SET quarantined=? WHERE id=?",
+                            (int(bool(op.get("flag", True))), rid),
+                        )
+                    elif kind == "set_vector":
+                        import numpy as np
+
+                        vec = np.frombuffer(bytes.fromhex(op["vec_hex"]), dtype=np.float32)
+                        c.execute(
+                            "INSERT OR REPLACE INTO vectors(id,dim,model,vec) VALUES(?,?,?,?)",
+                            (rid, int(vec.shape[0]), op.get("model", ""), vec.astype(np.float32).tobytes()),
+                        )
+                        c.execute("UPDATE records SET embedding_version=? WHERE id=?", (op.get("model", ""), rid))
+                    elif kind == "hard_delete":
+                        c.execute("DELETE FROM records WHERE id=?", (rid,))
+                        self._hard_delete_rows(c, rid)
+                c.commit()
+            except Exception:
+                self.flush()  # don't leave a broken transaction open
+                raise
+            self._invalidate_stats()
 
     # ------------------------------------------------------------------ reads
 

@@ -192,10 +192,13 @@ class NamespaceStore:
         self.manifest = Manifest()
         self._manifest_dirty = False
         self._closed = False
-        # scheduled physical purges: [(record_id, deadline_ms)] - the D7
-        # hard-delete deadline is only a guarantee if something can SEE when
-        # it comes due without rescanning the whole ops log
+        # scheduled physical purges: [(record_id, deadline_ms)] + id set - the
+        # D7 hard-delete deadline is only a guarantee if something can SEE when
+        # it comes due without rescanning the whole ops log. The set keeps
+        # tracking idempotent (a rotate replaying an op must not double-count).
         self._pending_hard: list[tuple[str, int]] = []
+        self._pending_hard_ids: set[str] = set()
+        self._rotating = False  # re-entrancy guard for rotate-inside-append_ops
         self._open()
 
     # ------------------------------------------------------------------ open/recover
@@ -239,6 +242,7 @@ class NamespaceStore:
             (o["id"], int(o.get("deadline", 0))) for o in ops
             if o.get("op") == "hard_delete" and o.get("id")
         ]
+        self._pending_hard_ids = {rid for rid, _ in self._pending_hard}
         self._apply_to_index(list(seg_records.values()), pending_ops, from_replay=True)
         wal = self.store.get(self.wal_key) or b""
         base = self.manifest.wal_base_seq
@@ -505,24 +509,51 @@ class NamespaceStore:
             else:
                 time.sleep(0.0002)
 
+    def _track_pending_hard(self, rid: str, deadline_ms: int) -> None:
+        """Idempotently schedule a physical purge (dedup across rotate
+        replays so pending counts stay honest)."""
+        if rid in self._pending_hard_ids:
+            return
+        self._pending_hard_ids.add(rid)
+        self._pending_hard.append((rid, deadline_ms))
+
     def append_op(self, op: dict) -> None:
+        self.append_ops([op])
+
+    def append_ops(self, ops: list[dict]) -> None:
+        """Persist + apply mutation ops in ONE durable store.append (one fsync
+        for the whole batch) and one index application per op row.
+
+        The previous per-op path (append_op called in a loop) issued an
+        fsync'd append AND a separate index commit PER OP - O(n) round trips
+        on the forget/destructive-sweep request path. Frame format is
+        unchanged (one op per frame), so replay is identical."""
+        if not ops:
+            return
         # hygiene: a self-supersede is inert everywhere - refuse to persist it
-        if op.get("op") == "supersede" and op.get("old") == op.get("new"):
+        ops = [op for op in ops if not (op.get("op") == "supersede" and op.get("old") == op.get("new"))]
+        if not ops:
             return
         with self._lock:
-            self.manifest.seq += 1
-            op["seq"] = self.manifest.seq
-            payload = json.dumps(op, separators=(",", ":")).encode()
-            frame = _frame_encode(self.envelope.encrypt(self.namespace, payload))
-            size = self.store.append(self.ops_key, frame)
+            frames = []
+            for op in ops:
+                self.manifest.seq += 1
+                op["seq"] = self.manifest.seq
+                payload = json.dumps(op, separators=(",", ":")).encode()
+                frames.append(_frame_encode(self.envelope.encrypt(self.namespace, payload)))
+            size = self.store.append(self.ops_key, b"".join(frames))
             self.manifest.ops_size = size
             self._manifest_dirty = True
-            if size >= self.wal_rotate_bytes:
+            # rotate is skipped while a rotation is already folding this log:
+            # re-entering would fold mid-replay state. The outer fold re-reads
+            # everything we just appended.
+            if size >= self.wal_rotate_bytes and not self._rotating:
                 self.rotate("ops-size")
-            if op.get("op") == "hard_delete" and op.get("id"):
-                self._pending_hard.append((op["id"], int(op.get("deadline", 0))))
-                METRICS.set_gauge("memd_pending_purges", len(self._pending_hard), ns=self.namespace)
-            self._apply_to_index([], [op])
+            for op in ops:
+                if op.get("op") == "hard_delete" and op.get("id"):
+                    self._track_pending_hard(op["id"], int(op.get("deadline", 0)))
+            METRICS.set_gauge("memd_pending_purges", len(self._pending_hard), ns=self.namespace)
+            self._apply_to_index([], ops)
 
     def has_due_deletes(self, now_ms_: int | None = None) -> bool:
         """True when at least one scheduled physical purge has passed its
@@ -559,42 +590,51 @@ class NamespaceStore:
                 self._log_gen += 1
                 self._written_pos = 0
                 self._synced_pos = 0
-            METRICS.inc("memd_rotations_total", ns=self.namespace, reason=reason)
-            recs: list[MemoryRecord] = []
-            for fr in self._read_frames(self.wal_key):
-                try:
-                    recs.extend(records_from_jsonl(self._decrypt_frame(fr)))
-                except Exception:
-                    METRICS.inc("memd_storage_parse_errors_total", where="rotate-wal", ns=self.namespace)
-                    continue
-            ops = self._read_ops()
-            kept, pending_ops, unq_ids = _apply_ops(recs, ops, now_ms(), force=False)
-            # quarantine decay: restore index visibility for expired flags
-            for rid_ in unq_ids:
-                self.index.mark_quarantined(rid_, False)
-            name = f"seg-{ulid_new()}"
-            if kept:
-                self._write_segment(name, kept, self.manifest.seq)
-                self.manifest.segments.append(
-                    {"name": name, "records": len(kept), "fold_seq": self.manifest.seq, "reason": reason}
-                )
-            self.index.flush()  # rows durable before advancing watermark
-            self.index.set_meta("applied_seq", str(self.manifest.seq))
-            self._persist_manifest()
-            # truncate logs (object-store friendly: rewrite empty)
-            self.store.delete(self.wal_key)
-            self.store.delete(self.ops_key)
-            self.manifest.wal_size = 0
-            self.manifest.ops_size = 0
-            self.manifest.wal_base_seq = self.manifest.seq  # next frame = base+1
-            self._synced_pos = 0
-            self._written_pos = 0
-            self._persist_manifest()
-            self._pending_hard = []  # rebuilt below: only still-pending (not-due) ops return
-            for op in pending_ops:
-                self.append_op(op)
-            METRICS.set_gauge("memd_pending_purges", len(self._pending_hard), ns=self.namespace)
-            return name
+            self._rotating = True
+            try:
+                return self._rotate_locked(reason)
+            finally:
+                self._rotating = False
+
+    def _rotate_locked(self, reason: str) -> str:
+        """Fold body (caller holds the ns lock and set _rotating)."""
+        METRICS.inc("memd_rotations_total", ns=self.namespace, reason=reason)
+        recs: list[MemoryRecord] = []
+        for fr in self._read_frames(self.wal_key):
+            try:
+                recs.extend(records_from_jsonl(self._decrypt_frame(fr)))
+            except Exception:
+                METRICS.inc("memd_storage_parse_errors_total", where="rotate-wal", ns=self.namespace)
+                continue
+        ops = self._read_ops()
+        kept, pending_ops, unq_ids = _apply_ops(recs, ops, now_ms(), force=False)
+        # quarantine decay: restore index visibility for expired flags
+        for rid_ in unq_ids:
+            self.index.mark_quarantined(rid_, False)
+        name = f"seg-{ulid_new()}"
+        if kept:
+            self._write_segment(name, kept, self.manifest.seq)
+            self.manifest.segments.append(
+                {"name": name, "records": len(kept), "fold_seq": self.manifest.seq, "reason": reason}
+            )
+        self.index.flush()  # rows durable before advancing watermark
+        self.index.set_meta("applied_seq", str(self.manifest.seq))
+        self._persist_manifest()
+        # truncate logs (object-store friendly: rewrite empty)
+        self.store.delete(self.wal_key)
+        self.store.delete(self.ops_key)
+        self.manifest.wal_size = 0
+        self.manifest.ops_size = 0
+        self.manifest.wal_base_seq = self.manifest.seq  # next frame = base+1
+        self._synced_pos = 0
+        self._written_pos = 0
+        self._persist_manifest()
+        # rebuild pending-purge tracking with only still-pending (not-due) ops
+        self._pending_hard = []
+        self._pending_hard_ids = set()
+        self.append_ops(pending_ops)  # one fsync; _rotating guard blocks nested folds
+        METRICS.set_gauge("memd_pending_purges", len(self._pending_hard), ns=self.namespace)
+        return name
 
     # ------------------------------------------------------------------ maintenance
 
@@ -672,9 +712,11 @@ class NamespaceStore:
                 self.store.delete(f"{self.prefix}/{on}")
             self.manifest.wal_size = 0
             self.manifest.ops_size = 0
-            self._pending_hard = []  # rebuilt below: only still-pending (not-due) ops return
-            for op in pending_ops:
-                self.append_op(op)
+            # rebuild pending-purge tracking with only still-pending (not-due)
+            # ops, re-persisted in ONE durable append
+            self._pending_hard = []
+            self._pending_hard_ids = set()
+            self.append_ops(pending_ops)
             self._persist_manifest()
             METRICS.set_gauge("memd_pending_purges", len(self._pending_hard), ns=self.namespace)
             rep.segments_out = len(self.manifest.segments)

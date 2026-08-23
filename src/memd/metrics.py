@@ -340,6 +340,7 @@ CORE_COUNTERS = {
     "memd_embed_failures_total": "embedding batch failures",
     "memd_embed_retries_total": "embedding retry attempts",
     "memd_embed_dead_letters_total": "embeddings dropped after retry cap",
+    "memd_embed_backlog_dropped_total": "embeddings deferred: backlog over capacity (reembed heals)",
     "memd_auto_compactions_total": "opportunistic compactions (self-enforced deadlines)",
     "memd_storage_parse_errors_total": "corrupt frames skipped in replay/load",
     "memd_audit_flush_failures_total": "audit entries lost to I/O errors",
