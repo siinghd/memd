@@ -37,7 +37,30 @@ _SEG_CHARS = re.compile(r"[^a-z0-9_-]")
 # needs a different operating point.
 MIN_COSINE = float(os.environ.get("MEMD_MIN_COSINE", "0.02"))
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# Vectors are stored as float16. A 384-dim float32 vector costs 1536 bytes on
+# disk (2053 B/record measured, including row + index overhead) and was the
+# single largest contributor to write amplification - on a 90-byte record the
+# vector ALONE was 22.8x the raw bytes against a <=3x SLO. Halving it is free
+# in quality terms: these are L2-normalised vectors and cosine is computed in
+# float32 after upcast, so the only loss is ~3 decimal digits of mantissa on
+# values in [-1, 1].
+VEC_DTYPE = np.float16
+
+
+def _vec_blob(vec: "np.ndarray") -> bytes:
+    v = np.asarray(vec, dtype=np.float32).ravel()
+    nrm = float(np.linalg.norm(v))
+    if nrm > 0:
+        v = v / nrm
+    return v.astype(VEC_DTYPE).tobytes()
+
+
+def _vec_from_blob(blob: bytes, dim: int) -> "np.ndarray":
+    """Decode one stored vector, tolerating pre-v2 float32 blobs."""
+    dtype = VEC_DTYPE if dim and len(blob) == dim * 2 else np.float32
+    return np.frombuffer(blob, dtype=dtype).astype(np.float32)
 
 
 @dataclass(frozen=True)
@@ -168,12 +191,66 @@ class NamespaceIndex:
               PRIMARY KEY(src, dst, link_type)
             );
             CREATE INDEX IF NOT EXISTS ix_links_dst ON links(dst);
+            -- EXTERNAL-CONTENT fts5: the index reads content from `records`
+            -- instead of storing its own copy. The previous plain fts5 kept a
+            -- second full copy of every record's text - measured at 10.27MB
+            -- beside records.content's 10.27MB on a 10K x 800B corpus, i.e.
+            -- one third of all durable bytes spent duplicating content that
+            -- already exists two feet away. Triggers keep it in sync, which
+            -- also deletes the manual fts maintenance the write path carried.
             CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
-              id UNINDEXED, content, tokenize='porter ascii'
+              content, content='records', content_rowid='rowid',
+              tokenize='porter ascii'
             );
+            CREATE TRIGGER IF NOT EXISTS records_ai AFTER INSERT ON records BEGIN
+              INSERT INTO fts(rowid, content) VALUES (new.rowid, new.content);
+            END;
+            CREATE TRIGGER IF NOT EXISTS records_ad AFTER DELETE ON records BEGIN
+              INSERT INTO fts(fts, rowid, content) VALUES('delete', old.rowid, old.content);
+            END;
+            CREATE TRIGGER IF NOT EXISTS records_au AFTER UPDATE ON records BEGIN
+              INSERT INTO fts(fts, rowid, content) VALUES('delete', old.rowid, old.content);
+              INSERT INTO fts(rowid, content) VALUES (new.rowid, new.content);
+            END;
             """
         )
         v = c.execute("SELECT v FROM meta WHERE k='schema_version'").fetchone()
+        if v is not None and int(v[0]) < SCHEMA_VERSION:
+            # v1 -> v2: the fts table changed shape (content-duplicating ->
+            # external-content). It is derived data, so rebuild rather than
+            # migrate: drop and repopulate from `records` in one statement.
+            c.executescript(
+                """
+                DROP TRIGGER IF EXISTS records_ai;
+                DROP TRIGGER IF EXISTS records_ad;
+                DROP TRIGGER IF EXISTS records_au;
+                DROP TABLE IF EXISTS fts;
+                CREATE VIRTUAL TABLE fts USING fts5(
+                  content, content='records', content_rowid='rowid',
+                  tokenize='porter ascii'
+                );
+                CREATE TRIGGER records_ai AFTER INSERT ON records BEGIN
+                  INSERT INTO fts(rowid, content) VALUES (new.rowid, new.content);
+                END;
+                CREATE TRIGGER records_ad AFTER DELETE ON records BEGIN
+                  INSERT INTO fts(fts, rowid, content) VALUES('delete', old.rowid, old.content);
+                END;
+                CREATE TRIGGER records_au AFTER UPDATE ON records BEGIN
+                  INSERT INTO fts(fts, rowid, content) VALUES('delete', old.rowid, old.content);
+                  INSERT INTO fts(rowid, content) VALUES (new.rowid, new.content);
+                END;
+                INSERT INTO fts(rowid, content) SELECT rowid, content FROM records;
+                """
+            )
+            # v1 -> v2 also halves stored vectors. Convert in place rather than
+            # dropping them: a rebuild would be correct (they are derived) but
+            # would cost a full re-embed, which for a BYO-key deployment is
+            # real money.
+            for _id, _dim, _blob in c.execute("SELECT id, dim, vec FROM vectors").fetchall():
+                if _dim and len(_blob) == int(_dim) * 4:
+                    c.execute("UPDATE vectors SET vec=? WHERE id=?",
+                              (_vec_blob(np.frombuffer(_blob, dtype=np.float32)), _id))
+            c.execute("UPDATE meta SET v=? WHERE k='schema_version'", (str(SCHEMA_VERSION),))
         if v is None:
             c.execute("INSERT INTO meta(k,v) VALUES('schema_version',?)", (str(SCHEMA_VERSION),))
         c.commit()
@@ -242,7 +319,6 @@ class NamespaceIndex:
                             json.dumps(rec.meta), int(quarantined.get(rec.id, False)), int(rec.deleted),
                         ),
                     )
-                    c.execute("INSERT OR REPLACE INTO fts(id, content) VALUES(?,?)", (rec.id, rec.content))
                     c.execute("DELETE FROM entities WHERE record_id=?", (rec.id,))
                     c.executemany(
                         "INSERT OR IGNORE INTO entities(entity_key, record_id) VALUES(?,?)",
@@ -262,7 +338,7 @@ class NamespaceIndex:
                     if vec is not None:
                         c.execute(
                             "INSERT OR REPLACE INTO vectors(id,dim,model,vec) VALUES(?,?,?,?)",
-                            (rec.id, int(vec.shape[0]), model, vec.astype(np.float32).tobytes()),
+                            (rec.id, int(vec.shape[0]), model, _vec_blob(vec)),
                         )
                 # no per-batch commit: lazy via _maybe_commit (replay-safe)
             except Exception:
@@ -351,11 +427,13 @@ class NamespaceIndex:
     OVERFLOW_MAX = 4096
 
     def set_vector(self, record_id: str, vec: np.ndarray, model: str) -> None:
+        blob = _vec_blob(vec)
+        # the in-RAM cache keeps float32 (BLAS scans it); only the DURABLE
+        # copy is halved, so search precision is untouched
         v = np.asarray(vec, dtype=np.float32).ravel()
-        nrm = float(np.linalg.norm(v))
-        if nrm > 0:
-            v = (v / nrm).astype(np.float32)
-        blob = v.tobytes()
+        _n = float(np.linalg.norm(v))
+        if _n > 0:
+            v = v / _n
         with self._lock:
             if self._closed:
                 METRICS.inc("memd_index_write_after_close_total", ns=self._ns_hint)
@@ -433,7 +511,8 @@ class NamespaceIndex:
     def _hard_delete_rows(c: sqlite3.Connection, record_id: str) -> None:
         """Row removals for a hard delete, no commit (shared by the single-id
         path and apply_ops_batch)."""
-        c.execute("DELETE FROM fts WHERE id=?", (record_id,))
+        # fts is external-content with triggers: deleting the record row
+        # removes its index entry, so touching fts here would double-delete
         c.execute("DELETE FROM vectors WHERE id=?", (record_id,))
         c.execute(
             "DELETE FROM entity_segments WHERE entity_key IN "
@@ -486,7 +565,7 @@ class NamespaceIndex:
                         vec = np.frombuffer(bytes.fromhex(op["vec_hex"]), dtype=np.float32)
                         c.execute(
                             "INSERT OR REPLACE INTO vectors(id,dim,model,vec) VALUES(?,?,?,?)",
-                            (rid, int(vec.shape[0]), op.get("model", ""), vec.astype(np.float32).tobytes()),
+                            (rid, int(vec.shape[0]), op.get("model", ""), _vec_blob(vec)),
                         )
                         c.execute("UPDATE records SET embedding_version=? WHERE id=?", (op.get("model", ""), rid))
                     elif kind == "hard_delete":
@@ -644,7 +723,7 @@ class NamespaceIndex:
 
         def _run(match_expr: str) -> list[Hit]:
             sql = (
-                f"SELECT r.*, bm25(fts) AS rank FROM fts JOIN records r ON r.id = fts.id "  # nosec B608
+                f"SELECT r.*, bm25(fts) AS rank FROM fts JOIN records r ON r.rowid = fts.rowid "  # nosec B608
                 f"WHERE fts MATCH ? AND {filt} ORDER BY rank LIMIT ?"
             )
             qargs = [match_expr] + args + [limit]
@@ -696,7 +775,7 @@ class NamespaceIndex:
         # scans + O(limit) hydrations instead of O(window) hydrations.
         with self._read() as _c:
             rows = _c.execute(
-                "SELECT r.id, r.content FROM fts JOIN records r ON r.id = fts.id "  # nosec B608
+                "SELECT r.id, r.content FROM fts JOIN records r ON r.rowid = fts.rowid "  # nosec B608
                 f"WHERE fts MATCH ? AND {or_filt} LIMIT ?",
                 [" OR ".join(f'"{w}"' for w in words)] + or_args + [window]).fetchall()
         if len(rows) >= window:
@@ -771,13 +850,15 @@ class NamespaceIndex:
 
     def _load_vectors_locked(self) -> None:
         rows = self._con.execute(
-            """SELECT v.id, v.vec FROM vectors v JOIN records r ON r.id=v.id
+            """SELECT v.id, v.vec, v.dim FROM vectors v JOIN records r ON r.id=v.id
                WHERE r.deleted=0 AND r.quarantined=0
                  AND r.invalidated_at IS NULL AND r.superseded_by IS NULL"""
         ).fetchall()
         ids = [r[0] for r in rows]
         if rows:
-            mat = np.frombuffer(b"".join(r[1] for r in rows), dtype=np.float32).reshape(len(rows), -1)
+            # decode per row so a store holding pre-v2 float32 blobs alongside
+            # v2 float16 ones still loads (dim tells us which each is)
+            mat = np.stack([_vec_from_blob(r[1], int(r[2])) for r in rows])
             norms = np.linalg.norm(mat, axis=1, keepdims=True)
             norms[norms == 0] = 1.0
             mat = mat / norms
@@ -1200,7 +1281,7 @@ class NamespaceIndex:
     def wipe(self) -> None:
         with self._lock:
             self._con.executescript(
-                "DELETE FROM fts; DELETE FROM vectors; DELETE FROM entities; "
+                "DELETE FROM vectors; DELETE FROM entities; "
                 "DELETE FROM entity_segments; DELETE FROM links; DELETE FROM records;"
             )
             self._con.commit()
