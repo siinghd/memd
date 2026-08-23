@@ -1,0 +1,268 @@
+"""Extractor contract (ADR-6): raw segments -> candidate facts.
+
+Contract rules:
+  - Extraction is a *derived index build*: re-runnable, versioned, never the
+    only copy of information (raw lane is retained).
+  - Every fact carries `entity_keys` (normalized cluster keys) and `lineage`
+    (the raw record ids it came from).
+  - Trust-tier propagation (D7): facts inherit the *cap* of their sources'
+    tiers - extraction from untrusted raw can never mint higher-trust facts.
+  - Conservative by default: precision over recall; consolidation resolves
+    conflicts cluster-locally via supersedence, never globally.
+
+Providers: LLMExtractor (BYO OpenAI-compatible key) and HeuristicExtractor
+(high-precision patterns; keeps the fact lane functional with zero keys).
+"""
+from __future__ import annotations
+
+import json
+import re
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+
+from memd.core.schema import MemoryRecord, Source
+
+PROMPT_VERSION = "v1"
+
+
+@dataclass
+class ExtractedFact:
+    content: str
+    entity_keys: list[str] = field(default_factory=list)
+    lineage: list[str] = field(default_factory=list)
+
+
+def normalize_entity_key(key: str) -> str:
+    k = key.strip().lower()
+    k = re.sub(r"[^a-z0-9._-]+", "_", k)
+    k = re.sub(r"_+", "_", k).strip("_")
+    return k[:120]
+
+
+def slug(s: str, max_len: int = 40) -> str:
+    s = re.sub(r"[^a-z0-9]+", "_", s.strip().lower()).strip("_")
+    return s[:max_len]
+
+
+class Extractor(ABC):
+    name: str = "base"
+
+    @abstractmethod
+    def extract(self, records: list[MemoryRecord]) -> list[ExtractedFact]: ...
+
+    def cap_source_tier(self, facts: list[ExtractedFact], sources: list[MemoryRecord]) -> list[ExtractedFact]:
+        return facts
+
+
+def min_source_tier(records: list[MemoryRecord]) -> Source:
+    if not records:
+        return Source.IMPORT
+    return min((r.provenance.source for r in records), key=lambda s: int(s))
+
+
+class HeuristicExtractor(Extractor):
+    """High-precision pattern extraction. Zero keys, zero network.
+
+    Facts are rewritten as standalone third-person statements (same contract
+    as the LLM prompt) keyed to canonical entity keys so supersedence works
+    out of the box. Original wording kept in meta.verbatim."""
+
+    name = "heuristic"
+
+    _PATTERNS: list[tuple[re.Pattern, str]] = [
+        # identity
+        (re.compile(r"\bmy name is\s+([A-Z][\w'-]*(?:\s[A-Z][\w'-]*)?)", re.I), "user.name"),
+        (re.compile(r"\b(?:call me|i(?:'m| am) called)\s+([A-Z][\w'-]*)", re.I), "user.name"),
+        # employment
+        (re.compile(r"\bi\s+(?:\w+\s+){0,3}?work(?:ed|ing)?\s+(?:at|for)\s+([A-Za-z0-9&.-]+)", re.I), "user.employer"),
+        (re.compile(r"\bmy employer is\s+([A-Za-z0-9&.-]+)", re.I), "user.employer"),
+        # location
+        (re.compile(r"\bi\s+(?:live|moved|relocated)\s+(?:to|in)\s+([A-Za-z .'-]+?)(?:[.,;!]|$)", re.I), "user.city"),
+        # deployment / tooling
+        (re.compile(r"\bwe\s+(?:deploy|ship|release)\s+(?:with|using|via)\s+(.+?)(?:[.,;!]|$)", re.I), "team.deploy_cmd"),
+        (re.compile(r"\bthe\s+(?:deploy|deployment)\s+command\s+is\s+(.+?)(?:[.,;!]|$)", re.I), "team.deploy_cmd"),
+        (re.compile(r"\bthe\s+(?:build|test|run)\s+command\s+is\s+(.+?)(?:[.,;!]|$)", re.I), "repo.build_cmd"),
+        # editors
+        (re.compile(r"\bmy editor is\s+([\w.-]+)", re.I), "user.editor"),
+        (re.compile(r"\b(?:i|we)\s+(?:switched|moved)\s+(?:my |our )?editor\s+to\s+([\w.-]+)", re.I), "user.editor"),
+        (re.compile(r"\bi\s+use\s+([\w.-]+)\s+as\s+my\s+editor", re.I), "user.editor"),
+        # preferences
+        (re.compile(r"\bwe\s+use\s+(.+?)\s+(?:for|to)\s+(\w+)", re.I), None),
+        (re.compile(r"\b(?:i|we)\s+(?:prefer|like)\s+(.+?)(?:[.,;!]|$)", re.I), None),
+        (re.compile(r"\b(?:i|we)\s+(?:hate|dislike|avoid|don't like|do not like)\s+(.+?)(?:[.,;!]|$)", re.I), None),
+        (re.compile(r"\b(?:always|never)\s+([a-z].*?)(?:[.,;!]|$)", re.I), None),
+        # contact / environment
+        (re.compile(r"\bmy\s+(?:email|e-mail)\s+is\s+(\S+@\S+)", re.I), "user.email"),
+        (re.compile(r"\bmy\s+(?:timezone|tz)\s+is\s+([\w/+_-]+)", re.I), "user.timezone"),
+        (re.compile(r"\bi\s+use\s+(?:a\s+)?([\w-]+)\s+(?:laptop|machine|computer)", re.I), "user.machine"),
+    ]
+
+    def extract(self, records: list[MemoryRecord]) -> list[ExtractedFact]:
+        facts: list[ExtractedFact] = []
+        # resolve display names within the batch so facts read as standalone
+        # third-person statements about the person, not opaque user ids
+        name_map = self._batch_names(records)
+        for rec in records:
+            text = rec.content.strip()
+            if not text or rec.kind not in ("raw_event", "procedure"):
+                continue
+            subject_id = rec.scope.user or rec.scope.agent or rec.scope.org or "the user"
+            subject = name_map.get(subject_id, subject_id)
+            for pat, key in self._PATTERNS:
+                m = pat.search(text)
+                if not m:
+                    continue
+                groups = [g.strip() for g in m.groups() if g and g.strip()]
+                if not groups:
+                    continue
+                if key is None:
+                    key = self._dynamic_key(pat, groups)
+                ekeys = [normalize_entity_key(key)] if key else []
+                content = self._third_person(normalize_entity_key(key), subject, groups)
+                facts.append(
+                    ExtractedFact(content=content, entity_keys=ekeys, lineage=[rec.id])
+                )
+        seen: set[str] = set()
+        out = []
+        for f in facts:
+            k = f.content.lower()
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(f)
+        return out
+
+    @staticmethod
+    def _batch_names(records: list[MemoryRecord]) -> dict[str, str]:
+        names: dict[str, str] = {}
+        for rec in records:
+            sid = rec.scope.user or rec.scope.agent
+            if not sid:
+                continue
+            m = re.search(r"\bmy name is\s+([A-Z][\w'-]*(?:\s[A-Z][\w'-]*)?)", rec.content, re.I)
+            if not m:
+                m = re.search(r"\b(?:call me|i(?:'m| am) called)\s+([A-Z][\w'-]*)", rec.content, re.I)
+            if m:
+                names.setdefault(sid, m.group(1).strip())
+        return names
+
+    @staticmethod
+    def _third_person(key: str, subject: str, groups: list[str]) -> str:
+        x = groups[0].strip().rstrip(".,;!")
+        y = groups[1].strip() if len(groups) > 1 else ""
+        if key == "user.name":
+            return f"{subject} is called {x}"
+        if key == "user.employer":
+            return f"{subject} works at {x}"
+        if key == "user.city":
+            return f"{subject} lives in {x}"
+        if key == "team.deploy_cmd":
+            return f"the team deploys with {x}"
+        if key == "repo.build_cmd":
+            return f"the build command is {x}"
+        if key == "user.editor":
+            return f"{subject}'s editor is {x}"
+        if key == "user.email":
+            return f"{subject}'s email is {x}"
+        if key == "user.timezone":
+            return f"{subject}'s timezone is {x}"
+        if key == "user.machine":
+            return f"{subject} uses a {x} machine"
+        if key.startswith("tool."):
+            return f"{subject} uses {x} for {y}" if y else f"{subject} uses {x}"
+        if key.startswith("user.pref."):
+            return f"{subject} prefers {x}"
+        if key.startswith("user.avoid."):
+            return f"{subject} avoids {x}"
+        if key.startswith("policy."):
+            return f"policy: {x}"
+        return f"{subject}: {x}"
+
+    @staticmethod
+    def _dynamic_key(pat: re.Pattern, groups: list[str]) -> str:
+        pats = pat.pattern
+        if "for|to" in pats:
+            return f"tool.{slug(groups[-1])}"
+        if "prefer|like" in pats:
+            return f"user.pref.{slug(groups[0], 24)}"
+        if "hate|dislike" in pats:
+            return f"user.avoid.{slug(groups[0], 24)}"
+        if "always|never" in pats:
+            head = slug(groups[0].split()[0] if groups[0].split() else "rule", 16)
+            return f"policy.{head}"
+        return "fact.general"
+
+
+class LLMExtractor(Extractor):
+    """Cheap-model extraction over OpenAI-compatible chat completions.
+    Batched per segment; prompt pinned by PROMPT_VERSION."""
+
+    name = "llm"
+
+    _SYSTEM_PROMPT = f"""You extract durable memories from agent conversation segments.
+Return ONLY a JSON array. Each item: {{"content": "<standalone third-person fact>", "entity_keys": ["<dot.separated.key>"]}}.
+Rules:
+- Only stable, reusable facts (identity, preferences, procedures, environment, decisions). No chit-chat.
+- entity_keys are short normalized keys like user.employer, repo.build_cmd, user.pref.editor.
+- One fact per distinct assertion; keep the original wording when possible.
+- If nothing qualifies, return [].
+prompt_version={PROMPT_VERSION}"""
+
+    def __init__(self, model: str, api_key: str, base_url: str = "https://api.openai.com/v1"):
+        import httpx
+
+        self.model = model
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self._client = httpx.Client(timeout=60)
+
+    def extract(self, records: list[MemoryRecord]) -> list[ExtractedFact]:
+        if not records:
+            return []
+        lines = [f"[{r.id}] {r.content}" for r in records]
+        user_msg = "Segment:\n" + "\n".join(lines)
+        resp = self._client.post(
+            f"{self.base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json={
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": self._SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                "temperature": 0,
+            },
+        )
+        resp.raise_for_status()
+        text = resp.json()["choices"][0]["message"]["content"]
+        return self._parse(text, records)
+
+    def _parse(self, text: str, records: list[MemoryRecord]) -> list[ExtractedFact]:
+        try:
+            start, end = text.find("["), text.rfind("]")
+            arr = json.loads(text[start : end + 1])
+        except Exception:
+            return []
+        id_set = {r.id for r in records}
+        out = []
+        for item in arr:
+            if not isinstance(item, dict):
+                continue
+            content = str(item.get("content", "")).strip()
+            if not content:
+                continue
+            ekeys = [normalize_entity_key(k) for k in item.get("entity_keys", []) if k]
+            lin = [x for x in item.get("lineage", []) if x in id_set]
+            out.append(ExtractedFact(content=content, entity_keys=ekeys, lineage=lin))
+        return out
+
+
+def resolve_extractor(config: dict | None = None) -> Extractor:
+    cfg = config or {}
+    if cfg.get("extraction_api_key"):
+        return LLMExtractor(
+            model=cfg.get("extraction_model", "gpt-4o-mini"),
+            api_key=cfg["extraction_api_key"],
+            base_url=cfg.get("extraction_base_url", "https://api.openai.com/v1"),
+        )
+    return HeuristicExtractor()

@@ -1,0 +1,205 @@
+"""Hosted client: same API as embedded Memory, over REST (D4 §4.2)."""
+from __future__ import annotations
+
+from typing import Any
+
+import httpx
+
+
+class HostedError(RuntimeError):
+    def __init__(self, status: int, message: str):
+        super().__init__(f"[{status}] {message}")
+        self.status = status
+
+
+class HostedMemory:
+    def __init__(self, api_key: str, base_url: str = "http://localhost:8700", namespace: str = "default",
+                 transport: httpx.BaseTransport | None = None):
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.namespace = namespace
+        self._client = httpx.Client(
+            base_url=self.base_url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=30,
+            transport=transport,  # injectable for tests (ASGITransport)
+        )
+
+    # -- writes -------------------------------------------------------
+    def add(self, content: str, **kw) -> list[str]:
+        body: dict[str, Any] = {"content": content}
+        for k in ("role", "session_id", "user_id", "agent_id", "org_id", "source", "actor_id", "t_event", "kind", "meta"):
+            if kw.get(k) is not None:
+                body[k] = self._src(kw[k]) if k == "source" else kw[k]
+        r = self._client.post(f"/v1/ns/{self._ns(kw)}/events", json={"events": [body]})
+        self._raise(r)
+        return r.json()["ids"]
+
+    def add_events(self, events: list[dict], **kw) -> list[str]:
+        body = []
+        for e in events:
+            ev: dict[str, Any] = {"content": e["content"]}
+            for k in ("role", "session_id", "user_id", "agent_id", "org_id", "source", "actor_id", "t_event", "kind", "meta"):
+                if e.get(k) is not None:
+                    ev[k] = self._src(e[k]) if k == "source" else e[k]
+            body.append(ev)
+        r = self._client.post(f"/v1/ns/{self._ns(kw)}/events", json={"events": body})
+        self._raise(r)
+        return r.json()["ids"]
+
+    def remember(self, content: str, *, entity_keys: list[str] | None = None, **kw) -> str:
+        body: dict[str, Any] = {"content": content, "entity_keys": entity_keys or []}
+        for k in ("kind", "session_id", "user_id", "agent_id", "org_id", "source", "actor_id",
+                  "t_event", "valid_from"):
+            if kw.get(k) is not None:
+                body[k] = self._src(kw[k]) if k == "source" else kw[k]
+        r = self._client.post(f"/v1/ns/{self._ns(kw)}/memories", json=body)
+        self._raise(r)
+        return r.json()["id"]
+
+    def observe(self, messages: list[dict], response: str, **kw) -> list[str]:
+        events = []
+        for m in messages:
+            if isinstance(m, dict) and m.get("content"):
+                events.append({"content": str(m["content"]), "role": m.get("role", "user"),
+                               **{k: kw[k] for k in ("session_id", "user_id", "agent_id", "org_id") if kw.get(k) is not None}})
+        events.append({"content": response, "role": "assistant",
+                       **{k: kw[k] for k in ("session_id", "user_id", "agent_id", "org_id") if kw.get(k) is not None}})
+        return self.add_events(events, namespace=kw.get("namespace"))
+
+    # -- reads --------------------------------------------------------
+    def search(self, query: str, **kw) -> Any:
+        from memd.engine.memory import SearchResult, SearchHit
+
+        body: dict[str, Any] = {"query": query}
+        for k in ("user_id", "session_id", "agent_id", "org_id", "budget_tokens", "as_of", "kinds",
+                  "include_quarantined"):
+            if kw.get(k) is not None:
+                body[k] = kw[k]
+        r = self._client.post(f"/v1/ns/{self._ns(kw)}/search", json=body)
+        self._raise(r)
+        d = r.json()
+        return SearchResult(
+            packed_context=d["packed_context"],
+            items=[SearchHit(**i) for i in d["items"]],
+            tokens_used=d["tokens_used"],
+            budget=d["budget"],
+            truncated=d["truncated"],
+            query_class=d["query_class"],
+            latency_ms=d["latency_ms"],
+        )
+
+    def pack(self, messages: list[dict], **kw) -> list[dict]:
+        last_user = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
+        if not last_user:
+            return messages
+        res = self.search(str(last_user), **kw)
+        if not res.items:
+            return messages
+        out = list(messages)
+        insert_at = 0
+        for i, m in enumerate(out):
+            if m.get("role") == "system":
+                insert_at = i + 1
+            else:
+                break
+        out.insert(insert_at, {"role": "system", "content": res.packed_context})
+        return out
+
+    def get(self, record_id: str, *, history: bool = False, **kw) -> dict | None:
+        ns = self._ns(kw)
+        r = self._client.get(f"/v1/ns/{ns}/memories/{record_id}", params={"history": str(history).lower()})
+        if r.status_code == 404:
+            return None
+        self._raise(r)
+        return r.json()
+
+    # -- lifecycle ----------------------------------------------------
+    def delete(self, record_id: str, *, hard: bool = False, **kw) -> bool:
+        r = self._client.delete(f"/v1/ns/{self._ns(kw)}/memories/{record_id}", params={"hard": str(hard).lower()})
+        if r.status_code == 404:
+            return False
+        self._raise(r)
+        return True
+
+    def close_session(self, session_id: str, **kw) -> dict:
+        r = self._client.post(f"/v1/ns/{self._ns(kw)}/sessions/{session_id}/close")
+        self._raise(r)
+        return r.json()
+
+    def stats(self, **kw) -> dict:
+        r = self._client.get(f"/v1/ns/{self._ns(kw)}/stats")
+        self._raise(r)
+        return r.json()
+
+    def export_jsonl(self, **kw) -> bytes:
+        r = self._client.post(f"/v1/ns/{self._ns(kw)}/export")
+        self._raise(r)
+        return r.content
+
+    def status(self, **kw) -> dict:
+        r = self._client.get("/v1/status")
+        self._raise(r)
+        return r.json()
+
+    def compact(self, force: bool = False, **kw) -> dict:
+        ns = self._ns(kw)
+        r = self._client.post(f"/v1/ns/{ns}/compact", params={"force": str(force).lower()})
+        self._raise(r)
+        return r.json()
+
+    def destroy_namespace(self, namespace: str | None = None, **kw) -> bool:
+        ns = namespace or self._ns(kw)
+        r = self._client.delete(f"/v1/ns/{ns}")
+        if r.status_code == 404:
+            return False
+        self._raise(r)
+        return True
+
+    # -- destructive query flows (parity with embedded / MCP memory_forget)
+    _FIND_KEYS = ("user_id", "session_id", "agent_id", "org_id", "as_of", "kinds")
+
+    def find_ids(self, query: str, **kw) -> list[str]:
+        body: dict[str, Any] = {"query": query}
+        for k in self._FIND_KEYS:
+            if kw.get(k) is not None:
+                body[k] = kw[k]
+        r = self._client.post(f"/v1/ns/{self._ns(kw)}/find_ids", json=body)
+        self._raise(r)
+        return r.json()["ids"]
+
+    def forget(self, query: str, *, confirm: bool = False, **kw) -> Any:
+        """Without confirm: returns the preview dict (what WOULD be deleted).
+        With confirm=True: executes and returns the deleted id list."""
+        body: dict[str, Any] = {"query": query, "confirm": confirm}
+        for k in self._FIND_KEYS:
+            if kw.get(k) is not None:
+                body[k] = kw[k]
+        r = self._client.post(f"/v1/ns/{self._ns(kw)}/forget", json=body)
+        self._raise(r)
+        d = r.json()
+        return d["deleted"] if confirm else d
+
+    # -- helpers ------------------------------------------------------
+    @staticmethod
+    def _src(v):
+        """Trust tiers arrive as Source enums from embedded-parity callers;
+        the REST contract speaks their lowercase names."""
+        from memd.core.schema import Source
+
+        return v.name.lower() if isinstance(v, Source) else v
+
+    def _ns(self, kw: dict) -> str:
+        return kw.get("namespace") or self.namespace
+
+    @staticmethod
+    def _raise(r: httpx.Response) -> None:
+        if r.status_code >= 400:
+            try:
+                detail = r.json().get("detail", r.text)
+            except Exception:
+                detail = r.text
+            raise HostedError(r.status_code, str(detail))
+
+    def close(self) -> None:
+        self._client.close()

@@ -1,0 +1,819 @@
+"""Derived index for one namespace (ADR-5): indexes are rebuildable views.
+
+Backing: SQLite (WAL mode) providing
+  - BM25 via FTS5 (tantivy-class sparse retrieval without a second service)
+  - flat exact vector scan via a cached numpy matrix (size-adaptive strategy:
+    namespaces < ~50K vectors - the vast majority - get perfect recall here;
+    IVF-PQ slots behind VectorSearchStrategy later without API change)
+  - btree columns for time / entity / scope / validity filtering
+
+Durability contract: the durable append (segments) is the source of truth;
+this index is committed synchronously before write-ack to give immediate
+read-your-writes, but a lost index commit is always recoverable by replaying
+segments (synchronous=NORMAL is therefore correct, not a shortcut).
+"""
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import threading
+import time
+from dataclasses import dataclass, field
+
+import numpy as np
+
+from memd.core.schema import MemoryRecord, Scope, Source
+from memd.metrics import METRICS
+
+# Minimum cosine for the vector lane to report a hit: kills zero-evidence
+# matches that are harmless in ranked search but dangerous for unbounded
+# sweeps (find_ids). Override with MEMD_MIN_COSINE if an embedding model
+# needs a different operating point.
+MIN_COSINE = float(os.environ.get("MEMD_MIN_COSINE", "0.02"))
+from memd.metrics import METRICS
+
+SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class IndexFilter:
+    scope: Scope | None = None
+    kinds: tuple[str, ...] | None = None
+    as_of: int | None = None  # None => currently-valid view
+    t_event_min: int | None = None
+    t_event_max: int | None = None
+    entity_keys: tuple[str, ...] | None = None
+    sources: tuple[str, ...] | None = None
+    include_invalid: bool = False
+    include_quarantined: bool = False
+    exclude_ids: frozenset[str] = field(default_factory=frozenset)
+    now: int | None = None  # boundary for not-yet-valid records (defaults to query time)
+
+
+@dataclass(frozen=True)
+class Hit:
+    record: MemoryRecord
+    score: float  # lane-specific raw score (bm25 rank, cosine, recency...)
+    lane: str  # "bm25" | "vector" | "time" | "entity" | "link"
+
+
+class NamespaceIndex:
+    def __init__(self, path: str):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.path = path
+        try:
+            os.chmod(path, 0o600)  # records may be sensitive; local file only
+        except OSError:
+            pass
+        self._lock = threading.RLock()
+        # vector cache: main matrix + bounded overflow block. Per-query cost is
+        # O(main) scan + O(overflow); overflow folds into main when it exceeds
+        # OVERFLOW_MAX rows, so write bursts never trigger O(total) copies.
+        self._main_mat: np.ndarray = np.zeros((0, 0), dtype=np.float32)
+        self._main_ids: list[str] = []
+        self._ovf_ids: list[str] = []
+        self._ovf_vecs: list[np.ndarray] = []
+        self._vec_loaded = False
+        self.OVERFLOW_MAX = 4096
+        self._con = sqlite3.connect(path, check_same_thread=False)
+        self._con.row_factory = sqlite3.Row
+        self._lazy_commits = 0
+        self._commit_threshold = 64
+        self._closed = False
+        self._stats_cache: dict | None = None
+        self._stats_at = 0.0
+        self._con.execute("PRAGMA journal_mode=WAL")
+        self._con.execute("PRAGMA synchronous=NORMAL")
+        self._con.execute("PRAGMA temp_store=MEMORY")
+        self._con.execute("PRAGMA busy_timeout=5000")
+        self._migrate()
+
+    def _migrate(self) -> None:
+        c = self._con
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+            CREATE TABLE IF NOT EXISTS records(
+              id TEXT PRIMARY KEY,
+              kind TEXT NOT NULL,
+              content TEXT NOT NULL,
+              scope_org TEXT, scope_agent TEXT, scope_user TEXT, scope_session TEXT,
+              source INTEGER NOT NULL,
+              actor_id TEXT, prov_session TEXT,
+              lineage TEXT NOT NULL DEFAULT '[]',
+              extractor TEXT,
+              t_event INTEGER NOT NULL,
+              t_ingested INTEGER NOT NULL,
+              valid_from INTEGER,
+              invalidated_at INTEGER,
+              superseded_by TEXT,
+              entity_keys TEXT NOT NULL DEFAULT '[]',
+              embedding_version TEXT,
+              meta TEXT NOT NULL DEFAULT '{}',
+              quarantined INTEGER NOT NULL DEFAULT 0,
+              deleted INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS ix_rec_kind ON records(kind);
+            CREATE INDEX IF NOT EXISTS ix_rec_tevent ON records(t_event);
+            CREATE INDEX IF NOT EXISTS ix_rec_scope ON records(scope_org, scope_user, scope_session);
+            CREATE INDEX IF NOT EXISTS ix_rec_valid ON records(invalidated_at, deleted);
+            CREATE TABLE IF NOT EXISTS vectors(
+              id TEXT PRIMARY KEY REFERENCES records(id) ON DELETE CASCADE,
+              dim INTEGER NOT NULL,
+              model TEXT NOT NULL,
+              vec BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS entities(
+              entity_key TEXT NOT NULL,
+              record_id TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+              PRIMARY KEY(entity_key, record_id)
+            );
+            CREATE TABLE IF NOT EXISTS entity_segments(
+              segment TEXT NOT NULL,
+              entity_key TEXT NOT NULL,
+              PRIMARY KEY(segment, entity_key)
+            );
+            CREATE TABLE IF NOT EXISTS links(
+              src TEXT NOT NULL,
+              dst TEXT NOT NULL,
+              link_type TEXT NOT NULL,
+              PRIMARY KEY(src, dst, link_type)
+            );
+            CREATE INDEX IF NOT EXISTS ix_links_dst ON links(dst);
+            CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
+              id UNINDEXED, content, tokenize='porter ascii'
+            );
+            """
+        )
+        v = c.execute("SELECT v FROM meta WHERE k='schema_version'").fetchone()
+        if v is None:
+            c.execute("INSERT INTO meta(k,v) VALUES('schema_version',?)", (str(SCHEMA_VERSION),))
+        c.commit()
+
+    def close(self) -> None:
+        with self._lock:
+            self.flush()
+            self._closed = True
+            self._con.close()
+
+    # ------------------------------------------------------------------ writes
+
+    def upsert(self, rec: MemoryRecord, vector: np.ndarray | None = None, model: str = "", quarantined: bool = False) -> None:
+        self.upsert_batch([(rec, vector, model)], {rec.id: quarantined})
+
+    def upsert_batch(
+        self,
+        items: list[tuple[MemoryRecord, np.ndarray | None, str]],
+        quarantined: dict[str, bool] | None = None,
+    ) -> None:
+        quarantined = quarantined or {}
+        with self._lock:
+            if self._closed:
+                return
+            c = self._con
+            try:
+                for rec, vec, model in items:
+                    p = rec.provenance
+                    c.execute(
+                        """INSERT INTO records(id,kind,content,scope_org,scope_agent,scope_user,scope_session,
+                             source,actor_id,prov_session,lineage,extractor,t_event,t_ingested,valid_from,
+                             invalidated_at,superseded_by,entity_keys,embedding_version,meta,quarantined,deleted)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                           ON CONFLICT(id) DO UPDATE SET
+                             kind=excluded.kind, content=excluded.content,
+                             scope_org=excluded.scope_org, scope_agent=excluded.scope_agent,
+                             scope_user=excluded.scope_user, scope_session=excluded.scope_session,
+                             source=excluded.source, actor_id=excluded.actor_id, prov_session=excluded.prov_session,
+                             lineage=excluded.lineage, extractor=excluded.extractor,
+                             t_event=excluded.t_event, t_ingested=excluded.t_ingested,
+                             valid_from=excluded.valid_from, invalidated_at=excluded.invalidated_at,
+                             superseded_by=excluded.superseded_by, entity_keys=excluded.entity_keys,
+                             embedding_version=excluded.embedding_version, meta=excluded.meta,
+                             quarantined=excluded.quarantined, deleted=excluded.deleted""",
+                        (
+                            rec.id, rec.kind, rec.content,
+                            rec.scope.org, rec.scope.agent, rec.scope.user, rec.scope.session,
+                            int(p.source), p.actor_id, p.session_id,
+                            json.dumps(p.lineage),
+                            json.dumps(p.extractor.to_dict()) if p.extractor else None,
+                            rec.time.t_event, rec.time.t_ingested, rec.time.valid_from,
+                            rec.time.invalidated_at, rec.time.superseded_by,
+                            json.dumps(rec.entity_keys), rec.embedding_version,
+                            json.dumps(rec.meta), int(quarantined.get(rec.id, False)), int(rec.deleted),
+                        ),
+                    )
+                    c.execute("INSERT OR REPLACE INTO fts(id, content) VALUES(?,?)", (rec.id, rec.content))
+                    c.execute("DELETE FROM entities WHERE record_id=?", (rec.id,))
+                    c.executemany(
+                        "INSERT OR IGNORE INTO entities(entity_key, record_id) VALUES(?,?)",
+                        [(k, rec.id) for k in rec.entity_keys],
+                    )
+                    c.execute("DELETE FROM entity_segments WHERE entity_key IN (SELECT entity_key FROM entities WHERE record_id=?)", (rec.id,))
+                    segs = {(part, k) for k in rec.entity_keys for part in k.split(".") if part}
+                    c.executemany(
+                        "INSERT OR IGNORE INTO entity_segments(segment, entity_key) VALUES(?,?)",
+                        list(segs),
+                    )
+                    if rec.kind == "link":
+                        lt = rec.meta.get("link_type", "refers_to")
+                        dst = rec.meta.get("target")
+                        if dst:
+                            c.execute("INSERT OR REPLACE INTO links(src,dst,link_type) VALUES(?,?,?)", (rec.id, dst, lt))
+                    if vec is not None:
+                        c.execute(
+                            "INSERT OR REPLACE INTO vectors(id,dim,model,vec) VALUES(?,?,?,?)",
+                            (rec.id, int(vec.shape[0]), model, vec.astype(np.float32).tobytes()),
+                        )
+                # no per-batch commit: lazy via _maybe_commit (replay-safe)
+            except Exception:
+                self.flush()  # don't leave a broken transaction open
+                raise
+            finally:
+                pass  # vector cache updates flow through set_vector (incremental)
+        self._stats_cache = None  # writes invalidate the stats cache
+        self._maybe_commit()
+
+    def set_meta(self, k: str, v: str) -> None:
+        with self._lock:
+            self._con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)", (k, v))
+            self._con.commit()
+
+    def get_meta(self, k: str) -> str | None:
+        with self._lock:
+            row = self._con.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
+            return row[0] if row else None
+
+    def _invalidate_stats(self) -> None:
+        self._stats_cache = None
+
+    def flush(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            if self._con.in_transaction:
+                self._con.commit()
+                METRICS.inc("memd_index_commits_total", forced="true")
+            self._lazy_commits = 0
+
+    def _maybe_commit(self) -> None:
+        """Lazy commit: readers share this connection (single-process embedded
+        engine), so uncommitted rows are visible; a lost commit on crash is
+        recoverable by replaying segments. Commit amortizes fsyncs."""
+        self._lazy_commits += 1
+        if self._lazy_commits >= self._commit_threshold:
+            METRICS.inc("memd_index_commits_total", forced="false")
+            self.flush()
+
+    OVERFLOW_MAX = 4096
+
+    def set_vector(self, record_id: str, vec: np.ndarray, model: str) -> None:
+        v = np.asarray(vec, dtype=np.float32).ravel()
+        nrm = float(np.linalg.norm(v))
+        if nrm > 0:
+            v = (v / nrm).astype(np.float32)
+        blob = v.tobytes()
+        with self._lock:
+            if self._closed:
+                METRICS.inc("memd_index_write_after_close_total", ns=self._ns_hint)
+                return
+            # durable store write always happens; the in-memory cache append
+            # is skipped only when the cache has not been built yet (the next
+            # search loads everything from sqlite)
+            self._con.execute(
+                "INSERT OR REPLACE INTO vectors(id,dim,model,vec) VALUES(?,?,?,?)",
+                (record_id, int(vec.shape[0]), model, blob),
+            )
+            self._con.execute("UPDATE records SET embedding_version=? WHERE id=?", (model, record_id))
+            if self._vec_loaded:
+                dim = self._main_mat.shape[1] if self._main_mat.size else int(v.shape[0])
+                if int(v.shape[0]) == dim or self._main_mat.size == 0:
+                    # v is already unit-norm; overflow append is O(P), P
+                    # bounded by fold threshold - never O(total) per write
+                    self._ovf_ids.append(record_id)
+                    self._ovf_vecs.append(v)
+                    if len(self._ovf_ids) >= self.OVERFLOW_MAX:
+                        self._fold_overflow_locked()
+                else:
+                    self.invalidate_vec_cache()
+        self._invalidate_stats()
+        self._maybe_commit()
+
+    def mark_superseded(self, old_id: str, new_id: str, at_ms: int) -> None:
+        with self._lock:
+            self._con.execute(
+                "UPDATE records SET invalidated_at=?, superseded_by=? WHERE id=?",
+                (at_ms, new_id, old_id),
+            )
+            self._con.commit()
+            self._invalidate_stats()
+
+    def mark_quarantined(self, record_id: str, flag: bool) -> None:
+        with self._lock:
+            self._con.execute("UPDATE records SET quarantined=? WHERE id=?", (int(flag), record_id))
+            self._con.commit()
+            self._invalidate_stats()
+
+    def tombstone(self, record_id: str, at_ms: int) -> bool:
+        with self._lock:
+            cur = self._con.execute(
+                "UPDATE records SET deleted=1, invalidated_at=COALESCE(invalidated_at,?) WHERE id=?",
+                (at_ms, record_id),
+            )
+            self._con.commit()
+            self._invalidate_stats()
+            return cur.rowcount > 0
+
+    def hard_delete(self, record_id: str) -> bool:
+        """Physical removal inside the index (compaction deadline path)."""
+        with self._lock:
+            cur = self._con.execute("DELETE FROM records WHERE id=?", (record_id,))
+            self._con.execute("DELETE FROM fts WHERE id=?", (record_id,))
+            self._con.execute("DELETE FROM vectors WHERE id=?", (record_id,))
+            self._con.execute(
+                "DELETE FROM entity_segments WHERE entity_key IN "
+                "(SELECT entity_key FROM entities WHERE record_id=?)",
+                (record_id,),
+            )
+            self._con.execute("DELETE FROM entities WHERE record_id=?", (record_id,))
+            self._con.execute("DELETE FROM links WHERE src=? OR dst=?", (record_id, record_id))
+            self._con.commit()
+            self._invalidate_stats()
+            return cur.rowcount > 0
+
+    # ------------------------------------------------------------------ reads
+
+    @staticmethod
+    def _row_to_record(row: sqlite3.Row) -> MemoryRecord:
+        ex = json.loads(row["extractor"]) if row["extractor"] else None
+        from memd.core.schema import ExtractorInfo, Provenance, TimeAxis
+
+        rec = MemoryRecord(
+            id=row["id"], namespace="", kind=row["kind"], content=row["content"],
+            scope=Scope(org=row["scope_org"], agent=row["scope_agent"], user=row["scope_user"], session=row["scope_session"]),
+            provenance=Provenance(
+                source=Source(int(row["source"])), actor_id=row["actor_id"], session_id=row["prov_session"],
+                lineage=json.loads(row["lineage"]),
+                extractor=ExtractorInfo(model=ex["model"], prompt_version=ex["prompt_version"]) if ex else None,
+            ),
+            time=TimeAxis(t_event=row["t_event"], t_ingested=row["t_ingested"], valid_from=row["valid_from"],
+                          invalidated_at=row["invalidated_at"], superseded_by=row["superseded_by"]),
+            entity_keys=json.loads(row["entity_keys"]), embedding_version=row["embedding_version"],
+            meta=json.loads(row["meta"]), deleted=bool(row["deleted"]),
+        )
+        if row["quarantined"]:
+            rec.meta["quarantined"] = True  # packing fences quarantined rows
+        return rec
+
+    def _filter_where(self, f: IndexFilter, args: list) -> str:
+        clauses = []
+        s = f.scope
+        if s is not None:
+            # Visibility: a record binds only the scope components it sets;
+            # the query must match those or leave them unconstrained.
+            # => query at session sees session+user+agent+org records;
+            #    query at user sees all that user's sessions + above; etc.
+            for col, val in (
+                ("scope_org", s.org),
+                ("scope_agent", s.agent),
+                ("scope_user", s.user),
+                ("scope_session", s.session),
+            ):
+                if val is not None:
+                    clauses.append(f"({col} IS NULL OR {col} = ?)")
+                    args.append(val)
+        if f.kinds:
+            clauses.append(f"kind IN ({','.join('?' * len(f.kinds))})")
+            args.extend(f.kinds)
+        if f.sources:
+            vals = [int(Source.parse(x)) for x in f.sources]
+            clauses.append(f"source IN ({','.join('?' * len(vals))})")
+            args.extend(vals)
+        if f.t_event_min is not None:
+            clauses.append("t_event >= ?")
+            args.append(f.t_event_min)
+        if f.t_event_max is not None:
+            clauses.append("t_event <= ?")
+            args.append(f.t_event_max)
+        if not f.include_invalid:
+            clauses.append("deleted = 0")
+            now = f.now if f.now is not None else time.time() * 1000
+            if f.as_of is None:
+                clauses.append("invalidated_at IS NULL")
+                clauses.append("superseded_by IS NULL")
+                # not-yet-valid records stay hidden in the current view
+                clauses.append("(valid_from IS NULL OR valid_from <= ?)")
+                args.append(now)
+            else:
+                clauses.append("(invalidated_at IS NULL OR invalidated_at > ?)")
+                args.append(f.as_of)
+                clauses.append("(valid_from IS NULL OR valid_from <= ?)")
+                args.append(f.as_of)
+        if not f.include_quarantined:
+            clauses.append("quarantined = 0")
+        if f.entity_keys:
+            clauses.append(
+                f"id IN (SELECT record_id FROM entities WHERE entity_key IN ({','.join('?' * len(f.entity_keys))}))"  # nosec B608
+            )
+            args.extend(f.entity_keys)
+        return " AND ".join(clauses) if clauses else "1=1"
+
+    def _fetch(self, where: str, args: list) -> list[MemoryRecord]:
+        rows = self._con.execute(f"SELECT * FROM records WHERE {where}", args).fetchall()  # nosec B608
+        out = []
+        for r in rows:
+            rec = self._row_to_record(r)
+            rec.namespace = self._ns_hint
+            out.append(rec)
+        return out
+
+    _ns_hint: str = ""
+
+    def get_by_id(self, record_id: str, include_deleted: bool = False) -> MemoryRecord | None:
+        with self._lock:
+            row = self._con.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
+        if row is None:
+            return None
+        if row["deleted"] and not include_deleted:
+            return None
+        rec = self._row_to_record(row)
+        rec.namespace = self._ns_hint
+        return rec
+
+    def query_records(self, f: IndexFilter, limit: int = 100) -> list[MemoryRecord]:
+        args: list = []
+        where = self._filter_where(f, args)
+        args.append(limit)
+        with self._lock:
+            rows = self._con.execute(
+                f"SELECT * FROM records WHERE {where} ORDER BY t_event DESC LIMIT ?", args  # nosec B608
+            ).fetchall()
+        out = []
+        for r in rows:
+            if r["id"] in f.exclude_ids:
+                continue
+            rec = self._row_to_record(r)
+            rec.namespace = self._ns_hint
+            out.append(rec)
+        return out
+
+    def search_bm25(self, query: str, f: IndexFilter, limit: int = 50) -> list[Hit]:
+        q = _fts_escape(query)
+        if not q:
+            return []
+        args: list = []
+        filt = self._filter_where(f, args)
+        sql = (
+            f"SELECT r.*, bm25(fts) AS rank FROM fts JOIN records r ON r.id = fts.id "  # nosec B608
+            f"WHERE fts MATCH ? AND {filt} ORDER BY rank LIMIT ?"
+        )
+        args = [q] + args + [limit]
+        with self._lock:
+            rows = self._con.execute(sql, args).fetchall()
+        hits = []
+        for r in rows:
+            if r["id"] in f.exclude_ids:
+                continue
+            rec = self._row_to_record(r)
+            rec.namespace = self._ns_hint
+            hits.append(Hit(record=rec, score=-float(r["rank"]), lane="bm25"))
+        return hits
+
+
+    def _fold_overflow_locked(self) -> None:
+        """Fold the overflow block into the main matrix (O(main)); called
+        only when overflow exceeds OVERFLOW_MAX so amortized cost per vector
+        stays O(1)."""
+        if not self._ovf_ids:
+            self._ovf_vecs = []
+            return
+        dim = self._main_mat.shape[1] if self._main_mat.size else len(self._ovf_vecs[0])
+        add = [v for v in self._ovf_vecs if v.shape[0] == dim]
+        if add:
+            block = np.stack(add).astype(np.float32)
+            m = self._main_mat
+            self._main_mat = block if m.size == 0 else np.vstack([m, block])
+            self._main_ids.extend(self._ovf_ids)
+        self._ovf_ids = []
+        self._ovf_vecs = []
+
+
+    def _load_vectors_locked(self) -> None:
+        rows = self._con.execute(
+            """SELECT v.id, v.vec FROM vectors v JOIN records r ON r.id=v.id
+               WHERE r.deleted=0 AND r.quarantined=0
+                 AND r.invalidated_at IS NULL AND r.superseded_by IS NULL"""
+        ).fetchall()
+        ids = [r[0] for r in rows]
+        if rows:
+            mat = np.frombuffer(b"".join(r[1] for r in rows), dtype=np.float32).reshape(len(rows), -1)
+            norms = np.linalg.norm(mat, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            mat = mat / norms
+            self._main_mat = mat.astype(np.float32)
+            self._main_ids = ids
+
+    def search_vector(self, query_vec: np.ndarray, f: IndexFilter, limit: int = 50) -> list[Hit]:
+        """Flat cosine scan over main+overflow blocks. Per-query cost:
+        O(main) BLAS dot + O(overflow) merge - never an O(total) rebuild."""
+        q = np.asarray(query_vec, dtype=np.float32).ravel()
+        nrm = float(np.linalg.norm(q))
+        if nrm > 0:
+            q = q / nrm
+        with self._lock:
+            if self._closed:
+                return []
+            if not self._vec_loaded:
+                self._load_vectors_locked()
+                self._vec_loaded = True
+            ids: list[str] = list(self._main_ids)
+            parts = []
+            if self._main_mat.size:
+                parts.append(self._main_mat @ q)
+            if self._ovf_ids:
+                ovf = np.stack(self._ovf_vecs).astype(np.float32)
+                ids.extend(self._ovf_ids)
+                parts.append(ovf @ q)
+        if not ids:
+            return []
+        scores = np.concatenate(parts) if len(parts) > 1 else parts[0]
+        k = min(limit * 4, len(ids))
+        top = np.argpartition(-scores, k - 1)[:k] if k < len(ids) else np.arange(len(ids))
+        top = top[np.argsort(-scores[top])]
+        cand_ids = [ids[i] for i in top]
+        cand_scores = [float(scores[i]) for i in top]
+        recs = {r.id: r for r in self.get_many(cand_ids)}
+        hits: list[Hit] = []
+        for cid, cscore in zip(cand_ids, cand_scores):
+            if cscore < MIN_COSINE:
+                continue  # no-evidence match: noise in ranked search, poison in sweeps
+            if cid in f.exclude_ids:
+                continue
+            r = recs.get(cid)
+            if r is None or not self._passes_filter(r, f):
+                continue
+            hits.append(Hit(record=r, score=cscore, lane="vector"))
+            if len(hits) >= limit:
+                break
+        return hits
+
+    def _passes_filter(self, rec: MemoryRecord, f: IndexFilter) -> bool:
+        s = f.scope
+        if s is not None:
+            rs = rec.scope
+            for qv, rv in ((s.org, rs.org), (s.agent, rs.agent), (s.user, rs.user), (s.session, rs.session)):
+                if rv is not None and qv is not None and rv != qv:
+                    return False
+        if f.kinds and rec.kind not in f.kinds:
+            return False
+        if not f.include_invalid:
+            if rec.deleted:
+                return False
+            if f.as_of is None:
+                if rec.time.invalidated_at is not None or rec.time.superseded_by is not None:
+                    return False
+                # not-yet-valid records stay hidden in the current view
+                vf = rec.time.valid_from
+                if vf is not None and vf > time.time() * 1000:
+                    return False
+            else:
+                if rec.time.invalidated_at is not None and rec.time.invalidated_at <= f.as_of:
+                    return False
+                if rec.time.valid_from is not None and rec.time.valid_from > f.as_of:
+                    return False
+        return True
+
+    def expand_links(self, seed_ids: list[str], hop: int = 1, limit: int = 50) -> list[MemoryRecord]:
+        if not seed_ids:
+            return []
+        qs = ",".join("?" * len(seed_ids))
+        with self._lock:
+            sql = f"SELECT r.* FROM links l JOIN records r ON r.id = l.dst WHERE l.src IN ({qs}) AND r.deleted=0 AND r.quarantined=0 AND r.invalidated_at IS NULL LIMIT ?"  # nosec B608 - qs is '?' placeholders only
+            rows = self._con.execute(sql, (*seed_ids, limit)).fetchall()
+            sql2 = f"SELECT r.* FROM links l JOIN records r ON r.id = l.src WHERE l.dst IN ({qs}) AND r.deleted=0 AND r.quarantined=0 AND r.invalidated_at IS NULL LIMIT ?"  # nosec B608 - qs is '?' placeholders only
+            rows += self._con.execute(sql2, (*seed_ids, limit)).fetchall()
+        seen, out = set(), []
+        for r in rows:
+            if r["id"] in seen or r["id"] in seed_ids:
+                continue
+            seen.add(r["id"])
+            rec = self._row_to_record(r)
+            rec.namespace = self._ns_hint
+            out.append(rec)
+        return out[:limit]
+
+    def records_missing_embedding(self, model: str, limit: int = 100_000) -> list[MemoryRecord]:
+        """Records with no vector or an outdated embedding_version - the
+        worklist for the re-embedding batch job (ADR-8). Quarantined records
+        are excluded: never pre-arm unreviewed content for retrieval."""
+        with self._lock:
+            rows = self._con.execute(
+                """SELECT r.* FROM records r LEFT JOIN vectors v ON v.id = r.id
+                   WHERE (v.id IS NULL OR (r.embedding_version IS NOT NULL AND r.embedding_version != ?))
+                     AND r.quarantined = 0
+                   ORDER BY r.t_ingested LIMIT ?""",
+                (model, limit),
+            ).fetchall()
+        out = []
+        for r in rows:
+            rec = self._row_to_record(r)
+            rec.namespace = self._ns_hint
+            out.append(rec)
+        return out
+
+    def entity_cluster(
+        self,
+        entity_key: str,
+        include_invalid: bool = False,
+        scope: Scope | None = None,
+    ) -> list[MemoryRecord]:
+        """Cluster members for one entity key. Scope-filtered: clusters are
+        per-visible-scope - never consolidate across tenants/users."""
+        f = IndexFilter(entity_keys=(entity_key,), include_invalid=include_invalid, scope=scope)
+        return self.query_records(f, limit=1000)
+
+    def records_of_session(
+        self,
+        session_id: str,
+        limit: int = 1000,
+        user_id: str | None = None,
+    ) -> list[MemoryRecord]:
+        """Exact-session raw records for segment-close extraction. Unlike
+        query visibility (which includes ancestor-scope rows), a session
+        boundary must sweep ONLY that session's own writes - NEVER
+        quarantined ones (extraction is gate 2 of the poisoning defense,
+        D7 #4), and - when a user binding is supplied - only rows bound to
+        that user (blocks cross-user session-id injection)."""
+        with self._lock:
+            total = self._con.execute(
+                "SELECT COUNT(*) FROM records WHERE scope_session = ? AND kind = 'raw_event' AND deleted = 0",
+                (session_id,),
+            ).fetchone()[0]
+            sql = """SELECT * FROM records WHERE scope_session = ? AND kind = 'raw_event'
+                   AND deleted = 0 AND quarantined = 0"""
+            args: list = [session_id]
+            if user_id:
+                sql += " AND (scope_user = ? OR scope_user IS NULL)"
+                args.append(user_id)
+            sql += " ORDER BY t_event LIMIT ?"
+            args.append(limit)
+            rows = self._con.execute(sql, args).fetchall()
+        if total > limit:
+            from memd.metrics import METRICS
+
+            METRICS.inc("memd_session_truncated_total", ns=self._ns_hint)
+        out = []
+        for r in rows:
+            rec = self._row_to_record(r)
+            rec.namespace = self._ns_hint
+            out.append(rec)
+        return out
+
+    def search_by_entity_tokens(self, tokens: list[str], f: IndexFilter, limit: int = 30) -> list[Hit]:
+        """Entity lane: records whose entity-key segments match query tokens.
+        Exact btree lookups on the segments table - O(tokens x log E + matches)."""
+        if not tokens:
+            return []
+        toks = [t.strip().lower() for t in tokens[:8] if len(t.strip()) >= 3]
+        if not toks:
+            return []
+        qs = ",".join("?" * len(toks))
+        filt_args: list = []
+        filt = self._filter_where(f, filt_args)
+        sql = (
+            f"SELECT r.* FROM entity_segments es JOIN entities e ON e.entity_key = es.entity_key "  # nosec B608
+            f"JOIN records r ON r.id = e.record_id "
+            f"WHERE es.segment IN ({qs}) AND {filt} ORDER BY r.t_event DESC LIMIT ?"
+        )
+        with self._lock:
+            rows = self._con.execute(sql, (*toks, *filt_args, limit)).fetchall()
+        hits = []
+        for r in rows:
+            if r["id"] in f.exclude_ids:
+                continue
+            rec = self._row_to_record(r)
+            rec.namespace = self._ns_hint
+            hits.append(Hit(record=rec, score=1.0, lane="entity"))
+        return hits
+
+    def history(self, record_id: str) -> list[MemoryRecord]:
+        """Supersedence chain including the seed: predecessors and successors."""
+        chain, seen = [], {record_id}
+        frontier = [record_id]
+        with self._lock:
+            while frontier:
+                qs = ",".join("?" * len(frontier))
+                sql = f"SELECT * FROM records WHERE superseded_by IN ({qs}) OR id IN (SELECT superseded_by FROM records WHERE id IN ({qs}))"  # nosec B608 - qs is '?' placeholders only
+                rows = self._con.execute(sql, (*frontier, *frontier)).fetchall()
+                nxt = []
+                for r in rows:
+                    rid = r["id"]
+                    if rid not in seen:
+                        seen.add(rid)
+                        nxt.append(rid)
+                        rec = self._row_to_record(r)
+                        rec.namespace = self._ns_hint
+                        chain.append(rec)
+                frontier = nxt
+            seed_row = self._con.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
+        if seed_row is not None:
+            seed = self._row_to_record(seed_row)
+            seed.namespace = self._ns_hint
+            chain.append(seed)
+        chain.sort(key=lambda r: r.time.t_ingested)
+        return chain
+
+    def stats(self) -> dict:
+        """Namespace stats with a 1s TTL cache: O(N) COUNT queries amortize to
+        ~zero for hot callers (MCP memory_status, REST /stats); any write
+        invalidates immediately so numbers stay honest where it matters."""
+        with self._lock:
+            now = time.monotonic()
+            if self._stats_cache is not None and now - self._stats_at < 1.0:
+                return dict(self._stats_cache)
+            total = self._con.execute("SELECT COUNT(*) FROM records WHERE deleted=0").fetchone()[0]
+            tombstones = self._con.execute("SELECT COUNT(*) FROM records WHERE deleted=1").fetchone()[0]
+            facts = self._con.execute("SELECT COUNT(*) FROM records WHERE kind='fact' AND deleted=0").fetchone()[0]
+            invalid = self._con.execute(
+                "SELECT COUNT(*) FROM records WHERE invalidated_at IS NOT NULL AND deleted=0"
+            ).fetchone()[0]
+            quarantined = self._con.execute("SELECT COUNT(*) FROM records WHERE quarantined=1").fetchone()[0]
+            vecs = self._con.execute("SELECT COUNT(*) FROM vectors").fetchone()[0]
+            dim_row = self._con.execute("SELECT dim, model FROM vectors LIMIT 1").fetchone()
+            links = self._con.execute("SELECT COUNT(*) FROM links").fetchone()[0]
+        st = {
+            "records": total,
+            "tombstones": tombstones,
+            "facts": facts,
+            "superseded": invalid,
+            "quarantined": quarantined,
+            "vectors": vecs,
+            "vec_dim": dim_row[0] if dim_row else None,
+            "embedding_model": dim_row[1] if dim_row else None,
+            "links": links,
+        }
+        with self._lock:
+            self._stats_cache = st
+            self._stats_at = time.monotonic()
+        return dict(st)
+
+    def all_records(self, batch: int = 1000) -> list[MemoryRecord]:
+        out, offset = [], 0
+        while True:
+            with self._lock:
+                rows = self._con.execute("SELECT * FROM records ORDER BY id LIMIT ? OFFSET ?", (batch, offset)).fetchall()
+            if not rows:
+                break
+            for r in rows:
+                rec = self._row_to_record(r)
+                rec.namespace = self._ns_hint
+                out.append(rec)
+            offset += batch
+        return out
+
+    def get_many(self, ids: list[str]) -> list[MemoryRecord]:
+        """Direct id lookup: O(k log N) via PK index."""
+        out: dict[str, MemoryRecord] = {}
+        with self._lock:
+            for i in range(0, len(ids), 500):
+                chunk = ids[i : i + 500]
+                qs = ",".join("?" * len(chunk))
+                rows = self._con.execute(f"SELECT * FROM records WHERE id IN ({qs})", chunk).fetchall()  # nosec B608
+                for r in rows:
+                    rec = self._row_to_record(r)
+                    rec.namespace = self._ns_hint
+                    out[rec.id] = rec
+        return [out[i] for i in ids if i in out]
+
+    def wipe(self) -> None:
+        with self._lock:
+            self._con.executescript(
+                "DELETE FROM fts; DELETE FROM vectors; DELETE FROM entities; "
+                "DELETE FROM entity_segments; DELETE FROM links; DELETE FROM records;"
+            )
+            self._con.commit()
+            self._main_mat = np.zeros((0, 0), dtype=np.float32)
+            self._main_ids = []
+            self._ovf_ids = []
+            self._ovf_vecs = []
+            self._vec_loaded = True
+
+    def invalidate_vec_cache(self) -> None:
+        """Fold-away hook after mass invalidation (compaction): next search
+        reloads the full matrix from sqlite."""
+        with self._lock:
+            self._vec_loaded = False
+            self._main_mat = np.zeros((0, 0), dtype=np.float32)
+            self._main_ids = []
+            self._ovf_ids = []
+            self._ovf_vecs = []
+
+
+def _fts_escape(query: str) -> str:
+    """OR-combined quoted terms: recall-first; bm25() ranks the rest."""
+    words = []
+    for tok in query.replace('"', " ").split():
+        tok = "".join(ch for ch in tok if ch.isalnum() or ch in "_-.")
+        if tok:
+            words.append(f'"{tok}"')
+    return " OR ".join(words)

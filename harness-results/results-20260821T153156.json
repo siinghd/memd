@@ -1,0 +1,143 @@
+{
+ "harness_version": "4bf7038fd5ce8b26",
+ "judge_config": {
+  "judge": "heuristic-v1",
+  "answer_model": "heuristic-extract",
+  "temperature": 0
+ },
+ "suites": [
+  {
+   "suite": "halumem-ops",
+   "system": "memd",
+   "harness_version": "4bf7038fd5ce8b26",
+   "cases": 10,
+   "accuracy": 0.1,
+   "tokens_per_query_avg": 112.6,
+   "latency_p50_ms": 4.13,
+   "latency_p95_ms": 4.91,
+   "duration_s": 0.86
+  }
+ ],
+ "cases": [
+  {
+   "case_id": "op0-employer-update",
+   "qclass": "knowledge_update",
+   "correct": false,
+   "score": 0.0,
+   "tokens_injected": 120,
+   "latency_ms": 5.793,
+   "detail": {
+    "answer": "I work at Initech",
+    "expected_hint": "Umbrella"
+   }
+  },
+  {
+   "case_id": "op1-city-update",
+   "qclass": "knowledge_update",
+   "correct": false,
+   "score": 0.0,
+   "tokens_injected": 113,
+   "latency_ms": 3.893,
+   "detail": {
+    "answer": "Relevant memories (provenance-tagged; older/superseded facts excluded):",
+    "expected_hint": "Hanoi"
+   }
+  },
+  {
+   "case_id": "op2-editor-update",
+   "qclass": "knowledge_update",
+   "correct": false,
+   "score": 0.0,
+   "tokens_injected": 115,
+   "latency_ms": 4.379,
+   "detail": {
+    "answer": "My editor is Helix.",
+    "expected_hint": "Zed"
+   }
+  },
+  {
+   "case_id": "op3-employer-update",
+   "qclass": "knowledge_update",
+   "correct": false,
+   "score": 0.0,
+   "tokens_injected": 119,
+   "latency_ms": 3.79,
+   "detail": {
+    "answer": "I work at Initech",
+    "expected_hint": "Wayne"
+   }
+  },
+  {
+   "case_id": "op4-city-update",
+   "qclass": "knowledge_update",
+   "correct": false,
+   "score": 0.0,
+   "tokens_injected": 113,
+   "latency_ms": 3.269,
+   "detail": {
+    "answer": "Relevant memories (provenance-tagged; older/superseded facts excluded):",
+    "expected_hint": "Oslo"
+   }
+  },
+  {
+   "case_id": "op5-editor-update",
+   "qclass": "knowledge_update",
+   "correct": false,
+   "score": 0.0,
+   "tokens_injected": 116,
+   "latency_ms": 4.41,
+   "detail": {
+    "answer": "My editor is Emacs.",
+    "expected_hint": "Helix"
+   }
+  },
+  {
+   "case_id": "op6-employer-update",
+   "qclass": "knowledge_update",
+   "correct": false,
+   "score": 0.0,
+   "tokens_injected": 120,
+   "latency_ms": 4.234,
+   "detail": {
+    "answer": "I work at Initech",
+    "expected_hint": "Aperture"
+   }
+  },
+  {
+   "case_id": "op7-city-update",
+   "qclass": "knowledge_update",
+   "correct": false,
+   "score": 0.0,
+   "tokens_injected": 113,
+   "latency_ms": 4.019,
+   "detail": {
+    "answer": "Relevant memories (provenance-tagged; older/superseded facts excluded):",
+    "expected_hint": "Cairo"
+   }
+  },
+  {
+   "case_id": "op8-editor-update",
+   "qclass": "knowledge_update",
+   "correct": false,
+   "score": 0.0,
+   "tokens_injected": 116,
+   "latency_ms": 4.909,
+   "detail": {
+    "answer": "My editor is Neovim.",
+    "expected_hint": "Emacs"
+   }
+  },
+  {
+   "case_id": "op9-employer-update",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 81,
+   "latency_ms": 3.936,
+   "detail": {
+    "answer": "I work at Initech",
+    "expected_hint": "Initech"
+   }
+  }
+ ]
+}

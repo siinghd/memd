@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+*.egg-info/
+memd-data/
+harness-results/*.json.tmp
+.ralph/ralph-loop.state.json
+.ralph/ralph-history.json

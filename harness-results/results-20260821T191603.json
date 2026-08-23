@@ -1,0 +1,1904 @@
+{
+ "harness_version": "a47e0bf474577c27",
+ "judge_config": {
+  "judge": "heuristic-v1",
+  "answer_model": "heuristic-extract",
+  "temperature": 0
+ },
+ "suites": [
+  {
+   "suite": "longmemeval-synthetic",
+   "system": "memd",
+   "harness_version": "a47e0bf474577c27",
+   "cases": 48,
+   "accuracy": 1.0,
+   "tokens_per_query_avg": 883.2,
+   "latency_p50_ms": 8.73,
+   "latency_p95_ms": 24.8,
+   "duration_s": 20.943
+  },
+  {
+   "suite": "longmemeval-synthetic",
+   "system": "plain-rag",
+   "harness_version": "a47e0bf474577c27",
+   "cases": 48,
+   "accuracy": 0.8333,
+   "tokens_per_query_avg": 116.2,
+   "latency_p50_ms": 0.89,
+   "latency_p95_ms": 7.69,
+   "duration_s": 18.721
+  },
+  {
+   "suite": "longmemeval-synthetic",
+   "system": "full-context",
+   "harness_version": "a47e0bf474577c27",
+   "cases": 48,
+   "accuracy": 1.0,
+   "tokens_per_query_avg": 11783.9,
+   "latency_p50_ms": 24.08,
+   "latency_p95_ms": 26.2,
+   "duration_s": 19.022
+  },
+  {
+   "suite": "halumem-ops",
+   "system": "memd",
+   "harness_version": "a47e0bf474577c27",
+   "cases": 10,
+   "accuracy": 1.0,
+   "tokens_per_query_avg": 51.4,
+   "latency_p50_ms": 2.81,
+   "latency_p95_ms": 2.97,
+   "duration_s": 0.905
+  }
+ ],
+ "cases": [
+  {
+   "case_id": "u0-sh-deploy",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 1957,
+   "latency_ms": 67.711,
+   "detail": {
+    "answer": "the team deploys with `make ship`",
+    "expected_hint": "make ship"
+   }
+  },
+  {
+   "case_id": "u0-sh-editor",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 498,
+   "latency_ms": 24.687,
+   "detail": {
+    "answer": "u0's editor is Neovim",
+    "expected_hint": "Neovim"
+   }
+  },
+  {
+   "case_id": "u0-mh-city",
+   "qclass": "multi_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 626,
+   "latency_ms": 11.579,
+   "detail": {
+    "answer": "Alice lives in Lisbon",
+    "expected_hint": "Lisbon"
+   }
+  },
+  {
+   "case_id": "u0-tp-review",
+   "qclass": "temporal",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 568,
+   "latency_ms": 12.562,
+   "detail": {
+    "answer": "My review meeting is scheduled on March 3rd.",
+    "expected_hint": "March 3rd"
+   }
+  },
+  {
+   "case_id": "u0-ku-employer",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 400,
+   "latency_ms": 9.65,
+   "detail": {
+    "answer": "u0 works at Initrode",
+    "expected_hint": "Initrode"
+   }
+  },
+  {
+   "case_id": "u0-sh-ticket",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 687,
+   "latency_ms": 15.887,
+   "detail": {
+    "answer": "My support ticket got resolved, reference ticket #100.",
+    "expected_hint": "ticket #100"
+   }
+  },
+  {
+   "case_id": "u1-sh-deploy",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 1958,
+   "latency_ms": 24.887,
+   "detail": {
+    "answer": "the team deploys with `cargo deploy`",
+    "expected_hint": "cargo deploy"
+   }
+  },
+  {
+   "case_id": "u1-sh-editor",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 701,
+   "latency_ms": 10.253,
+   "detail": {
+    "answer": "u1's editor is Emacs",
+    "expected_hint": "Emacs"
+   }
+  },
+  {
+   "case_id": "u1-mh-city",
+   "qclass": "multi_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 604,
+   "latency_ms": 10.282,
+   "detail": {
+    "answer": "Bob lives in Oslo",
+    "expected_hint": "Oslo"
+   }
+  },
+  {
+   "case_id": "u1-tp-review",
+   "qclass": "temporal",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 625,
+   "latency_ms": 6.365,
+   "detail": {
+    "answer": "My review meeting is scheduled on March 3rd.",
+    "expected_hint": "March 3rd"
+   }
+  },
+  {
+   "case_id": "u1-ku-employer",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 526,
+   "latency_ms": 10.778,
+   "detail": {
+    "answer": "u1 works at Initrode",
+    "expected_hint": "Initrode"
+   }
+  },
+  {
+   "case_id": "u1-sh-ticket",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 686,
+   "latency_ms": 7.075,
+   "detail": {
+    "answer": "My support ticket got resolved, reference ticket #101.",
+    "expected_hint": "ticket #101"
+   }
+  },
+  {
+   "case_id": "u2-sh-deploy",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 1958,
+   "latency_ms": 24.798,
+   "detail": {
+    "answer": "the team deploys with `npm run release`",
+    "expected_hint": "npm run release"
+   }
+  },
+  {
+   "case_id": "u2-sh-editor",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 761,
+   "latency_ms": 8.178,
+   "detail": {
+    "answer": "I use VS Code as my editor.",
+    "expected_hint": "VS Code"
+   }
+  },
+  {
+   "case_id": "u2-mh-city",
+   "qclass": "multi_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 1456,
+   "latency_ms": 41.6,
+   "detail": {
+    "answer": "Cara lives in Kyoto",
+    "expected_hint": "Kyoto"
+   }
+  },
+  {
+   "case_id": "u2-tp-review",
+   "qclass": "temporal",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 629,
+   "latency_ms": 5.852,
+   "detail": {
+    "answer": "My review meeting is scheduled on March 3rd.",
+    "expected_hint": "March 3rd"
+   }
+  },
+  {
+   "case_id": "u2-ku-employer",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 1610,
+   "latency_ms": 10.769,
+   "detail": {
+    "answer": "u2 works at Initrode",
+    "expected_hint": "Initrode"
+   }
+  },
+  {
+   "case_id": "u2-sh-ticket",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 720,
+   "latency_ms": 6.764,
+   "detail": {
+    "answer": "My support ticket got resolved, reference ticket #102.",
+    "expected_hint": "ticket #102"
+   }
+  },
+  {
+   "case_id": "u3-sh-deploy",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 1957,
+   "latency_ms": 17.505,
+   "detail": {
+    "answer": "the team deploys with `just prod`",
+    "expected_hint": "just prod"
+   }
+  },
+  {
+   "case_id": "u3-sh-editor",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 701,
+   "latency_ms": 7.436,
+   "detail": {
+    "answer": "u3's editor is Zed",
+    "expected_hint": "Zed"
+   }
+  },
+  {
+   "case_id": "u3-mh-city",
+   "qclass": "multi_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 679,
+   "latency_ms": 8.874,
+   "detail": {
+    "answer": "Dan lives in Austin",
+    "expected_hint": "Austin"
+   }
+  },
+  {
+   "case_id": "u3-tp-review",
+   "qclass": "temporal",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 566,
+   "latency_ms": 6.903,
+   "detail": {
+    "answer": "My review meeting is scheduled on March 3rd.",
+    "expected_hint": "March 3rd"
+   }
+  },
+  {
+   "case_id": "u3-ku-employer",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 786,
+   "latency_ms": 9.262,
+   "detail": {
+    "answer": "u3 works at Initrode",
+    "expected_hint": "Initrode"
+   }
+  },
+  {
+   "case_id": "u3-sh-ticket",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 685,
+   "latency_ms": 7.965,
+   "detail": {
+    "answer": "My support ticket got resolved, reference ticket #103.",
+    "expected_hint": "ticket #103"
+   }
+  },
+  {
+   "case_id": "u4-sh-deploy",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 1957,
+   "latency_ms": 17.815,
+   "detail": {
+    "answer": "the team deploys with `fab rollout`",
+    "expected_hint": "fab rollout"
+   }
+  },
+  {
+   "case_id": "u4-sh-editor",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 645,
+   "latency_ms": 7.459,
+   "detail": {
+    "answer": "u4's editor is Neovim",
+    "expected_hint": "Neovim"
+   }
+  },
+  {
+   "case_id": "u4-mh-city",
+   "qclass": "multi_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 524,
+   "latency_ms": 7.334,
+   "detail": {
+    "answer": "Elena lives in Nairobi",
+    "expected_hint": "Nairobi"
+   }
+  },
+  {
+   "case_id": "u4-tp-review",
+   "qclass": "temporal",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 626,
+   "latency_ms": 10.124,
+   "detail": {
+    "answer": "My review meeting is scheduled on March 3rd.",
+    "expected_hint": "March 3rd"
+   }
+  },
+  {
+   "case_id": "u4-ku-employer",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 525,
+   "latency_ms": 8.073,
+   "detail": {
+    "answer": "u4 works at Initrode",
+    "expected_hint": "Initrode"
+   }
+  },
+  {
+   "case_id": "u4-sh-ticket",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 687,
+   "latency_ms": 8.044,
+   "detail": {
+    "answer": "My support ticket got resolved, reference ticket #104.",
+    "expected_hint": "ticket #104"
+   }
+  },
+  {
+   "case_id": "u5-sh-deploy",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 1957,
+   "latency_ms": 20.812,
+   "detail": {
+    "answer": "the team deploys with `make ship`",
+    "expected_hint": "make ship"
+   }
+  },
+  {
+   "case_id": "u5-sh-editor",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 838,
+   "latency_ms": 8.606,
+   "detail": {
+    "answer": "u5's editor is Emacs",
+    "expected_hint": "Emacs"
+   }
+  },
+  {
+   "case_id": "u5-mh-city",
+   "qclass": "multi_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 603,
+   "latency_ms": 7.732,
+   "detail": {
+    "answer": "Frank lives in Perth",
+    "expected_hint": "Perth"
+   }
+  },
+  {
+   "case_id": "u5-tp-review",
+   "qclass": "temporal",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 626,
+   "latency_ms": 8.747,
+   "detail": {
+    "answer": "My review meeting is scheduled on March 3rd.",
+    "expected_hint": "March 3rd"
+   }
+  },
+  {
+   "case_id": "u5-ku-employer",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 643,
+   "latency_ms": 6.222,
+   "detail": {
+    "answer": "u5 works at Initrode",
+    "expected_hint": "Initrode"
+   }
+  },
+  {
+   "case_id": "u5-sh-ticket",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 686,
+   "latency_ms": 8.715,
+   "detail": {
+    "answer": "My support ticket got resolved, reference ticket #105.",
+    "expected_hint": "ticket #105"
+   }
+  },
+  {
+   "case_id": "u6-sh-deploy",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 1958,
+   "latency_ms": 14.846,
+   "detail": {
+    "answer": "the team deploys with `cargo deploy`",
+    "expected_hint": "cargo deploy"
+   }
+  },
+  {
+   "case_id": "u6-sh-editor",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 884,
+   "latency_ms": 10.31,
+   "detail": {
+    "answer": "I use VS Code as my editor.",
+    "expected_hint": "VS Code"
+   }
+  },
+  {
+   "case_id": "u6-mh-city",
+   "qclass": "multi_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 544,
+   "latency_ms": 5.311,
+   "detail": {
+    "answer": "Grace lives in Lisbon",
+    "expected_hint": "Lisbon"
+   }
+  },
+  {
+   "case_id": "u6-tp-review",
+   "qclass": "temporal",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 570,
+   "latency_ms": 8.187,
+   "detail": {
+    "answer": "My review meeting is scheduled on March 3rd.",
+    "expected_hint": "March 3rd"
+   }
+  },
+  {
+   "case_id": "u6-ku-employer",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 579,
+   "latency_ms": 6.638,
+   "detail": {
+    "answer": "u6 works at Initrode",
+    "expected_hint": "Initrode"
+   }
+  },
+  {
+   "case_id": "u6-sh-ticket",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 687,
+   "latency_ms": 11.758,
+   "detail": {
+    "answer": "My support ticket got resolved, reference ticket #106.",
+    "expected_hint": "ticket #106"
+   }
+  },
+  {
+   "case_id": "u7-sh-deploy",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 1958,
+   "latency_ms": 17.793,
+   "detail": {
+    "answer": "the team deploys with `npm run release`",
+    "expected_hint": "npm run release"
+   }
+  },
+  {
+   "case_id": "u7-sh-editor",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 525,
+   "latency_ms": 6.88,
+   "detail": {
+    "answer": "u7's editor is Zed",
+    "expected_hint": "Zed"
+   }
+  },
+  {
+   "case_id": "u7-mh-city",
+   "qclass": "multi_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 429,
+   "latency_ms": 6.884,
+   "detail": {
+    "answer": "Hank lives in Oslo",
+    "expected_hint": "Oslo"
+   }
+  },
+  {
+   "case_id": "u7-tp-review",
+   "qclass": "temporal",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 566,
+   "latency_ms": 6.456,
+   "detail": {
+    "answer": "My review meeting is scheduled on March 3rd.",
+    "expected_hint": "March 3rd"
+   }
+  },
+  {
+   "case_id": "u7-ku-employer",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 349,
+   "latency_ms": 5.616,
+   "detail": {
+    "answer": "u7 works at Initrode",
+    "expected_hint": "Initrode"
+   }
+  },
+  {
+   "case_id": "u7-sh-ticket",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 686,
+   "latency_ms": 6.553,
+   "detail": {
+    "answer": "My support ticket got resolved, reference ticket #107.",
+    "expected_hint": "ticket #107"
+   }
+  },
+  {
+   "case_id": "u0-sh-deploy",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 532,
+   "latency_ms": 9.221,
+   "detail": {
+    "answer": "We deploy with `make ship`, never raw ftp.",
+    "expected_hint": "make ship"
+   }
+  },
+  {
+   "case_id": "u0-sh-editor",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 28,
+   "latency_ms": 1.05,
+   "detail": {
+    "answer": "I use Neovim as my editor.",
+    "expected_hint": "Neovim"
+   }
+  },
+  {
+   "case_id": "u0-mh-city",
+   "qclass": "multi_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 20,
+   "latency_ms": 0.79,
+   "detail": {
+    "answer": "Alice lives in Lisbon",
+    "expected_hint": "Lisbon"
+   }
+  },
+  {
+   "case_id": "u0-tp-review",
+   "qclass": "temporal",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 47,
+   "latency_ms": 0.946,
+   "detail": {
+    "answer": "My review meeting is scheduled on March 3rd.",
+    "expected_hint": "March 3rd"
+   }
+  },
+  {
+   "case_id": "u0-ku-employer",
+   "qclass": "knowledge_update",
+   "correct": false,
+   "score": 0.0,
+   "tokens_injected": 40,
+   "latency_ms": 0.845,
+   "detail": {
+    "answer": "Alice is called Alice",
+    "expected_hint": "Initrode"
+   }
+  },
+  {
+   "case_id": "u0-sh-ticket",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 36,
+   "latency_ms": 0.883,
+   "detail": {
+    "answer": "My support ticket got resolved, reference ticket #100.",
+    "expected_hint": "ticket #100"
+   }
+  },
+  {
+   "case_id": "u1-sh-deploy",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 533,
+   "latency_ms": 7.664,
+   "detail": {
+    "answer": "We deploy with `cargo deploy`, never raw ftp.",
+    "expected_hint": "cargo deploy"
+   }
+  },
+  {
+   "case_id": "u1-sh-editor",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 25,
+   "latency_ms": 0.952,
+   "detail": {
+    "answer": "I use Emacs as my editor.",
+    "expected_hint": "Emacs"
+   }
+  },
+  {
+   "case_id": "u1-mh-city",
+   "qclass": "multi_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 17,
+   "latency_ms": 0.738,
+   "detail": {
+    "answer": "Bob lives in Oslo",
+    "expected_hint": "Oslo"
+   }
+  },
+  {
+   "case_id": "u1-tp-review",
+   "qclass": "temporal",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 45,
+   "latency_ms": 0.921,
+   "detail": {
+    "answer": "My review meeting is scheduled on March 3rd.",
+    "expected_hint": "March 3rd"
+   }
+  },
+  {
+   "case_id": "u1-ku-employer",
+   "qclass": "knowledge_update",
+   "correct": false,
+   "score": 0.0,
+   "tokens_injected": 37,
+   "latency_ms": 0.833,
+   "detail": {
+    "answer": "Bob is called Bob",
+    "expected_hint": "Initrode"
+   }
+  },
+  {
+   "case_id": "u1-sh-ticket",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 36,
+   "latency_ms": 0.864,
+   "detail": {
+    "answer": "My support ticket got resolved, reference ticket #101.",
+    "expected_hint": "ticket #101"
+   }
+  },
+  {
+   "case_id": "u2-sh-deploy",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 535,
+   "latency_ms": 7.727,
+   "detail": {
+    "answer": "We deploy with `npm run release`, never raw ftp.",
+    "expected_hint": "npm run release"
+   }
+  },
+  {
+   "case_id": "u2-sh-editor",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 21,
+   "latency_ms": 0.888,
+   "detail": {
+    "answer": "I use VS Code as my editor.",
+    "expected_hint": "VS Code"
+   }
+  },
+  {
+   "case_id": "u2-mh-city",
+   "qclass": "multi_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 19,
+   "latency_ms": 0.751,
+   "detail": {
+    "answer": "Cara lives in Kyoto",
+    "expected_hint": "Kyoto"
+   }
+  },
+  {
+   "case_id": "u2-tp-review",
+   "qclass": "temporal",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 41,
+   "latency_ms": 0.882,
+   "detail": {
+    "answer": "My review meeting is scheduled on March 3rd.",
+    "expected_hint": "March 3rd"
+   }
+  },
+  {
+   "case_id": "u2-ku-employer",
+   "qclass": "knowledge_update",
+   "correct": false,
+   "score": 0.0,
+   "tokens_injected": 39,
+   "latency_ms": 0.861,
+   "detail": {
+    "answer": "Cara is called Cara",
+    "expected_hint": "Initrode"
+   }
+  },
+  {
+   "case_id": "u2-sh-ticket",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 36,
+   "latency_ms": 0.855,
+   "detail": {
+    "answer": "My support ticket got resolved, reference ticket #102.",
+    "expected_hint": "ticket #102"
+   }
+  },
+  {
+   "case_id": "u3-sh-deploy",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 532,
+   "latency_ms": 7.519,
+   "detail": {
+    "answer": "We deploy with `just prod`, never raw ftp.",
+    "expected_hint": "just prod"
+   }
+  },
+  {
+   "case_id": "u3-sh-editor",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 24,
+   "latency_ms": 0.914,
+   "detail": {
+    "answer": "I use Zed as my editor.",
+    "expected_hint": "Zed"
+   }
+  },
+  {
+   "case_id": "u3-mh-city",
+   "qclass": "multi_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 18,
+   "latency_ms": 0.74,
+   "detail": {
+    "answer": "Dan lives in Austin",
+    "expected_hint": "Austin"
+   }
+  },
+  {
+   "case_id": "u3-tp-review",
+   "qclass": "temporal",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 44,
+   "latency_ms": 0.902,
+   "detail": {
+    "answer": "My review meeting is scheduled on March 3rd.",
+    "expected_hint": "March 3rd"
+   }
+  },
+  {
+   "case_id": "u3-ku-employer",
+   "qclass": "knowledge_update",
+   "correct": false,
+   "score": 0.0,
+   "tokens_injected": 38,
+   "latency_ms": 0.795,
+   "detail": {
+    "answer": "Dan is called Dan",
+    "expected_hint": "Initrode"
+   }
+  },
+  {
+   "case_id": "u3-sh-ticket",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 35,
+   "latency_ms": 0.889,
+   "detail": {
+    "answer": "My support ticket got resolved, reference ticket #103.",
+    "expected_hint": "ticket #103"
+   }
+  },
+  {
+   "case_id": "u4-sh-deploy",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 533,
+   "latency_ms": 7.605,
+   "detail": {
+    "answer": "We deploy with `fab rollout`, never raw ftp.",
+    "expected_hint": "fab rollout"
+   }
+  },
+  {
+   "case_id": "u4-sh-editor",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 28,
+   "latency_ms": 0.944,
+   "detail": {
+    "answer": "I use Neovim as my editor.",
+    "expected_hint": "Neovim"
+   }
+  },
+  {
+   "case_id": "u4-mh-city",
+   "qclass": "multi_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 21,
+   "latency_ms": 0.764,
+   "detail": {
+    "answer": "Elena lives in Nairobi",
+    "expected_hint": "Nairobi"
+   }
+  },
+  {
+   "case_id": "u4-tp-review",
+   "qclass": "temporal",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 47,
+   "latency_ms": 0.926,
+   "detail": {
+    "answer": "My review meeting is scheduled on March 3rd.",
+    "expected_hint": "March 3rd"
+   }
+  },
+  {
+   "case_id": "u4-ku-employer",
+   "qclass": "knowledge_update",
+   "correct": false,
+   "score": 0.0,
+   "tokens_injected": 40,
+   "latency_ms": 1.017,
+   "detail": {
+    "answer": "Elena is called Elena",
+    "expected_hint": "Initrode"
+   }
+  },
+  {
+   "case_id": "u4-sh-ticket",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 36,
+   "latency_ms": 0.88,
+   "detail": {
+    "answer": "My support ticket got resolved, reference ticket #104.",
+    "expected_hint": "ticket #104"
+   }
+  },
+  {
+   "case_id": "u5-sh-deploy",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 532,
+   "latency_ms": 7.777,
+   "detail": {
+    "answer": "We deploy with `make ship`, never raw ftp.",
+    "expected_hint": "make ship"
+   }
+  },
+  {
+   "case_id": "u5-sh-editor",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 27,
+   "latency_ms": 0.953,
+   "detail": {
+    "answer": "I use Emacs as my editor.",
+    "expected_hint": "Emacs"
+   }
+  },
+  {
+   "case_id": "u5-mh-city",
+   "qclass": "multi_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 20,
+   "latency_ms": 0.709,
+   "detail": {
+    "answer": "Frank lives in Perth",
+    "expected_hint": "Perth"
+   }
+  },
+  {
+   "case_id": "u5-tp-review",
+   "qclass": "temporal",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 47,
+   "latency_ms": 0.902,
+   "detail": {
+    "answer": "My review meeting is scheduled on March 3rd.",
+    "expected_hint": "March 3rd"
+   }
+  },
+  {
+   "case_id": "u5-ku-employer",
+   "qclass": "knowledge_update",
+   "correct": false,
+   "score": 0.0,
+   "tokens_injected": 40,
+   "latency_ms": 0.825,
+   "detail": {
+    "answer": "Frank is called Frank",
+    "expected_hint": "Initrode"
+   }
+  },
+  {
+   "case_id": "u5-sh-ticket",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 36,
+   "latency_ms": 0.861,
+   "detail": {
+    "answer": "My support ticket got resolved, reference ticket #105.",
+    "expected_hint": "ticket #105"
+   }
+  },
+  {
+   "case_id": "u6-sh-deploy",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 533,
+   "latency_ms": 7.686,
+   "detail": {
+    "answer": "We deploy with `cargo deploy`, never raw ftp.",
+    "expected_hint": "cargo deploy"
+   }
+  },
+  {
+   "case_id": "u6-sh-editor",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 23,
+   "latency_ms": 0.891,
+   "detail": {
+    "answer": "I use VS Code as my editor.",
+    "expected_hint": "VS Code"
+   }
+  },
+  {
+   "case_id": "u6-mh-city",
+   "qclass": "multi_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 20,
+   "latency_ms": 0.713,
+   "detail": {
+    "answer": "Grace lives in Lisbon",
+    "expected_hint": "Lisbon"
+   }
+  },
+  {
+   "case_id": "u6-tp-review",
+   "qclass": "temporal",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 42,
+   "latency_ms": 0.861,
+   "detail": {
+    "answer": "My review meeting is scheduled on March 3rd.",
+    "expected_hint": "March 3rd"
+   }
+  },
+  {
+   "case_id": "u6-ku-employer",
+   "qclass": "knowledge_update",
+   "correct": false,
+   "score": 0.0,
+   "tokens_injected": 40,
+   "latency_ms": 0.815,
+   "detail": {
+    "answer": "Grace is called Grace",
+    "expected_hint": "Initrode"
+   }
+  },
+  {
+   "case_id": "u6-sh-ticket",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 37,
+   "latency_ms": 0.92,
+   "detail": {
+    "answer": "My support ticket got resolved, reference ticket #106.",
+    "expected_hint": "ticket #106"
+   }
+  },
+  {
+   "case_id": "u7-sh-deploy",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 535,
+   "latency_ms": 7.482,
+   "detail": {
+    "answer": "We deploy with `npm run release`, never raw ftp.",
+    "expected_hint": "npm run release"
+   }
+  },
+  {
+   "case_id": "u7-sh-editor",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 25,
+   "latency_ms": 0.91,
+   "detail": {
+    "answer": "I use Zed as my editor.",
+    "expected_hint": "Zed"
+   }
+  },
+  {
+   "case_id": "u7-mh-city",
+   "qclass": "multi_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 18,
+   "latency_ms": 0.743,
+   "detail": {
+    "answer": "Hank lives in Oslo",
+    "expected_hint": "Oslo"
+   }
+  },
+  {
+   "case_id": "u7-tp-review",
+   "qclass": "temporal",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 45,
+   "latency_ms": 0.922,
+   "detail": {
+    "answer": "My review meeting is scheduled on March 3rd.",
+    "expected_hint": "March 3rd"
+   }
+  },
+  {
+   "case_id": "u7-ku-employer",
+   "qclass": "knowledge_update",
+   "correct": false,
+   "score": 0.0,
+   "tokens_injected": 38,
+   "latency_ms": 0.806,
+   "detail": {
+    "answer": "Hank is called Hank",
+    "expected_hint": "Initrode"
+   }
+  },
+  {
+   "case_id": "u7-sh-ticket",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 35,
+   "latency_ms": 0.866,
+   "detail": {
+    "answer": "My support ticket got resolved, reference ticket #107.",
+    "expected_hint": "ticket #107"
+   }
+  },
+  {
+   "case_id": "u0-sh-deploy",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11786,
+   "latency_ms": 26.202,
+   "detail": {
+    "answer": "We deploy with `make ship`, never raw ftp.",
+    "expected_hint": "make ship"
+   }
+  },
+  {
+   "case_id": "u0-sh-editor",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11786,
+   "latency_ms": 25.058,
+   "detail": {
+    "answer": "I use Neovim as my editor.",
+    "expected_hint": "Neovim"
+   }
+  },
+  {
+   "case_id": "u0-mh-city",
+   "qclass": "multi_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11786,
+   "latency_ms": 25.228,
+   "detail": {
+    "answer": "Alice lives in Lisbon",
+    "expected_hint": "Lisbon"
+   }
+  },
+  {
+   "case_id": "u0-tp-review",
+   "qclass": "temporal",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11786,
+   "latency_ms": 23.316,
+   "detail": {
+    "answer": "My review meeting is scheduled on March 3rd.",
+    "expected_hint": "March 3rd"
+   }
+  },
+  {
+   "case_id": "u0-ku-employer",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11786,
+   "latency_ms": 31.603,
+   "detail": {
+    "answer": "I switched jobs, now I work at Initrode.",
+    "expected_hint": "Initrode"
+   }
+  },
+  {
+   "case_id": "u0-sh-ticket",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11786,
+   "latency_ms": 24.247,
+   "detail": {
+    "answer": "My support ticket got resolved, reference ticket #100.",
+    "expected_hint": "ticket #100"
+   }
+  },
+  {
+   "case_id": "u1-sh-deploy",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11783,
+   "latency_ms": 23.525,
+   "detail": {
+    "answer": "We deploy with `cargo deploy`, never raw ftp.",
+    "expected_hint": "cargo deploy"
+   }
+  },
+  {
+   "case_id": "u1-sh-editor",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11783,
+   "latency_ms": 24.033,
+   "detail": {
+    "answer": "I use Emacs as my editor.",
+    "expected_hint": "Emacs"
+   }
+  },
+  {
+   "case_id": "u1-mh-city",
+   "qclass": "multi_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11783,
+   "latency_ms": 23.169,
+   "detail": {
+    "answer": "Bob lives in Oslo",
+    "expected_hint": "Oslo"
+   }
+  },
+  {
+   "case_id": "u1-tp-review",
+   "qclass": "temporal",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11783,
+   "latency_ms": 23.74,
+   "detail": {
+    "answer": "My review meeting is scheduled on March 3rd.",
+    "expected_hint": "March 3rd"
+   }
+  },
+  {
+   "case_id": "u1-ku-employer",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11783,
+   "latency_ms": 24.271,
+   "detail": {
+    "answer": "I switched jobs, now I work at Initrode.",
+    "expected_hint": "Initrode"
+   }
+  },
+  {
+   "case_id": "u1-sh-ticket",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11783,
+   "latency_ms": 24.695,
+   "detail": {
+    "answer": "My support ticket got resolved, reference ticket #101.",
+    "expected_hint": "ticket #101"
+   }
+  },
+  {
+   "case_id": "u2-sh-deploy",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11782,
+   "latency_ms": 25.638,
+   "detail": {
+    "answer": "We deploy with `npm run release`, never raw ftp.",
+    "expected_hint": "npm run release"
+   }
+  },
+  {
+   "case_id": "u2-sh-editor",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11782,
+   "latency_ms": 24.079,
+   "detail": {
+    "answer": "I use VS Code as my editor.",
+    "expected_hint": "VS Code"
+   }
+  },
+  {
+   "case_id": "u2-mh-city",
+   "qclass": "multi_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11782,
+   "latency_ms": 25.352,
+   "detail": {
+    "answer": "Cara lives in Kyoto",
+    "expected_hint": "Kyoto"
+   }
+  },
+  {
+   "case_id": "u2-tp-review",
+   "qclass": "temporal",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11782,
+   "latency_ms": 24.671,
+   "detail": {
+    "answer": "My review meeting is scheduled on March 3rd.",
+    "expected_hint": "March 3rd"
+   }
+  },
+  {
+   "case_id": "u2-ku-employer",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11782,
+   "latency_ms": 24.286,
+   "detail": {
+    "answer": "I switched jobs, now I work at Initrode.",
+    "expected_hint": "Initrode"
+   }
+  },
+  {
+   "case_id": "u2-sh-ticket",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11782,
+   "latency_ms": 24.98,
+   "detail": {
+    "answer": "My support ticket got resolved, reference ticket #102.",
+    "expected_hint": "ticket #102"
+   }
+  },
+  {
+   "case_id": "u3-sh-deploy",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11782,
+   "latency_ms": 23.323,
+   "detail": {
+    "answer": "We deploy with `just prod`, never raw ftp.",
+    "expected_hint": "just prod"
+   }
+  },
+  {
+   "case_id": "u3-sh-editor",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11782,
+   "latency_ms": 23.629,
+   "detail": {
+    "answer": "I use Zed as my editor.",
+    "expected_hint": "Zed"
+   }
+  },
+  {
+   "case_id": "u3-mh-city",
+   "qclass": "multi_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11782,
+   "latency_ms": 24.455,
+   "detail": {
+    "answer": "Dan lives in Austin",
+    "expected_hint": "Austin"
+   }
+  },
+  {
+   "case_id": "u3-tp-review",
+   "qclass": "temporal",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11782,
+   "latency_ms": 25.126,
+   "detail": {
+    "answer": "My review meeting is scheduled on March 3rd.",
+    "expected_hint": "March 3rd"
+   }
+  },
+  {
+   "case_id": "u3-ku-employer",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11782,
+   "latency_ms": 23.858,
+   "detail": {
+    "answer": "I switched jobs, now I work at Initrode.",
+    "expected_hint": "Initrode"
+   }
+  },
+  {
+   "case_id": "u3-sh-ticket",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11782,
+   "latency_ms": 24.352,
+   "detail": {
+    "answer": "My support ticket got resolved, reference ticket #103.",
+    "expected_hint": "ticket #103"
+   }
+  },
+  {
+   "case_id": "u4-sh-deploy",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11787,
+   "latency_ms": 25.54,
+   "detail": {
+    "answer": "We deploy with `fab rollout`, never raw ftp.",
+    "expected_hint": "fab rollout"
+   }
+  },
+  {
+   "case_id": "u4-sh-editor",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11787,
+   "latency_ms": 24.249,
+   "detail": {
+    "answer": "I use Neovim as my editor.",
+    "expected_hint": "Neovim"
+   }
+  },
+  {
+   "case_id": "u4-mh-city",
+   "qclass": "multi_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11787,
+   "latency_ms": 23.929,
+   "detail": {
+    "answer": "Elena lives in Nairobi",
+    "expected_hint": "Nairobi"
+   }
+  },
+  {
+   "case_id": "u4-tp-review",
+   "qclass": "temporal",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11787,
+   "latency_ms": 23.811,
+   "detail": {
+    "answer": "My review meeting is scheduled on March 3rd.",
+    "expected_hint": "March 3rd"
+   }
+  },
+  {
+   "case_id": "u4-ku-employer",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11787,
+   "latency_ms": 24.079,
+   "detail": {
+    "answer": "I switched jobs, now I work at Initrode.",
+    "expected_hint": "Initrode"
+   }
+  },
+  {
+   "case_id": "u4-sh-ticket",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11787,
+   "latency_ms": 23.876,
+   "detail": {
+    "answer": "My support ticket got resolved, reference ticket #104.",
+    "expected_hint": "ticket #104"
+   }
+  },
+  {
+   "case_id": "u5-sh-deploy",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11784,
+   "latency_ms": 23.593,
+   "detail": {
+    "answer": "We deploy with `make ship`, never raw ftp.",
+    "expected_hint": "make ship"
+   }
+  },
+  {
+   "case_id": "u5-sh-editor",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11784,
+   "latency_ms": 23.922,
+   "detail": {
+    "answer": "I use Emacs as my editor.",
+    "expected_hint": "Emacs"
+   }
+  },
+  {
+   "case_id": "u5-mh-city",
+   "qclass": "multi_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11784,
+   "latency_ms": 23.903,
+   "detail": {
+    "answer": "Frank lives in Perth",
+    "expected_hint": "Perth"
+   }
+  },
+  {
+   "case_id": "u5-tp-review",
+   "qclass": "temporal",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11784,
+   "latency_ms": 24.083,
+   "detail": {
+    "answer": "My review meeting is scheduled on March 3rd.",
+    "expected_hint": "March 3rd"
+   }
+  },
+  {
+   "case_id": "u5-ku-employer",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11784,
+   "latency_ms": 23.611,
+   "detail": {
+    "answer": "I switched jobs, now I work at Initrode.",
+    "expected_hint": "Initrode"
+   }
+  },
+  {
+   "case_id": "u5-sh-ticket",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11784,
+   "latency_ms": 24.458,
+   "detail": {
+    "answer": "My support ticket got resolved, reference ticket #105.",
+    "expected_hint": "ticket #105"
+   }
+  },
+  {
+   "case_id": "u6-sh-deploy",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11782,
+   "latency_ms": 24.425,
+   "detail": {
+    "answer": "We deploy with `cargo deploy`, never raw ftp.",
+    "expected_hint": "cargo deploy"
+   }
+  },
+  {
+   "case_id": "u6-sh-editor",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11782,
+   "latency_ms": 25.712,
+   "detail": {
+    "answer": "I use VS Code as my editor.",
+    "expected_hint": "VS Code"
+   }
+  },
+  {
+   "case_id": "u6-mh-city",
+   "qclass": "multi_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11782,
+   "latency_ms": 29.984,
+   "detail": {
+    "answer": "Grace lives in Lisbon",
+    "expected_hint": "Lisbon"
+   }
+  },
+  {
+   "case_id": "u6-tp-review",
+   "qclass": "temporal",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11782,
+   "latency_ms": 23.769,
+   "detail": {
+    "answer": "My review meeting is scheduled on March 3rd.",
+    "expected_hint": "March 3rd"
+   }
+  },
+  {
+   "case_id": "u6-ku-employer",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11782,
+   "latency_ms": 23.324,
+   "detail": {
+    "answer": "I switched jobs, now I work at Initrode.",
+    "expected_hint": "Initrode"
+   }
+  },
+  {
+   "case_id": "u6-sh-ticket",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11782,
+   "latency_ms": 23.726,
+   "detail": {
+    "answer": "My support ticket got resolved, reference ticket #106.",
+    "expected_hint": "ticket #106"
+   }
+  },
+  {
+   "case_id": "u7-sh-deploy",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11785,
+   "latency_ms": 24.628,
+   "detail": {
+    "answer": "We deploy with `npm run release`, never raw ftp.",
+    "expected_hint": "npm run release"
+   }
+  },
+  {
+   "case_id": "u7-sh-editor",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11785,
+   "latency_ms": 23.578,
+   "detail": {
+    "answer": "I use Zed as my editor.",
+    "expected_hint": "Zed"
+   }
+  },
+  {
+   "case_id": "u7-mh-city",
+   "qclass": "multi_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11785,
+   "latency_ms": 23.75,
+   "detail": {
+    "answer": "Hank lives in Oslo",
+    "expected_hint": "Oslo"
+   }
+  },
+  {
+   "case_id": "u7-tp-review",
+   "qclass": "temporal",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11785,
+   "latency_ms": 26.218,
+   "detail": {
+    "answer": "My review meeting is scheduled on March 3rd.",
+    "expected_hint": "March 3rd"
+   }
+  },
+  {
+   "case_id": "u7-ku-employer",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11785,
+   "latency_ms": 23.273,
+   "detail": {
+    "answer": "I switched jobs, now I work at Initrode.",
+    "expected_hint": "Initrode"
+   }
+  },
+  {
+   "case_id": "u7-sh-ticket",
+   "qclass": "single_hop",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 11785,
+   "latency_ms": 23.642,
+   "detail": {
+    "answer": "My support ticket got resolved, reference ticket #107.",
+    "expected_hint": "ticket #107"
+   }
+  },
+  {
+   "case_id": "op0-employer-update",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 52,
+   "latency_ms": 4.743,
+   "detail": {
+    "answer": "op0 works at Umbrella",
+    "expected_hint": "Umbrella"
+   }
+  },
+  {
+   "case_id": "op1-city-update",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 51,
+   "latency_ms": 2.833,
+   "detail": {
+    "answer": "op1 lives in Hanoi",
+    "expected_hint": "Hanoi"
+   }
+  },
+  {
+   "case_id": "op2-editor-update",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 51,
+   "latency_ms": 2.967,
+   "detail": {
+    "answer": "op2's editor is Zed",
+    "expected_hint": "Zed"
+   }
+  },
+  {
+   "case_id": "op3-employer-update",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 51,
+   "latency_ms": 2.815,
+   "detail": {
+    "answer": "op3 works at Wayne",
+    "expected_hint": "Wayne"
+   }
+  },
+  {
+   "case_id": "op4-city-update",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 51,
+   "latency_ms": 2.687,
+   "detail": {
+    "answer": "op4 lives in Oslo",
+    "expected_hint": "Oslo"
+   }
+  },
+  {
+   "case_id": "op5-editor-update",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 52,
+   "latency_ms": 2.74,
+   "detail": {
+    "answer": "op5's editor is Helix",
+    "expected_hint": "Helix"
+   }
+  },
+  {
+   "case_id": "op6-employer-update",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 52,
+   "latency_ms": 2.697,
+   "detail": {
+    "answer": "op6 works at Aperture",
+    "expected_hint": "Aperture"
+   }
+  },
+  {
+   "case_id": "op7-city-update",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 51,
+   "latency_ms": 2.813,
+   "detail": {
+    "answer": "op7 lives in Cairo",
+    "expected_hint": "Cairo"
+   }
+  },
+  {
+   "case_id": "op8-editor-update",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 52,
+   "latency_ms": 2.756,
+   "detail": {
+    "answer": "op8's editor is Emacs",
+    "expected_hint": "Emacs"
+   }
+  },
+  {
+   "case_id": "op9-employer-update",
+   "qclass": "knowledge_update",
+   "correct": true,
+   "score": 1.0,
+   "tokens_injected": 51,
+   "latency_ms": 2.813,
+   "detail": {
+    "answer": "op9 works at Initech",
+    "expected_hint": "Initech"
+   }
+  }
+ ]
+}
