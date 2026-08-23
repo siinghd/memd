@@ -4,7 +4,20 @@
 set -euo pipefail
 
 DIR=$(mktemp -d /tmp/memd-10min-XXXX)
-PY=${PYTHON:-python}
+# Resolve an interpreter instead of assuming a bare `python` exists. Debian,
+# Ubuntu and most container bases ship `python3` ONLY, so the flagship
+# onboarding story died at line 1 with "python: command not found" on exactly
+# the systems a new user is most likely to try it on.
+PY=${PYTHON:-}
+if [ -z "$PY" ]; then
+  for cand in python3 python; do
+    if command -v "$cand" >/dev/null 2>&1; then PY=$cand; break; fi
+  done
+fi
+if [ -z "$PY" ]; then
+  echo "no python interpreter found; set PYTHON=/path/to/python" >&2
+  exit 1
+fi
 trap 'rm -rf "$DIR"' EXIT
 cd "$DIR"
 export PYTHONPATH="${MEMD_SRC:-}"
