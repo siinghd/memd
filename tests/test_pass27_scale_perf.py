@@ -167,3 +167,44 @@ def test_reembed_has_an_operator_door(tmp_path):
         assert r.status_code == 200, r.text
         assert "embedded" in r.json() and "missing" in r.json()
         assert c.post("/v1/ns/acme/reembed").status_code == 401
+
+
+def test_open_does_not_materialize_the_reembed_worklist(tmp_path):
+    """Pass 19's vector-health gauge took len() of the WORKLIST, building a
+    MemoryRecord (three json.loads each) per missing vector on the namespace
+    OPEN path: 1066ms to reopen a 50K namespace with an incomplete lane.
+    The gauge needs a COUNT; the worklist belongs on the maintenance thread.
+    """
+    root = str(tmp_path / "d")
+    m = Memory(root, encrypt=False, config={"rate_max_writes": 10 ** 9})
+    for i in range(0, 12000, 2000):
+        m.add_events([{"content": f"note {i + j} about deployment", "user_id": "u"}
+                      for j in range(2000)])
+    m.flush()
+    m.close()
+
+    idx_calls = []
+    from memd.index.sqlite_index import NamespaceIndex
+    real = NamespaceIndex.records_missing_embedding
+
+    def spy(self, model, limit=100_000):
+        idx_calls.append(limit)
+        return real(self, model, limit)
+
+    NamespaceIndex.records_missing_embedding = spy
+    try:
+        t0 = time.monotonic()
+        m2 = Memory(root, encrypt=False, config={"vector_selfheal": False})
+        open_ms = (time.monotonic() - t0) * 1000
+        try:
+            assert not idx_calls, (
+                "open built the re-embed worklist; it only needs a count")
+            assert open_ms < 400, f"namespace open took {open_ms:.0f}ms"
+            from memd.metrics import METRICS
+            g = [x for x in METRICS.snapshot()["gauges"].get("memd_vectors_missing", [])
+                 if x["labels"].get("ns") == "default"]
+            assert g, "the vector-health gauge must still be published"
+        finally:
+            m2.close()
+    finally:
+        NamespaceIndex.records_missing_embedding = real

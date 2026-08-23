@@ -1042,6 +1042,24 @@ class NamespaceIndex:
             out.append(rec)
         return out[:limit]
 
+    def count_missing_embedding(self, model: str) -> int:
+        """How many live records lack a current-version vector.
+
+        A COUNT, not a worklist. The vector-health gauge only needs the number,
+        and materializing the worklist to take len() of it built ~45,000
+        MemoryRecord objects (three json.loads each) on the NAMESPACE OPEN
+        path: 1066ms to reopen a 50K namespace versus 54ms once the lane was
+        full. The reembed job still builds the real worklist - on the
+        maintenance thread, where that cost belongs."""
+        with self._read() as _c:
+            row = _c.execute(
+                "SELECT COUNT(*) FROM records r LEFT JOIN vectors v ON v.id = r.id "
+                "WHERE r.deleted=0 AND r.quarantined=0 AND r.invalidated_at IS NULL "
+                "AND r.superseded_by IS NULL AND r.kind != 'link' "
+                "AND (v.id IS NULL OR r.embedding_version IS NULL OR r.embedding_version != ?)",
+                (model,)).fetchone()
+        return int(row[0]) if row else 0
+
     def records_missing_embedding(self, model: str, limit: int = 100_000) -> list[MemoryRecord]:
         """Live, currently-valid records with no vector or an outdated
         embedding_version - the worklist for the re-embedding batch job

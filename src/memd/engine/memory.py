@@ -1309,7 +1309,7 @@ class Memory:
         behind the CLI: a hosted operator had no door on the node that needed it.
         """
         try:
-            missing = len(ns.index.records_missing_embedding(self.embedder.name, limit=100_000))
+            missing = ns.index.count_missing_embedding(self.embedder.name)
         except Exception:
             return 0
         METRICS.set_gauge("memd_vectors_missing", float(missing),
@@ -1653,7 +1653,7 @@ class Memory:
         try:
             METRICS.set_gauge(
                 "memd_vectors_missing",
-                float(len(ns.index.records_missing_embedding(self.embedder.name, limit=100_000))),
+                float(ns.index.count_missing_embedding(self.embedder.name)),
                 help="live records with no current-version vector", ns=ns.namespace)
         except Exception:
             pass
