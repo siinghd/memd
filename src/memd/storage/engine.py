@@ -159,8 +159,86 @@ def _apply_ops(
     return kept, pending, unquarantined
 
 
+# ---------------------------------------------------------------------------
+# Single-writer enforcement.
+#
+# StorageEngine assumed it was the only process on a data root: no lock, no
+# lease, no leader. Every process kept its OWN in-RAM Manifest and blindly
+# put() it, and LocalLogWriter held a long-lived fd on a wal that another
+# process's rotate/compact unlinks. Two processes on one root (uvicorn
+# --workers 2, two container replicas on one volume - the deployment shape
+# 03-architecture.md advertises) silently DESTROY acked data: a writer's
+# appends go to an unlinked inode while its manifest put() erases the other
+# process's segment reference, leaving an unreachable orphan that
+# _adopt_orphan_segments refuses because its fold_seq reads 0.
+#
+# Until a real multi-writer protocol exists (CAS on the manifest + a lease),
+# the honest behaviour is to refuse the second opener. Locks are refcounted
+# per PROCESS: opening the same namespace twice in one process is safe - the
+# in-process lock hierarchy already covers it - and only a second OS process
+# is rejected. Set MEMD_ALLOW_MULTI_PROCESS=1 to opt out (and accept the
+# data-loss risk documented above).
+
+_OWNER_FDS: dict[str, list] = {}   # path -> [fd, refcount]
+_OWNER_LOCK = threading.Lock()
+
+
+class NamespaceBusyError(RuntimeError):
+    """Another OS process already holds this namespace."""
+
+
+def _acquire_owner(lock_path: str) -> bool:
+    """Exclusive advisory lock, refcounted within this process."""
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - non-POSIX
+        return False
+    with _OWNER_LOCK:
+        held = _OWNER_FDS.get(lock_path)
+        if held is not None:
+            held[1] += 1
+            return True
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            raise NamespaceBusyError(
+                f"namespace is already open in another process (lock: {lock_path}). "
+                "memd is single-writer per data root: a second writer silently "
+                "destroys acked data. Run one process per root, or set "
+                "MEMD_ALLOW_MULTI_PROCESS=1 to override."
+            ) from None
+        os.write(fd, str(os.getpid()).encode())
+        _OWNER_FDS[lock_path] = [fd, 1]
+        return True
+
+
+def _release_owner(lock_path: str) -> None:
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover
+        return
+    with _OWNER_LOCK:
+        held = _OWNER_FDS.get(lock_path)
+        if held is None:
+            return
+        held[1] -= 1
+        if held[1] > 0:
+            return
+        _OWNER_FDS.pop(lock_path, None)
+        try:
+            fcntl.flock(held[0], fcntl.LOCK_UN)
+        finally:
+            os.close(held[0])
+
+
 class NamespaceStore:
-    """One namespace: WAL + segments + ops + derived index."""
+    """One namespace: WAL + segments + ops + derived index.
+
+    SINGLE WRITER per data root - see _acquire_owner above.
+    """
 
     def __init__(
         self,
@@ -178,6 +256,13 @@ class NamespaceStore:
         self.wal_key = f"{self.prefix}/wal"
         self.ops_key = f"{self.prefix}/ops"
         self.manifest_key = f"{self.prefix}/manifest.json"
+        # claim the namespace before touching any of its state
+        self._owner_path = None
+        root = getattr(store, "root", None)
+        if root and not os.environ.get("MEMD_ALLOW_MULTI_PROCESS"):
+            lock_path = os.path.join(root, "ns", namespace.replace("/", "__"), ".owner")
+            if _acquire_owner(lock_path):
+                self._owner_path = lock_path
         os.makedirs(cache_dir, exist_ok=True)
         safe = namespace.replace("/", "__")
         self.index = NamespaceIndex(os.path.join(cache_dir, f"{safe}.sqlite"))
@@ -818,6 +903,9 @@ class NamespaceStore:
         except Exception:
             pass  # closed/deleted index; replay covers it
         self.index.close()
+        if self._owner_path:
+            _release_owner(self._owner_path)
+            self._owner_path = None
 
 
 class StorageEngine:

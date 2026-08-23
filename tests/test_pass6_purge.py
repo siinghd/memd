@@ -41,9 +41,14 @@ class TestSelfEnforcingPurge:
         assert marker.encode() in _raw_namespace_bytes(mem, "default")
 
         mem.delete(rid, hard=True)
-        # deadline is 60ms; ordinary work afterward must trigger enforcement
+        # deadline is 60ms; ordinary work afterward must trigger enforcement.
+        # Enforcement now runs on the maintenance thread rather than inline on
+        # the writer (a namespace-scale compaction must never sit on a write
+        # ack - see _MaintenanceWorker), so drain the documented flush point.
+        # The guarantee under test is unchanged: no operator intervention.
         time.sleep(0.08)
         mem.add_events([{"content": "unrelated later activity", "user_id": "u1"}])
+        mem.flush()
 
         recs, ops = mem.ns.load_all_records()
         assert all(r.id != rid for r in recs), "physically purged from records"
@@ -71,6 +76,7 @@ class TestSelfEnforcingPurge:
         time.sleep(0.08)
         mem.close_session("sess-auto") if False else None
         mem.add_events([{"content": "trigger", "user_id": "u1"}])
+        mem.flush()  # background maintenance drain; see the note above
         after = M.snapshot()["counters"].get("memd_auto_compactions_total", [])
         total_before = sum(e["value"] for e in before)
         total_after = sum(e["value"] for e in after)

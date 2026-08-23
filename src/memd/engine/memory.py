@@ -157,6 +157,11 @@ class _EmbedWorker:
         self.batch_size = batch_size
         self.flush_s = flush_s
         self._stop = threading.Event()
+        # Batches are dequeued BEFORE they are embedded, so queue-empty alone
+        # never meant "the work is done" - drain() returned while a batch was
+        # still in flight and flush() inherited that broken promise.
+        self._inflight = 0
+        self._inflight_lock = threading.Lock()
         self._thread = threading.Thread(target=self._run, daemon=True, name="memd-embed")
         self._thread.start()
 
@@ -188,8 +193,14 @@ class _EmbedWorker:
                     break
                 batches.setdefault(ns_name, {})[rid] = text
             METRICS.set_gauge("memd_embed_queue_depth", self.q.qsize())
-            for ns_bucket, batch in batches.items():
-                self._embed_one(ns_bucket, batch)
+            with self._inflight_lock:
+                self._inflight += 1
+            try:
+                for ns_bucket, batch in batches.items():
+                    self._embed_one(ns_bucket, batch)
+            finally:
+                with self._inflight_lock:
+                    self._inflight -= 1
 
     def _embed_one(self, ns_name: str, batch: dict[str, str]) -> None:
         t0 = time.monotonic()
@@ -223,15 +234,108 @@ class _EmbedWorker:
                     self.retries.pop(key, None)
                     METRICS.inc("memd_embed_dead_letters_total")
 
+    def _pending(self) -> int:
+        with self._inflight_lock:
+            return self.q.qsize() + self._inflight
+
     def drain(self, timeout_s: float = 30.0) -> int:
-        """Block until queue empty (used by close/flush paths)."""
+        """Block until the queue is empty AND no batch is still being applied.
+
+        Waiting on queue-empty alone let drain() (and therefore flush())
+        return while a dequeued batch was mid-embed, so "flushed" did not mean
+        the vector lane was complete."""
         waited = 0.0
-        while not self.q.empty() and waited < timeout_s:
+        while self._pending() and waited < timeout_s:
             time.sleep(0.05)
             waited += 0.05
-        return self.q.qsize()
+        return self._pending()
 
-    def stop(self) -> None:
+    def stop(self, drain_timeout_s: float = 0.0) -> None:
+        """Stop the worker, optionally draining first.
+
+        Without a drain, everything still queued is discarded SILENTLY: a
+        clean shutdown could throw away most of a namespace's vectors and
+        nothing distinguished that from a complete vector lane. Whatever is
+        still pending when the timeout expires is now counted, so a degraded
+        lane is visible to an operator (reembed() heals it).
+        """
+        if drain_timeout_s > 0:
+            self.drain(timeout_s=drain_timeout_s)
+        left = self._pending()
+        if left:
+            METRICS.inc("memd_embed_dropped_on_close_total", left,
+                        help="embeddings still pending when the worker stopped")
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+
+class _MaintenanceWorker:
+    """Background runner for namespace-scale maintenance.
+
+    D2 is explicit: "Per-write maintenance scope: O(entity cluster), never
+    O(namespace)". Due hard-delete purges violated that by running
+    `ns.compact()` INLINE on the writer's thread - compaction reads every live
+    record and rewrites the whole live set, so the first ordinary write after
+    a purge deadline came due paid 8131ms at 200K records (vs ~3ms for the
+    identical call moments before), 813x the embedded write-ack SLO. In hosted
+    mode that write holds the namespace lock, stalling every concurrent
+    request on the tenant.
+
+    The compliance guarantee (D7 #8) is unchanged: the purge still happens
+    with no operator intervention, and is still proven by a metric plus an
+    audit entry - it just no longer happens on a caller's latency path.
+    Work is deduped per namespace; flush()/close() drain it.
+    """
+
+    def __init__(self, run_fn):
+        self.run_fn = run_fn
+        self._q: "queue.Queue[str]" = queue.Queue()
+        self._queued: set[str] = set()
+        self._lock = threading.Lock()
+        self._inflight = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="memd-maint")
+        self._thread.start()
+
+    def submit(self, ns_name: str) -> None:
+        with self._lock:
+            if ns_name in self._queued:
+                return  # already scheduled: compaction is idempotent
+            self._queued.add(ns_name)
+        self._q.put(ns_name)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                ns_name = self._q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            with self._lock:
+                self._queued.discard(ns_name)
+                self._inflight += 1
+            try:
+                self.run_fn(ns_name)
+            except Exception:
+                METRICS.inc("memd_maintenance_failures_total",
+                            help="background maintenance runs that raised")
+            finally:
+                with self._lock:
+                    self._inflight -= 1
+
+    def pending(self) -> int:
+        with self._lock:
+            return self._q.qsize() + self._inflight
+
+    def drain(self, timeout_s: float = 60.0) -> int:
+        waited = 0.0
+        while self.pending() and waited < timeout_s:
+            time.sleep(0.02)
+            waited += 0.02
+        return self.pending()
+
+    def stop(self, drain_timeout_s: float = 0.0) -> None:
+        if drain_timeout_s > 0:
+            self.drain(timeout_s=drain_timeout_s)
         self._stop.set()
         self._thread.join(timeout=5)
 
@@ -360,6 +464,8 @@ class Memory:
         preset_core(METRICS, ns=namespace)  # single registration: series exist from t=0
         self._qcache = _SearchCache()
         self._qepochs: dict[str, int] = {}
+        self._embed_close_drain_s = float(cfg.get("embed_close_drain_s", 30.0))
+        self._maint = _MaintenanceWorker(self._run_due_purge)
         self._embed_worker = _EmbedWorker(
             self.embedder,
             self._apply_vectors,
@@ -1119,19 +1225,32 @@ class Memory:
         return len(ids)
 
     def _enforce_purge_deadlines(self, ns) -> bool:
-        """Self-enforce the physical-purge guarantee (D7 #8): when a scheduled
-        hard delete comes due, run an unforced compaction NOW instead of
-        waiting for an operator to remember /compact. Cheap no-op otherwise
-        (one bounded list scan)."""
+        """Self-enforce the physical-purge guarantee (D7 #8) OFF the caller's
+        thread: when a scheduled hard delete comes due, schedule the
+        compaction that erases it. Cheap no-op otherwise (one bounded list
+        scan). See _MaintenanceWorker for why this must not run inline."""
         if not ns.has_due_deletes():
+            return False
+        self._maint.submit(ns.namespace)
+        METRICS.inc("memd_purges_scheduled_total",
+                    help="due hard-delete purges handed to background maintenance",
+                    ns=ns.namespace)
+        return True
+
+    def _run_due_purge(self, ns_name: str) -> bool:
+        """Background body of the purge deadline. Resolves the namespace by
+        PEEK so a namespace destroyed between scheduling and running stays
+        destroyed rather than being re-materialized by name."""
+        ns = self.engine.peek_namespace(ns_name)
+        if ns is None or not ns.has_due_deletes():
             return False
         t0 = time.monotonic()
         rep = ns.compact(force=False)  # force=False still enforces due deadlines
-        METRICS.inc("memd_auto_compactions_total", reason="hard_delete_deadline", ns=ns.namespace)
+        METRICS.inc("memd_auto_compactions_total", reason="hard_delete_deadline", ns=ns_name)
         METRICS.observe("memd_compaction_ms", (time.monotonic() - t0) * 1000,
-                        help="compaction duration (ms)", ns=ns.namespace, forced="auto")
-        self._bump_epoch(ns.namespace)
-        self._audit_for(ns.namespace).append(actor="system", action="auto_compact", target=ns.namespace,
+                        help="compaction duration (ms)", ns=ns_name, forced="auto")
+        self._bump_epoch(ns_name)
+        self._audit_for(ns_name).append(actor="system", action="auto_compact", target=ns_name,
                           detail={"reason": "hard_delete_deadline",
                                   "purged": rep.records_purged,
                                   "hard_deleted_purged": rep.hard_deleted_purged})
@@ -1241,9 +1360,19 @@ class Memory:
         # block new ops + serialize against in-flight exports/reads before
         # shredding (an export racing destroy would otherwise recreate the
         # namespace mid-teardown)
+        # Lock order in this engine is StorageEngine._lock > NamespaceStore._lock
+        # (> _wlock / _sync_lock / index._lock). Taking the ns lock HERE and
+        # then blocking on the engine lock inside destroy_namespace was the one
+        # place that inverted it - an ABBA deadlock against StorageEngine.close(),
+        # which holds the engine lock and then blocks on each ns lock. Both
+        # directions are reachable from the public surface: DELETE /v1/ns/{ns}
+        # racing the lifespan shutdown hook wedged BOTH threads permanently -
+        # no timeout, no error, no metric, and the container lost the manifest
+        # flush that close() was performing.
+        # StorageEngine.destroy_namespace already marks destroyed and takes the
+        # ns lock itself, under the engine lock, in the correct order.
         ns_store.mark_destroyed()
-        with ns_store._lock:
-            ok = self.engine.destroy_namespace(name)
+        ok = self.engine.destroy_namespace(name)
         self._bump_epoch(name)
         # The shredded namespace's ledger was encrypted under a data key that
         # no longer exists: its buffered tail is undecryptable, and appending
@@ -1443,6 +1572,7 @@ class Memory:
         if impl is not None:
             return None  # hosted mode: nothing buffered locally
         self._embed_worker.drain(timeout_s=60)
+        self._maint.drain(timeout_s=60)
         self.ns.index.flush()
         self._flush_all_audits()
 
@@ -1452,7 +1582,10 @@ class Memory:
             return impl.close()
         if getattr(self, "_metrics_dumper", None):
             self._metrics_dumper.stop()
-        self._embed_worker.stop()
+        # bounded drain before stopping: a clean close should not silently
+        # discard the vector lane it was asked to persist
+        self._embed_worker.stop(drain_timeout_s=float(self._embed_close_drain_s))
+        self._maint.stop(drain_timeout_s=float(self._embed_close_drain_s))
         self.ns.index.flush()
         self._flush_all_audits()
         self.ns.close()

@@ -568,6 +568,7 @@ class NamespaceIndex:
                 hits.append(Hit(record=rec, score=-float(r["rank"]), lane="bm25"))
             return hits
 
+        and_hits: list[Hit] = []
         if len(words) > 1:
             and_hits = _run(" AND ".join(f'"{w}"' for w in words))
             if len(and_hits) >= min(10, limit):
@@ -577,25 +578,51 @@ class NamespaceIndex:
         # OR tier, BOUNDED: ranking the full posting list made any query with
         # a high-document-frequency term O(everything) - ~150ms at 50K docs
         # when a single stemmed word appeared in all records. Instead take a
-        # fixed docid-ordered window (FTS5 serves it in milliseconds), hydrate,
-        # and re-rank by term coverage in Python - coverage reproduces bm25's
-        # multi-match preference at bounded cost. When total matches <= window,
-        # the candidate SET is identical to the unbounded version.
+        # bounded window (FTS5 serves it in milliseconds), hydrate, and re-rank
+        # by term coverage in Python - coverage reproduces bm25's multi-match
+        # preference at bounded cost.
+        #
+        # The window is FILTERED IN SQL, not after. Selecting ids with no
+        # predicate and filtering in Python counted PRE-filter rows, so any
+        # older bulk of matching-but-ineligible rows (other scope, tombstoned,
+        # superseded, quarantined, not-yet-valid) consumed the whole window and
+        # starved the eligible records out of the lane entirely - 5 live
+        # in-scope records behind 400 ineligible ones returned ZERO hits, and a
+        # routine bulk delete (which leaves fts rows in place) made the
+        # survivors invisible. Same LIMIT-before-predicate family as pass 1 and
+        # pass 15; the fix is to make the LIMIT count only eligible rows.
         window = max(limit * 8, 320)
+        or_args: list = []
+        or_filt = self._filter_where(f, or_args)
         with self._lock:
             if self._closed:
                 return []
             ids = [r[0] for r in self._con.execute(
-                "SELECT id FROM fts WHERE fts MATCH ? LIMIT ?",
-                (" OR ".join(f'"{w}"' for w in words), window)).fetchall()]
-        if not ids:
-            return []
+                "SELECT r.id FROM fts JOIN records r ON r.id = fts.id "  # nosec B608
+                f"WHERE fts MATCH ? AND {or_filt} LIMIT ?",
+                [" OR ".join(f'"{w}"' for w in words)] + or_args + [window]).fetchall()]
+        if len(ids) >= window:
+            # recall is capped by the window from here on: say so, rather than
+            # letting a silent truncation read as "we found everything"
+            METRICS.inc("memd_bm25_window_saturated_total",
+                        help="bm25 OR scans that filled the bounded window (recall capped)")
         wset = set(words)
-        recs = self.get_many(ids)
-        # predicate enforcement lives HERE in the bounded path - the windowed
-        # id scan bypasses SQL-side filtering, so dropping this check leaked
-        # across scopes and validity windows (caught by fuzz + roundtrip tests)
+        recs = self.get_many(ids) if ids else []
+        # belt-and-braces for predicates SQL cannot express
         recs = [r for r in recs if self._passes_filter(r, f)]
+        # The AND tier proved these documents match EVERY term and they are
+        # already SQL-filtered. Discarding them because there were fewer than
+        # ten (exactly the high-precision case) and then failing to re-find
+        # them in a saturated window returned a page of one-term matches while
+        # the only document matching the whole query was absent.
+        if and_hits:
+            seen = {r.id for r in recs}
+            for h in and_hits:
+                if h.record.id not in seen:
+                    recs.append(h.record)
+                    seen.add(h.record.id)
+        if not recs:
+            return []
 
         def _coverage(rec: MemoryRecord) -> int:
             toks = set()
