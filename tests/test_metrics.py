@@ -10,29 +10,30 @@ def test_counter_gauge_histogram_roundtrip():
     r.inc("memd_test_writes_total", 3, ns="a", help="writes")
     r.inc("memd_test_writes_total", 2, ns="a")
     r.set_gauge("memd_queue_depth", 7.0, help="depth")
-    for v in (0.002, 0.02, 0.3):
-        r.observe("memd_write_seconds", v, help="ack", ns="a")
+    for v in (2.0, 20.0, 300.0):  # MILLISECONDS - the memd unit contract
+        r.observe("memd_write_ack_ms", v, help="ack", ns="a")
     snap = r.snapshot()
     assert sum(x["value"] for x in snap["counters"]["memd_test_writes_total"]) == 5
-    h = snap["histograms"]["memd_write_seconds"][0]
+    h = snap["histograms"]["memd_write_ack_ms"][0]
     assert h["count"] == 3
-    assert abs(h["sum"] - 0.322) < 1e-6
+    assert abs(h["sum"] - 322.0) < 1e-6
     # each observation lands in its first bucket >= value
-    assert h["buckets"]["0.005"] == 1 and h["buckets"]["0.025"] == 1 and h["buckets"]["0.5"] == 1
+    assert h["buckets"]["2.5"] == 1 and h["buckets"]["20"] == 1 and h["buckets"]["500"] == 1
+    assert h["overflow"] == 0
 
 
 def test_prometheus_render():
     r = Registry()
     r.inc("memd_x_total", 4, ns="b", help="x counter")
     r.set_gauge("memd_y", 1.5, help="y gauge")
-    r.observe("memd_z_seconds", 0.004, help="z hist")
+    r.observe("memd_z_ms", 4.0, help="z hist")
     text = r.render_prometheus()
     assert "# TYPE memd_x_total counter" in text
     assert 'memd_x_total{ns="b"} 4' in text
-    assert "# TYPE memd_z_seconds histogram" in text
-    assert 'memd_z_seconds_bucket{le="0.005"} 1' in text
-    assert 'memd_z_seconds_bucket{le="+Inf"} 1' in text
-    assert "memd_z_seconds_sum" in text and "memd_z_seconds_count 1" in text
+    assert "# TYPE memd_z_ms histogram" in text
+    assert 'memd_z_ms_bucket{le="5"} 1' in text
+    assert 'memd_z_ms_bucket{le="+Inf"} 1' in text
+    assert "memd_z_ms_sum" in text and "memd_z_ms_count 1" in text
 
 
 def test_thread_safety():
@@ -40,13 +41,13 @@ def test_thread_safety():
     def worker():
         for _ in range(2000):
             r.inc("memd_t_total")
-            r.observe("memd_t_seconds", 0.001)
+            r.observe("memd_t_ms", 1.0)
     ts = [threading.Thread(target=worker) for _ in range(8)]
     [t.start() for t in ts]
     [t.join() for t in ts]
     snap = r.snapshot()
     assert snap["counters"]["memd_t_total"][0]["value"] == 16000
-    assert snap["histograms"]["memd_t_seconds"][0]["count"] == 16000
+    assert snap["histograms"]["memd_t_ms"][0]["count"] == 16000
 
 
 def test_cardinality_guard_evicts_oldest():
@@ -59,14 +60,14 @@ def test_cardinality_guard_evicts_oldest():
 
 def test_global_metrics_usable_and_json_serializable():
     METRICS.inc("memd_smoke_total")
-    METRICS.observe("memd_smoke_seconds", 0.01)
+    METRICS.observe("memd_smoke_ms", 10.0)
     blob = json.dumps(METRICS.snapshot())  # must be JSON-safe for dumpers/harness
     assert "memd_smoke_total" in blob
 
 
 def test_timer_context():
     r = Registry()
-    with r.timer("memd_timer_seconds", help="t"):
+    with r.timer("memd_timer_ms", help="t"):
         pass
     snap = r.snapshot()
-    assert snap["histograms"]["memd_timer_seconds"][0]["count"] == 1
+    assert snap["histograms"]["memd_timer_ms"][0]["count"] == 1

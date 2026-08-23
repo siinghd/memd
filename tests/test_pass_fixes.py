@@ -143,11 +143,13 @@ def test_snapshot_has_quantiles():
     from memd.metrics import Registry
 
     r = Registry()
-    for v in (0.002, 0.004, 0.006, 0.008, 0.2):
-        r.observe("memd_q_seconds", v, help="q")
-    h = r.snapshot()["histograms"]["memd_q_seconds"][0]
+    # milliseconds - memd's unit contract (see metrics module docstring)
+    for v in (2.0, 4.0, 6.0, 8.0, 200.0):
+        r.observe("memd_q_ms", v, help="q")
+    h = r.snapshot()["histograms"]["memd_q_ms"][0]
     assert h["count"] == 5
-    assert 0 <= h["p50"] <= 0.01 <= h["p95"] <= h["p99"] <= 0.25, (h["p50"], h["p95"], h["p99"])
+    assert 0 <= h["p50"] <= 10.0 <= h["p95"] <= h["p99"] <= 250.0, (h["p50"], h["p95"], h["p99"])
+    assert h["overflow"] == 0
 
 
 def test_encrypted_audit_log_readable_and_verifiable(tmp_path):

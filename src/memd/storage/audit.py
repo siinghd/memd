@@ -18,8 +18,100 @@ class AuditLog:
         self.key = key
         self.envelope = envelope
         self._lock = threading.Lock()
-        data = store.get(key) or b""
-        self._tail_hash = self._last_hash(data)
+        self._tail_hash = "0" * 64
+        self._load_tail()
+
+    # ---------------------------------------------------------------- framing
+
+    def _state_key(self) -> str:
+        return self.key + ".state"
+
+    def _ns(self) -> str:
+        return self.key.split("/")[1] if "/" in self.key else ""
+
+    def _decode(self, data: bytes) -> bytes:
+        """Envelope-framed `[len][ciphertext]...` -> plaintext NDJSON.
+
+        Plaintext ledgers pass through untouched (they start with '{')."""
+        if not (self.envelope is not None and self.envelope.enabled and data and data[:1] != b"{"):
+            return data
+        ns = self._ns()
+        dec: list[bytes] = []
+        i = 0
+        while i + 4 <= len(data):
+            ln = int.from_bytes(data[i : i + 4], "big")
+            chunk = data[i + 4 : i + 4 + ln]
+            try:
+                dec.append(self.envelope.decrypt(ns, chunk))
+            except Exception:
+                pass  # torn/garbled frame: skip; chain verify will flag gaps
+            i += 4 + ln
+        return b"".join(dec)
+
+    def _size(self) -> int:
+        try:
+            return int(self.store.size(self.key))
+        except Exception:
+            return 0
+
+    def _checkpoint(self, size: int | None = None) -> None:
+        """Persist the tail digest next to the ledger.
+
+        Two defects motivate this sidecar, both fixed by it:
+          1. O(1) open. __init__ used to `store.get(key)` the WHOLE ledger just
+             to learn the last hash - 47.9MB / 143.7MB peak RSS at 200K
+             entries, paid on every namespace open (cold-start SLO p90<=1.5s).
+          2. Chain integrity across restarts. `_last_hash` parsed the object as
+             NDJSON, but an ENCRYPTED ledger is `[len][ciphertext]` frames, so
+             the parse always failed and the tail silently reset to 0*64. With
+             encryption on (the default) every reopen forked the hash chain and
+             verify() returned False forever after - a real tamper became
+             indistinguishable from a routine restart.
+        The checkpoint is written AFTER the data append: a crash in between
+        leaves a stale `bytes` and the reader self-heals via the full-read path.
+        """
+        try:
+            put = getattr(self.store, "put_hint", None) or self.store.put
+            put(
+                self._state_key(),
+                json.dumps({"h": self._tail_hash,
+                            "bytes": self._size() if size is None else size},
+                           separators=(",", ":")).encode(),
+            )
+        except Exception:
+            # Best-effort by construction: the checkpoint is a read-side
+            # optimization and the full-read path reproduces it exactly, so a
+            # store that cannot put (or an I/O error) must degrade to the slow
+            # open - never propagate into the caller's write.
+            from memd.metrics import METRICS
+
+            METRICS.inc("memd_audit_checkpoint_failures_total")
+
+    def _load_tail(self) -> str:
+        """Sets self._tail_hash; returns it. Self-heals the sidecar on the
+        cold path so the expensive full read is paid at most once per ledger."""
+        size = self._size()
+        raw = None
+        try:
+            raw = self.store.get(self._state_key())
+        except Exception:
+            raw = None
+        if raw:
+            try:
+                st = json.loads(raw.decode())
+                if int(st.get("bytes", -1)) == size and isinstance(st.get("h"), str) and st["h"]:
+                    self._tail_hash = str(st["h"])  # O(1): no ledger read at all
+                    return self._tail_hash
+            except Exception:
+                pass
+        # cold path: sidecar absent (first open / upgrade) or stale (crash
+        # between append and checkpoint). Decode properly so an encrypted
+        # ledger yields its real tail instead of resetting the chain.
+        data = self.store.get(self.key) or b""
+        self._tail_hash = self._last_hash(self._decode(data))
+        if data:
+            self._checkpoint(size)  # heal: the next open is O(1)
+        return self._tail_hash
 
     @staticmethod
     def _last_hash(data: bytes) -> str:
@@ -51,23 +143,11 @@ class AuditLog:
                 payload = len(enc).to_bytes(4, "big") + enc
             self.store.append(self.key, payload)
             self._tail_hash = entry["h"]
+            self._checkpoint()
 
     def read(self) -> list[dict]:
-        data = self.store.get(self.key) or b""
+        data = self._decode(self.store.get(self.key) or b"")
         out = []
-        if self.envelope is not None and self.envelope.enabled and data and data[:1] != b"{":
-            ns = self.key.split("/")[1] if "/" in self.key else ""
-            dec = []
-            i = 0
-            while i + 4 <= len(data):
-                ln = int.from_bytes(data[i : i + 4], "big")
-                chunk = data[i + 4 : i + 4 + ln]
-                try:
-                    dec.append(self.envelope.decrypt(ns, chunk))
-                except Exception:
-                    pass  # torn/garbled frame: skip; chain verify will flag gaps
-                i += 4 + ln
-            data = b"".join(dec)
         for line in data.decode(errors="replace").splitlines():
             line = line.strip()
             if not line:
@@ -139,6 +219,7 @@ class BufferedAuditLog(AuditLog):
             self._since = 0
             try:
                 self.store.append(self.key, blob)
+                self._checkpoint()
             except OSError:
                 from memd.metrics import METRICS
 

@@ -7,6 +7,8 @@ rebuildable except the segments themselves.
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import os
 import shutil
 import tempfile
@@ -15,11 +17,36 @@ from dataclasses import dataclass
 
 from memd.metrics import METRICS
 
+# Per-request I/O attribution. The global memd_store_ops_total counter says
+# how many object-store round trips the PROCESS made; it can never answer the
+# question the complexity budget actually asks - "how many round trips did
+# THIS request cost?" - because concurrent work interleaves into the same
+# counter. This context-local tally rides with the request instead.
+_req_io: "contextvars.ContextVar[dict | None]" = contextvars.ContextVar("memd_req_io", default=None)
+
 
 def _count_op(op: str) -> None:
     """I/O round-trip counting per store operation class - request-level I/O
     budgets are only auditable if the ops themselves are visible."""
     METRICS.inc("memd_store_ops_total", op=op, help="object-store operations by type")
+    tally = _req_io.get()
+    if tally is not None:
+        tally[op] = tally.get(op, 0) + 1
+
+
+@contextlib.contextmanager
+def count_io():
+    """Count object-store round trips for the enclosed request.
+
+    Yields a dict that fills in as I/O happens: `{"get": 3, "append": 1}`.
+    Context-local, so concurrent requests on other threads never bleed in.
+    """
+    tally: dict[str, int] = {}
+    token = _req_io.set(tally)
+    try:
+        yield tally
+    finally:
+        _req_io.reset(token)
 
 
 @dataclass(frozen=True)
@@ -50,6 +77,16 @@ class ObjectStore(ABC):
     @abstractmethod
     def append(self, key: str, data: bytes) -> int:
         """Append to a log-style key; returns new total size. Must be durable on return."""
+
+    def put_hint(self, key: str, data: bytes) -> None:
+        """Write a small REBUILDABLE hint object (a cache, a checkpoint).
+
+        Hints carry no durability requirement by construction: every reader
+        must detect a stale or missing hint and recompute. Stores may skip
+        fsync for these. The default is the durable path, so a store that does
+        not override this is simply slower, never wrong.
+        """
+        self.put(key, data)
 
     @abstractmethod
     def size(self, key: str) -> int: ...
@@ -154,6 +191,28 @@ class LocalObjectStore(ObjectStore):
                 os.fsync(f.fileno())
             os.replace(tmp, path)
             self._fsync_dir(os.path.dirname(path))
+        except BaseException:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+
+    def put_hint(self, key: str, data: bytes) -> None:
+        """Atomic (temp + rename) but NOT fsynced.
+
+        put() costs two fsyncs - one for the file, one for the parent dir. On
+        the write path that is ~2.7ms of the 10ms write-ack budget, paid for a
+        rebuildable hint. A crash may lose or stale the hint; the reader
+        detects that by size and recomputes, so only the rename atomicity
+        (never a torn hint) actually matters here.
+        """
+        _count_op("put_hint")
+        path = self._path(key)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.replace(tmp, path)
         except BaseException:
             if os.path.exists(tmp):
                 os.unlink(tmp)

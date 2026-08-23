@@ -16,6 +16,7 @@ import queue
 import threading
 import time
 from collections import OrderedDict
+from contextlib import ExitStack as _ExitStack
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -33,6 +34,7 @@ from memd.query.planner import plan_query
 from memd.storage.audit import AuditLog, BufferedAuditLog
 from memd.storage.crypto import LocalKeyEnvelope, NullKeyEnvelope
 from memd.storage.engine import StorageEngine
+from memd.storage.objectstore import count_io
 
 DEFAULT_BUDGET_TOKENS = 2000
 HARD_DELETE_PURGE_MS = 72 * 3600 * 1000  # D7 #8 default physical-purge window
@@ -332,10 +334,14 @@ class Memory:
         # the facade holds a direct reference to this store for its lifetime:
         # pin it so LRU churn of other namespaces can't close it underneath us
         self.engine.pin_namespace(namespace)
-        self.audit = BufferedAuditLog(
-            self.engine.store, f"ns/{namespace}/audit", envelope,
-            flush_every=int(cfg.get("audit_flush_every", 32)),
-        )
+        # D7 #7 ledgers are PER NAMESPACE. They are held in an LRU keyed by
+        # namespace (mirroring the engine's namespace table) and routed by the
+        # OPERATION's target namespace - see _audit_for().
+        self._audit_flush_every = int(cfg.get("audit_flush_every", 32))
+        self._audit_max_open = int(cfg.get("audit_max_open", 64))
+        self._audit_lock = threading.Lock()
+        self._audits: "OrderedDict[str, BufferedAuditLog]" = OrderedDict()
+        self.audit = self._audit_for(namespace)  # facade default, never evicted
         self.embedder: Embedder = resolve_embedder(cfg)
         self.extractor: Extractor = resolve_extractor(cfg)
         self.quarantine = QuarantinePolicy(
@@ -415,7 +421,7 @@ class Memory:
             METRICS.inc("memd_quarantined_total", ns=ns.namespace, reason=v.reason or "unknown")
         t0 = time.monotonic()
         ns.append([rec])
-        METRICS.observe("memd_write_ack_seconds", (time.monotonic() - t0) * 1000,
+        METRICS.observe("memd_write_ack_ms", (time.monotonic() - t0) * 1000,
                         help="durable write ack latency (ms)", ns=ns.namespace)
         self._bump_epoch(ns.namespace)
         METRICS.inc("memd_writes_total", help="raw/explicit lane writes", ns=ns.namespace, kind=kind, source=src.name.lower())
@@ -425,7 +431,7 @@ class Memory:
             self._embed_worker.submit(ns.namespace, rec.id, rec.content)
         if session_id:
             self._taint(session_id).observe(int(src))
-        self.audit.append(actor=actor_id or role, action="add", target=rec.id, detail={"kind": kind, "source": src.name})
+        self._audit_for(ns.namespace).append(actor=actor_id or role, action="add", target=rec.id, detail={"kind": kind, "source": src.name})
         return [rec.id]
 
     def add_events(
@@ -479,7 +485,7 @@ class Memory:
                 quarantined_flags[rec.id] = True
         t0 = time.monotonic()
         ns.append(records)
-        METRICS.observe("memd_write_ack_seconds", (time.monotonic() - t0) * 1000,
+        METRICS.observe("memd_write_ack_ms", (time.monotonic() - t0) * 1000,
                         help="durable write ack latency (ms)", ns=ns.namespace, batched="true")
         self._bump_epoch(ns.namespace)
         METRICS.inc("memd_writes_total", len(records), ns=ns.namespace, kind="batch", source="mixed")
@@ -490,7 +496,7 @@ class Memory:
                 self._embed_worker.submit(ns.namespace, rec.id, rec.content)
         for sid, tier in taint_updates:
             self._taint(sid).observe(tier)
-        self.audit.append(
+        self._audit_for(ns.namespace).append(
             actor="batch", action="add_events", target=f"{len(records)} events",
             detail={"quarantined": len(quarantined_flags)},
         )
@@ -548,14 +554,14 @@ class Memory:
         pairs = self._consolidate_explicit(ns, rec)
         t0 = time.monotonic()
         ns.append([rec])
-        METRICS.observe("memd_write_ack_seconds", (time.monotonic() - t0) * 1000,
+        METRICS.observe("memd_write_ack_ms", (time.monotonic() - t0) * 1000,
                         help="durable write ack latency (ms)", ns=ns.namespace)
         self._bump_epoch(ns.namespace)
         self._apply_supersedence(ns, pairs)
         METRICS.inc("memd_writes_total", help="raw/explicit lane writes", ns=ns.namespace, kind=kind, source=src.name.lower())
         METRICS.inc("memd_remembers_total", ns=ns.namespace)
         self._embed_worker.submit(ns.namespace, rec.id, rec.content)
-        self.audit.append(actor=actor_id or "explicit", action="remember", target=rec.id, detail={"entity_keys": ekeys})
+        self._audit_for(ns.namespace).append(actor=actor_id or "explicit", action="remember", target=rec.id, detail={"entity_keys": ekeys})
         return rec.id
 
     def _consolidate_explicit(self, ns, rec: MemoryRecord) -> list[tuple[str, str]]:
@@ -631,6 +637,53 @@ class Memory:
 
     # ------------------------------------------------------------------ reads
 
+    def _audit_for(self, ns_name: str) -> BufferedAuditLog:
+        """The audit ledger belonging to `ns_name`.
+
+        Ledgers are per-namespace objects (`ns/<ns>/audit`) and are exported
+        per namespace, so they must be routed by the TARGET namespace of the
+        operation. Binding one ledger to the facade's default namespace - the
+        previous shape - meant a single facade serving many namespaces filed
+        every tenant's adds/searches/deletes into the default namespace's
+        ledger: one tenant's exportable, SIEM-bound trail carried another
+        tenant's record ids, while the namespace that actually served the
+        request had no trail at all. Same defect family as the pass-1 vector
+        misfiling: facade default silently standing in for the real target.
+
+        O(1) amortized; bounded by `audit_max_open` open ledgers (LRU, the
+        facade default is pinned).
+        """
+        with self._audit_lock:
+            log = self._audits.get(ns_name)
+            if log is not None:
+                self._audits.move_to_end(ns_name)
+                return log
+            log = BufferedAuditLog(
+                self.engine.store, f"ns/{ns_name}/audit", self.engine.envelope,
+                flush_every=self._audit_flush_every,
+            )
+            self._audits[ns_name] = log
+            while len(self._audits) > self._audit_max_open:
+                victim_name = next(
+                    (k for k in self._audits if k != self.namespace_name), None)
+                if victim_name is None:
+                    break
+                victim = self._audits.pop(victim_name)
+                try:
+                    victim.flush()  # never drop a tenant's entries on eviction
+                except Exception:
+                    METRICS.inc("memd_audit_flush_failures_total", ns=victim_name)
+            return log
+
+    def _flush_all_audits(self) -> None:
+        with self._audit_lock:
+            logs = list(self._audits.values())
+        for lg in logs:
+            try:
+                lg.flush()
+            except Exception:
+                METRICS.inc("memd_audit_flush_failures_total")
+
     def _audit_target_for_query(self, query: str) -> str:
         if self._audit_query_text:
             return query[:80]
@@ -677,9 +730,15 @@ class Memory:
                             qclass=cached.query_class, cache="hit")
             return cached
         METRICS.inc("memd_search_cache_misses_total")
+        io_stack = _ExitStack()
+        io_tally = io_stack.enter_context(count_io())
         ns = self._ns_for(namespace)
         scope = Scope(org=org_id, agent=agent_id, user=user_id, session=session_id)
+        _st0 = time.monotonic()
         plan = plan_query(query)
+        METRICS.observe("memd_search_stage_ms", (time.monotonic() - _st0) * 1000,
+                        help="per-stage search timing (ms): plan/fuse/pack",
+                        ns=ns.namespace, stage="plan")
         filt_kwargs = dict(
             scope=scope,
             kinds=tuple(kinds) if kinds else plan.kinds,
@@ -719,8 +778,16 @@ class Memory:
                             help="per-lane candidate fetch duration (ms)", ns=ns.namespace, lane="vector")
         except Exception:
             METRICS.inc("memd_embed_query_failures_total", ns=ns.namespace)
+        _st0 = time.monotonic()
         fused = rrf_fuse(lane_hits, weights=plan.weights, limit=max(plan.candidate_k, 40))
+        METRICS.observe("memd_search_stage_ms", (time.monotonic() - _st0) * 1000,
+                        help="per-stage search timing (ms): plan/fuse/pack",
+                        ns=ns.namespace, stage="fuse")
+        _st0 = time.monotonic()
         packed = pack_context(fused, budget_tokens=budget_tokens, query_class=plan.qclass)
+        METRICS.observe("memd_search_stage_ms", (time.monotonic() - _st0) * 1000,
+                        help="per-stage search timing (ms): plan/fuse/pack",
+                        ns=ns.namespace, stage="pack")
         items = [
             SearchHit(
                 id=i.id,
@@ -737,9 +804,6 @@ class Memory:
             )
             for i in packed.items
         ]
-        latency = (time.monotonic() - t0) * 1000
-        METRICS.observe("memd_search_latency_ms", latency, help="end-to-end search latency (ms)",
-                        ns=ns.namespace, qclass=plan.qclass, cache="miss")
         METRICS.inc("memd_search_total", ns=ns.namespace, qclass=plan.qclass)
         METRICS.observe("memd_packed_tokens", packed.tokens_used, help="tokens injected per search",
                         buckets=(64, 128, 256, 512, 1024, 2048, 4096, 8192), ns=ns.namespace)
@@ -750,8 +814,21 @@ class Memory:
         for lane, hits in lane_hits.items():
             METRICS.observe("memd_lane_candidates", len(hits), help="candidates per lane per search",
                             buckets=(0, 1, 5, 10, 25, 50, 100), ns=ns.namespace, lane=lane)
-        self.audit.append(actor="search", action="search",
+        self._audit_for(ns.namespace).append(actor="search", action="search",
                           target=self._audit_target_for_query(query), detail={"hits": len(items)})
+        # measured LAST: the audit append is real per-request work and used to
+        # sit outside the timer, so p99 under-reported every search
+        latency = (time.monotonic() - t0) * 1000
+        METRICS.observe("memd_search_latency_ms", latency, help="end-to-end search latency (ms)",
+                        ns=ns.namespace, qclass=plan.qclass, cache="miss")
+        io_stack.close()
+        # I/O counts per request (the complexity budget's separate axis): a
+        # search must stay O(1) in object-store round trips no matter how many
+        # rows it touches. This is the metric that would catch a regression to
+        # an N+1 pattern; the process-wide counter never could.
+        METRICS.observe("memd_search_store_ops", float(sum(io_tally.values())),
+                        help="object-store round trips per search",
+                        buckets=(0, 1, 2, 4, 8, 16, 32, 64, 128), ns=ns.namespace)
         result = SearchResult(
             packed_context=packed.text,
             items=items,
@@ -830,7 +907,7 @@ class Memory:
         self._embed_worker.drain(timeout_s=60)
         # durable boundary: commit index + audit before folding the segment
         ns.index.flush()
-        self.audit.flush()
+        self._audit_for(ns.namespace).flush()
         t0 = time.monotonic()
         seg_records = ns.index.records_of_session(session_id, user_id=user_id)
         try:
@@ -840,14 +917,14 @@ class Memory:
             # an extractor outage must never block the session boundary or
             # wedge the WAL. Facts can be regenerated later via reindex.
             METRICS.inc("memd_extraction_failures_total", ns=ns.namespace)
-            self.audit.append(actor="system", action="extraction_failed",
+            self._audit_for(ns.namespace).append(actor="system", action="extraction_failed",
                               target=session_id, detail={"error": str(ex)[:200]})
             extracted = []
         facts_written, consolidation = self._write_facts(ns, extracted, seg_records)
         seg_name = ns.rotate(f"session-close:{session_id}")
         self._taints.drop(session_id)  # taint is per-session; closed = gone
         self._enforce_purge_deadlines(ns)  # segment fold enforces due purges too
-        self.audit.append(actor="system", action="close_session", target=session_id,
+        self._audit_for(ns.namespace).append(actor="system", action="close_session", target=session_id,
                           detail={"facts": facts_written, "segment": seg_name})
         METRICS.observe("memd_session_close_ms", (time.monotonic() - t0) * 1000,
                         help="session close: extract+consolidate+rotate (ms)", ns=ns.namespace)
@@ -995,7 +1072,7 @@ class Memory:
             ns.index.hard_delete(record_id)
         METRICS.inc("memd_deletes_total", hard=hard, ns=ns.namespace)
         self._bump_epoch(ns.namespace)
-        self.audit.append(actor=actor, action="hard_delete" if hard else "delete", target=record_id)
+        self._audit_for(ns.namespace).append(actor=actor, action="hard_delete" if hard else "delete", target=record_id)
         if hard:
             self._enforce_purge_deadlines(ns)
         return ok
@@ -1033,7 +1110,7 @@ class Memory:
         ns.index.apply_ops_batch(ops)
         METRICS.inc("memd_deletes_total", len(ids), hard=hard, ns=ns.namespace, batched="true")
         self._bump_epoch(ns.namespace)
-        self.audit.append(
+        self._audit_for(ns.namespace).append(
             actor=actor, action="hard_delete_batch" if hard else "delete_batch",
             target=f"{len(ids)} records", detail={"count": len(ids), "hard": hard},
         )
@@ -1051,10 +1128,10 @@ class Memory:
         t0 = time.monotonic()
         rep = ns.compact(force=False)  # force=False still enforces due deadlines
         METRICS.inc("memd_auto_compactions_total", reason="hard_delete_deadline", ns=ns.namespace)
-        METRICS.observe("memd_compaction_seconds", time.monotonic() - t0,
-                        help="compaction duration (s)", ns=ns.namespace, forced="auto")
+        METRICS.observe("memd_compaction_ms", (time.monotonic() - t0) * 1000,
+                        help="compaction duration (ms)", ns=ns.namespace, forced="auto")
         self._bump_epoch(ns.namespace)
-        self.audit.append(actor="system", action="auto_compact", target=ns.namespace,
+        self._audit_for(ns.namespace).append(actor="system", action="auto_compact", target=ns.namespace,
                           detail={"reason": "hard_delete_deadline",
                                   "purged": rep.records_purged,
                                   "hard_deleted_purged": rep.hard_deleted_purged})
@@ -1084,7 +1161,11 @@ class Memory:
             raise ValueError(f"query exceeds {MAX_QUERY_CHARS} char cap")
         ns = self._ns_for(namespace)
         scope = Scope(org=org_id, agent=agent_id, user=user_id, session=session_id)
+        _st0 = time.monotonic()
         plan = plan_query(query)
+        METRICS.observe("memd_search_stage_ms", (time.monotonic() - _st0) * 1000,
+                        help="per-stage search timing (ms): plan/fuse/pack",
+                        ns=ns.namespace, stage="plan")
         t0 = time.monotonic()
         filt = IndexFilter(
             scope=scope, kinds=tuple(kinds) if kinds else plan.kinds, as_of=as_of,
@@ -1146,8 +1227,9 @@ class Memory:
         # one durable batch for the whole sweep (delete_many), not an
         # fsync-per-id loop
         self.delete_many(ids, actor=actor, namespace=namespace)
-        self.audit.append(actor=actor, action="forget",
-                          target=self._audit_target_for_query(query), detail={"deleted": len(ids)})
+        self._audit_for(self._ns_for(namespace).namespace).append(
+            actor=actor, action="forget",
+            target=self._audit_target_for_query(query), detail={"deleted": len(ids)})
         return ids
 
     def destroy_namespace(self, namespace: str | None = None, actor: str = "api") -> bool:
@@ -1163,13 +1245,18 @@ class Memory:
         with ns_store._lock:
             ok = self.engine.destroy_namespace(name)
         self._bump_epoch(name)
+        # The shredded namespace's ledger was encrypted under a data key that
+        # no longer exists: its buffered tail is undecryptable, and appending
+        # to it would re-create BOTH the object and a fresh data key beneath a
+        # crypto-shredded namespace (D7 #9). Drop it without flushing.
+        with self._audit_lock:
+            self._audits.pop(name, None)
         if name == self.namespace_name:
             self.ns = self.engine.namespace(name)
-            self.audit = BufferedAuditLog(
-                self.engine.store, f"ns/{name}/audit", self.engine.envelope,
-                flush_every=self.audit.flush_every,
-            )
+            self.audit = self._audit_for(name)
         METRICS.inc("memd_destroys_total", ns=name)
+        # destroy is an ADMINISTRATIVE act on the engine, so it lands in the
+        # facade's own ledger - never in the ledger of the namespace just shredded
         self.audit.append(actor=actor, action="destroy_namespace", target=name)
         return ok
 
@@ -1187,12 +1274,12 @@ class Memory:
         for line in self.engine.namespace(name).export_jsonl_iter():
             n += 1
             yield line
-        METRICS.observe("memd_export_seconds", time.monotonic() - t0,
-                        help="export duration (s)", ns=name)
+        METRICS.observe("memd_export_ms", (time.monotonic() - t0) * 1000,
+                        help="export duration (ms)", ns=name)
         METRICS.inc("memd_exports_total", ns=name)
         METRICS.inc("memd_export_records_total", n, ns=name,
                     help="records streamed by exports")
-        self.audit.append(actor="export", action="export", target=name,
+        self._audit_for(name).append(actor="export", action="export", target=name,
                           detail={"records": n})
 
     def export_jsonl(self, namespace: str | None = None) -> bytes:
@@ -1209,12 +1296,12 @@ class Memory:
             n += 1
             buf += line
         data = bytes(buf)
-        METRICS.observe("memd_export_seconds", time.monotonic() - t0,
-                        help="export duration (s)", ns=name)
+        METRICS.observe("memd_export_ms", (time.monotonic() - t0) * 1000,
+                        help="export duration (ms)", ns=name)
         METRICS.inc("memd_exports_total", ns=name)
         METRICS.inc("memd_export_records_total", n, ns=name,
                     help="records streamed by exports")
-        self.audit.append(actor="export", action="export", target=name,
+        self._audit_for(name).append(actor="export", action="export", target=name,
                           detail={"bytes": len(data), "records": n})
         return data
 
@@ -1224,15 +1311,15 @@ class Memory:
             return impl.compact(force=force, namespace=namespace)
         ns = self._ns_for(namespace)
         ns.index.flush()
-        self.audit.flush()
+        self._audit_for(ns.namespace).flush()
         t0 = time.monotonic()
         rep = ns.compact(force=force)
-        METRICS.observe("memd_compaction_seconds", time.monotonic() - t0,
-                        help="compaction duration (s)", ns=ns.namespace, forced=str(force))
+        METRICS.observe("memd_compaction_ms", (time.monotonic() - t0) * 1000,
+                        help="compaction duration (ms)", ns=ns.namespace, forced=str(force))
         self._bump_epoch(ns.namespace)
         METRICS.inc("memd_compactions_total", ns=ns.namespace, forced=str(force))
         METRICS.inc("memd_records_purged_total", rep.records_purged, ns=ns.namespace)
-        self.audit.append(actor="maintenance", action="compact", target=ns.namespace, detail=rep.__dict__)
+        self._audit_for(ns.namespace).append(actor="maintenance", action="compact", target=ns.namespace, detail=rep.__dict__)
         return rep.__dict__
 
     def stats(self, namespace: str | None = None) -> dict:
@@ -1250,10 +1337,27 @@ class Memory:
         METRICS.set_gauge("memd_quarantined", st.get("quarantined", 0), ns=ns.namespace)
         return st
 
-    def status(self) -> dict:
+    def status(self, ns_filter: str | None = None) -> dict:
+        """Engine status. `ns_filter` restricts the inventory to one namespace:
+        the namespace list is TENANT information and must not be handed to a
+        key that is 403'd on every entry in it. Scoping also avoids the
+        O(namespaces) object-store walk that list_namespaces() performs - a
+        scoped key costs one exists() probe instead."""
         impl = self._hosted()
         if impl is not None:
             return impl.status()
+        if ns_filter is not None:
+            names = ([ns_filter]
+                     if self.engine.store.exists(f"ns/{ns_filter}/manifest.json")
+                     else [])
+            return {
+                "mode": "embedded",
+                "namespaces": names,
+                "default_namespace": ns_filter,
+                "embedder": self.embedder.name,
+                "extractor": self.extractor.name,
+                "version": "0.1.0",
+            }
         names = self.engine.list_namespaces()
         return {
             "mode": "embedded",
@@ -1324,12 +1428,12 @@ class Memory:
             for j, rec in enumerate(chunk):
                 ns.index.set_vector(rec.id, vecs[j], self.embedder.name)
                 done += 1
-        METRICS.observe("memd_reembed_seconds", time.monotonic() - t0,
-                        help="re-embedding batch duration (s)", ns=ns.namespace)
+        METRICS.observe("memd_reembed_ms", (time.monotonic() - t0) * 1000,
+                        help="re-embedding batch duration (ms)", ns=ns.namespace)
         METRICS.inc("memd_reembed_total", done, ns=ns.namespace)
         if done:
             self._bump_epoch(ns.namespace)  # vector lane changed -> cached contexts are stale
-        self.audit.append(actor="maintenance", action="reembed", target=ns.namespace,
+        self._audit_for(ns.namespace).append(actor="maintenance", action="reembed", target=ns.namespace,
                           detail={"embedded": done, "model": self.embedder.name})
         return {"namespace": ns.namespace, "missing": len(stale), "embedded": done,
                 "model": self.embedder.name}
@@ -1340,7 +1444,7 @@ class Memory:
             return None  # hosted mode: nothing buffered locally
         self._embed_worker.drain(timeout_s=60)
         self.ns.index.flush()
-        self.audit.flush()
+        self._flush_all_audits()
 
     def close(self) -> None:
         impl = self._hosted()
@@ -1350,6 +1454,6 @@ class Memory:
             self._metrics_dumper.stop()
         self._embed_worker.stop()
         self.ns.index.flush()
-        self.audit.flush()
+        self._flush_all_audits()
         self.ns.close()
         self.engine.close()

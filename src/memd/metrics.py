@@ -6,7 +6,13 @@ here; surfaces:
   - JSON snapshot via metrics.snapshot() (harness results embed it)
   - optional periodic JSON dump: MEMD_METRICS_PATH env (for graphing)
 
-Naming follows Prometheus convention: memd_<thing>_<unit>_total/_seconds.
+UNIT CONTRACT (deliberate, and a deliberate deviation from Prometheus's
+seconds-base convention): every duration in memd is measured, named and
+bucketed in MILLISECONDS, suffix `_ms`. The D2 SLO table is written in ms
+(write ack p99 <= 10ms, retrieval p50 <= 20ms / p99 <= 100ms, cold open
+p90 <= 1.5s); one unit end-to-end is what keeps a dashboard honest. Mixing
+the two is what previously made every latency quantile wrong - see
+LATENCY_MS_BUCKETS below.
 """
 from __future__ import annotations
 
@@ -19,7 +25,17 @@ import time
 from collections import OrderedDict
 from typing import Any
 
-DEFAULT_BUCKETS = (0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
+# Millisecond ladder, deliberately dense where the SLOs are graded:
+#   write ack p99 <= 10ms | retrieval p50 <= 20ms, p99 <= 100ms | cold open
+#   p90 <= 1500ms | compaction/reembed seconds | extraction lag <= 60s p95.
+# A duration that lands past the last bucket is counted in `overflow` and
+# reported as >= the top bound - never averaged away (see _quantile).
+LATENCY_MS_BUCKETS = (
+    0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 15, 20, 35, 50, 75, 100, 250, 500,
+    1000, 2500, 5000, 10_000, 30_000, 60_000,
+)
+# Back-compat alias: `observe()` defaults to the latency ladder.
+DEFAULT_BUCKETS = LATENCY_MS_BUCKETS
 
 
 def _labels_key(labels: dict[str, Any]) -> tuple:
@@ -27,12 +43,13 @@ def _labels_key(labels: dict[str, Any]) -> tuple:
 
 
 class _Series:
-    __slots__ = ("value", "buckets", "bucket_counts", "sum", "count")
+    __slots__ = ("value", "buckets", "bucket_counts", "overflow", "sum", "count")
 
     def __init__(self, buckets: tuple[float, ...]):
         self.value = 0.0
         self.buckets = buckets
         self.bucket_counts = [0] * len(buckets)
+        self.overflow = 0  # observations above the last bucket (the +Inf band)
         self.sum = 0.0
         self.count = 0
 
@@ -42,8 +59,18 @@ class Registry:
         self._lock = threading.Lock()
         self._series: "OrderedDict[tuple, _Series]" = OrderedDict()
         self._meta: dict[str, tuple[str, str]] = {}  # name -> (type, help)
+        # keys registered by preset_core(): the SLO series a dashboard graphs.
+        # A FIFO guard evicted these first (they are inserted at t=0), so a
+        # burst of label churn silently deleted exactly the series that must
+        # never disappear. They are exempt from cardinality eviction.
+        self._protected: set[tuple] = set()
         self.max_series = max_series
+        # LRU bookkeeping only matters once eviction is possible; below this
+        # watermark the recency touch is pure overhead on the hottest path in
+        # the process (one observe() per lane per search).
+        self._lru_watermark = max(1, (max_series * 8) // 10)
         self.started = time.time()
+        self._res_sampled = 0.0
 
     def preset(self, name: str, kind: str, help: str = "", *,
                buckets: tuple[float, ...] = DEFAULT_BUCKETS,
@@ -54,6 +81,7 @@ class Registry:
             self._meta.setdefault(name, (kind, help or name))
             for labels in (samples or [{}]):
                 key = (name, _labels_key(labels))
+                self._protected.add(key)
                 if key not in self._series:
                     self._series[key] = _Series(buckets if kind == "histogram" else ())
                     self._series.move_to_end(key)
@@ -62,15 +90,18 @@ class Registry:
              buckets: tuple[float, ...]) -> _Series:
         key = (name, _labels_key(labels))
         s = self._series.get(key)
-        if s is None:
-            if len(self._series) >= self.max_series:
-                self._series.popitem(last=False)  # evict oldest (cardinality guard)
-            b = buckets if buckets else ()
-            s = _Series(b)
-            self._series[key] = s
-            self._meta.setdefault(name, (kind, help_text))
-        elif name in self._meta and self._meta[name][0] != kind:
-            pass
+        if s is not None:
+            if len(self._series) >= self._lru_watermark:
+                self._series.move_to_end(key)  # LRU only under eviction pressure
+            return s
+        if len(self._series) >= self.max_series:
+            victim = next((k for k in self._series if k not in self._protected), None)
+            if victim is not None:
+                del self._series[victim]  # evict least-recently-USED, never a preset
+        b = buckets if buckets else ()
+        s = _Series(b)
+        self._series[key] = s
+        self._meta.setdefault(name, (kind, help_text))
         return s
 
     # ------------------------------------------------------------------ API
@@ -101,61 +132,152 @@ class Registry:
             i = bisect.bisect_left(s.buckets, v)
             if i < len(s.buckets):
                 s.bucket_counts[i] += 1
-            # values above the last bucket are counted by +Inf (= s.count) at
-            # exposition time; no per-bucket increment is needed
+            else:
+                # Above the top bound. Prometheus exposition derives +Inf from
+                # s.count, but the JSON snapshot's quantiles need to KNOW the
+                # band is populated: without this counter a fully-overflowed
+                # histogram silently reported p50 == p95 == p99 == mean.
+                s.overflow += 1
 
     def timer(self, name: str, *, help: str = "", buckets: tuple[float, ...] = DEFAULT_BUCKETS,
               **labels: Any):
-        """Context manager: metrics.timer('memd_x_seconds').__enter__/exit."""
+        """Context manager timing a block in MILLISECONDS (unit contract):
+        `with METRICS.timer('memd_x_ms', ns=ns): ...`"""
         return _Timer(self, name, help, buckets, labels)
+
+    # ----------------------------------------------------------- resources
+
+    def sample_resources(self, min_interval_s: float = 1.0) -> None:
+        """Process resource use - RSS, open fds, threads, CPU seconds.
+
+        The brief requires resource use alongside latency/throughput/errors;
+        none of it was ever gauged, so a memory or fd leak was invisible in the
+        very surface built to catch it. Sampled lazily at export time and
+        throttled, so a scrape storm cannot turn into a /proc storm. Linux
+        /proc is the fast path; every read degrades silently elsewhere.
+        """
+        now = time.monotonic()
+        with self._lock:
+            if now - self._res_sampled < min_interval_s:
+                return
+            self._res_sampled = now
+        try:
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        self.set_gauge("memd_process_rss_bytes",
+                                       float(line.split()[1]) * 1024,
+                                       help="resident set size (bytes)")
+                    elif line.startswith("Threads:"):
+                        self.set_gauge("memd_process_threads", float(line.split()[1]),
+                                       help="OS threads in this process")
+        except OSError:
+            pass
+        try:
+            self.set_gauge("memd_process_open_fds", float(len(os.listdir("/proc/self/fd"))),
+                           help="open file descriptors")
+        except OSError:
+            pass
+        try:
+            t = os.times()
+            self.set_gauge("memd_process_cpu_seconds", float(t.user + t.system),
+                           help="process CPU seconds (user+system)")
+        except OSError:
+            pass
 
     # ------------------------------------------------------------- exports
 
-    def snapshot(self) -> dict[str, Any]:
+    @staticmethod
+    def _visible(lkey: tuple, ns_filter: "set[str] | None") -> bool:
+        """Tenancy filter for the export surfaces.
+
+        Metric labels carry namespace names, so an unfiltered export hands one
+        tenant every other tenant's traffic shape, record counts and error
+        rates - through a key that is 403'd on those same namespaces. Series
+        with NO ns label are process-global and stay visible.
+        """
+        if ns_filter is None:
+            return True
+        for k, v in lkey:
+            if k == "ns":
+                return v in ns_filter
+        return True
+
+    def snapshot(self, ns_filter: "set[str] | None" = None) -> dict[str, Any]:
+        """Point-in-time JSON view.
+
+        The lock is held ONLY to copy each series' primitives - quantile
+        interpolation and dict building happen outside it. Holding the global
+        lock across the whole O(series x buckets) computation stalled every
+        concurrent observe() on every hot path for the duration of a scrape
+        (162-184ms at cap cardinality): the observability surface was itself a
+        latency source on the request path. Copy cost is one pass over the
+        bucket arrays; the math is three.
+        """
+        self.sample_resources()
         with self._lock:
-            out: dict[str, Any] = {
-                "_process_uptime_s": round(time.time() - self.started, 3),
-                "counters": {},
-                "gauges": {},
-                "histograms": {},
-            }
-            for (name, lkey), s in self._series.items():
-                labels = dict(lkey)
-                kind = self._meta.get(name, ("", ""))[0]
-                if kind == "histogram":
-                    # quantiles estimated by linear interpolation within buckets
-                    def _quantile(s: _Series, q: float) -> float:
-                        if s.count == 0:
-                            return 0.0
-                        target = q * s.count
-                        cum = 0.0
-                        prev = 0.0
-                        for b, c in zip(s.buckets, s.bucket_counts):
-                            if cum + c >= target:
-                                frac = (target - cum) / c if c else 0.0
-                                return round(prev + (b - prev) * frac, 6)
-                            cum += c
-                            prev = b
-                        return round(s.sum / s.count, 6)
+            uptime = round(time.time() - self.started, 3)
+            # O(series) POINTER copy only - the bucket arrays are read outside
+            # the lock, exactly as render_prometheus() already does. A metrics
+            # reader may observe a series mid-update (count/sum skewed by one
+            # observation); that is the deliberate trade for never stalling a
+            # request path behind a scrape.
+            items = list(self._series.items())
+            meta = dict(self._meta)
+        raw = [
+            (name, lkey, meta.get(name, ("", ""))[0], s.buckets,
+             list(s.bucket_counts), s.overflow, s.sum, s.count, s.value)
+            for (name, lkey), s in items if self._visible(lkey, ns_filter)
+        ]
 
-                    h = out["histograms"].setdefault(name, [])
-                    h.append({
-                        "labels": labels,
-                        "count": s.count,
-                        "sum": round(s.sum, 6),
-                        "avg": round(s.sum / s.count, 6) if s.count else 0.0,
-                        "p50": _quantile(s, 0.50),
-                        "p95": _quantile(s, 0.95),
-                        "p99": _quantile(s, 0.99),
-                        "buckets": dict(zip(map(str, s.buckets), s.bucket_counts)),
-                    })
-                elif kind == "counter":
-                    out["counters"].setdefault(name, []).append({"labels": labels, "value": s.value})
-                else:
-                    out["gauges"].setdefault(name, []).append({"labels": labels, "value": s.value})
-            return out
+        def _quantile(buckets, counts, overflow, total, ssum, q: float) -> float:
+            if total == 0:
+                return 0.0
+            target = q * total
+            cum = 0.0
+            prev = 0.0
+            for b, c in zip(buckets, counts):
+                if cum + c >= target:
+                    frac = (target - cum) / c if c else 0.0
+                    return round(prev + (b - prev) * frac, 6)
+                cum += c
+                prev = b
+            # target lies in the +Inf band: report at least the top bound.
+            # Returning the MEAN here (the previous behaviour) hid every tail -
+            # a histogram whose values all exceeded the ladder reported
+            # p50 == p95 == p99 == avg.
+            if not buckets:
+                return round(ssum / total, 6)
+            return round(max(float(buckets[-1]), ssum / total), 6)
 
-    def render_prometheus(self) -> str:
+        out: dict[str, Any] = {
+            "_process_uptime_s": uptime,
+            "counters": {},
+            "gauges": {},
+            "histograms": {},
+        }
+        for name, lkey, kind, buckets, counts, overflow, ssum, count, value in raw:
+            labels = dict(lkey)
+            if kind == "histogram":
+                out["histograms"].setdefault(name, []).append({
+                    "labels": labels,
+                    "count": count,
+                    "sum": round(ssum, 6),
+                    "avg": round(ssum / count, 6) if count else 0.0,
+                    "p50": _quantile(buckets, counts, overflow, count, ssum, 0.50),
+                    "p95": _quantile(buckets, counts, overflow, count, ssum, 0.95),
+                    "p99": _quantile(buckets, counts, overflow, count, ssum, 0.99),
+                    "buckets": dict(zip(map(str, buckets), counts)),
+                    "overflow": overflow,  # observations past the top bound
+                })
+            elif kind == "counter":
+                out["counters"].setdefault(name, []).append({"labels": labels, "value": value})
+            else:
+                out["gauges"].setdefault(name, []).append({"labels": labels, "value": value})
+        return out
+
+    def render_prometheus(self, ns_filter: "set[str] | None" = None) -> str:
+        self.sample_resources()
         lines: list[str] = []
         snap_meta = self._meta
         seen_help: set[str] = set()
@@ -168,6 +290,8 @@ class Registry:
         with self._lock:
             items = list(self._series.items())
         for (name, lkey), s in items:
+            if not self._visible(lkey, ns_filter):
+                continue
             kind = snap_meta.get(name, ("gauge", ""))[0]
             lbl = ",".join(f'{k}="{v}"' for k, v in lkey) if lkey else ""
             lblc = "{" + lbl + "}" if lbl else ""
@@ -243,15 +367,25 @@ class PeriodicDumper:
     """Append-only metrics history for trend graphing: one timestamped JSON
     snapshot per line (JSONL - queryable with jq / duckdb / pandas), appended
     every `interval_s`. Lines are small O_APPEND writes (atomic on local
-    POSIX); the file rotates at `rotate_bytes` so a long-lived process can't
-    grow it without bound. Set MEMD_METRICS_PATH to enable."""
+    POSIX). Set MEMD_METRICS_PATH to enable.
+
+    Retention is the point of a trend store, so it is sized deliberately: the
+    dump is COMPACT by default (count/sum/avg/quantiles/overflow per series,
+    without the raw bucket vector, which dominates the line and is not what a
+    trend graph reads) and `keep` rotations are retained rather than one. At
+    cap cardinality the previous shape - full buckets, a single rotation -
+    held roughly ten minutes of history, which cannot show a trend. Set
+    MEMD_METRICS_FULL=1 to keep raw buckets when re-deriving quantiles
+    offline matters more than retention."""
 
     def __init__(self, path: str, interval_s: float = 10.0, registry: Registry | None = None,
-                 rotate_bytes: int = 64 * 1024 * 1024):
+                 rotate_bytes: int = 64 * 1024 * 1024, keep: int = 8, compact: bool = True):
         self.path = path
         self.interval_s = interval_s
         self.reg = registry or METRICS
         self.rotate_bytes = rotate_bytes
+        self.keep = max(1, keep)
+        self.compact = compact
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True, name="memd-metrics-dump")
 
@@ -267,13 +401,28 @@ class PeriodicDumper:
         while not self._stop.wait(self.interval_s):
             self._dump()
 
+    def _rotate(self) -> None:
+        """Shift .1 .. .keep down by one and seal the live file as .1."""
+        oldest = f"{self.path}.{self.keep}"
+        if os.path.exists(oldest):
+            os.remove(oldest)
+        for i in range(self.keep - 1, 0, -1):
+            src = f"{self.path}.{i}"
+            if os.path.exists(src):
+                os.replace(src, f"{self.path}.{i + 1}")
+        os.replace(self.path, f"{self.path}.1")
+
     def _dump(self) -> None:
         try:
             snap = self.reg.snapshot()
+            if self.compact:
+                for series in snap.get("histograms", {}).values():
+                    for h in series:
+                        h.pop("buckets", None)
             snap["_epoch_ms"] = int(time.time() * 1000)
             line = json.dumps(snap, separators=(",", ":")) + "\n"
             if os.path.exists(self.path) and os.path.getsize(self.path) >= self.rotate_bytes:
-                os.replace(self.path, self.path + ".1")  # keep one older window
+                self._rotate()
             with open(self.path, "a") as f:  # O_APPEND: atomic per line here
                 f.write(line)
         except OSError:
@@ -285,23 +434,32 @@ def auto_dumper_from_env(registry: Registry | None = None) -> PeriodicDumper | N
     if not path:
         return None
     interval = float(os.environ.get("MEMD_METRICS_INTERVAL_S", "10"))
-    d = PeriodicDumper(path, interval, registry)
+    d = PeriodicDumper(
+        path, interval, registry,
+        keep=int(os.environ.get("MEMD_METRICS_KEEP", "8")),
+        compact=not os.environ.get("MEMD_METRICS_FULL"),
+    )
     d.start()
     return d
 
 
 CORE_HISTOGRAMS = {
-    "memd_write_ack_seconds": ("durable write ack latency (ms)", DEFAULT_BUCKETS),
+    "memd_write_ack_ms": ("durable write ack latency (ms)", DEFAULT_BUCKETS),
     "memd_search_latency_ms": ("end-to-end search latency (ms)", DEFAULT_BUCKETS),
     "memd_find_ids_ms": ("find_ids sweep duration (ms)", DEFAULT_BUCKETS),
     "memd_mcp_tool_ms": ("MCP tool duration (ms)", DEFAULT_BUCKETS),
     "memd_packed_tokens": ("tokens injected per search",
                            (64, 128, 256, 512, 1024, 2048, 4096, 8192)),
     "memd_search_hits": ("packed items per search", (1, 2, 5, 10, 20, 50)),
+    "memd_search_store_ops": ("object-store round trips per search",
+                              (0, 1, 2, 4, 8, 16, 32, 64, 128)),
     "memd_lane_candidates": ("candidates per lane per search",
                              (0, 1, 5, 10, 25, 50, 100)),
     "memd_session_close_ms": ("session close duration (ms)", DEFAULT_BUCKETS),
-    "memd_compaction_seconds": ("compaction duration (s)", DEFAULT_BUCKETS),
+    "memd_compaction_ms": ("compaction duration (ms)", DEFAULT_BUCKETS),
+    "memd_export_ms": ("export duration (ms)", DEFAULT_BUCKETS),
+    "memd_reembed_ms": ("re-embedding batch duration (ms)", DEFAULT_BUCKETS),
+    "memd_search_stage_ms": ("per-stage search timing (ms): plan/fuse/pack", DEFAULT_BUCKETS),
     "memd_embed_batch_size": ("texts per embedding batch", (1, 4, 8, 16, 32, 64, 128)),
     "memd_embed_apply_ms": ("embed + index apply duration (ms)", DEFAULT_BUCKETS),
     "memd_http_request_ms": ("HTTP request duration (ms)", DEFAULT_BUCKETS),
@@ -345,6 +503,7 @@ CORE_COUNTERS = {
     "memd_auto_compactions_total": "opportunistic compactions (self-enforced deadlines)",
     "memd_storage_parse_errors_total": "corrupt frames skipped in replay/load",
     "memd_audit_flush_failures_total": "audit entries lost to I/O errors",
+    "memd_audit_checkpoint_failures_total": "audit tail checkpoints not persisted (slow open next time)",
     "memd_session_truncated_total": "sessions exceeding extraction row limit",
     "memd_http_requests_total": "HTTP requests",
     "memd_http_errors_total": "HTTP 5xx errors",
@@ -355,12 +514,15 @@ CORE_COUNTERS = {
     "memd_orphan_segments_adopted_total": "unreferenced segments healed on open",
     "memd_index_write_after_close_total": "index writes skipped after close",
     "memd_store_ops_total": "object-store operations by type",
-    "memd_embed_backlog_dropped_total": "embeddings dropped: backlog over capacity",
     "memd_embed_target_missing_total": "embeddings dropped because the target namespace is gone",
     "memd_forgets_total": "query-driven forget sweeps executed",
 }
 
 CORE_GAUGES = {
+    "memd_process_rss_bytes": "resident set size (bytes)",
+    "memd_process_open_fds": "open file descriptors",
+    "memd_process_threads": "OS threads in this process",
+    "memd_process_cpu_seconds": "process CPU seconds (user+system)",
     "memd_embed_queue_depth": "pending embedding texts",
     "memd_records": "live record count",
     "memd_vectors": "vector count",

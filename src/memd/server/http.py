@@ -434,7 +434,11 @@ def create_app(
                 METRICS.inc("memd_auth_failures_total", reason="metrics")
                 raise HTTPException(401, "missing or invalid bearer key")
             failures.record_success(client)
-        return Response(content=METRICS.render_prometheus(), media_type="text/plain; version=0.0.4")
+            ns_filter = None if p.namespace == "*" else {p.namespace}
+        else:
+            ns_filter = None  # public scrape: operator opted the whole fleet in
+        return Response(content=METRICS.render_prometheus(ns_filter=ns_filter),
+                        media_type="text/plain; version=0.0.4")
 
     @app.get("/v1/metrics/json")
     def metrics_json(p: Principal = Depends(auth)):
@@ -443,15 +447,15 @@ def create_app(
 
         from memd.metrics import METRICS
 
-        snap = METRICS.snapshot()
+        snap = METRICS.snapshot(ns_filter=None if p.namespace == "*" else {p.namespace})
         snap["_epoch_ms"] = int(_t.time() * 1000)
         return snap
 
     @app.get("/v1/status")
     def status(p: Principal = Depends(auth)):
-        # authenticated: the namespace inventory is tenant information, not
-        # something to hand to unauthenticated probers
-        return engine.status()
+        # authenticated AND scoped: the namespace inventory is tenant
+        # information, so a key bound to one namespace sees only that one
+        return engine.status(ns_filter=None if p.namespace == "*" else p.namespace)
 
     return app
 
