@@ -466,7 +466,7 @@ class Memory:
         self._qcache = _SearchCache()
         self._qepochs: dict[str, int] = {}
         self._embed_close_drain_s = float(cfg.get("embed_close_drain_s", 30.0))
-        self._maint = _MaintenanceWorker(self._run_due_purge)
+        self._maint = _MaintenanceWorker(self._run_maintenance)
         self._embed_worker = _EmbedWorker(
             self.embedder,
             self._apply_vectors,
@@ -474,6 +474,8 @@ class Memory:
             max_queue=int(cfg.get("embed_max_queue", 5_000)),
         )
         self.audit.append(actor="system", action="open", target=namespace, detail={"embedder": self.embedder.name})
+        self._vector_selfheal = bool(cfg.get("vector_selfheal", True))
+        self._report_vector_health(self.ns)
 
     # ------------------------------------------------------------------ writes
 
@@ -843,8 +845,12 @@ class Memory:
             # that described neither the hit nor a fresh query.
             return _dc_replace(cached, latency_ms=round(hit_ms, 3))
         METRICS.inc("memd_search_cache_misses_total")
-        io_stack = _ExitStack()
-        io_tally = io_stack.enter_context(count_io())
+        # entered/exited explicitly rather than via `with`, because the tally
+        # must close AFTER the latency observation below. count_io()'s reset
+        # tolerates being unwound in another context, so an early return or an
+        # exception leaves at most an orphan dict that the next search replaces.
+        io_ctx = count_io()
+        io_tally = io_ctx.__enter__()
         ns = self._ns_for(namespace)
         scope = Scope(org=org_id, agent=agent_id, user=user_id, session=session_id)
         _st0 = time.monotonic()
@@ -934,7 +940,7 @@ class Memory:
         latency = (time.monotonic() - t0) * 1000
         METRICS.observe("memd_search_latency_ms", latency, help="end-to-end search latency (ms)",
                         ns=ns.namespace, qclass=plan.qclass, cache="miss")
-        io_stack.close()
+        io_ctx.__exit__(None, None, None)
         # I/O counts per request (the complexity budget's separate axis): a
         # search must stay O(1) in object-store round trips no matter how many
         # rows it touches. This is the metric that would catch a regression to
@@ -1243,6 +1249,38 @@ class Memory:
                     help="due hard-delete purges handed to background maintenance",
                     ns=ns.namespace)
         return True
+
+    def _run_maintenance(self, job: str) -> bool:
+        if job.startswith("reembed:"):
+            ns_name = job.split(":", 1)[1]
+            if self.engine.peek_namespace(ns_name) is None:
+                return False
+            self.reembed(namespace=ns_name)
+            return True
+        return self._run_due_purge(job)
+
+    def _report_vector_health(self, ns) -> int:
+        """Publish how much of the vector lane is missing, and schedule the heal.
+
+        Losing the derived index cache (a node restore, a wiped volume) replays
+        every RECORD from segments but zero VECTORS - the lane is rebuildable
+        by contract, so nothing was wrong, and nothing said anything either. A
+        namespace could serve every query with one of its four fusion lanes
+        empty and look FASTER while doing it (no vector matrix to build), so
+        latency monitoring could never surface it. reembed() existed, but only
+        behind the CLI: a hosted operator had no door on the node that needed it.
+        """
+        try:
+            missing = len(ns.index.records_missing_embedding(self.embedder.name, limit=100_000))
+        except Exception:
+            return 0
+        METRICS.set_gauge("memd_vectors_missing", float(missing),
+                          help="live records with no current-version vector", ns=ns.namespace)
+        if missing and self._vector_selfheal:
+            # heal on the maintenance thread, never at open time on the
+            # caller's path (that is the pass-17 lesson)
+            self._maint.submit(f"reembed:{ns.namespace}")
+        return missing
 
     def _run_due_purge(self, ns_name: str) -> bool:
         """Background body of the purge deadline. Resolves the namespace by
@@ -1566,6 +1604,13 @@ class Memory:
                 done += 1
         METRICS.observe("memd_reembed_ms", (time.monotonic() - t0) * 1000,
                         help="re-embedding batch duration (ms)", ns=ns.namespace)
+        try:
+            METRICS.set_gauge(
+                "memd_vectors_missing",
+                float(len(ns.index.records_missing_embedding(self.embedder.name, limit=100_000))),
+                help="live records with no current-version vector", ns=ns.namespace)
+        except Exception:
+            pass
         METRICS.inc("memd_reembed_total", done, ns=ns.namespace)
         if done:
             self._bump_epoch(ns.namespace)  # vector lane changed -> cached contexts are stale

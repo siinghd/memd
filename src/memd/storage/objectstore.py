@@ -46,7 +46,15 @@ def count_io():
     try:
         yield tally
     finally:
-        _req_io.reset(token)
+        try:
+            _req_io.reset(token)
+        except ValueError:
+            # The token belongs to the context it was created in. If the
+            # manager is unwound somewhere else (an abandoned ExitStack
+            # finalized by GC, a generator closed on another task), resetting
+            # is both impossible and unnecessary - clear instead of raising
+            # out of a finalizer, which surfaces as an unraisable exception.
+            _req_io.set(None)
 
 
 @dataclass(frozen=True)

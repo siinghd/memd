@@ -531,6 +531,7 @@ CORE_GAUGES = {
     "memd_embed_queue_depth": "pending embedding texts",
     "memd_records": "live record count",
     "memd_vectors": "vector count",
+    "memd_vectors_missing": "live records with no current-version vector",
     "memd_quarantined": "quarantined record count",
     "memd_pending_purges": "scheduled physical purges not yet due",
 }

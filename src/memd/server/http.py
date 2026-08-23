@@ -464,6 +464,19 @@ def create_app(
         METRICS.inc("memd_forgets_total", ns=ns)
         return {"deleted": deleted, "count": len(deleted), "confirmed": True}
 
+    @app.post("/v1/ns/{ns}/reembed")
+    def reembed(ns: str, p: Principal = Depends(auth)):
+        """Rebuild the vector lane from raw (ADR-8).
+
+        Restoring segments onto a node without the derived index cache replays
+        every record but zero vectors, so retrieval runs with one of its four
+        fusion lanes empty - and looks faster, not broken. The heal existed
+        only behind the CLI, which a hosted operator cannot reach on the node
+        that needs it. O(records missing a current-version vector); charged to
+        the heavy-maintenance budget."""
+        heavy(ns, "reembed", p)
+        return engine.reembed(namespace=ns)
+
     @app.get("/health")
     def health():
         return {"ok": True, "version": "0.1.0"}
