@@ -21,6 +21,14 @@ class AuditLog:
     # class-level defaults so read()/verify() work on a hand-built instance
     # (tests construct one via __new__ to feed the chain a forged ledger)
     _segments = 0
+    _pruned = 0
+    # Hash the RETAINED window chains back to. Retention is bounded, so the
+    # oldest surviving entry's `prev` points at a segment that no longer
+    # exists; verifying from 0*64 therefore failed forever once the ring
+    # engaged (4000 appended -> 800 readable -> verify() False, permanently).
+    # Tamper-evidence is a property of the window you still hold, not of
+    # history you deliberately discarded.
+    _chain_start = "0" * 64
     rotate_bytes = ROTATE_BYTES
 
     def __init__(self, store, key: str, envelope=None, rotate_bytes: int | None = None):
@@ -29,6 +37,8 @@ class AuditLog:
         self.envelope = envelope
         self.rotate_bytes = int(rotate_bytes if rotate_bytes is not None else self.ROTATE_BYTES)
         self._segments = 0
+        self._pruned = 0
+        self._chain_start = "0" * 64
         self._lock = threading.Lock()
         self._tail_hash = "0" * 64
         self._load_tail()
@@ -40,6 +50,22 @@ class AuditLog:
 
     def _seg_key(self, n: int) -> str:
         return f"{self.key}.{n:05d}"
+
+    def _first_prev(self, seg_key: str) -> str | None:
+        """`prev` digest of the first entry in a sealed segment."""
+        try:
+            data = self._decode(self.store.get(seg_key) or b"")
+            for line in data.decode(errors="replace").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                e = json.loads(line)
+                if isinstance(e, dict) and isinstance(e.get("prev"), str):
+                    return e["prev"]
+                return None
+        except Exception:
+            return None
+        return None
 
     def _maybe_rotate(self) -> None:
         """Seal the live ledger into a numbered segment when it grows past
@@ -58,10 +84,23 @@ class AuditLog:
             self._segments += 1
             if self._segments > self.KEEP_SEGMENTS:
                 oldest = self._segments - self.KEEP_SEGMENTS - 1
+                # Re-anchor the chain BEFORE dropping the segment: the new
+                # oldest surviving entry's `prev` is the digest of the last
+                # entry we are about to discard, so it becomes the start of
+                # the verifiable window.
+                anchor = self._first_prev(self._seg_key(oldest + 1))
                 try:
                     self.store.delete(self._seg_key(oldest))
                 except Exception:
                     pass
+                else:
+                    self._pruned += 1
+                    if anchor:
+                        self._chain_start = anchor
+                    from memd.metrics import METRICS
+
+                    METRICS.inc("memd_audit_segments_pruned_total",
+                                help="audit segments dropped past the retention bound")
             self._checkpoint(0)
             from memd.metrics import METRICS
 
@@ -122,7 +161,9 @@ class AuditLog:
                 self._state_key(),
                 json.dumps({"h": self._tail_hash,
                             "bytes": self._size() if size is None else size,
-                            "segs": self._segments},
+                            "segs": self._segments,
+                            "pruned": self._pruned,
+                            "chain_start": self._chain_start},
                            separators=(",", ":")).encode(),
             )
         except Exception:
@@ -147,6 +188,8 @@ class AuditLog:
             try:
                 st = json.loads(raw.decode())
                 self._segments = int(st.get("segs", 0) or 0)
+                self._pruned = int(st.get("pruned", 0) or 0)
+                self._chain_start = str(st.get("chain_start") or "0" * 64)
                 if int(st.get("bytes", -1)) == size and isinstance(st.get("h"), str) and st["h"]:
                     self._tail_hash = str(st["h"])  # O(1): no ledger read at all
                     return self._tail_hash
@@ -225,7 +268,16 @@ class AuditLog:
         return out
 
     def verify(self) -> bool:
-        prev = "0" * 64
+        """Tamper-evidence over the RETAINED window.
+
+        Retention is bounded (KEEP_SEGMENTS), so verification anchors at
+        `_chain_start` - the digest the oldest surviving entry chains back to -
+        rather than at zero. Anchoring at zero made verify() permanently False
+        the moment the ring engaged, which reads as "tampered" when the truth
+        is "we pruned on purpose". `_pruned` records that history was dropped
+        so a reader can tell the two apart.
+        """
+        prev = self._chain_start
         for e in self.read():
             body = json.dumps({k: v for k, v in e.items() if k != "h"}, sort_keys=True).encode()
             if e.get("prev") != prev or e.get("h") != hashlib.sha256(body).hexdigest():

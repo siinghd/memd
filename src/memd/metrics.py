@@ -515,6 +515,8 @@ CORE_COUNTERS = {
     "memd_audit_flush_failures_total": "audit entries lost to I/O errors",
     "memd_audit_checkpoint_failures_total": "audit tail checkpoints not persisted (slow open next time)",
     "memd_audit_rotations_total": "audit ledger segments sealed",
+    "memd_audit_appends_dropped_total": "audit appends discarded for a shredded namespace",
+    "memd_audit_segments_pruned_total": "audit segments dropped past the retention bound",
     "memd_audit_rotation_failures_total": "audit ledger rotations that failed (ledger keeps growing)",
     "memd_session_truncated_total": "sessions exceeding extraction row limit",
     "memd_http_requests_total": "HTTP requests",

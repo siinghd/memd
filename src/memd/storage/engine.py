@@ -325,6 +325,8 @@ class NamespaceStore:
         import tempfile as _tf
 
         try:
+            if self._closed:
+                return False
             if self.index.stats().get("records", 0) < self.SNAPSHOT_MIN_RECORDS:
                 return False
             self.index.flush()
@@ -363,12 +365,24 @@ class NamespaceStore:
             # (an operator, a cleanup script, a test fixture - this bit me
             # while benchmarking) would delete the durable folded index
             name = f"index-{ulid_new()}.snap"
-            payload = self.envelope.encrypt(self.namespace, blob) if self.envelope.enabled else blob
-            self.store.put(self._snapshot_key(name), payload)
-            old = self.manifest.snapshot_name
-            self.manifest.snapshot_name = name
-            self.manifest.snapshot_seq = self.manifest.seq
-            self._persist_manifest()
+            # The expensive part (backup + gzip) ran WITHOUT the namespace lock
+            # on purpose. Publishing must take it: a destroy racing this would
+            # otherwise put() an object under a crypto-SHREDDED namespace and,
+            # worse, envelope.encrypt() would mint a FRESH data key for it -
+            # resurrecting the namespace and defeating the shred (D7 #9). This
+            # is the same hazard the audit ledger has, guarded there in pass 16
+            # and reintroduced here.
+            with self._lock:
+                if self._closed:
+                    METRICS.inc("memd_index_snapshot_failures_total",
+                                ns=self.namespace, detail="namespace_gone")
+                    return False
+                payload = self.envelope.encrypt(self.namespace, blob) if self.envelope.enabled else blob
+                self.store.put(self._snapshot_key(name), payload)
+                old = self.manifest.snapshot_name
+                self.manifest.snapshot_name = name
+                self.manifest.snapshot_seq = self.manifest.seq
+                self._persist_manifest()
             if old and old != name:      # only after the new one is referenced
                 try:
                     self.store.delete(self._snapshot_key(old))
@@ -772,7 +786,31 @@ class NamespaceStore:
                     owner = True
             if owner:
                 try:
-                    cur = self._writer()
+                    # Acquire the writer under _wlock and re-check the
+                    # generation there. _seal_wal_writer_locked takes the same
+                    # lock, so this is mutually exclusive with a rotate/compact
+                    # seal. Without it, a seal landing in the gap would make
+                    # _writer() REOPEN the wal handle - and the compaction that
+                    # sealed it then unlinks the key underneath, re-creating
+                    # the pass-22 ghost-inode data loss by race. The gen check
+                    # at the top of the loop is read before this gap and cannot
+                    # close it.
+                    with self._wlock:
+                        if self._log_gen != my_gen:
+                            with self._sync_lock:
+                                self._sync_busy = False
+                            return
+                        cur = self._writer()
+                        covered_to = self._written_pos
+                    # Snapshot the write frontier BEFORE the fsync. Reading
+                    # _written_pos AFTER it claimed durability for anything
+                    # another appender wrote while the fsync was in flight:
+                    # measured 160 violations across 8 writers, up to 3108
+                    # bytes marked durable that no fsync ever covered, and the
+                    # appender waiting on those bytes returned immediately -
+                    # an ACK for data that was not on disk. Bytes written
+                    # after this read are also covered by the fsync; not
+                    # claiming them is merely conservative.
                     cur.sync()
                 except (OSError, ValueError):
                     # writer closed by a concurrent rotate: our frame is in
@@ -781,7 +819,7 @@ class NamespaceStore:
                         self._sync_busy = False
                     return
                 with self._sync_lock:
-                    self._synced_pos = max(self._synced_pos, self._written_pos)
+                    self._synced_pos = max(self._synced_pos, covered_to)
                     self._sync_busy = False
                 time.sleep(0)
             else:

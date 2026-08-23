@@ -99,12 +99,18 @@ def test_session_sweep_uses_a_session_index(tmp_path):
             m.add_events([{"content": f"note {i + j}", "user_id": "u",
                            "session_id": f"s{(i + j) % 200}"} for j in range(500)])
         m.flush()
+        # Assert the ACTUAL query records_of_session runs, and name the index.
+        # The first version of this test allowed any index and ran a
+        # hand-written proxy query, so it passed on the pre-pass-20 tree where
+        # the planner picked ix_rec_kind and walked every raw_event row.
         plan = m.ns.index._con.execute(
-            "EXPLAIN QUERY PLAN SELECT * FROM records WHERE scope_session = ? "
-            "AND kind = 'raw_event' AND deleted = 0", ("s7",)).fetchall()
+            "EXPLAIN QUERY PLAN "
+            "SELECT * FROM records WHERE scope_session = ? AND kind = 'raw_event' "
+            "AND deleted = 0 AND quarantined = 0 ORDER BY t_event LIMIT ?",
+            ("s7", 1000)).fetchall()
         text = " ".join(str(r[-1]) for r in plan)
-        assert "SCAN" not in text.upper() or "INDEX" in text.upper(), (
-            f"session sweep is scanning the namespace: {text}")
+        assert "ix_rec_session" in text, (
+            f"session sweep is not using the session index: {text}")
         assert len(m.ns.index.records_of_session("s7")) == 20
     finally:
         m.close()

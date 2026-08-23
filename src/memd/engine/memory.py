@@ -183,6 +183,15 @@ class _EmbedWorker:
                 ns_name, rid, text = self.q.get(timeout=self.flush_s)
             except queue.Empty:
                 continue
+            # Count the work as in-flight the moment it LEAVES the queue.
+            # Incrementing after the batch was assembled left dequeued items in
+            # neither q.qsize() nor _inflight, so drain() - and therefore
+            # flush() - could report the vector lane complete while a batch was
+            # still in hand. The window is narrow (it lost to drain()'s 50ms
+            # poll in 80 trials) but it is real, and this is where the count
+            # belongs.
+            with self._inflight_lock:
+                self._inflight += 1
             # batch PER NAMESPACE: vectors belong to the namespace that owns
             # the record - a shared cross-namespace batch would misfile them.
             # Common case is one bucket; batching efficiency is unchanged.
@@ -194,8 +203,6 @@ class _EmbedWorker:
                     break
                 batches.setdefault(ns_name, {})[rid] = text
             METRICS.set_gauge("memd_embed_queue_depth", self.q.qsize())
-            with self._inflight_lock:
-                self._inflight += 1
             try:
                 for ns_bucket, batch in batches.items():
                     self._embed_one(ns_bucket, batch)
@@ -268,6 +275,27 @@ class _EmbedWorker:
                         help="embeddings still pending when the worker stopped")
         self._stop.set()
         self._thread.join(timeout=5)
+
+
+class _NullAuditLog:
+    """Ledger for a namespace that no longer exists. Appends are discarded
+    rather than encrypted, because encrypting would re-create the data key the
+    crypto-shred just destroyed."""
+
+    flush_every = 0
+
+    def append(self, *a, **kw) -> None:
+        METRICS.inc("memd_audit_appends_dropped_total",
+                    help="audit appends discarded for a shredded namespace")
+
+    def flush(self) -> None:
+        return None
+
+    def read(self) -> list:
+        return []
+
+    def verify(self) -> bool:
+        return True
 
 
 class _MaintenanceWorker:
@@ -446,6 +474,14 @@ class Memory:
         self._audit_max_open = int(cfg.get("audit_max_open", 64))
         self._audit_lock = threading.Lock()
         self._audits: "OrderedDict[str, BufferedAuditLog]" = OrderedDict()
+        # Namespaces crypto-shredded by this process. An audit append encrypts
+        # its payload, and encrypting for a shredded namespace MINTS A FRESH
+        # DATA KEY - resurrecting what D7 #9 just destroyed. Pass 16 dropped
+        # the ledger on destroy, but any later _audit_for() rebuilt it: a
+        # compaction whose audit entry lands after the destroy (the pass-22
+        # snapshot widened that window) was enough. Bounded; cleared when the
+        # namespace legitimately exists again.
+        self._shredded: "OrderedDict[str, None]" = OrderedDict()
         self.audit = self._audit_for(namespace)  # facade default, never evicted
         self.embedder: Embedder = resolve_embedder(cfg)
         self.extractor: Extractor = resolve_extractor(cfg)
@@ -763,6 +799,8 @@ class Memory:
         facade default is pinned).
         """
         with self._audit_lock:
+            if ns_name in self._shredded:
+                return _NullAuditLog()   # never resurrect a shredded namespace
             log = self._audits.get(ns_name)
             if log is not None:
                 self._audits.move_to_end(ns_name)
@@ -1425,6 +1463,9 @@ class Memory:
         # crypto-shredded namespace (D7 #9). Drop it without flushing.
         with self._audit_lock:
             self._audits.pop(name, None)
+            self._shredded[name] = None
+            while len(self._shredded) > 1024:
+                self._shredded.popitem(last=False)
         if name == self.namespace_name:
             self.ns = self.engine.namespace(name)
             self.audit = self._audit_for(name)
@@ -1547,7 +1588,12 @@ class Memory:
     def _ns_for(self, namespace: str | None):
         if namespace is None or namespace == self.namespace_name:
             return self.ns
-        return self.engine.namespace(namespace)
+        store = self.engine.namespace(namespace)
+        if namespace in self._shredded:
+            # materialized again: it legitimately exists, so stop tombstoning it
+            with self._audit_lock:
+                self._shredded.pop(namespace, None)
+        return store
 
     def _taint(self, session_id: str) -> SessionTaint:
         return self._taints.get(session_id)
