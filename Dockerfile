@@ -4,7 +4,13 @@ WORKDIR /app
 
 COPY pyproject.toml LICENSE ./
 COPY src ./src
-RUN pip install --no-cache-dir . && pip install --no-cache-dir mcp || true
+# Shell precedence matters here: `A && B || true` is `(A && B) || true`, so
+# the trailing `|| true` swallowed a failure of the CORE install too - the
+# image built successfully with memd itself absent and failed at runtime.
+# Only the OPTIONAL extra is allowed to fail.
+RUN pip install --no-cache-dir . \
+ && python -c "import memd; print('memd', memd.__file__)" \
+ && { pip install --no-cache-dir mcp || echo "optional extra 'mcp' unavailable; continuing"; }
 
 # run as unprivileged user; /data is the only writable volume
 RUN useradd -m -u 10001 memd && mkdir -p /data && chown memd:memd /data

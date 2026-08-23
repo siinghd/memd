@@ -11,7 +11,7 @@ from typing import Any
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from memd.core.schema import Kind
 from memd.engine.memory import Memory
@@ -51,16 +51,32 @@ class MemoryIn(BaseModel):
     valid_from: int | None = None
 
 
+def _validate_kinds(v):
+    """The kind vocabulary is CLOSED. Leaving `kinds` unbounded and
+    unvalidated let a caller inflate per-request work with request size (each
+    entry becomes a SQL placeholder plus per-row Python filtering) using
+    values that can never match anything - amplification for free. Reject at
+    the door instead of carrying junk into the query planner."""
+    if v is None:
+        return v
+    bad = [k for k in v if k not in Kind.ALL]
+    if bad:
+        raise ValueError(f"unknown kind(s) {bad!r}; expected a subset of {list(Kind.ALL)}")
+    return list(dict.fromkeys(v))  # dedupe: repeats only multiply work
+
+
 class SearchIn(BaseModel):
     query: str = Field(min_length=1, max_length=10_000)
     budget_tokens: int = Field(default=2000, ge=64, le=128_000)
     as_of: int | None = None
-    kinds: list[str] | None = None
+    kinds: list[str] | None = Field(default=None, max_length=len(Kind.ALL))
     user_id: str | None = None
     session_id: str | None = None
     agent_id: str | None = None
     org_id: str | None = None
     include_quarantined: bool = False
+
+    _ck = field_validator("kinds")(_validate_kinds)
 
 
 class FindIn(BaseModel):
@@ -68,7 +84,9 @@ class FindIn(BaseModel):
     budget: a destructive sweep must see every match."""
     query: str = Field(min_length=1, max_length=10_000)
     as_of: int | None = None
-    kinds: list[str] | None = None
+    kinds: list[str] | None = Field(default=None, max_length=len(Kind.ALL))
+
+    _ck = field_validator("kinds")(_validate_kinds)
     user_id: str | None = None
     session_id: str | None = None
     agent_id: str | None = None
@@ -102,6 +120,10 @@ def create_app(
     keystore = KeyStore(keys_path, admin_key=admin_key)
     limiter = RateLimiter()
     failures = FailureLimiter()
+    # tenancy-level ceiling: per-KEY budgets alone let a tenant multiply its
+    # quota by minting more keys, which defeats D6 noisy-neighbour containment
+    ns_limiter = RateLimiter()
+    ns_rate_limit_per_min = int(os.environ.get("MEMD_NS_RATE_LIMIT_PER_MIN", "3000"))
     # heavy maintenance endpoints get a separate small budget: they are
     # O(namespace) operations and must not be spam-able by a normal key
     heavy_limiter = RateLimiter(max_buckets=1000)
@@ -114,7 +136,15 @@ def create_app(
         finally:
             engine.close()
 
-    app = FastAPI(title="memd", version="0.1.0", description="Agent memory engine", lifespan=lifespan)
+    # Interactive docs and the OpenAPI schema were served unauthenticated,
+    # handing an anonymous prober the full route inventory and request shapes
+    # of an otherwise entirely authenticated API. Opt-in for development.
+    _docs = bool(os.environ.get("MEMD_ENABLE_DOCS"))
+    app = FastAPI(title="memd", version="0.1.0", description="Agent memory engine",
+                  lifespan=lifespan,
+                  docs_url="/docs" if _docs else None,
+                  redoc_url="/redoc" if _docs else None,
+                  openapi_url="/openapi.json" if _docs else None)
     app.state.engine = engine
     app.state.keystore = keystore
 
@@ -201,15 +231,39 @@ def create_app(
             failures.record_failure(client)
             METRICS.inc("memd_auth_failures_total", reason="invalid")
             raise HTTPException(401, "invalid key")
-        if ns is not None and p.namespace not in ("*", ns):
-            failures.record_failure(client)
-            METRICS.inc("memd_auth_failures_total", reason="namespace")
-            raise HTTPException(403, f"key not valid for namespace {ns!r}")
         failures.record_success(client)
-        if not limiter.allow(p.key_id, p.rate_limit_per_min):
-            METRICS.inc("memd_rate_limited_total", ns=ns)
-            raise HTTPException(429, "rate limit exceeded")
+        if ns is not None and p.namespace not in ("*", ns):
+            # AUTHZ, not authn: this key authenticated fine. Booking it as an
+            # auth failure fed the anti-credential-stuffing limiter, whose
+            # buckets are keyed by CLIENT (spoofable to an arbitrary value
+            # behind a trusted proxy) - so a holder of any valid key could
+            # lock a chosen bucket out of the whole API for the failure window
+            # by looping requests at a namespace they do not own. Volume abuse
+            # here is the rate limiter's job, below; it is charged per key and
+            # per namespace, both of which are authenticated facts.
+            METRICS.inc("memd_authz_denials_total", help="namespace authorization denials",
+                        reason="namespace")
+            _charge_rate(p, ns)
+            raise HTTPException(403, f"key not valid for namespace {ns!r}")
+        _charge_rate(p, ns)
         return p
+
+    def _charge_rate(p: Principal, ns: str | None) -> None:
+        """Charge the request against BOTH the key's budget and the owning
+        namespace's budget.
+
+        Charging the key alone made a tenant's effective quota scale with how
+        many keys it minted: ten keys, ten times the budget, and the
+        noisy-neighbour containment D6 asks for evaporates. The namespace
+        bucket is the tenancy-level ceiling; the key bucket still contains a
+        single runaway client inside a tenant."""
+        if not limiter.allow(p.key_id, p.rate_limit_per_min):
+            METRICS.inc("memd_rate_limited_total", ns=ns, scope="key")
+            raise HTTPException(429, "rate limit exceeded")
+        owner = p.namespace if p.namespace != "*" else (ns or "*")
+        if owner != "*" and not ns_limiter.allow(f"ns:{owner}", ns_rate_limit_per_min):
+            METRICS.inc("memd_rate_limited_total", ns=owner, scope="namespace")
+            raise HTTPException(429, "namespace rate limit exceeded")
 
     def heavy(ns: str, route: str, p: Principal) -> None:
         """Separate small token budget for O(namespace) maintenance calls."""
@@ -434,6 +488,11 @@ def create_app(
                 METRICS.inc("memd_auth_failures_total", reason="metrics")
                 raise HTTPException(401, "missing or invalid bearer key")
             failures.record_success(client)
+            # rendering the registry is O(series); leaving the one route
+            # without a budget made it the cheapest way to burn server CPU
+            if not limiter.allow(f"metrics:{p.key_id}", 60):
+                METRICS.inc("memd_rate_limited_total", scope="metrics")
+                raise HTTPException(429, "metrics rate limit exceeded")
             ns_filter = None if p.namespace == "*" else {p.namespace}
         else:
             ns_filter = None  # public scrape: operator opted the whole fleet in

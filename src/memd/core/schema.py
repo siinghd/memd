@@ -100,11 +100,42 @@ class Scope:
         """True if `other` (a record's scope) is visible from `self` (the query
         scope). A record binds only the components it sets; the query must
         match those or leave them unconstrained. So a session query sees its
-        session + ancestors; a user query sees all that user's sessions."""
-        for f in ("org", "agent", "user", "session"):
+        session + ancestors; a user query sees all that user's sessions.
+
+        `session` is the exception, and it is a security-relevant one. The
+        symmetric "either side unset means match" rule treated an UNSET user
+        on the record as "belongs to everyone", so a record captured with only
+        a session id - `add(content, session_id=...)` with no user_id, the most
+        natural way an agent logs a turn before it knows who it is talking to -
+        was returned to EVERY other user's scoped query in the namespace.
+        Reproduced: a record written under session s_bob came back from
+        `search(..., user_id="alice")`.
+
+        Session is the narrowest level in the hierarchy, so binding it can only
+        ever restrict. A record bound to a session is therefore visible to that
+        session, or - when the record also names its owning user - to that
+        user. It is never visible to a different user, and never to a query
+        that names no one.
+        """
+        for f in ("org", "agent", "user"):
             mine = getattr(self, f)
             theirs = getattr(other, f)
             if mine is not None and theirs is not None and mine != theirs:
+                return False
+        # session narrows, as it always did: a query naming a session does
+        # not see a different session's records
+        if (self.session is not None and other.session is not None
+                and self.session != other.session):
+            return False
+        # ...and a session-bound record that names NO owning user is private
+        # to that session. This is the half that was missing: such a record
+        # was treated as belonging to everyone.
+        if other.session is not None and other.user is None:
+            if (self.session != other.session
+                    and (self.user is not None or self.session is not None)):
+                # An entirely unconstrained query (embedded single-user mode,
+                # admin sweeps) still sees everything - it asserts no
+                # restriction rather than claiming an identity.
                 return False
         return True
 

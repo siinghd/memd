@@ -16,6 +16,7 @@ import queue
 import threading
 import time
 from collections import OrderedDict
+from dataclasses import replace as _dc_replace
 from contextlib import ExitStack as _ExitStack
 from dataclasses import dataclass, field
 from typing import Any
@@ -830,11 +831,17 @@ class Memory:
         )
         cached = self._qcache.get(cache_key)
         if cached is not None:
+            hit_ms = (time.monotonic() - t0) * 1000
             METRICS.inc("memd_search_cache_hits_total")
-            METRICS.observe("memd_search_latency_ms", (time.monotonic() - t0) * 1000,
+            METRICS.observe("memd_search_latency_ms", hit_ms,
                             help="end-to-end search latency (ms)", ns=ns_name,
                             qclass=cached.query_class, cache="hit")
-            return cached
+            # latency_ms must describe THIS call. Returning the cached object
+            # verbatim replayed the original MISS's latency to every
+            # subsequent hit - so a caller (and bench/slo_bench.py, which
+            # grades the retrieval SLO from this field) read a stale number
+            # that described neither the hit nor a fresh query.
+            return _dc_replace(cached, latency_ms=round(hit_ms, 3))
         METRICS.inc("memd_search_cache_misses_total")
         io_stack = _ExitStack()
         io_tally = io_stack.enter_context(count_io())

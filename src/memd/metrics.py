@@ -512,6 +512,7 @@ CORE_COUNTERS = {
     "memd_http_requests_total": "HTTP requests",
     "memd_http_errors_total": "HTTP 5xx errors",
     "memd_auth_failures_total": "authentication failures",
+    "memd_authz_denials_total": "namespace authorization denials (valid key, wrong namespace)",
     "memd_rate_limited_total": "requests rejected by rate limiter",
     "memd_heavy_throttled_total": "heavy maintenance calls rejected by throttle",
     "memd_keystore_load_failures_total": "keys-file loads that failed (stale map served)",

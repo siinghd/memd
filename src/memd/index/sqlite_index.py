@@ -454,11 +454,22 @@ class NamespaceIndex:
                 ("scope_org", s.org),
                 ("scope_agent", s.agent),
                 ("scope_user", s.user),
-                ("scope_session", s.session),
             ):
                 if val is not None:
                     clauses.append(f"({col} IS NULL OR {col} = ?)")
                     args.append(val)
+            # session is the private leaf - see Scope.contains. This MUST
+            # mirror the Python predicate exactly: the two filters diverging
+            # is how the pass-1 and pass-15 leaks happened.
+            if s.session is not None:
+                clauses.append("(scope_session IS NULL OR scope_session = ?)")
+                args.append(s.session)
+            if s.user is not None or s.session is not None:
+                parts = ["scope_session IS NULL", "scope_user IS NOT NULL"]
+                if s.session is not None:
+                    parts.append("scope_session = ?")
+                    args.append(s.session)
+                clauses.append("(" + " OR ".join(parts) + ")")
         if f.kinds:
             clauses.append(f"kind IN ({','.join('?' * len(f.kinds))})")
             args.extend(f.kinds)
@@ -781,13 +792,33 @@ class NamespaceIndex:
         return hits[:limit]
 
     def _passes_filter(self, rec: MemoryRecord, f: IndexFilter) -> bool:
+        """Python-side twin of _filter_where. Every predicate the SQL path
+        enforces must be enforced here too: the lanes that hydrate rows before
+        (or instead of) SQL filtering - the bounded bm25 window, the time
+        lane's recency fetch - reach records through THIS function alone.
+
+        Scope is delegated to Scope.contains rather than re-implemented. The
+        open-coded copy that used to live here diverged from it: it applied a
+        symmetric "either side unset matches" rule, so after Scope.contains
+        learned that a session-bound record is private, the TIME LANE still
+        returned another user's session-scoped record to a user-scoped query.
+        One predicate, one definition."""
         s = f.scope
-        if s is not None:
-            rs = rec.scope
-            for qv, rv in ((s.org, rs.org), (s.agent, rs.agent), (s.user, rs.user), (s.session, rs.session)):
-                if rv is not None and qv is not None and rv != qv:
-                    return False
+        if s is not None and not s.contains(rec.scope):
+            return False
         if f.kinds and rec.kind not in f.kinds:
+            return False
+        if f.sources:
+            allowed = {int(Source.parse(x)) for x in f.sources}
+            if int(rec.provenance.source) not in allowed:
+                return False
+        if f.t_event_min is not None and rec.time.t_event < f.t_event_min:
+            return False
+        if f.t_event_max is not None and rec.time.t_event > f.t_event_max:
+            return False
+        if f.entity_keys and not (set(f.entity_keys) & set(rec.entity_keys)):
+            return False
+        if rec.id in f.exclude_ids:
             return False
         # quarantine: single authority for every Python-side filter path
         # (the bounded bm25 window hydrates rows BEFORE any SQL could exclude

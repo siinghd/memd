@@ -36,17 +36,45 @@ def bench_writes(mem: Memory, n: int = 500) -> dict:
             "p99": round(pctl(lat, .99), 3), "max": round(max(lat), 3)}
 
 
-def bench_retrieval(mem: Memory, queries: int = 200) -> dict:
-    # ensure embeddings flushed so the vector lane is warm
+TOPICS = ["standup", "refactor", "deploy", "cache", "auth", "lint"]
+
+
+def bench_retrieval(mem: Memory, queries: int = 200, corpus_n: int = 3000) -> dict:
+    """Warm retrieval: the NAMESPACE is warm, not the query.
+
+    Two measurement defects fixed here, both of which made this gate grade
+    something other than retrieval:
+      - it recorded `res.latency_ms`, memd's self-report, and discarded the
+        wall clock it had already started. Anything outside memd's own timer
+        was invisible to the SLO.
+      - it asked only 25 distinct questions across 200 iterations, so ~87% of
+        the samples were repeat-query CACHE HITS, and a hit used to replay the
+        original miss's latency_ms. The reported p50/p99 described neither.
+    Queries are now distinct (this is retrieval, not cache) and timed by the
+    caller's clock. Cache-hit latency is reported separately, because that
+    number is real and useful - it is just not the retrieval SLO.
+    """
     mem.flush()
     lat = []
+    step = max(1, corpus_n // max(1, queries))
     for i in range(queries):
-        q = f"benchmark query about topic {i % 25} deployment details"
+        # distinct (so this measures retrieval, not the repeat-query cache) but
+        # drawn from the seeded corpus vocabulary (so it stays representative)
+        n = (i * step) % corpus_n
+        q = f"{TOPICS[i % len(TOPICS)]} session discussed follow ups number {n}"
         t0 = time.monotonic()
-        res = mem.search(q, user_id="bench", budget_tokens=2000)
-        lat.append(res.latency_ms)
+        mem.search(q, user_id="bench", budget_tokens=2000)
+        lat.append((time.monotonic() - t0) * 1000)
+    hits = []
+    warm_q = f"{TOPICS[0]} session discussed follow ups number 0"
+    for _ in range(50):
+        t0 = time.monotonic()
+        mem.search(warm_q, user_id="bench", budget_tokens=2000)
+        hits.append((time.monotonic() - t0) * 1000)
     return {"n": queries, "p50": round(pctl(lat, .5), 3), "p95": round(pctl(lat, .95), 3),
-            "p99": round(pctl(lat, .99), 3)}
+            "p99": round(pctl(lat, .99), 3),
+            "cache_hit_p50": round(pctl(hits, .5), 3),
+            "cache_hit_p99": round(pctl(hits, .99), 3)}
 
 
 def bench_cold_open(root: str, namespace: str = "default") -> dict:
@@ -81,7 +109,7 @@ def main() -> None:
         mem.flush()
 
         w = bench_writes(mem, args.writes)
-        r = bench_retrieval(mem, args.queries)
+        r = bench_retrieval(mem, args.queries, corpus_n=args.events)
 
         # read-your-writes: search immediately after add, no flush allowed
         mem.add("the secret deployment codeword is zanzibar", session_id="ryw", user_id="bench")
