@@ -249,10 +249,18 @@ class LocalObjectStore(ObjectStore):
         _count_op("list")
         base = self._path(prefix) if prefix else self.root
         if not os.path.isdir(base):
-            # prefix may point at files directly
+            # The prefix names no directory. It may still be a FILE prefix
+            # inside an existing parent ("ns/x/seg-"), so scan that parent -
+            # but only that parent. Walking the entire store to answer a
+            # prefix whose parent does not even exist turned every
+            # destroy_namespace of an absent namespace into an O(all objects)
+            # scan.
+            parent_key = prefix.rsplit("/", 1)[0] if "/" in prefix else ""
+            parent_dir = self._path(parent_key) if parent_key else self.root
+            if not os.path.isdir(parent_dir):
+                return []
             out = []
-            root_prefix = prefix + "/"
-            for dirpath, _dirs, files in os.walk(self.root):
+            for dirpath, _dirs, files in os.walk(parent_dir):
                 rel = os.path.relpath(dirpath, self.root).replace(os.sep, "/")
                 for fn in sorted(files):
                     k = f"{rel}/{fn}" if rel != "." else fn
@@ -296,6 +304,12 @@ class LocalObjectStore(ObjectStore):
         return LocalLogWriter(self._path(key))
 
     def remove_prefix(self, prefix: str) -> int:
+        # A prefix that names neither a directory nor a file has nothing under
+        # it. Falling through to list() made destroying an absent (or
+        # already-destroyed) namespace walk every object in the store.
+        base = self._path(prefix.rstrip("/")) if prefix else self.root
+        if not os.path.exists(base):
+            return 0
         n = 0
         for k in self.list(prefix):
             self.delete(k)

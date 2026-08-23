@@ -522,9 +522,22 @@ class NamespaceStore:
 
     def append(self, records: list[MemoryRecord]) -> int:
         """Durable append + synchronous index apply (read-your-writes).
+
         Group commit: the caller's bytes are written (OS-visible) under the
         write lock; durability waits for an fsync that started after those
-        bytes - concurrent appenders share fsyncs instead of serializing."""
+        bytes, so concurrent appenders share fsyncs instead of serializing.
+
+        The wait happens OUTSIDE the namespace lock deliberately. Holding that
+        lock across `_durably_written` meant no two appenders were ever inside
+        the sync-owner election at once, so the coalescing this docstring
+        describes could never happen and the non-owner branch was dead code -
+        measured at 200 fsyncs for 200 appends across 8 writer threads.
+        Correctness is unchanged: the frame is already OS-visible before the
+        lock is released, `my_gen` makes a concurrent rotate a no-wait (the
+        frame is then in an atomically-put segment), and the derived index is
+        rebuildable, so a crash between the index upsert and the fsync loses
+        only bytes that were never acked.
+        """
         if not records:
             return self.manifest.wal_size
         payload = records_to_jsonl(records)
@@ -535,12 +548,16 @@ class NamespaceStore:
             self.manifest.wal_size = my_end
             self.manifest.seq += 1
             self._manifest_dirty = True
-            self._durably_written(my_end, my_gen)
             qflags = {r.id: bool(r.meta.get("quarantined")) for r in records}
             self.index.upsert_batch([(r, None, "") for r in records], qflags)
-            if my_end >= self.wal_rotate_bytes:
-                self.rotate("size")
-            return self.manifest.wal_size
+            size = self.manifest.wal_size
+        self._durably_written(my_end, my_gen)   # ack only after fsync
+        if my_end >= self.wal_rotate_bytes:
+            with self._lock:
+                if not self._closed and self.manifest.wal_size >= self.wal_rotate_bytes:
+                    self.rotate("size")
+                size = self.manifest.wal_size
+        return size
 
     def _wal_write(self, frame: bytes) -> tuple[int, int]:
         """Write a frame OS-visible. Returns (end offset, log generation).
@@ -792,6 +809,18 @@ class NamespaceStore:
         rep = CompactionReport(duration_ms=0)
         with self._lock:
             self._ensure_open()
+            if not force and self._compaction_is_noop():
+                # Nothing to fold and nothing to apply. The unconditional path
+                # read every live record and rewrote the whole live set anyway
+                # - O(live) I/O for a guaranteed no-op, and compaction is
+                # reachable from an authenticated endpoint and from the
+                # maintenance thread.
+                METRICS.inc("memd_compactions_skipped_total",
+                            help="compactions skipped: provably nothing to do",
+                            ns=self.namespace)
+                rep.segments_in = rep.segments_out = len(self.manifest.segments)
+                rep.duration_ms = int((time.monotonic() - t0) * 1000)
+                return rep
             recs, ops = self.load_all_records()
             rep.bytes_before = sum(self.store.size(f"{self.prefix}/{s['name']}") for s in self.manifest.segments)
             rep.segments_in = len(self.manifest.segments)
@@ -838,6 +867,29 @@ class NamespaceStore:
             rep.duration_ms = int((time.monotonic() - t0) * 1000)
             self.index.invalidate_vec_cache()  # fold dead rows out of the scan matrix
         return rep
+
+    def _compaction_is_noop(self) -> bool:
+        """True only when folding provably cannot change anything.
+
+        Deliberately conservative - every condition must hold:
+          - at most one segment, so there is nothing to merge;
+          - an empty WAL and ops log, so there is nothing to apply;
+          - no scheduled hard delete, so no purge deadline is waiting;
+          - no quarantined rows, so no decay is pending.
+        Any doubt falls through to the real compaction.
+        """
+        try:
+            if len(self.manifest.segments) > 1:
+                return False
+            if self._pending_hard:
+                return False
+            if self.store.size(self.wal_key) or self.store.size(self.ops_key):
+                return False
+            if self.index.stats().get("quarantined"):
+                return False
+        except Exception:
+            return False
+        return True
 
     def rebuild_index(self) -> int:
         # lock: same completeness requirement as export - a concurrent

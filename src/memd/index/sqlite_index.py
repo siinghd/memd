@@ -14,6 +14,7 @@ segments (synchronous=NORMAL is therefore correct, not a shortcut).
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -90,6 +91,14 @@ class NamespaceIndex:
         self._local = threading.local()
         self._reader_cons: list = []
         self._reader_lock = threading.Lock()
+        # close() must not free a connection another thread is executing on -
+        # that is a SEGFAULT, not an exception. Before reads moved off the
+        # writer lock they were serialized against close() by that same lock;
+        # now they need their own barrier. Readers are counted, close() drains
+        # them. The counter is held only around the execute, never during it,
+        # so concurrency is unaffected.
+        self._readers_active = 0
+        self._readers_gone = threading.Condition(self._reader_lock)
         self._pending = False  # writes committed lazily, not yet visible cross-connection
         self._lazy_commits = 0
         self._commit_threshold = 64
@@ -130,6 +139,11 @@ class NamespaceIndex:
             CREATE INDEX IF NOT EXISTS ix_rec_kind ON records(kind);
             CREATE INDEX IF NOT EXISTS ix_rec_tevent ON records(t_event);
             CREATE INDEX IF NOT EXISTS ix_rec_scope ON records(scope_org, scope_user, scope_session);
+            -- session-close sweeps filter on scope_session ALONE, which the
+            -- composite above cannot serve (its leading columns are
+            -- unconstrained), so every segment close scanned the whole
+            -- namespace instead of one session's rows
+            CREATE INDEX IF NOT EXISTS ix_rec_session ON records(scope_session, kind);
             CREATE INDEX IF NOT EXISTS ix_rec_valid ON records(invalidated_at, deleted);
             CREATE TABLE IF NOT EXISTS vectors(
               id TEXT PRIMARY KEY REFERENCES records(id) ON DELETE CASCADE,
@@ -170,6 +184,11 @@ class NamespaceIndex:
             self._closed = True
             self._con.close()
         with self._reader_lock:
+            # _closed is already True, so no NEW reader can start; wait for the
+            # ones in flight before freeing their connections
+            while self._readers_active:
+                if not self._readers_gone.wait(timeout=5.0):
+                    break  # never hang teardown on a wedged reader
             cons, self._reader_cons = self._reader_cons, []
         for c in cons:  # per-thread read connections hold their own fds
             try:
@@ -276,6 +295,25 @@ class NamespaceIndex:
                 METRICS.inc("memd_index_commits_total", forced="true")
             self._lazy_commits = 0
             self._pending = False
+
+    @contextlib.contextmanager
+    def _read(self):
+        """Borrow this thread's read connection for one statement.
+
+        Raises RuntimeError once the index is closed, which is how every other
+        lifecycle race in this engine already surfaces (the HTTP layer maps it
+        to a clean 503/410 and the destroy-race tests whitelist it)."""
+        with self._reader_lock:
+            if self._closed:
+                raise RuntimeError("index closed")
+            self._readers_active += 1
+        try:
+            yield self._reader()
+        finally:
+            with self._reader_lock:
+                self._readers_active -= 1
+                if self._readers_active == 0:
+                    self._readers_gone.notify_all()
 
     def _reader(self) -> sqlite3.Connection:
         """This thread's read connection.
@@ -560,7 +598,8 @@ class NamespaceIndex:
     _ns_hint: str = ""
 
     def get_by_id(self, record_id: str, include_deleted: bool = False) -> MemoryRecord | None:
-        row = self._reader().execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
+        with self._read() as _c:
+            row = _c.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
         if row is None:
             return None
         if row["deleted"] and not include_deleted:
@@ -573,9 +612,10 @@ class NamespaceIndex:
         args: list = []
         where = self._filter_where(f, args)
         args.append(limit)
-        rows = self._reader().execute(
-            f"SELECT * FROM records WHERE {where} ORDER BY t_event DESC LIMIT ?", args  # nosec B608
-        ).fetchall()
+        with self._read() as _c:
+            rows = _c.execute(
+                f"SELECT * FROM records WHERE {where} ORDER BY t_event DESC LIMIT ?", args  # nosec B608
+            ).fetchall()
         out = []
         for r in rows:
             if r["id"] in f.exclude_ids:
@@ -608,7 +648,8 @@ class NamespaceIndex:
                 f"WHERE fts MATCH ? AND {filt} ORDER BY rank LIMIT ?"
             )
             qargs = [match_expr] + args + [limit]
-            rows = self._reader().execute(sql, qargs).fetchall()
+            with self._read() as _c:
+                rows = _c.execute(sql, qargs).fetchall()
             hits = []
             for r in rows:
                 if r["id"] in f.exclude_ids:
@@ -653,10 +694,11 @@ class NamespaceIndex:
         # pinned the GIL and stopped reads scaling past two threads. Rank on
         # content, then hydrate only the survivors: O(window) cheap string
         # scans + O(limit) hydrations instead of O(window) hydrations.
-        rows = self._reader().execute(
-            "SELECT r.id, r.content FROM fts JOIN records r ON r.id = fts.id "  # nosec B608
-            f"WHERE fts MATCH ? AND {or_filt} LIMIT ?",
-            [" OR ".join(f'"{w}"' for w in words)] + or_args + [window]).fetchall()
+        with self._read() as _c:
+            rows = _c.execute(
+                "SELECT r.id, r.content FROM fts JOIN records r ON r.id = fts.id "  # nosec B608
+                f"WHERE fts MATCH ? AND {or_filt} LIMIT ?",
+                [" OR ".join(f'"{w}"' for w in words)] + or_args + [window]).fetchall()
         if len(rows) >= window:
             # recall is capped by the window from here on: say so, rather than
             # letting a silent truncation read as "we found everything"
@@ -754,7 +796,8 @@ class NamespaceIndex:
             return None
         args: list = []
         where = self._filter_where(f, args)
-        rows = self._reader().execute(f"SELECT id FROM records WHERE {where}", args).fetchall()  # nosec B608
+        with self._read() as _c:
+            rows = _c.execute(f"SELECT id FROM records WHERE {where}", args).fetchall()  # nosec B608
         return {r[0] for r in rows}
 
     def search_vector(self, query_vec: np.ndarray, f: IndexFilter, limit: int = 50) -> list[Hit]:
@@ -1001,11 +1044,12 @@ class NamespaceIndex:
         def fetch(window: int) -> list[sqlite3.Row]:
             if self._closed:
                 return []
-            return self._reader().execute(
-                "SELECT * FROM records WHERE deleted=0 AND quarantined=0 "
-                "ORDER BY t_event DESC LIMIT ?",
-                (window,),
-            ).fetchall()
+            with self._read() as _c:
+                return _c.execute(
+                    "SELECT * FROM records WHERE deleted=0 AND quarantined=0 "
+                    "ORDER BY t_event DESC LIMIT ?",
+                    (window,),
+                ).fetchall()
 
         for window in (limit * 4, limit * 16):
             rows = fetch(window)
@@ -1053,7 +1097,8 @@ class NamespaceIndex:
             f"JOIN records r ON r.id = e.record_id "
             f"WHERE es.segment IN ({qs}) AND {filt} ORDER BY r.t_event DESC LIMIT ?"
         )
-        rows = self._reader().execute(sql, (*toks, *filt_args, limit)).fetchall()
+        with self._read() as _c:
+            rows = _c.execute(sql, (*toks, *filt_args, limit)).fetchall()
         hits = []
         for r in rows:
             if r["id"] in f.exclude_ids:
@@ -1067,8 +1112,7 @@ class NamespaceIndex:
         """Supersedence chain including the seed: predecessors and successors."""
         chain, seen = [], {record_id}
         frontier = [record_id]
-        _con = self._reader()
-        if True:
+        with self._read() as _con:
             while frontier:
                 qs = ",".join("?" * len(frontier))
                 sql = f"SELECT * FROM records WHERE superseded_by IN ({qs}) OR id IN (SELECT superseded_by FROM records WHERE id IN ({qs}))"  # nosec B608 - qs is '?' placeholders only
@@ -1142,8 +1186,7 @@ class NamespaceIndex:
     def get_many(self, ids: list[str]) -> list[MemoryRecord]:
         """Direct id lookup: O(k log N) via PK index."""
         out: dict[str, MemoryRecord] = {}
-        _con = self._reader()
-        if True:
+        with self._read() as _con:
             for i in range(0, len(ids), 500):
                 chunk = ids[i : i + 500]
                 qs = ",".join("?" * len(chunk))

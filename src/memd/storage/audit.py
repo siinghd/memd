@@ -13,10 +13,22 @@ from memd.core.schema import now_ms
 
 
 class AuditLog:
-    def __init__(self, store, key: str, envelope=None):
+    # Ledgers grow ~200 bytes per operation and nothing ever reclaimed them:
+    # a namespace serving 1000 req/s accrued ~17GB/day. Sealed segments keep
+    # the live object bounded; read()/verify() walk segments then the tail.
+    ROTATE_BYTES = 64 * 1024 * 1024
+    KEEP_SEGMENTS = 16
+    # class-level defaults so read()/verify() work on a hand-built instance
+    # (tests construct one via __new__ to feed the chain a forged ledger)
+    _segments = 0
+    rotate_bytes = ROTATE_BYTES
+
+    def __init__(self, store, key: str, envelope=None, rotate_bytes: int | None = None):
         self.store = store
         self.key = key
         self.envelope = envelope
+        self.rotate_bytes = int(rotate_bytes if rotate_bytes is not None else self.ROTATE_BYTES)
+        self._segments = 0
         self._lock = threading.Lock()
         self._tail_hash = "0" * 64
         self._load_tail()
@@ -25,6 +37,40 @@ class AuditLog:
 
     def _state_key(self) -> str:
         return self.key + ".state"
+
+    def _seg_key(self, n: int) -> str:
+        return f"{self.key}.{n:05d}"
+
+    def _maybe_rotate(self) -> None:
+        """Seal the live ledger into a numbered segment when it grows past
+        `rotate_bytes`.
+
+        Ordering is copy-then-truncate, so a crash in between leaves the tail
+        present in BOTH the segment and the live object. That is deliberate:
+        losing audit entries is worse than seeing one twice, and read()
+        de-duplicates on the entry hash, which a hash chain gives us for free.
+        """
+        try:
+            if self._size() < self.rotate_bytes:
+                return
+            self.store.copy(self.key, self._seg_key(self._segments))
+            self.store.truncate(self.key, 0)
+            self._segments += 1
+            if self._segments > self.KEEP_SEGMENTS:
+                oldest = self._segments - self.KEEP_SEGMENTS - 1
+                try:
+                    self.store.delete(self._seg_key(oldest))
+                except Exception:
+                    pass
+            self._checkpoint(0)
+            from memd.metrics import METRICS
+
+            METRICS.inc("memd_audit_rotations_total", help="audit ledger segments sealed")
+        except Exception:
+            from memd.metrics import METRICS
+
+            METRICS.inc("memd_audit_rotation_failures_total",
+                        help="audit ledger rotations that failed (ledger keeps growing)")
 
     def _ns(self) -> str:
         return self.key.split("/")[1] if "/" in self.key else ""
@@ -75,7 +121,8 @@ class AuditLog:
             put(
                 self._state_key(),
                 json.dumps({"h": self._tail_hash,
-                            "bytes": self._size() if size is None else size},
+                            "bytes": self._size() if size is None else size,
+                            "segs": self._segments},
                            separators=(",", ":")).encode(),
             )
         except Exception:
@@ -99,6 +146,7 @@ class AuditLog:
         if raw:
             try:
                 st = json.loads(raw.decode())
+                self._segments = int(st.get("segs", 0) or 0)
                 if int(st.get("bytes", -1)) == size and isinstance(st.get("h"), str) and st["h"]:
                     self._tail_hash = str(st["h"])  # O(1): no ledger read at all
                     return self._tail_hash
@@ -144,19 +192,35 @@ class AuditLog:
             self.store.append(self.key, payload)
             self._tail_hash = entry["h"]
             self._checkpoint()
+            self._maybe_rotate()
 
     def read(self) -> list[dict]:
-        data = self._decode(self.store.get(self.key) or b"")
-        out = []
-        for line in data.decode(errors="replace").splitlines():
-            line = line.strip()
-            if not line:
-                continue
+        out: list[dict] = []
+        seen: set[str] = set()
+        keys = [self._seg_key(n) for n in range(self._segments)] + [self.key]
+        for k in keys:
             try:
-                e = json.loads(line)
-            except json.JSONDecodeError:
+                blob = self.store.get(k)
+            except Exception:
+                blob = None
+            if not blob:
                 continue
-            if isinstance(e, dict) and "action" in e:
+            data = self._decode(blob) if k != self.key else self._decode(blob)
+            for line in data.decode(errors="replace").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not (isinstance(e, dict) and "action" in e):
+                    continue
+                h = e.get("h")
+                if h in seen:
+                    continue  # crash window between copy and truncate
+                if isinstance(h, str):
+                    seen.add(h)
                 out.append(e)
         return out
 
@@ -220,6 +284,7 @@ class BufferedAuditLog(AuditLog):
             try:
                 self.store.append(self.key, blob)
                 self._checkpoint()
+                self._maybe_rotate()
             except OSError:
                 from memd.metrics import METRICS
 
