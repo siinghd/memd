@@ -723,7 +723,14 @@ class NamespaceIndex:
 
         def _run(match_expr: str) -> list[Hit]:
             sql = (
-                f"SELECT r.*, bm25(fts) AS rank FROM fts JOIN records r ON r.rowid = fts.rowid "  # nosec B608
+                # CROSS JOIN pins the join order: fts drives, records is
+                # probed by rowid. Without it the planner drove from `records`
+                # (via ix_rec_valid, because the scope/validity predicates sit
+                # there) and probed the fts index once PER ROW - 10K probes,
+                # turning a 17ms lane into 22 SECONDS at 10K records. The plain
+                # fts5 table happened to cost out the other way; external
+                # content changed the estimate, not the right answer.
+                f"SELECT r.*, bm25(fts) AS rank FROM fts CROSS JOIN records r ON r.rowid = fts.rowid "  # nosec B608
                 f"WHERE fts MATCH ? AND {filt} ORDER BY rank LIMIT ?"
             )
             qargs = [match_expr] + args + [limit]
@@ -775,7 +782,7 @@ class NamespaceIndex:
         # scans + O(limit) hydrations instead of O(window) hydrations.
         with self._read() as _c:
             rows = _c.execute(
-                "SELECT r.id, r.content FROM fts JOIN records r ON r.rowid = fts.rowid "  # nosec B608
+                "SELECT r.id, r.content FROM fts CROSS JOIN records r ON r.rowid = fts.rowid "  # nosec B608
                 f"WHERE fts MATCH ? AND {or_filt} LIMIT ?",
                 [" OR ".join(f'"{w}"' for w in words)] + or_args + [window]).fetchall()
         if len(rows) >= window:

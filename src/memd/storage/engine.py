@@ -55,6 +55,12 @@ class Manifest:
     wal_size: int = 0
     ops_size: int = 0
     wal_base_seq: int = 0  # seq counter value when the current wal opened
+    # Derived-index snapshot: the seq it reflects, and the object holding it.
+    # Cold start on a node without the local cache was an O(live records)
+    # replay - 593ms at 10K, 2380ms at 40K, crossing the 1.5s cold-first-query
+    # SLO at ~25K records - because nothing durable held the FOLDED form.
+    snapshot_seq: int = 0
+    snapshot_name: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -64,6 +70,8 @@ class Manifest:
             "wal_size": self.wal_size,
             "ops_size": self.ops_size,
             "wal_base_seq": self.wal_base_seq,
+            "snapshot_seq": self.snapshot_seq,
+            "snapshot_name": self.snapshot_name,
         }
 
     @classmethod
@@ -74,6 +82,8 @@ class Manifest:
             segments=list(d.get("segments") or []),
             wal_size=int(d.get("wal_size", 0)),
             ops_size=int(d.get("ops_size", 0)),
+            snapshot_seq=int(d.get("snapshot_seq", 0) or 0),
+            snapshot_name=str(d.get("snapshot_name", "") or ""),
             wal_base_seq=int(d.get("wal_base_seq", 0)),
         )
 
@@ -287,6 +297,139 @@ class NamespaceStore:
         self._rotating = False  # re-entrancy guard for rotate-inside-append_ops
         self._open()
 
+    # ---------------------------------------------------------- index snapshot
+
+    SNAPSHOT_MIN_RECORDS = 2_000   # below this, full replay is already fast
+
+    def _snapshot_key(self, name: str) -> str:
+        return f"{self.prefix}/{name}"
+
+    def write_index_snapshot(self) -> bool:
+        """Persist the FOLDED derived index to the object store.
+
+        Object storage holds the source of truth, but only in raw form: every
+        cold start on a node without the local cache had to re-fold all of it,
+        O(live records), with no query servable until it finished (593ms at
+        10K, 2380ms at 40K, ~12s at 200K, against a 1.5s cold-first-query
+        SLO). Nothing durable held the folded form, so every node paid to
+        rebuild the same thing.
+
+        The snapshot is a gzipped SQLite image taken with sqlite3's online
+        backup API (consistent without blocking writers), envelope-encrypted
+        like every other object, and stamped with the seq it reflects.
+        It is a CACHE: losing, corrupting or ignoring it costs time, never
+        correctness - `_open` falls back to full replay.
+        """
+        import gzip
+        import sqlite3 as _sq
+        import tempfile as _tf
+
+        try:
+            if self.index.stats().get("records", 0) < self.SNAPSHOT_MIN_RECORDS:
+                return False
+            self.index.flush()
+            fd, tmp = _tf.mkstemp(prefix="memd-snap-", suffix=".sqlite")
+            os.close(fd)
+            try:
+                dst = _sq.connect(tmp)
+                try:
+                    # sqlite's backup API cannot make progress while the
+                    # SOURCE connection holds an open write transaction - it
+                    # retries forever - and this index commits LAZILY, so a
+                    # transaction is usually open. Commit inside the lock,
+                    # immediately before the copy, so nothing can reopen one in
+                    # between. (Flushing outside the lock was not enough: the
+                    # embed worker reopened a transaction in the gap and the
+                    # backup wedged the whole namespace - maintenance thread
+                    # holding index._lock, every writer queued behind it.)
+                    with self.index._lock:
+                        if self.index._closed:
+                            return False
+                        if self.index._con.in_transaction:
+                            self.index._con.commit()
+                        self.index._con.backup(dst)
+                finally:
+                    dst.close()
+                with open(tmp, "rb") as f:
+                    blob = gzip.compress(f.read(), compresslevel=1)
+            finally:
+                for suffix in ("", "-wal", "-shm"):
+                    try:
+                        os.unlink(tmp + suffix)
+                    except OSError:
+                        pass
+            # deliberately NOT named *.sqlite*: it lives in the namespace
+            # prefix beside segments, and anything sweeping "sqlite files"
+            # (an operator, a cleanup script, a test fixture - this bit me
+            # while benchmarking) would delete the durable folded index
+            name = f"index-{ulid_new()}.snap"
+            payload = self.envelope.encrypt(self.namespace, blob) if self.envelope.enabled else blob
+            self.store.put(self._snapshot_key(name), payload)
+            old = self.manifest.snapshot_name
+            self.manifest.snapshot_name = name
+            self.manifest.snapshot_seq = self.manifest.seq
+            self._persist_manifest()
+            if old and old != name:      # only after the new one is referenced
+                try:
+                    self.store.delete(self._snapshot_key(old))
+                except Exception:
+                    pass
+            METRICS.inc("memd_index_snapshots_written_total", ns=self.namespace)
+            METRICS.observe("memd_index_snapshot_bytes", float(len(payload)),
+                            help="index snapshot size (bytes)",
+                            buckets=(1e5, 1e6, 1e7, 5e7, 1e8, 5e8), ns=self.namespace)
+            return True
+        except Exception as ex:  # noqa: BLE001 - a cache write must never fail a caller
+            METRICS.inc("memd_index_snapshot_failures_total", ns=self.namespace,
+                        detail=type(ex).__name__)
+            return False
+
+    def _install_index_snapshot(self) -> int:
+        """Materialize the snapshot into the local cache. Returns its seq (0 if
+        unusable). Only called when the local cache is EMPTY, so nothing can
+        be lost by overwriting it."""
+        import gzip
+
+        name = self.manifest.snapshot_name
+        if not name or self.manifest.snapshot_seq <= 0:
+            return 0
+        try:
+            blob = self.store.get(self._snapshot_key(name))
+            if not blob:
+                return 0
+            if self.envelope.enabled:
+                blob = self.envelope.decrypt(self.namespace, blob)
+            raw = gzip.decompress(blob)
+            path = self.index.path
+            self.index.close()
+            tmp = path + ".incoming"
+            with open(tmp, "wb") as f:
+                f.write(raw)
+            for suffix in ("-wal", "-shm"):
+                try:
+                    os.unlink(path + suffix)
+                except OSError:
+                    pass
+            os.replace(tmp, path)
+            self.index = NamespaceIndex(path)
+            self.index._ns_hint = self.namespace
+            applied = int(self.index.get_meta("applied_seq") or 0)
+            seq = min(int(self.manifest.snapshot_seq), applied) if applied else 0
+            if seq <= 0:
+                return 0
+            METRICS.inc("memd_index_snapshots_loaded_total", ns=self.namespace)
+            return seq
+        except Exception as ex:  # noqa: BLE001 - fall back to full replay
+            METRICS.inc("memd_index_snapshot_failures_total", ns=self.namespace,
+                        detail=type(ex).__name__)
+            try:
+                if getattr(self.index, "_closed", False):
+                    self.index = NamespaceIndex(self.index.path)
+                    self.index._ns_hint = self.namespace
+            except Exception:
+                pass
+            return 0
+
     # ------------------------------------------------------------------ open/recover
 
     def _open(self) -> None:
@@ -306,6 +449,11 @@ class NamespaceStore:
             applied = int(self.index.get_meta("applied_seq") or 0)
         except ValueError:
             applied = 0
+        if applied == 0 and self.manifest.snapshot_seq > 0:
+            # Fresh local cache (node restore, wiped volume, first open on this
+            # machine) and a folded image exists: install it and let the
+            # existing watermark logic replay only the tail past it.
+            applied = self._install_index_snapshot()
         seg_records: dict[str, MemoryRecord] = {}
         max_fold = 0
         for seg in self.manifest.segments:
@@ -706,25 +854,39 @@ class NamespaceStore:
         orphaned segment and lost data."""
         with self._lock:
             self._ensure_open()
-            # seal the persistent writer: take BOTH locks so an in-flight
-            # append finishes its write (wlock) and its fsync (sync lock)
-            # before the fd closes - otherwise writers hit closed-file errors
-            # and lose frames
-            with self._wlock, self._sync_lock:
-                if self._wal_writer is not None:
-                    try:
-                        self._wal_writer.close()
-                    except Exception:
-                        pass
-                    self._wal_writer = None
-                self._log_gen += 1
-                self._written_pos = 0
-                self._synced_pos = 0
+            self._seal_wal_writer_locked()
             self._rotating = True
             try:
                 return self._rotate_locked(reason)
             finally:
                 self._rotating = False
+
+    def _seal_wal_writer_locked(self) -> None:
+        """Close the persistent WAL handle and void its offsets.
+
+        MUST be called by anything that deletes the wal key. Take BOTH locks so
+        an in-flight append finishes its write (wlock) and its fsync (sync
+        lock) before the fd closes - otherwise writers hit closed-file errors
+        and lose frames.
+
+        `compact()` deleted the wal WITHOUT this and silently lost every
+        subsequent write: the LogWriter kept its fd on the now-UNLINKED inode,
+        so appends went to a ghost file that no reopen could ever see. The
+        record was acked, was visible in-process (the derived index had it),
+        and vanished on restart. The durability contract says an ack means a
+        durable append; this broke it, and no prior pass caught it because the
+        SIGKILL crash-consistency suite never compacts mid-stream.
+        """
+        with self._wlock, self._sync_lock:
+            if self._wal_writer is not None:
+                try:
+                    self._wal_writer.close()
+                except Exception:
+                    pass
+                self._wal_writer = None
+            self._log_gen += 1
+            self._written_pos = 0
+            self._synced_pos = 0
 
     def _rotate_locked(self, reason: str) -> str:
         """Fold body (caller holds the ns lock and set _rotating)."""
@@ -848,12 +1010,16 @@ class NamespaceStore:
             # commit the new-segment-only view BEFORE deleting anything it
             # replaces - see docstring crash-ordering note
             self._persist_manifest()
+            # seal the writer BEFORE unlinking the wal it points at - see
+            # _seal_wal_writer_locked for what happens otherwise
+            self._seal_wal_writer_locked()
             self.store.delete(self.wal_key)
             self.store.delete(self.ops_key)
             for on in old_names:
                 self.store.delete(f"{self.prefix}/{on}")
             self.manifest.wal_size = 0
             self.manifest.ops_size = 0
+            self.manifest.wal_base_seq = self.manifest.seq  # next frame = base+1
             # rebuild pending-purge tracking with only still-pending (not-due)
             # ops, re-persisted in ONE durable append
             self._pending_hard = []
@@ -864,8 +1030,19 @@ class NamespaceStore:
             rep.segments_out = len(self.manifest.segments)
             rep.records_folded = len(kept)
             rep.bytes_after = self.store.size(f"{self.prefix}/{name}") if kept else 0
-            rep.duration_ms = int((time.monotonic() - t0) * 1000)
             self.index.invalidate_vec_cache()  # fold dead rows out of the scan matrix
+        # Compaction is the natural snapshot point: the index has just been
+        # folded and stamped with this manifest.seq, and compaction already
+        # costs O(live) and runs off the request path (pass 17), so the
+        # snapshot rides along instead of adding a new maintenance schedule.
+        #
+        # OUTSIDE the namespace lock, deliberately: the snapshot is an
+        # O(index bytes) backup + gzip, and taking it under that lock blocked
+        # every writer on the namespace for its whole duration (a writer sat
+        # 900s on `with self._lock` in append). It reads a consistent image via
+        # sqlite's online backup API, so it needs no such exclusion.
+        self.write_index_snapshot()
+        rep.duration_ms = int((time.monotonic() - t0) * 1000)
         return rep
 
     def _compaction_is_noop(self) -> bool:
