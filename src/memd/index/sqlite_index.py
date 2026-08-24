@@ -1028,9 +1028,9 @@ class NamespaceIndex:
             return []
         qs = ",".join("?" * len(seed_ids))
         with self._lock:
-            sql = f"SELECT r.* FROM links l JOIN records r ON r.id = l.dst WHERE l.src IN ({qs}) AND r.deleted=0 AND r.quarantined=0 AND r.invalidated_at IS NULL LIMIT ?"  # nosec B608 - qs is '?' placeholders only
+            sql = f"SELECT r.* FROM links l JOIN records r ON r.id = l.dst WHERE l.src IN ({qs}) AND r.deleted=0 AND r.quarantined=0 AND r.invalidated_at IS NULL LIMIT ?"  # nosec B608
             rows = self._con.execute(sql, (*seed_ids, limit)).fetchall()
-            sql2 = f"SELECT r.* FROM links l JOIN records r ON r.id = l.src WHERE l.dst IN ({qs}) AND r.deleted=0 AND r.quarantined=0 AND r.invalidated_at IS NULL LIMIT ?"  # nosec B608 - qs is '?' placeholders only
+            sql2 = f"SELECT r.* FROM links l JOIN records r ON r.id = l.src WHERE l.dst IN ({qs}) AND r.deleted=0 AND r.quarantined=0 AND r.invalidated_at IS NULL LIMIT ?"  # nosec B608
             rows += self._con.execute(sql2, (*seed_ids, limit)).fetchall()
         seen, out = set(), []
         for r in rows:
@@ -1221,7 +1221,7 @@ class NamespaceIndex:
         with self._read() as _con:
             while frontier:
                 qs = ",".join("?" * len(frontier))
-                sql = f"SELECT * FROM records WHERE superseded_by IN ({qs}) OR id IN (SELECT superseded_by FROM records WHERE id IN ({qs}))"  # nosec B608 - qs is '?' placeholders only
+                sql = f"SELECT * FROM records WHERE superseded_by IN ({qs}) OR id IN (SELECT superseded_by FROM records WHERE id IN ({qs}))"  # nosec B608
                 rows = _con.execute(sql, (*frontier, *frontier)).fetchall()
                 nxt = []
                 for r in rows:

@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: build, verify, publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev,mcp]" build twine
+
+      # Never cut a release from a red tree.
+      - name: Suite
+        run: python -m pytest tests/ -q --timeout=600
+      - name: Eval gate
+        run: python -m memd.harness.run --suite all --gate
+      - name: Ten-minute story
+        run: bash scripts/ten_minute_test.sh
+
+      - name: Build
+        run: python -m build
+      - name: Verify metadata
+        run: twine check dist/*
+      - name: Clean-install smoke test
+        run: |
+          python -m venv /tmp/clean
+          /tmp/clean/bin/pip install dist/*.whl
+          /tmp/clean/bin/python -c "from memd import Memory; import tempfile; Memory(tempfile.mkdtemp()).close()"
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+      # Publishing to an index requires a token you set deliberately. Without
+      # PYPI_API_TOKEN in repo secrets this step is skipped, so tagging never
+      # publishes by accident. NOTE: the name `memd` is TAKEN on PyPI - set
+      # [project].name to something free (memd-engine was available) before
+      # enabling this.
+      # The `secrets` context is not reliably available inside `if:`, so the
+      # presence check goes through env instead of the condition.
+      - name: Check for a publish token
+        id: token
+        env:
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          if [ -n "$PYPI_API_TOKEN" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "PYPI_API_TOKEN not set - skipping index publish (this is the default)."
+          fi
+      - name: Publish to PyPI
+        if: steps.token.outputs.present == 'true'
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: twine upload dist/*

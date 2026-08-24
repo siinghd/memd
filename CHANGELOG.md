@@ -1,0 +1,96 @@
+# Changelog
+
+Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+This project's engineering log - every defect with its reproduction and
+before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
+
+## [Unreleased]
+
+### Added
+- CI: tests on 3.11/3.12, the eval gate at three seed/scale configs, bandit,
+  a clean-install smoke test, and a container smoke test. Benchmarks run
+  nightly as informational artifacts and never gate the build.
+- `POST /v1/ns/{ns}/reembed` - rebuilds the vector lane from raw. Previously
+  CLI-only, which a hosted operator cannot reach on the node that needs it.
+- Derived-index snapshots: compaction publishes a gzipped, encrypted image of
+  the folded index, so a cold node restores it instead of re-folding every
+  record. Cold open at 40K records: 2111ms -> 922ms.
+- Per-namespace rate ceiling (`MEMD_NS_RATE_LIMIT_PER_MIN`), so a tenant can no
+  longer multiply its quota by minting keys.
+- Process resource gauges (RSS, fds, threads, CPU), per-request object-store
+  I/O counts, per-stage search timings, and a bounded vector-health gauge with
+  self-heal.
+
+### Fixed - data integrity
+- **Two processes on one data root silently destroyed acked data** (8 of 150
+  writes lost, measured). A second writer now fails fast with
+  `NamespaceBusyError`.
+- **A write acked after `compact()` was lost on restart** - compaction unlinked
+  the WAL while the log writer held its fd, so later appends went to a ghost
+  inode. This predated every prior release.
+- **Group commit acked writes that no fsync covered** (160 false acks, up to
+  3108 bytes) - the durability watermark was published after the fsync instead
+  of captured before it.
+- A due hard-delete purge ran a full-namespace compaction inline on the next
+  ordinary write: 804ms write ack at 20K records, now 6.9ms on a maintenance
+  thread. The D7 purge guarantee is unchanged.
+- A clean `close()` discarded queued embeddings (1 of 40 vectors kept, now 40).
+- ABBA deadlock between namespace destroy and engine shutdown.
+- A segfault when the index closed under a live reader.
+
+### Fixed - retrieval correctness
+- The BM25 lane discarded its own exact matches when it found fewer than ten,
+  and its bounded window counted rows *before* filtering, so eligible records
+  were starved out entirely (0 of 5 returned; now 5 of 5). A routine bulk
+  delete made every survivor invisible.
+- A query-plan inversion made the lexical lane 22 seconds at 10K records.
+
+### Fixed - security
+- **A record captured with only a session id was visible to every other user**
+  in the namespace. Session is now the private leaf of the scope hierarchy.
+- Audit entries were filed under the facade's default namespace, putting one
+  tenant's record ids in another's exportable SIEM trail.
+- The audit hash chain reset on every reopen under encryption, so `verify()`
+  returned False forever after the first restart.
+- `/metrics`, `/v1/metrics/json` and `/v1/status` returned the whole fleet's
+  telemetry and namespace inventory to any authenticated key.
+- A wrong-namespace 403 was booked as an authentication failure, letting any
+  valid key lock a chosen client bucket out of the entire API.
+- A crypto-shredded namespace could be resurrected - with a fresh data key - by
+  an in-flight snapshot or a late audit append.
+- Interactive docs and the OpenAPI schema are no longer public by default.
+- `kinds` is bounded and validated; the Dockerfile no longer masks a failed
+  core install.
+
+### Fixed - observability
+- **Every latency quantile in the system was the mean.** Millisecond values
+  were recorded into second-scale buckets, so no observation was ever bucketed
+  and p50/p95/p99 all collapsed to the average. Durations are now measured,
+  named and bucketed in milliseconds throughout.
+- `bench/slo_bench.py` graded the retrieval SLO on memd's self-reported latency
+  while ~87% of its samples were cache hits replaying a stale value.
+- `snapshot()` held the global metrics lock across the whole quantile
+  computation, stalling every hot path for the duration of a scrape.
+
+### Changed
+- Write amplification: FTS5 no longer stores a second copy of every record and
+  vectors are stored at half width. 800B records 7.29x -> 5.02x; 4KB 2.80x.
+  `02-slos.md`'s flat 3x bar is amended to a record-size-aware one, with the
+  arithmetic - a dense vector is a *fixed* cost per record, so a flat ratio
+  stated per raw byte is unreachable below ~4KB at any embedding dimension.
+- Audit ledgers are per-namespace, O(1) to open, and bounded in size.
+- Index schema v1 -> v2, migrated on open. No re-embed required.
+
+### Known limitations
+- `retrieve_p50 <= 20ms` is not met (~28ms on the development machine).
+- Only `LocalObjectStore` ships, so the hosted SLOs in `02-slos.md` are
+  unevidenced. Single writer per data root.
+- BM25 tokenization is `ascii`, so CJK is not indexed by the lexical lane.
+- Flat vector scan; no IVF/HNSW above the documented ~50K-vector ceiling.
+
+## [0.1.0]
+Initial engine: record schema with bitemporal supersedence and trust tiers,
+WAL/segment storage with compaction and crypto-shred, hybrid retrieval
+(BM25 + vector + entity + time, RRF-fused, budget-packed), async fact
+extraction and consolidation, REST/SDK/MCP doors, and a frozen eval harness
+with an adversarial ship gate.

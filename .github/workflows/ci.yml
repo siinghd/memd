@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  test:
+    name: tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 matches the Dockerfile; 3.11 is the declared floor.
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: pip install -e ".[dev,mcp]"
+      - name: Unit + regression suite
+        run: python -m pytest tests/ -q --timeout=600
+      - name: Eval gate (accuracy, cost, adversarial zero-regression)
+        run: python -m memd.harness.run --suite all --gate
+      - name: Eval gate at other seeds and scales
+        run: |
+          python -m memd.harness.run --suite all --gate --seed 123 --users 12
+          python -m memd.harness.run --suite all --gate --seed 99 --users 20
+      - name: Ten-minute story (fresh dir -> cross-session recall)
+        run: bash scripts/ten_minute_test.sh
+      - name: Upload harness results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-results-py${{ matrix.python }}
+          path: harness-results/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  security:
+    name: static security scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install bandit
+      # Fail on High/Medium only. The Low findings are audited, deliberate
+      # degradation paths (try/except/pass around rebuildable state); B608 is
+      # excluded in pyproject after audit - every dynamic SQL fragment
+      # interpolates only '?' placeholder lists and internal column names.
+      - name: bandit (fail on High/Medium)
+        run: bandit -r src/memd -c pyproject.toml -ll -q
+
+  package:
+    name: build + clean-install
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install build twine
+      - run: python -m build
+      - run: twine check dist/*
+      # A stranger's experience: install the wheel into a bare venv and use it.
+      - name: Clean-install smoke test
+        run: |
+          python -m venv /tmp/clean
+          /tmp/clean/bin/pip install dist/*.whl
+          /tmp/clean/bin/python - <<'PY'
+          import tempfile
+          from memd import Memory
+          m = Memory(tempfile.mkdtemp())
+          m.add("We deploy with make ship, never CI", session_id="s1", user_id="u1")
+          m.close_session("s1")
+          hits = m.search("how do we deploy?", user_id="u1")
+          assert hits.items, "cross-session recall failed from a clean install"
+          m.close()
+          print("clean install OK:", hits.items[0].content[:60])
+          PY
+          /tmp/clean/bin/memd --help > /dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 14
+
+  docker:
+    name: image build + container smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: docker build -t memd/memd:ci .
+      # The image runs as uid 10001, so this uses a NAMED VOLUME. A bind mount
+      # needs --user or a chown of the host dir; see README-engine.md.
+      - name: Run and exercise the REST door
+        run: |
+          docker run -d --name memd-ci -p 8700:8700 \
+            -e MEMD_ADMIN_KEY=ci-admin-key -v memd-ci-data:/data \
+            memd/memd:ci serve --http
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8700/health >/dev/null && break || sleep 1
+          done
+          curl -sf http://127.0.0.1:8700/health
+          H='Authorization: Bearer ci-admin-key'
+          curl -sf -X POST http://127.0.0.1:8700/v1/ns/ci/memories -H "$H" \
+            -H 'Content-Type: application/json' \
+            -d '{"content":"we deploy with make ship, never CI","user_id":"u1"}'
+          curl -sf -X POST http://127.0.0.1:8700/v1/ns/ci/search -H "$H" \
+            -H 'Content-Type: application/json' \
+            -d '{"query":"how do we deploy?","user_id":"u1"}' | grep -q packed_context
+          echo "container smoke OK"
+      - name: Logs on failure
+        if: failure()
+        run: docker logs memd-ci || true
+      - name: Cleanup
+        if: always()
+        run: docker rm -f memd-ci || true

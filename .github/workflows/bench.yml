@@ -1,0 +1,38 @@
+name: Bench (informational)
+
+# Latency is NOT a CI gate. Shared runners are noisy and oversubscribed, and
+# bench/scale_bench.py exits 1 on an SLO breach by design - wiring that to a
+# required check makes CI permanently red and teaches everyone to ignore it.
+# These run nightly, publish numbers as artifacts, and never fail the build.
+# Treat the numbers as a trend line, and re-measure on dedicated hardware
+# before believing any absolute figure.
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  bench:
+    name: SLO + scale benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - name: SLO bench (3.5K events)
+        continue-on-error: true
+        run: python bench/slo_bench.py | tee bench-slo.json
+      - name: Scale bench (50K records)
+        continue-on-error: true
+        run: python bench/scale_bench.py --records 50000 | tee bench-scale.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-${{ github.run_number }}
+          path: bench-*.json
+          retention-days: 90
