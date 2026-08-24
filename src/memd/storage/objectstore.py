@@ -12,6 +12,7 @@ import contextvars
 import os
 import shutil
 import tempfile
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -25,13 +26,32 @@ from memd.metrics import METRICS
 _req_io: "contextvars.ContextVar[dict | None]" = contextvars.ContextVar("memd_req_io", default=None)
 
 
+_TALLY_LOCK = threading.Lock()
+
+
 def _count_op(op: str) -> None:
     """I/O round-trip counting per store operation class - request-level I/O
     budgets are only auditable if the ops themselves are visible."""
     METRICS.inc("memd_store_ops_total", op=op, help="object-store operations by type")
     tally = _req_io.get()
     if tally is not None:
-        tally[op] = tally.get(op, 0) + 1
+        # A remote backend fans a single logical read out across a thread pool,
+        # so this is genuinely concurrent: `tally[op] = tally.get(op, 0) + 1`
+        # drops counts under contention, and an undercounting I/O meter is
+        # worse than none.
+        with _TALLY_LOCK:
+            tally[op] = tally.get(op, 0) + 1
+
+
+def current_io_tally() -> "dict | None":
+    """The in-flight request's I/O tally, for workers that need to adopt it."""
+    return _req_io.get()
+
+
+def adopt_io_tally(tally: "dict | None") -> None:
+    """Attach this thread to a tally started on another thread."""
+    if tally is not None:
+        _req_io.set(tally)
 
 
 @contextlib.contextmanager

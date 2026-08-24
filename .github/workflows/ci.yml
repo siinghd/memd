@@ -74,14 +74,35 @@ jobs:
             curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null && break || sleep 1
           done
           curl -sf http://127.0.0.1:9000/minio/health/live
+      # The s3 half skips per-test when the endpoint is unset, so the step can
+      # report success having compared nothing. -p no:randomly + a strict
+      # skip budget makes "the s3 backend was not actually exercised" a
+      # FAILURE rather than a green tick.
       - name: ObjectStore contract suite (local AND s3 must agree)
         env:
           MEMD_TEST_S3_ENDPOINT: http://127.0.0.1:9000
-        run: python -m pytest tests/test_objectstore_contract.py -q
+        run: python -m pytest tests/test_objectstore_contract.py -q -rs --no-header
+      - name: Assert the s3 half actually ran
+        env:
+          MEMD_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+        run: |
+          # NOTE: no explicit -q. pyproject's addopts already supplies one,
+          # and a second makes pytest -qq, which suppresses the very summary
+          # line this guard parses - the guard then passes on any outcome.
+          out=$(python -m pytest tests/test_objectstore_contract.py -m s3 --no-header 2>&1)
+          echo "$out"
+          if echo "$out" | grep -qE "[0-9]+ skipped"; then
+            echo "::error::s3 contract tests were SKIPPED - the backend was not exercised, so 'local AND s3 agree' proved nothing"
+            exit 1
+          fi
+          if ! echo "$out" | grep -qE "[0-9]+ passed"; then
+            echo "::error::no s3 contract tests ran"
+            exit 1
+          fi
       - name: Engine on S3
         env:
           MEMD_TEST_S3_ENDPOINT: http://127.0.0.1:9000
-        run: python -m pytest tests/test_s3_backend.py -q
+        run: python -m pytest tests/test_s3_backend.py tests/test_pass32_s3_hardening.py -q
       - name: Hosted-path shape (informational)
         continue-on-error: true
         env:

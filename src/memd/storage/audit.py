@@ -67,7 +67,7 @@ class AuditLog:
             return None
         return None
 
-    def _maybe_rotate(self) -> None:
+    def _maybe_rotate(self, size: int | None = None) -> None:
         """Seal the live ledger into a numbered segment when it grows past
         `rotate_bytes`.
 
@@ -77,7 +77,7 @@ class AuditLog:
         de-duplicates on the entry hash, which a hash chain gives us for free.
         """
         try:
-            if self._size() < self.rotate_bytes:
+            if (self._size() if size is None else size) < self.rotate_bytes:
                 return
             self.store.copy(self.key, self._seg_key(self._segments))
             self.store.truncate(self.key, 0)
@@ -334,9 +334,13 @@ class BufferedAuditLog(AuditLog):
             self._buffer.clear()
             self._since = 0
             try:
-                self.store.append(self.key, blob)
-                self._checkpoint()
-                self._maybe_rotate()
+                # append() returns the new size, so neither the checkpoint nor
+                # the rotate check needs to re-measure it. Letting each call
+                # _size() cost two extra round trips per flush on a remote
+                # store, for a number we were already handed.
+                size = self.store.append(self.key, blob)
+                self._checkpoint(size)
+                self._maybe_rotate(size)
             except OSError:
                 from memd.metrics import METRICS
 

@@ -34,6 +34,9 @@ from memd.storage.objectstore import LocalObjectStore, ObjectStore
 
 HARD_DELETE_DEADLINE_MS = 72 * 3600 * 1000
 DEFAULT_WAL_ROTATE_BYTES = 8 * 1024 * 1024
+# Object stores make every WAL frame an object, so replay cost is measured
+# in round trips, not bytes. 512 frames bounds a cold open's fan-out.
+DEFAULT_WAL_ROTATE_FRAMES = 512
 
 
 @dataclass
@@ -258,11 +261,20 @@ class NamespaceStore:
         cache_dir: str,
         envelope: KeyEnvelope | None = None,
         wal_rotate_bytes: int = DEFAULT_WAL_ROTATE_BYTES,
+        wal_rotate_frames: int = DEFAULT_WAL_ROTATE_FRAMES,
     ):
         self.namespace = namespace
         self.store = store
         self.envelope = envelope or NullKeyEnvelope()
         self.wal_rotate_bytes = wal_rotate_bytes
+        # On a store with no persistent log handle - i.e. an object store -
+        # every WAL frame is its own OBJECT, so the meaningful bound on replay
+        # is the frame COUNT, not the byte size. Rotating on bytes alone let a
+        # 2000-record namespace accumulate 2000 objects, and cold open then
+        # issued 2002 GetObject calls and took 8.4s against a 1.5s SLO. Bytes
+        # were never the cost on that backend; round trips were.
+        self.wal_rotate_frames = int(wal_rotate_frames)
+        self._wal_frames = 0
         self.prefix = f"ns/{namespace}"
         self.wal_key = f"{self.prefix}/wal"
         self.ops_key = f"{self.prefix}/ops"
@@ -730,6 +742,7 @@ class NamespaceStore:
             self._ensure_open()
             frame = _frame_encode(self.envelope.encrypt(self.namespace, payload))
             my_end, my_gen = self._wal_write(frame)
+            self._wal_frames += 1
             self.manifest.wal_size = my_end
             self.manifest.seq += 1
             self._manifest_dirty = True
@@ -737,10 +750,15 @@ class NamespaceStore:
             self.index.upsert_batch([(r, None, "") for r in records], qflags)
             size = self.manifest.wal_size
         self._durably_written(my_end, my_gen)   # ack only after fsync
-        if my_end >= self.wal_rotate_bytes:
+        frames_over = (not self._has_log_writer()
+                       and self._wal_frames >= self.wal_rotate_frames)
+        if my_end >= self.wal_rotate_bytes or frames_over:
             with self._lock:
-                if not self._closed and self.manifest.wal_size >= self.wal_rotate_bytes:
-                    self.rotate("size")
+                if not self._closed and (
+                        self.manifest.wal_size >= self.wal_rotate_bytes
+                        or (not self._has_log_writer()
+                            and self._wal_frames >= self.wal_rotate_frames)):
+                    self.rotate("frames" if frames_over else "size")
                 size = self.manifest.wal_size
         return size
 
@@ -922,6 +940,9 @@ class NamespaceStore:
             finally:
                 self._rotating = False
 
+    def _reset_wal_frames(self) -> None:
+        self._wal_frames = 0
+
     def _seal_wal_writer_locked(self) -> None:
         """Close the persistent WAL handle and void its offsets.
 
@@ -979,6 +1000,7 @@ class NamespaceStore:
         self.manifest.wal_size = 0
         self.manifest.ops_size = 0
         self.manifest.wal_base_seq = self.manifest.seq  # next frame = base+1
+        self._reset_wal_frames()
         self._synced_pos = 0
         self._written_pos = 0
         self._persist_manifest()
@@ -1081,6 +1103,7 @@ class NamespaceStore:
             self.manifest.wal_size = 0
             self.manifest.ops_size = 0
             self.manifest.wal_base_seq = self.manifest.seq  # next frame = base+1
+            self._reset_wal_frames()
             # rebuild pending-purge tracking with only still-pending (not-due)
             # ops, re-persisted in ONE durable append
             self._pending_hard = []
@@ -1215,6 +1238,7 @@ class StorageEngine:
         store: ObjectStore | None = None,
         cache_dir: str | None = None,
         wal_rotate_bytes: int = DEFAULT_WAL_ROTATE_BYTES,
+        wal_rotate_frames: int = DEFAULT_WAL_ROTATE_FRAMES,
         max_open_namespaces: int = 64,
     ):
         self.root = root
@@ -1222,6 +1246,7 @@ class StorageEngine:
         self.envelope = envelope
         self.cache_dir = cache_dir or os.path.join(root, "_cache")
         self.wal_rotate_bytes = wal_rotate_bytes
+        self.wal_rotate_frames = wal_rotate_frames
         # LRU-bounded open-namespace table. Every open NamespaceStore pins a
         # SQLite connection + WAL handle + manifest; the tenant mix is
         # "many tiny, heavy tail, mostly idle" (D2), so an unbounded table
@@ -1285,7 +1310,8 @@ class StorageEngine:
             nstore = self._namespaces.get(ns)
             if nstore is None:
                 nstore = NamespaceStore(
-                    ns, self.store, self.cache_dir, self.envelope, self.wal_rotate_bytes
+                    ns, self.store, self.cache_dir, self.envelope, self.wal_rotate_bytes,
+                    self.wal_rotate_frames,
                 )
                 self._namespaces[ns] = nstore
                 self._evict_locked()
