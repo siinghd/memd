@@ -426,3 +426,55 @@ def test_copy_over_a_log_clears_its_stale_seq_hint():
     s.copy("src", "dst")
     returned = s.append("dst", b"Y")
     assert returned == s.size("dst") == 4, f"append returned {returned}, real size {s.size('dst')}"
+
+
+# ------------------------------ pass 29: findings from re-auditing pass 28
+
+@pytest.mark.s3
+class TestLeaseClockAndStaleWriters:
+    def test_a_future_dated_lease_does_not_wedge_a_namespace_forever(self):
+        """`age = now - ts` goes NEGATIVE when the holder's clock is ahead
+        (NTP step, VM drift, bad RTC), so the lease was never stale and a crash
+        behind it made the namespace un-openable for the length of the skew -
+        defeating the point of having a TTL at all."""
+        s = _s3(lease_ttl_s=2.0)
+        rescuer = _s3(lease_ttl_s=2.0)
+        rescuer.prefix = s.prefix
+        s._raw_put(s._owner_key("future"), f"skewed:1\n{time.time() + 3600}".encode())
+        s._raw_put(s._owner_key("past"), f"dead:2\n{time.time() - 3600}".encode())
+        time.sleep(2.5)
+        assert rescuer.try_acquire_owner("past", "new:9") is True, "control: sane stamp"
+        assert rescuer.try_acquire_owner("future", "new:9") is True, \
+            "a future-dated lease is permanently un-reclaimable"
+        rescuer.release_owner("past")
+        rescuer.release_owner("future")
+
+    def test_a_stalled_writer_cannot_overwrite_the_new_owner(self):
+        """Only append() was hardened (part creation is a conditional PUT);
+        put/delete/truncate are unconditional overwrites. A writer that stalled
+        long enough for its lease to be reclaimed kept believing it was the
+        owner until its next heartbeat, and its put() silently replaced the new
+        owner's manifest."""
+        a = _s3(lease_ttl_s=2.0)
+        b = _s3(lease_ttl_s=2.0)
+        b.prefix = a.prefix
+        assert a.try_acquire_owner("ns1", "node-A:1") is True
+        a._lease_stop.set()                      # A stalls: heartbeat stops
+        time.sleep(2.5)
+        assert b.try_acquire_owner("ns1", "node-B:2") is True
+        b.put("ns/ns1/manifest.json", b'{"owner":"B"}')
+        with pytest.raises(RuntimeError, match="lease"):
+            a.put("ns/ns1/manifest.json", b'{"owner":"A","STALE":true}')
+        assert a._raw_get(a._full("ns/ns1/manifest.json")) == b'{"owner":"B"}'
+
+    def test_a_healthy_heartbeat_costs_no_extra_round_trip(self):
+        """The ownership re-check must fire only when our own beat has gone
+        stale, or it would add a GET to every single mutation."""
+        s = _s3(lease_ttl_s=60.0)
+        s.try_acquire_owner("ns1", "node-A:1")
+        with count_io() as io:
+            for i in range(20):
+                s.put(f"ns/ns1/k{i}", b"x")
+        assert io.get("get_object", 0) == 0, \
+            f"the fence check is doing I/O on a healthy heartbeat: {dict(io)}"
+        s.release_owner("ns1")

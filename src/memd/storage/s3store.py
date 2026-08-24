@@ -139,6 +139,10 @@ class S3ObjectStore(ObjectStore):
         # namespace so writes fail loudly instead of interleaving with the new
         # owner's. See try_acquire_owner.
         self._fenced: set[str] = set()
+        # Last SUCCESSFUL heartbeat per namespace, on the MONOTONIC clock.
+        # Wall-clock is what the lease body carries and is therefore subject to
+        # another machine's skew; "is my own heartbeat fresh?" must not be.
+        self._last_beat: dict[str, float] = {}
         self._lease_stop = threading.Event()
         self._lease_thread: threading.Thread | None = None
         # running logical size per key, so an append does not re-LIST the log
@@ -644,11 +648,45 @@ class S3ObjectStore(ObjectStore):
         parts = key.split("/")
         return parts[1] if len(parts) >= 2 and parts[0] == "ns" else None
 
+    def _beat_period(self) -> float:
+        return max(1.0, self.lease_ttl_s / 3.0)
+
+    def _verify_owner(self, ns: str, holder: str) -> None:
+        """Synchronously confirm we still hold `ns`; fence if we do not."""
+        try:
+            cur = (self._raw_get(self._owner_key(ns)) or b"").decode()
+        except Exception:
+            return          # transient: the heartbeat will retry
+        who = cur.split("\n", 1)[0] if cur else ""
+        if cur and who != holder:
+            self._fenced.add(ns)
+            self._leases.pop(ns, None)
+            METRICS.inc("memd_s3_owner_lease_lost_total",
+                        help="single-writer leases lost to another holder")
+        else:
+            self._last_beat[ns] = time.monotonic()
+
     def _check_fence(self, key: str) -> None:
-        if not self._fenced:
-            return
         ns = self._ns_of(key)
-        if ns and ns in self._fenced:
+        if ns is None:
+            return
+        if ns not in self._fenced:
+            holder = self._leases.get(ns)
+            if holder is not None:
+                # Only the heartbeat used to evaluate ownership, so a writer
+                # that had STALLED - and whose lease another node therefore
+                # legitimately reclaimed - kept believing it was the owner
+                # until its next beat. append() survives that window because
+                # part creation is a conditional PUT, but put/delete/truncate
+                # are unconditional: a stalled writer's put() overwrote the new
+                # owner's manifest, silently, with no error to either side.
+                # If our own heartbeat has gone stale, confirm ownership before
+                # mutating anything. Free when the beat is healthy; one GET
+                # exactly when the process has been stalled, which is when it
+                # is dangerous.
+                if time.monotonic() - self._last_beat.get(ns, 0.0) > self._beat_period():
+                    self._verify_owner(ns, holder)
+        if ns in self._fenced:
             raise RuntimeError(
                 f"lost the single-writer lease on namespace {ns!r}; this "
                 "process has been fenced. Another writer owns it - continuing "
@@ -682,6 +720,7 @@ class S3ObjectStore(ObjectStore):
                                     help="single-writer leases lost to another holder")
                         continue
                     self._raw_put(key, f"{holder}\n{time.time()}".encode())
+                    self._last_beat[ns] = time.monotonic()
                     METRICS.inc("memd_s3_owner_lease_renewals_total",
                                 help="single-writer lease heartbeats")
                 except Exception:
@@ -720,6 +759,7 @@ class S3ObjectStore(ObjectStore):
                                     IfNoneMatch="*")
             self._leases[namespace] = holder
             self._fenced.discard(namespace)
+            self._last_beat[namespace] = time.monotonic()
             self._start_lease_thread()
             return True
         except Exception as ex:
@@ -737,12 +777,23 @@ class S3ObjectStore(ObjectStore):
         try:
             who, ts = existing.decode().split("\n", 1)
             age = now - float(ts)
+            if age < -max(5.0, self.lease_ttl_s):
+                # Stamped meaningfully in the FUTURE: the holder's clock is
+                # ahead (NTP step, VM drift, a bad RTC). A negative age is
+                # never greater than the TTL, so such a lease was never stale
+                # and a crash behind it made the namespace un-openable for the
+                # length of the skew - defeating the whole point of having a
+                # TTL. Treat it as stale and say so, loudly enough to diagnose.
+                METRICS.inc("memd_s3_owner_lease_clock_skew_total",
+                            help="leases stamped in the future (holder clock ahead)")
+                age = self.lease_ttl_s + 1
         except Exception:
             who, age = "?", self.lease_ttl_s + 1
         if who == holder:
             self._raw_put(key, body)      # our own lease: refresh
             self._leases[namespace] = holder
             self._fenced.discard(namespace)
+            self._last_beat[namespace] = time.monotonic()
             self._start_lease_thread()
             return True
         if age > self.lease_ttl_s:
@@ -754,6 +805,7 @@ class S3ObjectStore(ObjectStore):
             self._raw_put(key, body)
             self._leases[namespace] = holder
             self._fenced.discard(namespace)
+            self._last_beat[namespace] = time.monotonic()
             self._start_lease_thread()
             return True
         return False
