@@ -298,3 +298,131 @@ def test_a_snapshot_makes_cold_open_flat(tmp_path):
             f"the snapshot was not used: {dict(io)}"
     finally:
         m2.close()
+
+
+# ------------------------------------ pass 28: the pass-27 fixes, re-audited
+
+@pytest.mark.s3
+def test_the_wal_frame_bound_survives_restarts(tmp_path):
+    """The frame counter started at 0 on every open, so the bound held only
+    within one process: six cycles of 400 writes left 2,400 WAL parts in the
+    bucket while the counter read 400 each time. Cold open was O(records)
+    again for any workload that restarts."""
+    from memd.engine.memory import Memory
+
+    cfg = {"s3_endpoint_url": ENDPOINT, "s3_access_key": KEY, "s3_secret_key": SECRET,
+           "s3_region": "us-east-1", "rate_max_writes": 10 ** 9}
+    pfx = f"reopen-{uuid.uuid4().hex[:8]}"
+    local = str(tmp_path / "node")
+    for cycle in range(5):
+        m = Memory(f"s3://{BUCKET}/{pfx}", encrypt=False, config=dict(cfg, local_dir=local))
+        try:
+            for i in range(300):
+                m.add(f"cycle {cycle} record {i}", user_id="u")
+            m.flush()
+            parts = sum(1 for k, _ in m.ns.store._iter_keys(f"{pfx}/ns/default/wal.__part-"))
+            assert parts <= m.ns.wal_rotate_frames, (
+                f"cycle {cycle}: {parts} WAL parts exceeds the {m.ns.wal_rotate_frames}-frame "
+                "bound - the counter is not seeded from the log at open")
+        finally:
+            m.close()
+
+
+@pytest.mark.s3
+def test_copy_is_fenced_like_every_other_mutating_path():
+    """copy() writes dst and reaps its parts, so a fenced writer could
+    overwrite the new owner's data through it - the same gap remove_prefix
+    had."""
+    a = _s3(lease_ttl_s=2.0)
+    a.try_acquire_owner("ns1", "node-A:1")
+    a.put("ns/ns1/keep", b"the new owner's data")
+    a.put("src", b"payload")
+    a._raw_put(a._owner_key("ns1"), f"node-B:2\n{time.time()}".encode())
+    for _ in range(12):
+        if "ns1" in a._fenced:
+            break
+        time.sleep(0.5)
+    assert "ns1" in a._fenced
+    with pytest.raises(RuntimeError, match="lease"):
+        a.copy("src", "ns/ns1/keep")
+    assert a._raw_get(a._full("ns/ns1/keep")) == b"the new owner's data"
+
+
+@pytest.mark.s3
+def test_every_mutating_method_fences():
+    """Enumerated statically so a NEW mutating method cannot be added without
+    a fence check - two have already shipped without one."""
+    import ast
+
+    src = open(os.path.join(os.path.dirname(__file__), "..",
+                            "src", "memd", "storage", "s3store.py")).read()
+    cls = next(n for n in ast.parse(src).body
+               if isinstance(n, ast.ClassDef) and n.name == "S3ObjectStore")
+    lease_internals = {"try_acquire_owner", "release_owner", "_renew_leases",
+                       "_start_lease_thread", "_delete_batch"}
+    unfenced = []
+    for fn in cls.body:
+        if not isinstance(fn, ast.FunctionDef) or fn.name.startswith("_raw"):
+            continue
+        if fn.name in lease_internals:
+            continue
+        body = ast.unparse(fn)
+        mutates = any(w in body for w in ("put_object", "delete_object", "delete_objects",
+                                          "_raw_put", "_raw_delete", "upload_part",
+                                          "copy_object", "_delete_batch"))
+        if mutates and "_check_fence" not in body:
+            unfenced.append(fn.name)
+    assert not unfenced, f"mutating methods without a fence check: {unfenced}"
+
+
+class TestAdversariallyNamedNamespaces:
+    """`_validate_ns` permits dots, hyphens and underscores, so
+    'acme.__part-000000000000' and 'acme.__seq' are LEGAL namespace names that
+    collide with this backend's internal key scheme. Pass 27's boundary fix
+    closed the obvious sibling case ('acme-eu') and left these open: a LIST
+    prefix of '<key>.__part-' still matched 'ns/acme.__part-000000000000/...'.
+    """
+
+    EVIL = "acme.__part-000000000000"
+
+    def _check(self, s):
+        s.put("ns/acme/manifest.json", b"tenant A")
+        s.append("ns/acme/wal", b"tenant A frames")
+        s.put(f"ns/{self.EVIL}/manifest.json", b"tenant C")
+        s.put("ns/acme.__seq/manifest.json", b"tenant D")
+        s.put("ns/acme-eu/manifest.json", b"tenant B")
+        removed = s.remove_prefix("ns/acme")
+        assert s.get("ns/acme/manifest.json") is None, "target survived"
+        assert s.get(f"ns/{self.EVIL}/manifest.json") == b"tenant C"
+        assert s.get("ns/acme.__seq/manifest.json") == b"tenant D"
+        assert s.get("ns/acme-eu/manifest.json") == b"tenant B"
+        return removed
+
+    def test_local_oracle(self, tmp_path):
+        assert self._check(LocalObjectStore(str(tmp_path / "o"))) == 2
+
+    @pytest.mark.s3
+    def test_s3_agrees(self):
+        assert self._check(_s3()) == 2
+
+    @pytest.mark.s3
+    def test_namespace_validation_still_permits_these_names(self):
+        """If this ever stops being true the tests above lose their point."""
+        from memd.storage.engine import _validate_ns
+
+        assert _validate_ns(self.EVIL) == self.EVIL
+        assert _validate_ns("acme.__seq") == "acme.__seq"
+
+
+@pytest.mark.s3
+def test_copy_over_a_log_clears_its_stale_seq_hint():
+    """A leftover hint made the first append after a copy-over resume from a
+    stale {seq, bytes} and return a wrong size - and that value becomes
+    manifest.wal_size, which replay trusts."""
+    s = _s3()
+    for _ in range(200):
+        s.append("dst", b"x" * 50)
+    s.append("src", b"SRC")
+    s.copy("src", "dst")
+    returned = s.append("dst", b"Y")
+    assert returned == s.size("dst") == 4, f"append returned {returned}, real size {s.size('dst')}"

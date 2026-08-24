@@ -321,15 +321,29 @@ class S3ObjectStore(ObjectStore):
         """
         base = self._full(prefix.rstrip("/"))
         seen: set[str] = set()
+        # everything genuinely beneath the directory
         for full, size in self._iter_keys(base + "/"):
             if full not in seen:
                 seen.add(full)
                 yield full, size
-        for suffix in (_PART_SEP, ".__seq"):
-            for full, size in self._iter_keys(base + suffix):
-                if full not in seen:
-                    seen.add(full)
-                    yield full, size
+        # ...plus this key's OWN append parts. The scan is a LIST prefix, so it
+        # must be filtered by the exact part pattern: `_validate_ns` permits
+        # dots, hyphens and underscores, which makes
+        # "acme.__part-000000000000" a LEGAL namespace name whose objects sit
+        # under `ns/acme.__part-000000000000/`. Matching the prefix alone
+        # destroyed that namespace along with `acme` - the first cut of this
+        # boundary fix closed the obvious sibling case and left this one open.
+        for full, size in self._iter_keys(base + _PART_SEP):
+            if _PART_RE.match(full) and full not in seen:
+                seen.add(full)
+                yield full, size
+        # ...and its seq hint, by EXACT key rather than prefix (same reason:
+        # "acme.__seq" is also a legal namespace name).
+        hint = base + ".__seq"
+        hsize = self._raw_head(hint)
+        if hsize is not None and hint not in seen:
+            seen.add(hint)
+            yield hint, hsize
         head = self._raw_head(base)
         if head is not None and base not in seen:
             yield base, head
@@ -529,15 +543,23 @@ class S3ObjectStore(ObjectStore):
         _count_op("copy")
         _validate_key(src)
         _validate_key(dst)
+        # copy WRITES dst and reaps dst's parts, so it is a mutating path and
+        # must fence like the others. It was the last one missing - the same
+        # gap remove_prefix had, and a fenced writer could still overwrite the
+        # new owner's data through it.
+        self._check_fence(dst)
         segs = self._segments(src)
         if not segs:
             return
-        # replacing dst means its own parts must go, same as put()
-        for full, _ in self._parts(dst):
-            self._raw_delete(full)
+        # replacing dst means its own parts AND its seq hint must go, same as
+        # put(). Leaving the hint behind made the first append after a
+        # copy-over resume from a stale {seq, bytes} and return a wrong size -
+        # and that value becomes manifest.wal_size, which replay trusts.
+        self._delete_batch([{"Key": f} for f, _ in self._parts(dst)])
         with self._seq_lock:
             self._next_part.pop(dst, None)
             self._size_cache.pop(dst, None)
+        self._raw_delete(self._seq_hint_key(dst))
 
         if len(segs) == 1 and segs[0][0] == self._full(src):
             self._client.copy_object(

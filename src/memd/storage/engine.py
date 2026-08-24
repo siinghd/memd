@@ -556,6 +556,14 @@ class NamespaceStore:
             self._apply_to_index(recs, [], from_replay=True)
         if good_end < len(wal):
             self.store.truncate(self.wal_key, good_end)  # torn-tail repair
+        # Seed the frame counter from what is actually in the WAL. Starting it
+        # at zero on every open meant the frame bound did not survive a
+        # RESTART: six cycles of 400 writes left 2,400 WAL parts in the bucket
+        # while the in-process counter read 400 each time, so the WAL grew
+        # without bound across restarts and cold open went back to being
+        # O(records). The bound has to be a property of the log, not of the
+        # process that happens to be holding it.
+        self._wal_frames = idx
         self.manifest.wal_size = self.store.size(self.wal_key)
         self.manifest.ops_size = sum(4 + len(f) for f in self._read_frames(self.ops_key))
         # commit replayed rows FIRST, only then advance the watermark -
