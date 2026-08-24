@@ -26,6 +26,18 @@ any probe fails the build.
   someone with filesystem read access on the same machine. Hosted deployments
   are expected to swap the root-key provider for a KMS; that provider does not
   ship yet.
+- **With the S3 backend, data is remote but KEYS ARE LOCAL.** That is a
+  deliberate, load-bearing asymmetry: crypto-shred still works (the key never
+  left the node, so destroying it makes the remote ciphertext inert), but a
+  second node cannot decrypt the bucket. Back up the local key directory
+  separately and treat it as the crown jewels - losing it is equivalent to
+  shredding every namespace. This is "one node with remote durability", not
+  "any node serves any namespace".
+- **Single-writer on S3 is a LEASE, not a distributed lock.** The first writer
+  claims `ns/<ns>/.owner` with a conditional PUT and a second gets
+  `NamespaceBusyError`; a lease older than the TTL is reclaimable so a crashed
+  node cannot wedge a namespace. It makes split-brain loud, not impossible.
+  Do not run two writers and rely on it.
 - **Audit retention is bounded** (16 sealed segments, 64MB each by default).
   Past that the oldest is dropped and the hash chain is re-anchored, so
   `verify()` proves tamper-evidence over the *retained window*.

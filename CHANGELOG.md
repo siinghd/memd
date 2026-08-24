@@ -7,6 +7,19 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
 ## [Unreleased]
 
 ### Added
+- **S3-compatible object store backend** (`pip install "memd[s3]"`,
+  `Memory("s3://bucket/prefix")`) for AWS S3, Cloudflare R2, MinIO and Ceph.
+  S3 has no append, so each append is its own immutable object and the logical
+  object is their ordered concatenation: one durable write ack = one PUT, and a
+  torn frame cannot exist. Single-writer is enforced by a lease rather than a
+  file lock, since `flock` cannot see another machine. Exercised in CI against
+  a real S3 server. This makes the hosted SLOs in `02-slos.md` evidenced rather
+  than aspirational - with the caveat that the measurements are against a
+  server on loopback, so the latencies are a floor and the round-trip counts
+  (1 PUT per write, 0 reads per warm search) are the durable claim.
+- An `ObjectStore` contract suite that every backend must pass, with
+  `LocalObjectStore` as the oracle. The interface previously had one
+  implementation and therefore no specification.
 - CI: tests on 3.11/3.12, the eval gate at three seed/scale configs, bandit,
   a clean-install smoke test, and a container smoke test. Benchmarks run
   nightly as informational artifacts and never gate the build.
@@ -83,8 +96,10 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
 
 ### Known limitations
 - `retrieve_p50 <= 20ms` is not met (~28ms on the development machine).
-- Only `LocalObjectStore` ships, so the hosted SLOs in `02-slos.md` are
-  unevidenced. Single writer per data root.
+- Single writer per data root, on every backend. `uvicorn --workers N` with
+  N>1 does not work.
+- With the S3 backend, envelope keys stay local: a second node cannot decrypt
+  the bucket. A KMS key provider is not built.
 - BM25 tokenization is `ascii`, so CJK is not indexed by the lexical lane.
 - Flat vector scan; no IVF/HNSW above the documented ~50K-vector ceiling.
 

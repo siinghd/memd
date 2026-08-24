@@ -51,6 +51,56 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  s3:
+    name: engine on a real S3 API (MinIO)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: pip install -e ".[dev,s3]"
+      # A service container cannot take a command, and MinIO needs one, so it
+      # runs as a plain container instead.
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null && break || sleep 1
+          done
+          curl -sf http://127.0.0.1:9000/minio/health/live
+      - name: ObjectStore contract suite (local AND s3 must agree)
+        env:
+          MEMD_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+        run: python -m pytest tests/test_objectstore_contract.py -q
+      - name: Engine on S3
+        env:
+          MEMD_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+        run: python -m pytest tests/test_s3_backend.py -q
+      - name: Hosted-path shape (informational)
+        continue-on-error: true
+        env:
+          MEMD_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+        run: python bench/s3_bench.py | tee bench-s3.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-s3
+          path: bench-s3.json
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: MinIO logs on failure
+        if: failure()
+        run: docker logs minio || true
+      - name: Cleanup
+        if: always()
+        run: docker rm -f minio || true
+
   security:
     name: static security scan
     runs-on: ubuntu-latest

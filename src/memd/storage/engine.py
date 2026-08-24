@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import threading
 import time
 from collections import OrderedDict
@@ -266,13 +267,35 @@ class NamespaceStore:
         self.wal_key = f"{self.prefix}/wal"
         self.ops_key = f"{self.prefix}/ops"
         self.manifest_key = f"{self.prefix}/manifest.json"
-        # claim the namespace before touching any of its state
+        # Claim the namespace before touching any of its state.
+        #
+        # Backend-aware on purpose: `flock` cannot see another MACHINE, so on a
+        # remote store it protects nothing. A store that knows how to lease
+        # ownership (see S3ObjectStore.try_acquire_owner) gets asked; only the
+        # local filesystem falls back to flock. Without this the pass-17
+        # single-writer protection would silently evaporate the moment anyone
+        # pointed memd at S3 - which is exactly the deployment where two
+        # writers are most likely.
         self._owner_path = None
-        root = getattr(store, "root", None)
-        if root and not os.environ.get("MEMD_ALLOW_MULTI_PROCESS"):
-            lock_path = os.path.join(root, "ns", namespace.replace("/", "__"), ".owner")
-            if _acquire_owner(lock_path):
-                self._owner_path = lock_path
+        self._owner_lease = None
+        if not os.environ.get("MEMD_ALLOW_MULTI_PROCESS"):
+            leaser = getattr(store, "try_acquire_owner", None)
+            if callable(leaser):
+                holder = f"{socket.gethostname()}:{os.getpid()}"
+                if not leaser(namespace, holder):
+                    raise NamespaceBusyError(
+                        f"namespace {namespace!r} is leased by another writer. "
+                        "memd is single-writer per data root: a second writer "
+                        "silently destroys acked data. Set "
+                        "MEMD_ALLOW_MULTI_PROCESS=1 to override.")
+                self._owner_lease = namespace
+            else:
+                root = getattr(store, "root", None)
+                if root:
+                    lock_path = os.path.join(
+                        root, "ns", namespace.replace("/", "__"), ".owner")
+                    if _acquire_owner(lock_path):
+                        self._owner_path = lock_path
         os.makedirs(cache_dir, exist_ok=True)
         safe = namespace.replace("/", "__")
         self.index = NamespaceIndex(os.path.join(cache_dir, f"{safe}.sqlite"))
@@ -1173,6 +1196,12 @@ class NamespaceStore:
         if self._owner_path:
             _release_owner(self._owner_path)
             self._owner_path = None
+        if self._owner_lease is not None:
+            try:
+                self.store.release_owner(self._owner_lease)
+            except Exception:
+                pass  # a lease expires on its own; never fail teardown on it
+            self._owner_lease = None
 
 
 class StorageEngine:

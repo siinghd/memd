@@ -459,9 +459,37 @@ class Memory:
             self._impl = HostedMemory(api_key=api_key, base_url=base_url or "http://localhost:8700",
                                       namespace=namespace, transport=transport)
             return
+        store = None
+        if str(path).startswith("s3://"):
+            # Remote source of truth. Two things stay LOCAL and must, so the
+            # local directory is part of the configuration rather than an
+            # implementation detail:
+            #   - the SQLite derived index (rebuildable by contract; the pass-22
+            #     snapshot is what makes a cold node cheap), and
+            #   - envelope keys, which is why this is "one node with remote
+            #     durability" rather than "any node serves any namespace".
+            #     Crypto-shred still works; a second node cannot decrypt.
+            from memd.storage.s3store import S3ObjectStore
+
+            rest = str(path)[len("s3://"):]
+            bucket, _, s3_prefix = rest.partition("/")
+            if not bucket:
+                raise ValueError(f"malformed s3 url {path!r}: expected s3://bucket[/prefix]")
+            store = S3ObjectStore(
+                bucket=bucket, prefix=s3_prefix,
+                endpoint_url=cfg.get("s3_endpoint_url") or os.environ.get("MEMD_S3_ENDPOINT"),
+                access_key=cfg.get("s3_access_key"),
+                secret_key=cfg.get("s3_secret_key"),
+                region=cfg.get("s3_region") or os.environ.get("AWS_REGION"),
+            )
+            path = str(cfg.get("local_dir")
+                       or os.environ.get("MEMD_LOCAL_DIR")
+                       or os.path.join(".memd-local", bucket, s3_prefix or "_"))
         os.makedirs(path, exist_ok=True)
         envelope = LocalKeyEnvelope(os.path.join(path, "keys")) if encrypt else NullKeyEnvelope()
-        self.engine = StorageEngine(os.path.join(path, "store"), envelope=envelope)
+        self.engine = StorageEngine(os.path.join(path, "store"), envelope=envelope,
+                                    store=store,
+                                    cache_dir=os.path.join(path, "_cache") if store else None)
         self.namespace_name = namespace
         self.ns = self.engine.namespace(namespace)
         # the facade holds a direct reference to this store for its lifetime:

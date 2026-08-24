@@ -83,11 +83,56 @@ Concretely:
   namespace. `MEMD_ALLOW_MULTI_PROCESS=1` disables the lock and re-enables the
   data loss; it exists for recovery tooling, not for serving.
 
-A multi-writer protocol (CAS on the manifest + a lease) is the real fix and is
-not built. Object storage is the source-of-truth *interface*, but the only
-implementation that ships is the local filesystem, so **every hosted SLO in
-[02-slos.md](02-slos.md) is unevidenced by construction** until an S3 backend
-exists.
+A multi-writer protocol (manifest CAS on ETag) is the real fix and is not
+built.
+
+## Object storage as the source of truth (S3 / R2 / MinIO)
+
+```bash
+pip install "memd[s3]"
+```
+```python
+mem = Memory("s3://my-bucket/memd", config={
+    "local_dir": "./.memd-local",          # index cache + envelope keys stay here
+    # endpoint/credentials optional: the normal boto3 chain applies
+    "s3_endpoint_url": "http://127.0.0.1:9000",
+})
+```
+
+S3 has no append, and `append()` is the WAL's whole contract. Each append is
+its own immutable object (`<key>.__part-000000000042`) and the logical object
+is their ordered concatenation — so **one durable write ack = one PUT**, and a
+torn frame cannot exist. The read-modify-write alternative would transfer
+O(WAL) bytes per ack and was rejected on both latency and cost.
+
+Measured against a real S3 server (MinIO on localhost — see the caveat below):
+
+| | measured | SLO |
+|---|---|---|
+| durable write ack | p50 **8.8 ms**, p90 **10.1 ms** | p50 ≤ 150 ms, p90 ≤ 300 ms |
+| warm retrieval | p50 **26.0 ms**, p99 **71.2 ms** | p50 ≤ 100 ms, p99 ≤ 400 ms |
+| cold node (bucket only, no local cache) | open **170 ms** + first query **38 ms** | first query p90 ≤ 1.5 s |
+| **object-store round trips per write** | **1 PUT** | O(1) |
+| **object-store round trips per warm search** | **0** | O(1) |
+
+The latencies are from a server on loopback and are a floor, not a forecast for
+S3-across-a-WAN. The **round-trip counts are not** — they are structural, and
+they are the number that decides both the cost model and how a WAN changes
+things. A warm search touches object storage zero times because retrieval is
+served by the local derived index.
+
+What stays local, and why it matters: the SQLite derived index (rebuildable by
+contract — pass 22's snapshot is what makes a cold node cheap) and the envelope
+**keys**. Data is remote, keys are not, so this is *one node with remote
+durability*, not *any node serves any namespace*. Crypto-shred still works — the
+key is local, destroy it and the ciphertext is inert — but a second node cannot
+decrypt. A KMS key provider is the missing piece and is not built.
+
+Single-writer is still enforced, by a **lease** rather than a file lock (`flock`
+cannot see another machine): the first writer claims `ns/<ns>/.owner` with a
+conditional PUT, a second gets `NamespaceBusyError`, and a lease older than the
+TTL is reclaimable so a crashed node cannot wedge a namespace forever. It makes
+split-brain loud, not impossible.
 
 ## Doors (one engine)
 
