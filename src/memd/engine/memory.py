@@ -11,6 +11,7 @@ validity filter -> budget-aware packing with provenance tags.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import threading
@@ -27,7 +28,7 @@ from memd.core.schema import ExtractorInfo, Kind, MemoryRecord, Scope, Source, n
 from memd.index.sqlite_index import IndexFilter
 from memd.metrics import METRICS, auto_dumper_from_env, preset_core
 from memd.pipeline.consolidation import ConsolidationResult, QuarantinePolicy, consolidate_facts
-from memd.pipeline.embedder import Embedder, resolve_embedder
+from memd.pipeline.embedder import Embedder, requested_embedder, resolve_embedder
 from memd.pipeline.extractor import ExtractedFact, Extractor, resolve_extractor
 from memd.query.fusion import rrf_fuse
 from memd.query.packing import PackedContext, count_tokens, pack_context
@@ -36,6 +37,8 @@ from memd.storage.audit import AuditLog, BufferedAuditLog
 from memd.storage.crypto import LocalKeyEnvelope, NullKeyEnvelope
 from memd.storage.engine import StorageEngine
 from memd.storage.objectstore import count_io
+
+_log = logging.getLogger(__name__)
 
 DEFAULT_BUDGET_TOKENS = 2000
 HARD_DELETE_PURGE_MS = 72 * 3600 * 1000  # D7 #8 default physical-purge window
@@ -163,6 +166,8 @@ class _EmbedWorker:
         # still in flight and flush() inherited that broken promise.
         self._inflight = 0
         self._inflight_lock = threading.Lock()
+        # set once the embedder's load() has returned or raised
+        self._load_done = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True, name="memd-embed")
         self._thread.start()
 
@@ -177,7 +182,29 @@ class _EmbedWorker:
         METRICS.set_gauge("memd_embed_queue_depth", self.q.qsize(), help="pending embedding texts")
         return True
 
+    def _load_embedder(self) -> None:
+        """Warm the embedder HERE, on the worker's own thread. A local ONNX
+        model costs seconds to import and load; built inside Memory() it sat
+        ahead of the first write ack (the pass-19 SIGKILL test saw nothing
+        acked within 0.5s). Writes queue meanwhile, and search serves from the
+        lanes that need no query vector until embedder.ready() flips."""
+        try:
+            self.embedder.load()
+        except Exception:
+            # every batch now fails against it and dead-letters; the bm25 and
+            # entity lanes still serve, and reembed() heals the vector lane
+            # once a working embedder is configured
+            _log.exception("memd: embedder %s failed to load; the vector lane is degraded",
+                           self.embedder.name)
+        finally:
+            self._load_done.set()
+
+    def wait_ready(self, timeout_s: float) -> bool:
+        """Wait (bounded) for the embedder load to finish; True if it did."""
+        return self._load_done.wait(timeout=max(0.0, timeout_s))
+
     def _run(self) -> None:
+        self._load_embedder()
         while not self._stop.is_set():
             try:
                 ns_name, rid, text = self.q.get(timeout=self.flush_s)
@@ -430,6 +457,11 @@ class _SearchCache:
 
 
 MAX_QUERY_CHARS = 64 * 1024  # embedder-cost guard for engine-side queries
+# find_ids: a vector-only candidate must beat the median of the sweep's
+# vector sample by this much (see Memory._vector_only_floor); the median is
+# only trusted once the sample has a few points in it
+_VECTOR_ONLY_MEDIAN_MARGIN = 0.1
+_VECTOR_ONLY_MIN_SAMPLE = 5
 
 
 class Memory:
@@ -530,6 +562,7 @@ class Memory:
         self._qcache = _SearchCache()
         self._qepochs: dict[str, int] = {}
         self._embed_close_drain_s = float(cfg.get("embed_close_drain_s", 30.0))
+        self._embed_flush_drain_s = float(cfg.get("embed_flush_drain_s", 60.0))
         self._maint = _MaintenanceWorker(self._run_maintenance)
         self._embed_worker = _EmbedWorker(
             self.embedder,
@@ -538,6 +571,10 @@ class Memory:
             max_queue=int(cfg.get("embed_max_queue", 5_000)),
         )
         self.audit.append(actor="system", action="open", target=namespace, detail={"embedder": self.embedder.name})
+        # which embedder is active decides retrieval AND forget() semantics,
+        # and "auto" depends on what happens to be installed: say it once
+        _log.info("memd: opened namespace %r with embedder %s (kind=%s, requested=%s)",
+                  namespace, self.embedder.name, self.embedder.kind, requested_embedder(cfg))
         self._vector_selfheal = bool(cfg.get("vector_selfheal", True))
         self._report_vector_health(self.ns)
 
@@ -896,6 +933,9 @@ class Memory:
             (user_id, session_id, agent_id, org_id),
             budget_tokens, as_of, tuple(kinds) if kinds else None,
             include_quarantined, self._qepochs.get(ns_name, 0),
+            # a result served before the model loaded has no vector lane: it
+            # must not outlive the load
+            self.embedder.ready(),
         )
         cached = self._qcache.get(cache_key)
         if cached is not None:
@@ -956,16 +996,20 @@ class Memory:
             METRICS.observe("memd_lane_ms", (time.monotonic() - _lt0) * 1000,
                             help="per-lane candidate fetch duration (ms)", ns=ns.namespace, lane=lane_name)
         # graceful degradation (ADR-8): if the embedder is unreachable
-        # (BYO-key API outage), BM25 + entity lanes still serve - retrieval
-        # degrades, it never dies
-        try:
-            _lt0 = time.monotonic()
-            qvec = self.embedder.embed_one(query)
-            lane_hits["vector"] = ns.index.search_vector(qvec, filt, limit=plan.candidate_k)
-            METRICS.observe("memd_lane_ms", (time.monotonic() - _lt0) * 1000,
-                            help="per-lane candidate fetch duration (ms)", ns=ns.namespace, lane="vector")
-        except Exception:
-            METRICS.inc("memd_embed_query_failures_total", ns=ns.namespace)
+        # (BYO-key API outage) or its model is still loading in the embed
+        # worker, BM25 + entity lanes still serve - retrieval degrades, it
+        # never dies, and it never waits on a model load
+        if not self.embedder.ready():
+            METRICS.inc("memd_embed_query_not_ready_total", ns=ns.namespace)
+        else:
+            try:
+                _lt0 = time.monotonic()
+                qvec = self.embedder.embed_one(query)
+                lane_hits["vector"] = ns.index.search_vector(qvec, filt, limit=plan.candidate_k)
+                METRICS.observe("memd_lane_ms", (time.monotonic() - _lt0) * 1000,
+                                help="per-lane candidate fetch duration (ms)", ns=ns.namespace, lane="vector")
+            except Exception:
+                METRICS.inc("memd_embed_query_failures_total", ns=ns.namespace)
         _st0 = time.monotonic()
         fused = rrf_fuse(lane_hits, weights=plan.weights, limit=max(plan.candidate_k, 40))
         METRICS.observe("memd_search_stage_ms", (time.monotonic() - _st0) * 1000,
@@ -1407,12 +1451,18 @@ class Memory:
         )
         # no packing budget here: a delete-by-query sweep must see every match
         sweep_limit = 10_000
-        try:
-            qvec = self.embedder.embed_one(query)
-            vector_hits = ns.index.search_vector(qvec, filt, limit=sweep_limit)
-        except Exception:
-            METRICS.inc("memd_embed_query_failures_total", ns=ns.namespace)
-            vector_hits = []
+        vector_hits = []
+        if not self.embedder.ready():
+            # model still loading: sweep on lexical evidence only (the
+            # conservative direction for a delete)
+            METRICS.inc("memd_embed_query_not_ready_total", ns=ns.namespace)
+        else:
+            try:
+                qvec = self.embedder.embed_one(query)
+                vector_hits = ns.index.search_vector(qvec, filt, limit=sweep_limit)
+            except Exception:
+                METRICS.inc("memd_embed_query_failures_total", ns=ns.namespace)
+                vector_hits = []
         lane_hits = {
             "bm25": ns.index.search_bm25(query, filt, limit=sweep_limit),
             "vector": vector_hits,
@@ -1424,7 +1474,7 @@ class Memory:
         # grounding (bm25/entity lane) OR a strong vector match. Vector-only
         # weak similarity must never drive mass deletion.
         vec_scores = {h.record.id: h.score for h in lane_hits["vector"]}
-        strong_vec = 0.35
+        strong_vec = self._vector_only_floor(list(vec_scores.values()))
         ids = []
         for it in fused:
             lexical = bool(set(it.lanes) & {"bm25", "entity"})
@@ -1435,6 +1485,25 @@ class Memory:
         METRICS.inc("memd_find_ids_total", ns=ns.namespace)
         METRICS.inc("memd_find_ids_matched_total", len(ids), ns=ns.namespace)
         return ids
+
+    def _vector_only_floor(self, scores: list[float]) -> float:
+        """Minimum cosine for a vector-ONLY candidate in a destructive sweep.
+
+        Absolute part: the embedder's strong_match_cosine. A fixed 0.35 was
+        calibrated on the hash embedder, where unrelated strings score ~0;
+        bge-small scores unrelated short strings ~0.5-0.6, so the same
+        number had forget() delete 120 records instead of 60.
+        Relative part: the candidate must also beat the median similarity of
+        the sweep's own vector sample by a margin, so a namespace whose
+        records all sit close together in embedding space (a homogeneous
+        corpus, or a model with an unusually high baseline) cannot be swept
+        wholesale on vector evidence. The sample is the scoped top
+        `sweep_limit`, which only biases the median upward - more
+        conservative, never less."""
+        floor = float(self.embedder.strong_match_cosine)
+        if len(scores) >= _VECTOR_ONLY_MIN_SAMPLE:
+            floor = max(floor, float(np.median(scores)) + _VECTOR_ONLY_MEDIAN_MARGIN)
+        return floor
 
     def forget(
         self,
@@ -1577,6 +1646,11 @@ class Memory:
         st = ns.stats()
         st["namespace"] = ns.namespace
         st["embedder"] = self.embedder.name
+        st["embedder_kind"] = self.embedder.kind
+        st["embedder_ready"] = self.embedder.ready()
+        # embeddings queued or mid-batch: non-zero after flush() means the
+        # drain timed out and the vector lane is still catching up
+        st["embed_pending"] = self._embed_worker._pending()
         st["extractor"] = self.extractor.name
         # live gauges so /metrics and stats() agree on current state
         METRICS.set_gauge("memd_records", st.get("records", 0), ns=ns.namespace)
@@ -1701,7 +1775,22 @@ class Memory:
         impl = self._hosted()
         if impl is not None:
             return None  # hosted mode: nothing buffered locally
-        self._embed_worker.drain(timeout_s=60)
+        budget = self._embed_flush_drain_s
+        deadline = time.monotonic() + budget
+        left = self._embed_worker.drain(timeout_s=budget)
+        # nothing queued does not mean the vector lane is serving: the model
+        # may still be loading. flush() is the caller's "make it consistent"
+        # point, so it waits for that too (within the same budget).
+        self._embed_worker.wait_ready(deadline - time.monotonic())
+        if left:
+            # drain() gave up with work still queued or mid-batch: the
+            # vector lane is incomplete (it keeps draining in the background)
+            # and "flushed" must not silently claim otherwise
+            METRICS.inc("memd_flush_embed_pending_total",
+                        help="flushes that returned with embeddings still pending")
+            _log.warning("memd: flush() returned with %d embedding(s) still pending after %.1fs; "
+                         "the vector lane is incomplete until the embed worker catches up",
+                         left, budget)
         self._maint.drain(timeout_s=60)
         self.ns.index.flush()
         self._flush_all_audits()
