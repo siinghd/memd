@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import threading
 import time
@@ -262,6 +263,7 @@ class NamespaceStore:
         envelope: KeyEnvelope | None = None,
         wal_rotate_bytes: int = DEFAULT_WAL_ROTATE_BYTES,
         wal_rotate_frames: int = DEFAULT_WAL_ROTATE_FRAMES,
+        lexical: dict | None = None,
     ):
         self.namespace = namespace
         self.store = store
@@ -330,7 +332,36 @@ class NamespaceStore:
         self._pending_hard: list[tuple[str, int]] = []
         self._pending_hard_ids: set[str] = set()
         self._rotating = False  # re-entrancy guard for rotate-inside-append_ops
+        self._replayed_at_open = False
         self._open()
+        self._attach_lexical(lexical)
+
+    def _attach_lexical(self, lexical: dict | None) -> None:
+        """Optional tantivy accelerator for the bm25 lane (derived, local,
+        rebuildable - see memd.index.tantivy_lexical). Attached AFTER replay:
+        rows replayed without it may have changed under an old index, so any
+        replay at open rebuilds it. It must never stop a namespace opening."""
+        path = os.path.splitext(self.index.path)[0] + ".tantivy"
+        if not lexical or lexical.get("backend") != "tantivy":
+            # opened without it: rows changed now would be missing from an
+            # index kept around, and an operator who turned it off should not
+            # keep a second copy of the text on disk
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            return
+        try:
+            from memd.index.tantivy_lexical import TantivyLexical
+
+            self.index.attach_lexical(TantivyLexical(
+                self.index, path,
+                commit_ms=int(lexical.get("commit_ms", 500)),
+                commit_docs=int(lexical.get("commit_docs", 512)),
+                force_rebuild=self._replayed_at_open,
+            ))
+        except Exception as ex:  # noqa: BLE001 - FTS5 serves the lane
+            METRICS.inc("memd_lexical_attach_failures_total",
+                        help="namespaces opened without the tantivy accelerator (FTS5 serves)",
+                        ns=self.namespace, detail=type(ex).__name__)
 
     # ---------------------------------------------------------- index snapshot
 
@@ -503,6 +534,7 @@ class NamespaceStore:
             # machine) and a folded image exists: install it and let the
             # existing watermark logic replay only the tail past it.
             applied = self._install_index_snapshot()
+            self._replayed_at_open = True
         seg_records: dict[str, MemoryRecord] = {}
         max_fold = 0
         for seg in self.manifest.segments:
@@ -536,6 +568,8 @@ class NamespaceStore:
         ]
         self._pending_hard_ids = {rid for rid, _ in self._pending_hard}
         self._apply_to_index(list(seg_records.values()), pending_ops, from_replay=True)
+        if seg_records or pending_ops:
+            self._replayed_at_open = True
         wal = self.store.get(self.wal_key) or b""
         base = self.manifest.wal_base_seq
         recs = []
@@ -554,6 +588,7 @@ class NamespaceStore:
                 break
         if recs:
             self._apply_to_index(recs, [], from_replay=True)
+            self._replayed_at_open = True
         if good_end < len(wal):
             self.store.truncate(self.wal_key, good_end)  # torn-tail repair
         # Seed the frame counter from what is actually in the WAL. Starting it
@@ -1248,8 +1283,11 @@ class StorageEngine:
         wal_rotate_bytes: int = DEFAULT_WAL_ROTATE_BYTES,
         wal_rotate_frames: int = DEFAULT_WAL_ROTATE_FRAMES,
         max_open_namespaces: int = 64,
+        lexical: dict | None = None,
     ):
         self.root = root
+        # {"backend": "fts5"|"tantivy", "commit_ms", "commit_docs"}
+        self.lexical = dict(lexical or {})
         self.store = store or LocalObjectStore(root)
         self.envelope = envelope
         self.cache_dir = cache_dir or os.path.join(root, "_cache")
@@ -1319,7 +1357,7 @@ class StorageEngine:
             if nstore is None:
                 nstore = NamespaceStore(
                     ns, self.store, self.cache_dir, self.envelope, self.wal_rotate_bytes,
-                    self.wal_rotate_frames,
+                    self.wal_rotate_frames, lexical=self.lexical,
                 )
                 self._namespaces[ns] = nstore
                 self._evict_locked()
@@ -1386,6 +1424,8 @@ class StorageEngine:
                 os.unlink(idx_path + suffix)
             except FileNotFoundError:
                 pass
+        # the tantivy accelerator holds the same text (tokenized): shred it too
+        shutil.rmtree(os.path.join(self.cache_dir, f"{safe}.tantivy"), ignore_errors=True)
         if self.envelope is not None:
             self.envelope.destroy(ns)
         return existed or n > 0

@@ -28,6 +28,12 @@ import numpy as np
 
 from memd.core.schema import ExtractorInfo, Kind, MemoryRecord, Scope, Source, now_ms
 from memd.index.sqlite_index import IndexFilter
+from memd.index.tantivy_lexical import (
+    DEFAULT_COMMIT_DOCS,
+    DEFAULT_COMMIT_MS,
+    requested_lexical_backend,
+    resolve_lexical_backend,
+)
 from memd.metrics import METRICS, auto_dumper_from_env, preset_core
 from memd.pipeline.consolidation import ConsolidationResult, QuarantinePolicy, consolidate_facts
 from memd.pipeline.embedder import Embedder, requested_embedder, resolve_embedder
@@ -585,9 +591,16 @@ class Memory:
                        or os.path.join(".memd-local", bucket, s3_prefix or "_"))
         os.makedirs(path, exist_ok=True)
         envelope = LocalKeyEnvelope(os.path.join(path, "keys")) if encrypt else NullKeyEnvelope()
+        # resolved before any namespace opens: the accelerator attaches at open
+        self.lexical_backend = resolve_lexical_backend(cfg)
         self.engine = StorageEngine(os.path.join(path, "store"), envelope=envelope,
                                     store=store,
-                                    cache_dir=os.path.join(path, "_cache") if store else None)
+                                    cache_dir=os.path.join(path, "_cache") if store else None,
+                                    lexical={
+                                        "backend": self.lexical_backend,
+                                        "commit_ms": int(cfg.get("lexical_commit_ms", DEFAULT_COMMIT_MS)),
+                                        "commit_docs": int(cfg.get("lexical_commit_docs", DEFAULT_COMMIT_DOCS)),
+                                    })
         self.namespace_name = namespace
         self.ns = self.engine.namespace(namespace)
         # the facade holds a direct reference to this store for its lifetime:
@@ -616,6 +629,7 @@ class Memory:
             RerankStage(reranker, k=int(cfg.get("rerank_k", DEFAULT_RERANK_K))) if reranker else None)
         self.pack_mode: str = resolve_pack_mode(cfg)
         self.rerank_gate: float = float(cfg.get("rerank_gate", DEFAULT_RERANK_GATE))
+        self._lexical_flush_drain_s = float(cfg.get("lexical_flush_drain_s", 60.0))
         self.extractor: Extractor = resolve_extractor(cfg)
         self.quarantine = QuarantinePolicy(
             rate_max_writes=int(cfg.get("rate_max_writes", 120)),
@@ -650,10 +664,12 @@ class Memory:
         _log.info("memd: opened namespace %r with embedder %s (kind=%s, requested=%s)",
                   namespace, self.embedder.name, self.embedder.kind, requested_embedder(cfg))
         # the reranker decides whether search text leaves the machine: say so
-        _log.info("memd: reranker %s (model=%s, requested=%s, pack_mode=%s); fuse_vector=%s",
+        _log.info("memd: reranker %s (model=%s, requested=%s, pack_mode=%s); "
+                  "lexical backend %s (requested=%s); fuse_vector=%s",
                   self.rerank.name if self.rerank else "none",
                   self.rerank.model if self.rerank else "-", requested_reranker(cfg),
-                  self.pack_mode, self.fuse_vector)
+                  self.pack_mode, self.lexical_backend, requested_lexical_backend(cfg),
+                  self.fuse_vector)
         if self.rerank is not None and callable(getattr(self.rerank.reranker, "load", None)):
             # warm the reranker off the caller's path: a local cross-encoder
             # takes seconds to load (a first download is ~1GB) and the Jev SDK
@@ -1807,6 +1823,8 @@ class Memory:
         st["fuse_vector"] = self.fuse_vector
         st["reranker"] = self.rerank.stats() if self.rerank is not None else {"name": "none"}
         st["pack_mode"] = self.pack_mode
+        lex = ns.index.lexical
+        st["lexical"] = lex.stats() if lex is not None else {"backend": "fts5"}
         st["extractor"] = self.extractor.name
         # live gauges so /metrics and stats() agree on current state
         METRICS.set_gauge("memd_records", st.get("records", 0), ns=ns.namespace)
@@ -1952,6 +1970,11 @@ class Memory:
                          left, budget)
         self._maint.drain(timeout_s=60)
         self.ns.index.flush()
+        lex = self.ns.index.lexical
+        if lex is not None:
+            # the tantivy accelerator is derived and serves its tail from
+            # FTS5 meanwhile, so this is about speed, not visibility
+            lex.drain(timeout_s=self._lexical_flush_drain_s)
         self._flush_all_audits()
 
     def close(self) -> None:

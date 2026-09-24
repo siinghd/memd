@@ -6,6 +6,9 @@ Backing: SQLite (WAL mode) providing
     namespaces < ~50K vectors - the vast majority - get perfect recall here;
     IVF-PQ slots behind VectorSearchStrategy later without API change)
   - btree columns for time / entity / scope / validity filtering
+  - optionally, a tantivy accelerator for the bm25 lane (memd[fast]; see
+    memd.index.tantivy_lexical): a derived view of this index, attached by
+    the namespace store; FTS5 stays the synchronous source of truth
 
 Durability contract: the durable append (segments) is the source of truth;
 this index is committed synchronously before write-ack to give immediate
@@ -128,6 +131,9 @@ class NamespaceIndex:
         self._closed = False
         self._stats_cache: dict | None = None
         self._stats_at = 0.0
+        # optional lexical accelerator (TantivyLexical); every mutation below
+        # tells it which rows changed BEFORE the change becomes visible
+        self.lexical = None
         self._con.execute("PRAGMA journal_mode=WAL")
         self._con.execute("PRAGMA synchronous=NORMAL")
         self._con.execute("PRAGMA temp_store=MEMORY")
@@ -255,7 +261,17 @@ class NamespaceIndex:
             c.execute("INSERT INTO meta(k,v) VALUES('schema_version',?)", (str(SCHEMA_VERSION),))
         c.commit()
 
+    def attach_lexical(self, lexical) -> None:
+        self.lexical = lexical
+
     def close(self) -> None:
+        lex, self.lexical = self.lexical, None
+        if lex is not None:
+            # its final batch reads this index, so it goes first
+            try:
+                lex.close()
+            except Exception:
+                pass
         with self._lock:
             self.flush()
             self._closed = True
@@ -340,6 +356,10 @@ class NamespaceIndex:
                             "INSERT OR REPLACE INTO vectors(id,dim,model,vec) VALUES(?,?,?,?)",
                             (rec.id, int(vec.shape[0]), model, _vec_blob(vec)),
                         )
+                # new rows land above the lexical watermark, where the FTS5
+                # tail serves them until the accelerator indexes them
+                if self.lexical is not None:
+                    self.lexical.note_new(len(items))
                 # no per-batch commit: lazy via _maybe_commit (replay-safe)
             except Exception:
                 self.flush()  # don't leave a broken transaction open
@@ -460,8 +480,27 @@ class NamespaceIndex:
         self._invalidate_stats()
         self._maybe_commit()
 
+    def _lex_touch(self, ids) -> None:
+        if self.lexical is not None:
+            self.lexical.touch(list(ids))
+
+    def _lex_before_hard_delete(self, c: sqlite3.Connection, record_id: str) -> None:
+        """SQLite reuses the highest rowid once its row is deleted, which
+        would put the next insert BELOW the lexical watermark: lower the
+        accelerator's scan floor so the tail still serves (and it re-indexes)
+        whatever lands there."""
+        if self.lexical is None:
+            return
+        row = c.execute("SELECT rowid FROM records WHERE id=?", (record_id,)).fetchone()
+        if row is None:
+            return
+        top = c.execute("SELECT MAX(rowid) FROM records").fetchone()[0]
+        if top is not None and int(row[0]) >= int(top):
+            self.lexical.lower_floor(int(row[0]) - 1)
+
     def mark_superseded(self, old_id: str, new_id: str, at_ms: int) -> None:
         with self._lock:
+            self._lex_touch([old_id])
             self._con.execute(
                 "UPDATE records SET invalidated_at=?, superseded_by=? WHERE id=?",
                 (at_ms, new_id, old_id),
@@ -471,6 +510,7 @@ class NamespaceIndex:
 
     def mark_quarantined(self, record_id: str, flag: bool) -> None:
         with self._lock:
+            self._lex_touch([record_id])
             if flag:
                 self._con.execute(
                     "UPDATE records SET quarantined=1 WHERE id=?", (record_id,))
@@ -490,6 +530,7 @@ class NamespaceIndex:
 
     def tombstone(self, record_id: str, at_ms: int) -> bool:
         with self._lock:
+            self._lex_touch([record_id])
             cur = self._con.execute(
                 "UPDATE records SET deleted=1, invalidated_at=COALESCE(invalidated_at,?) WHERE id=?",
                 (at_ms, record_id),
@@ -501,6 +542,8 @@ class NamespaceIndex:
     def hard_delete(self, record_id: str) -> bool:
         """Physical removal inside the index (compaction deadline path)."""
         with self._lock:
+            self._lex_touch([record_id])
+            self._lex_before_hard_delete(self._con, record_id)
             cur = self._con.execute("DELETE FROM records WHERE id=?", (record_id,))
             self._hard_delete_rows(self._con, record_id)
             self._con.commit()
@@ -535,6 +578,9 @@ class NamespaceIndex:
             if self._closed:
                 return
             c = self._con
+            self._lex_touch([op.get("id") or op.get("old") for op in ops
+                             if (op.get("id") or op.get("old"))
+                             and op.get("op") in ("tombstone", "supersede", "quarantine", "hard_delete")])
             try:
                 for op in ops:
                     kind = op.get("op")
@@ -569,6 +615,7 @@ class NamespaceIndex:
                         )
                         c.execute("UPDATE records SET embedding_version=? WHERE id=?", (op.get("model", ""), rid))
                     elif kind == "hard_delete":
+                        self._lex_before_hard_delete(c, rid)
                         c.execute("DELETE FROM records WHERE id=?", (rid,))
                         self._hard_delete_rows(c, rid)
                 c.commit()
@@ -721,18 +768,54 @@ class NamespaceIndex:
         bm25 ordering is not free either: FTS5 scores every row on the posting
         lists of the query terms, so cost grows with posting-list length for
         high-document-frequency terms (stopwords are dropped to keep that
-        bounded). A native top-k (block-max / WAND-style) index is the known
-        future item if that becomes the bottleneck."""
+        bounded). With the tantivy accelerator attached (memd[fast]), the
+        lane is answered by its block-max WAND top-k plus an FTS5 tail, and
+        falls back here whenever it cannot answer exactly."""
+        METRICS.inc("memd_bm25_queries_total", help="bm25 lane queries (one ranked FTS5 OR query each)")
+        lex = self.lexical
+        if lex is not None and not self._closed:
+            hits = lex.search(query, f, limit)
+            if hits is not None:
+                return hits
         q_all = _fts_escape(query)
         if not q_all or self._closed:
             return []
-        match_expr = " OR ".join(f'"{w}"' for w in q_all.split())
+        return self._fts5_bm25(" OR ".join(f'"{w}"' for w in q_all.split()), f, limit)
+
+    def _fts5_bm25(self, match_expr: str, f: IndexFilter, limit: int, *,
+                   rowid_min: int | None = None, ids: list[str] | None = None,
+                   ids_only: bool = False) -> list:
+        """The FTS5 bm25 query itself. `rowid_min` / `ids` restrict it to the
+        lexical accelerator's tail: rows above its watermark, or rows changed
+        since its last commit. `ids_only` returns [(id, score)] (SQL-filtered,
+        not hydrated) for a caller that hydrates what it keeps."""
+        if self._closed:
+            return []
         args: list = []
         # Filtering stays IN SQL so the LIMIT counts only eligible rows: a
         # bulk of matching-but-ineligible rows (other scope, tombstoned,
         # superseded, quarantined, not-yet-valid) must never starve eligible
         # records out of the lane.
         filt = self._filter_where(f, args)
+        extra = ""
+        extra_args: list = []
+        if rowid_min is not None:
+            extra = " AND fts.rowid > ?"
+            extra_args = [int(rowid_min)]
+        if ids is not None:
+            if not ids:
+                return []
+            with self._read() as _c:
+                rowids = []
+                for i in range(0, len(ids), 500):
+                    chunk = ids[i:i + 500]
+                    rowids += [r[0] for r in _c.execute(
+                        f"SELECT rowid FROM records WHERE id IN ({','.join('?' * len(chunk))})",  # nosec B608
+                        chunk).fetchall()]
+            if not rowids:
+                return []
+            extra += f" AND fts.rowid IN ({','.join('?' * len(rowids))})"
+            extra_args += rowids
         sql = (
             # CROSS JOIN pins the join order: fts drives, records is
             # probed by rowid. Without it the planner drove from `records`
@@ -741,14 +824,16 @@ class NamespaceIndex:
             # turning a 17ms lane into 22 SECONDS at 10K records. The plain
             # fts5 table happened to cost out the other way; external
             # content changed the estimate, not the right answer.
-            f"SELECT r.*, bm25(fts) AS rank FROM fts CROSS JOIN records r ON r.rowid = fts.rowid "  # nosec B608
-            f"WHERE fts MATCH ? AND {filt} ORDER BY rank LIMIT ?"
+            f"SELECT {'r.id' if ids_only else 'r.*'}, bm25(fts) AS rank "  # nosec B608
+            f"FROM fts CROSS JOIN records r ON r.rowid = fts.rowid "
+            f"WHERE fts MATCH ?{extra} AND {filt} ORDER BY rank LIMIT ?"
         )
         # exclude_ids is applied in Python; over-fetch so it never shrinks the page
-        qargs = [match_expr] + args + [limit + len(f.exclude_ids)]
+        qargs = [match_expr] + extra_args + args + [limit + len(f.exclude_ids)]
         with self._read() as _c:
             rows = _c.execute(sql, qargs).fetchall()
-        METRICS.inc("memd_bm25_queries_total", help="bm25 lane queries (one ranked FTS5 OR query each)")
+        if ids_only:
+            return [(r["id"], -float(r["rank"])) for r in rows if r["id"] not in f.exclude_ids][:limit]
         hits: list[Hit] = []
         for r in rows:
             if r["id"] in f.exclude_ids:
@@ -1279,6 +1364,8 @@ class NamespaceIndex:
 
     def wipe(self) -> None:
         with self._lock:
+            if self.lexical is not None:
+                self.lexical.reset()  # rowids restart: the watermark is void
             self._con.executescript(
                 "DELETE FROM vectors; DELETE FROM entities; "
                 "DELETE FROM entity_segments; DELETE FROM links; DELETE FROM records;"

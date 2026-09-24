@@ -467,6 +467,7 @@ CORE_HISTOGRAMS = {
     "memd_http_request_ms": ("HTTP request duration (ms)", DEFAULT_BUCKETS),
     "memd_lane_ms": ("per-lane candidate fetch duration (ms)", DEFAULT_BUCKETS),
     "memd_rerank_ms": ("reranker call duration (ms), including fallbacks", DEFAULT_BUCKETS),
+    "memd_lexical_commit_ms": ("tantivy indexer batch: read + index + commit (ms)", DEFAULT_BUCKETS),
 }
 
 CORE_COUNTERS = {
@@ -536,6 +537,13 @@ CORE_COUNTERS = {
     "memd_forgets_total": "query-driven forget sweeps executed",
     "memd_rerank_calls_total": "searches that asked the reranker",
     "memd_rerank_fallback_total": "searches that kept the unreranked order: reranker failed, timed out or was not ready",
+    "memd_lexical_searches_total": "bm25-lane queries served by tantivy",
+    "memd_lexical_fallback_total": "bm25-lane queries served by FTS5 instead of tantivy",
+    "memd_lexical_tail_hits_total": "bm25-lane hits served from the FTS5 tail (not yet in tantivy)",
+    "memd_lexical_rebuilds_total": "tantivy lexical index rebuilds",
+    "memd_lexical_indexed_total": "rows (re)indexed into tantivy",
+    "memd_lexical_index_failures_total": "tantivy indexer steps that failed (the lane serves from FTS5)",
+    "memd_lexical_attach_failures_total": "namespaces opened without the tantivy accelerator (FTS5 serves)",
 }
 
 CORE_GAUGES = {
@@ -549,6 +557,7 @@ CORE_GAUGES = {
     "memd_vectors_missing": "live records with no current-version vector",
     "memd_quarantined": "quarantined record count",
     "memd_pending_purges": "scheduled physical purges not yet due",
+    "memd_lexical_lag": "changes not yet in the tantivy index (served from FTS5)",
 }
 
 
