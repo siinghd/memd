@@ -6,6 +6,12 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-24
+
+First release evaluated on real data: LongMemEval (ICLR 2025), not memd's synthetic
+suite. Session retrieval ndcg@5 on LongMemEval_S dev: 0.727 (0.1.0) -> 0.866 (zero-key
+default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
+
 ### Added
 - **Reranker plug-in** (`memd.query.rerank`): the top-30 of the bm25 lane
   (plus the vector lane with a real embedder) is reordered by a relevance
@@ -86,6 +92,31 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
 - A segfault when the index closed under a live reader.
 
 ### Fixed - retrieval correctness
+- **The BM25 lane did not rank by BM25.** For natural-language questions the
+  AND tier almost never fired (0 of 376 LongMemEval questions), and the OR
+  fallback re-ranked an *unordered* 320-row window by distinct-term coverage,
+  with no IDF and no TF. It is now one FTS5 `ORDER BY bm25()` query, filtered in
+  SQL. Lane-alone ndcg@5 went from 0.739 to 0.891 on LongMemEval_S and from 0.241 to 0.884
+  on LongMemEval_M, and it was also 78-85% of search CPU.
+- The time lane returned the newest rows for *every* query. It now runs only on
+  recency intent ("recently", "latest", ...) or an explicit time bound (+0.048 ndcg@5).
+- The stopword list contained words fitted to the synthetic test generator
+  ("session", "number", "notes", "agreed", ...), silently dropping real query
+  words. Removed, from both the BM25 and the hash-embedder paths.
+- Ranking depended on the wall clock: recency was scored against `now()` and
+  then quantized, so memories a few years old collapsed into shared score
+  tiers. `now` is now data-relative (or `as_of`), and ordering uses the exact score.
+- Retrieval was nondeterministic: re-ingesting identical data changed the
+  top-10 for ~23% of queries (ULID/ingest-time tie-breaks). Tie-breaks are now
+  content-derived; a separate-process rerun is identical on 126/126 questions.
+- `forget()` over-deleted under real embeddings: its fixed 0.35 cosine
+  "strong match" floor sits below bge-small's median for *unrelated* strings.
+  The floor is now per-embedder (hash 0.35, bge 0.85), with a margin check.
+- The embedder silently changed with installed packages. Selection is now
+  explicit (`embedder` / `MEMD_EMBEDDER`), reported in `stats()`, and the
+  model loads lazily and is shared per process (`Memory()` no longer blocks
+  on a model load; an open/close cycle no longer grows RSS by ~67 MB).
+- `load_real` did not read the real LongMemEval format (it yielded zero events).
 - The BM25 lane discarded its own exact matches when it found fewer than ten,
   and its bounded window counted rows *before* filtering, so eligible records
   were starved out entirely (0 of 5 returned; now 5 of 5). A routine bulk
@@ -145,7 +176,11 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
 - Index schema v1 -> v2, migrated on open. No re-embed required.
 
 ### Known limitations
-- `retrieve_p50 <= 20ms` is not met (~28ms on the development machine).
+- Search latency grows with namespace size under FTS5 (p50 15/44/114 ms at
+  10K/50K/150K records on real turns); install `memd[fast]` (tantivy: 5.7/7.3/8.8 ms).
+- Multi-session aggregation questions ("how many X did I ...") remain the
+  weakest category end to end (see BENCHMARKS.md).
+- The Jev reranker adds ~1 s per search (network) and sends candidate texts to TypeSafe.
 - Single writer per data root, on every backend. `uvicorn --workers N` with
   N>1 does not work.
 - With the S3 backend, envelope keys stay local: a second node cannot decrypt

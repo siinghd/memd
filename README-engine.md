@@ -61,8 +61,8 @@ of an otherwise authenticated API). Set `MEMD_ENABLE_DOCS=1` for development.
 
 ### 4. Docker
 ```bash
-docker build -t memd/memd:0.1.0 .
-docker run -d -p 8700:8700 -e MEMD_ADMIN_KEY=... -v memddata:/data memd/memd:0.1.0 serve --http
+docker build -t memd/memd:0.2.0 .
+docker run -d -p 8700:8700 -e MEMD_ADMIN_KEY=... -v memddata:/data memd/memd:0.2.0 serve --http
 ```
 The image runs as **uid 10001**, so a *named volume* (above) works but a
 **bind mount does not** unless you either pass `--user "$(id -u):$(id -g)"` or

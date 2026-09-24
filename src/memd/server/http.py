@@ -140,7 +140,7 @@ def create_app(
     # handing an anonymous prober the full route inventory and request shapes
     # of an otherwise entirely authenticated API. Opt-in for development.
     _docs = bool(os.environ.get("MEMD_ENABLE_DOCS"))
-    app = FastAPI(title="memd", version="0.1.0", description="Agent memory engine",
+    app = FastAPI(title="memd", version=__import__("memd").__version__, description="Agent memory engine",
                   lifespan=lifespan,
                   docs_url="/docs" if _docs else None,
                   redoc_url="/redoc" if _docs else None,
@@ -479,7 +479,7 @@ def create_app(
 
     @app.get("/health")
     def health():
-        return {"ok": True, "version": "0.1.0"}
+        return {"ok": True, "version": __import__("memd").__version__}
 
     @app.get("/metrics")
     def metrics_endpoint(request: Request, creds: HTTPAuthorizationCredentials | None = Depends(bearer)):

@@ -1858,7 +1858,7 @@ class Memory:
                 "default_namespace": ns_filter,
                 "embedder": self.embedder.name,
                 "extractor": self.extractor.name,
-                "version": "0.1.0",
+                "version": __import__("memd").__version__,
             }
         names = self.engine.list_namespaces()
         return {
@@ -1867,7 +1867,7 @@ class Memory:
             "default_namespace": self.namespace_name,
             "embedder": self.embedder.name,
             "extractor": self.extractor.name,
-            "version": "0.1.0",
+            "version": __import__("memd").__version__,
         }
 
     # ------------------------------------------------------------------ internals
