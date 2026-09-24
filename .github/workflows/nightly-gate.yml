@@ -1,0 +1,44 @@
+name: Nightly real-data gate
+
+# Retrieval quality on REAL conversations, which the per-PR synthetic
+# harness cannot see (a bm25 lane that ranked by distinct query-term coverage
+# passed it and scored 0.739 ndcg@5 on LongMemEval). Unlike bench.yml this
+# job FAILS when quality regresses: session ndcg_any@5 < 0.80 on 60 fixed
+# LongMemEval_S questions, hash embedder, no reranker. Nightly only - it
+# downloads ~280MB and ingests ~30K turns - and it skips cleanly when the
+# dataset cannot be fetched.
+
+on:
+  schedule:
+    - cron: "41 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  lme-gate:
+    name: LongMemEval_S gate (hash, no reranker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      MEMD_LME_CACHE: ${{ github.workspace }}/.lme-cache
+      MEMD_RERANKER: none
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: pip install -e ".[dev]"
+      - uses: actions/cache@v4
+        with:
+          path: .lme-cache
+          key: longmemeval-s-cleaned-v1
+      - name: Gate (fails below ndcg_any@5 0.80)
+        run: python bench/lme_gate.py --embedder hash --reranker none --out lme-gate.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lme-gate-${{ github.run_number }}
+          path: lme-gate.json
+          if-no-files-found: ignore
+          retention-days: 90
