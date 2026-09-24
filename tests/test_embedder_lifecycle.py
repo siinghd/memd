@@ -37,7 +37,7 @@ def test_explicit_hash_is_reported_by_stats(tmp_path):
     m = Memory(str(tmp_path / "d"), config={"embedder": "hash"})
     try:
         st = m.stats()
-        assert st["embedder"] == "hash-ngram-384"
+        assert st["embedder"] == "hash-ngram-384-v2"
         assert st["embedder_kind"] == "hash"
         assert st["embedder_ready"] is True
         assert st["embed_pending"] == 0
@@ -87,7 +87,7 @@ def test_open_logs_the_active_embedder_once(tmp_path, caplog):
              if r.name == "memd.engine.memory" and "embedder" in r.getMessage()
              and r.levelno == logging.INFO]
     assert len(lines) == 1, lines
-    assert "hash-ngram-384" in lines[0] and "requested=hash" in lines[0]
+    assert "hash-ngram-384-v2" in lines[0] and "requested=hash" in lines[0]
 
 
 # ------------------------------------------------- strong-match thresholds
@@ -109,6 +109,54 @@ def test_vector_only_floor_rises_above_the_namespace_median(tmp_path):
         assert m._vector_only_floor([0.7] * 9 + [0.95]) == pytest.approx(0.8)
         # a spread-out sample: the embedder's floor governs
         assert m._vector_only_floor([0.05, 0.1, 0.1, 0.2, 0.9]) == pytest.approx(0.35)
+    finally:
+        m.close()
+
+
+def _vector_models(m: Memory) -> set[str]:
+    m.ns.index.flush()
+    return {r[0] for r in m.ns.index._con.execute("SELECT model FROM vectors").fetchall()}
+
+
+def _missing_gauge(ns: str = "default") -> float:
+    g = [x for x in METRICS.snapshot()["gauges"].get("memd_vectors_missing", [])
+         if x["labels"].get("ns") == ns]
+    return g[-1]["value"] if g else -1.0
+
+
+def test_vectors_from_the_pre_v2_hash_embedder_are_re_embedded_on_open(tmp_path):
+    """Patch 2 changed the HashEmbedder's features (stopwords) but kept its
+    name, and the name is the embedding version stamped on every vector - so
+    stores embedded before it were never re-embedded and mixed two feature
+    spaces in one lane. The version is now part of the name, and the existing
+    open-time vector-health check flags the old vectors and heals them."""
+    root = str(tmp_path / "d")
+    m = Memory(root, config={"embedder": "hash"})
+    m.embedder.name = "hash-ngram-384"  # what patch-2 builds stamped
+    for i in range(6):
+        m.add(f"record {i} about kumquat orchards", user_id="u")
+    m.flush()
+    assert _vector_models(m) == {"hash-ngram-384"}
+    m.close()
+
+    # flagged: with self-heal off the mismatch is visible and left alone
+    m = Memory(root, config={"embedder": "hash", "vector_selfheal": False})
+    try:
+        assert m.embedder.name == "hash-ngram-384-v2"
+        assert _missing_gauge() == 6.0
+        m.flush()
+        assert _vector_models(m) == {"hash-ngram-384"}
+    finally:
+        m.close()
+
+    # healed: a normal open schedules the re-embed on the maintenance thread
+    m = Memory(root, config={"embedder": "hash"})
+    try:
+        m.flush()  # drains the maintenance worker
+        assert _vector_models(m) == {"hash-ngram-384-v2"}
+        assert m.stats()["embedding_model"] == "hash-ngram-384-v2"
+        assert _missing_gauge() == 0.0
+        assert m.find_ids("kumquat orchards", user_id="u")
     finally:
         m.close()
 
@@ -207,7 +255,7 @@ def test_the_local_model_loads_once_per_process(monkeypatch):
 # ------------------------------------------------------------ flush honesty
 
 class _GatedEmbedder(Embedder):
-    name = "hash-ngram-384"
+    name = HashEmbedder(384).name
     kind = "hash"
     dim = 384
 

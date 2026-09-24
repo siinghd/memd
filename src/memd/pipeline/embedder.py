@@ -91,10 +91,17 @@ class HashEmbedder(Embedder):
 
     kind = "hash"
     strong_match_cosine = 0.35
+    # Bumped whenever the features change. The name is the embedding version
+    # stamped on every stored vector, and a namespace re-embeds (open-time
+    # vector-health check -> reembed()) whatever carries another version.
+    # v2: the synthetic-generator words are no longer stopwords; vectors
+    # stored as plain "hash-ngram-384" were hashed from different features.
+    VERSION = "v2"
 
     def __init__(self, dim: int = 384):
         self.dim = dim
-        self.name = f"hash-ngram-{dim}"
+        self.name = f"hash-ngram-{dim}-{self.VERSION}"
+
 
     def _feats(self, text: str) -> list[str]:
         words = [w for w in _WORD_RE.findall(text.lower()) if w not in _STOPWORDS]
