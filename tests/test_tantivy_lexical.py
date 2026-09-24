@@ -182,6 +182,55 @@ def test_a_write_is_searchable_before_the_batcher_runs(tmp_path):
         m.close()
 
 
+def test_a_just_written_rare_term_outranks_committed_common_matches(tmp_path):
+    """The tail used to be interleaved by rank: tantivy's best common-term
+    match came first even when the only record holding the rare, decisive
+    query term had just been written."""
+    m = _mem(tmp_path / "d", lexical_commit_ms=600_000, lexical_commit_docs=10 ** 6)
+    try:
+        m.add_events([{"content": f"weekly meeting schedule calendar time slot {i}", "user_id": "u"}
+                      for i in range(60)])
+        m.add_events([{"content": f"grocery list item {i} bread milk", "user_id": "u"}
+                      for i in range(120)])
+        lex = _ready(m)
+        gold = m.add("the vault password is zanzibar", user_id="u")[0]
+        tail0 = _counter("memd_lexical_tail_hits_total")
+        hits = m.ns.index.search_bm25("meeting schedule calendar time zanzibar",
+                                      IndexFilter(scope=Scope(user="u")), limit=10)
+        assert _counter("memd_lexical_tail_hits_total") > tail0, "not served from the tail"
+        assert hits[0].record.id == gold, hits[0].record.content
+        assert lex.stats()["pending"] >= 1
+    finally:
+        m.close()
+
+
+def test_pending_rows_are_served_only_while_eligible_and_few(tmp_path):
+    m = _mem(tmp_path / "d", lexical_commit_ms=600_000, lexical_commit_docs=10 ** 6)
+    try:
+        ids = m.add_events([{"content": f"harbor ferry timetable {i}", "user_id": "u"} for i in range(40)])
+        _ready(m)
+        f = IndexFilter(scope=Scope(user="u"))
+        # a bulk delete leaves 30 pending rows, none of them eligible: the
+        # query stays on tantivy (no per-row FTS5 lookups)
+        m.delete_many(ids[:30])
+        served = _counter("memd_lexical_searches_total")
+        hits = m.ns.index.search_bm25("harbor ferry timetable", f, limit=50)
+        assert {h.record.id for h in hits} == set(ids[30:])
+        assert _counter("memd_lexical_searches_total") == served + 1
+        # many rows that BECAME eligible since the last commit: FTS5 answers
+        for rid in ids[30:]:
+            m.ns.index.mark_quarantined(rid, True)
+        m.flush()
+        for rid in ids[30:]:
+            m.ns.index.mark_quarantined(rid, False)
+        before = _counter("memd_lexical_fallback_total", reason="pending")
+        hits = m.ns.index.search_bm25("harbor ferry timetable", f, limit=50)
+        assert {h.record.id for h in hits} == set(ids[30:])
+        assert _counter("memd_lexical_fallback_total", reason="pending") == before + 1
+    finally:
+        m.close()
+
+
 def test_delete_supersede_and_quarantine_are_visible_immediately(tmp_path):
     m = _mem(tmp_path / "d", lexical_commit_ms=600_000, lexical_commit_docs=10 ** 6)
     try:

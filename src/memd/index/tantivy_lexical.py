@@ -26,9 +26,18 @@ Correctness model - FTS5 stays the synchronous source of truth:
   - open: a missing, corrupt, foreign (different SQLite file) or uncleanly
     closed index is rebuilt in the background; until it has caught up the
     lane is served by FTS5.
-Tail merge: the few tail hits (recent writes) are interleaved with tantivy's
-hits by rank (tantivy's first, then the tail's first, ...), since the two
-BM25 implementations' raw scores are not on one scale.
+Tail merge: tail hits are placed among tantivy's by score. Both are BM25
+(k1 1.2, b 0.75) over the same text, so a rare decisive term scores high in
+either; they differ in IDF floor (FTS5 ~0 for terms in over half the rows,
+tantivy >= ln 2), stemmer and length quantization, so the merge is
+approximate - and it only matters for writes younger than one batch.
+Re-scoring tantivy's candidates in FTS5 instead would restore FTS5's cost
+(a `rowid IN (...)` bm25 query costs ~2.7 ms per row at 50K). A plain
+rank interleave, the first version, put a just-written record holding the
+one rare query term below tantivy's best common-term match.
+Rows changed since the last commit are served from FTS5 only while they
+still pass the filter (a deleted row needs no serving) and are few; many
+such rows send the query to FTS5.
 """
 from __future__ import annotations
 
@@ -59,6 +68,7 @@ TOUCH_BATCH = 4096           # changed ids re-indexed per step
 WRITER_HEAP = 32_000_000     # tantivy needs >= 15MB per writer thread
 MAX_TANTIVY_LIMIT = 1000     # larger (sweep) limits go to FTS5
 MAX_FAILURES = 5             # consecutive step failures before giving up
+MAX_PENDING_TAIL = 8         # changed-and-eligible rows served per query from FTS5
 _I64_MIN = -(2 ** 63)
 
 _ROW_COLS = ("rowid, id, content, scope_org, scope_agent, scope_user, scope_session, kind, "
@@ -614,14 +624,25 @@ class TantivyLexical:
         match_expr = " OR ".join(f'"{w}"' for w in q_all.split())
         tail = idx._fts5_bm25(match_expr, f, limit, rowid_min=tail_from, ids_only=True)
         if pending:
-            tail += idx._fts5_bm25(match_expr, f, limit, ids=sorted(pending), ids_only=True)
+            # only changed rows that are eligible NOW need serving (deletes
+            # and supersessions - the common changes - never do); a bm25
+            # lookup restricted to given rows costs ~2 ms per row in FTS5
+            live = self._eligible(sorted(pending), f)
+            if len(live) > MAX_PENDING_TAIL:
+                METRICS.inc("memd_lexical_fallback_total", ns=self.ns, reason="pending")
+                return None
+            if live:
+                tail += idx._fts5_bm25(match_expr, f, limit, ids=live, ids_only=True)
+        # one list by score (see "Tail merge"), tantivy first on ties
+        ranked = [(score, 0, i, rid) for i, (rid, score) in enumerate(main)]
+        ranked += [(score, 1, i, rid) for i, (rid, score) in enumerate(tail)]
+        ranked.sort(key=lambda t: (-t[0], t[1], t[2]))
         order: list[tuple[str, float]] = []
         seen: set[str] = set()
-        for i in range(max(len(main), len(tail))):
-            for src in (main, tail):
-                if i < len(src) and src[i][0] not in seen:
-                    seen.add(src[i][0])
-                    order.append(src[i])
+        for score, _src, _i, rid in ranked:
+            if rid not in seen:
+                seen.add(rid)
+                order.append((rid, score))
         # hydrate only what is returned (a chunk at a time) and post-check
         # EVERY row against SQLite, the source of truth
         hits: list = []
@@ -648,6 +669,20 @@ class TantivyLexical:
         METRICS.inc("memd_lexical_searches_total", help="bm25-lane queries served by tantivy",
                     ns=self.ns)
         return hits
+
+    def _eligible(self, ids: list[str], f: "IndexFilter") -> list[str]:
+        """The ids whose rows pass `f` in SQLite right now (PK lookups)."""
+        out: list[str] = []
+        idx = self.index
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            args: list = list(chunk)
+            where = idx._filter_where(f, args)
+            with idx._read() as c:
+                out += [r[0] for r in c.execute(
+                    f"SELECT id FROM records WHERE id IN ({','.join('?' * len(chunk))}) AND {where}",  # nosec B608
+                    args).fetchall()]
+        return out
 
     def _hydrate(self, ids: list[str]) -> dict:
         if not ids:
