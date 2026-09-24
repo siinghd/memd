@@ -937,17 +937,20 @@ class Memory:
         filt = IndexFilter(**filt_kwargs)
         lane_hits: dict[str, list] = {}
         tokens = [t for t in query.lower().split() if len(t) >= 3]
-        # per-lane stage timing: end-to-end latency alone can't show WHICH
-        # lane regressed (SLO triage needs the breakdown)
-        for lane_name, lane_fn in (
+        lanes = [
             ("bm25", lambda: ns.index.search_bm25(query, filt, limit=plan.candidate_k)),
             ("entity", lambda: ns.index.search_by_entity_tokens(tokens, filt, limit=20)),
+        ]
+        if plan.use_time_lane:
             # the documented third fan-out (D3 architecture: time/entity btree
-            # scan): planner weights a "time" lane but nothing produced one -
-            # temporal queries had NO recency-proximate candidates and relied
-            # on lexical similarity surfacing fresh records by luck
-            ("time", lambda: ns.index.search_time_lane(filt, limit=plan.candidate_k)),
-        ):
+            # scan). It returns the newest rows REGARDLESS of the query, so it
+            # runs only on recency intent or an explicit time bound: invoked
+            # unconditionally it injected query-independent rows into fusion
+            # (measured -0.048 ndcg@5 on LongMemEval)
+            lanes.append(("time", lambda: ns.index.search_time_lane(filt, limit=plan.candidate_k)))
+        # per-lane stage timing: end-to-end latency alone can't show WHICH
+        # lane regressed (SLO triage needs the breakdown)
+        for lane_name, lane_fn in lanes:
             _lt0 = time.monotonic()
             lane_hits[lane_name] = lane_fn()
             METRICS.observe("memd_lane_ms", (time.monotonic() - _lt0) * 1000,
@@ -969,7 +972,8 @@ class Memory:
                         help="per-stage search timing (ms): plan/fuse/pack",
                         ns=ns.namespace, stage="fuse")
         _st0 = time.monotonic()
-        packed = pack_context(fused, budget_tokens=budget_tokens, query_class=plan.qclass)
+        # as_of anchors the recency tilt; without it packing is data-relative
+        packed = pack_context(fused, budget_tokens=budget_tokens, now=as_of, query_class=plan.qclass)
         METRICS.observe("memd_search_stage_ms", (time.monotonic() - _st0) * 1000,
                         help="per-stage search timing (ms): plan/fuse/pack",
                         ns=ns.namespace, stage="pack")

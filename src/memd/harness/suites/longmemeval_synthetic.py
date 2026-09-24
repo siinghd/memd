@@ -6,17 +6,24 @@ wedge classes - knowledge-update, knowledge-overwrite, abstention.
 
 The real LongMemEval is used when MEMD_LME_DATA points at a JSON file with
 either {"events": [...], "cases": [...]} in this suite's schema, or a list of
-rows shaped like LongMemEval records:
-  {"session": [{"content": ..., "role": ..., "user_id"?...}], "question": ...,
-   "answer": ...}
+rows. Two row shapes are accepted:
+  - the real LongMemEval release (longmemeval_s / _m / _oracle):
+      {"question_id", "question_type", "question", "question_date", "answer",
+       "answer_session_ids", "haystack_dates", "haystack_session_ids",
+       "haystack_sessions": [[{"role", "content", "has_answer"?}, ...], ...]}
+  - a flat legacy shape:
+      {"session": [{"content": ..., "role": ..., "user_id"?...}],
+       "question": ..., "answer": ...}
 Rows are converted to events+cases at load time. The synthetic suite exists
 so CI can gate every commit offline with zero network.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import os
 import random
+import re
 
 DAY = 86_400_000
 T0 = 1_700_000_000_000
@@ -129,6 +136,53 @@ def build(seed: int = 42, users: int = 8) -> tuple[list[dict], list[dict]]:
     return generate_cases(seed=seed, users=users)
 
 
+_LME_DATE = re.compile(r"\s*(\d{4})/(\d{1,2})/(\d{1,2})(?:.*?(\d{1,2}):(\d{2}))?")
+
+
+def _lme_date_ms(s: str) -> int | None:
+    """'2023/05/20 (Sat) 02:21' -> epoch ms (UTC; the dataset has no zone)."""
+    m = _LME_DATE.match(str(s))
+    if not m:
+        return None
+    y, mo, d, hh, mm = (int(x) if x else 0 for x in m.groups())
+    dt = _dt.datetime(y, mo, d, hh, mm, tzinfo=_dt.timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def _load_lme_row(row: dict, events: list[dict], cases: list[dict]) -> None:
+    """One real LongMemEval question: its own user (haystacks are per
+    question), one event per haystack turn, one case. Abstention variants
+    (question_id ending in `_abs`) are skipped: substring grading of
+    "expected" cannot score an abstention."""
+    qid = str(row["question_id"])
+    if qid.endswith("_abs"):
+        return
+    uid = qid
+    sids = row.get("haystack_session_ids") or []
+    dates = row.get("haystack_dates") or []
+    for k, session in enumerate(row.get("haystack_sessions") or []):
+        sid = str(sids[k]) if k < len(sids) else f"s{k}"
+        t_event = _lme_date_ms(dates[k]) if k < len(dates) else None
+        for turn in session:
+            content = turn.get("content") if isinstance(turn, dict) else turn
+            if not content:
+                continue
+            events.append({
+                "content": str(content), "user_id": uid,
+                # uid-scoped: the same distractor session id recurs across
+                # questions, and the harness closes sessions by id alone
+                "session_id": f"{uid}:{sid}",
+                "role": (turn.get("role") if isinstance(turn, dict) else None) or "user",
+                "t_event": t_event,
+            })
+    cases.append({
+        "id": qid, "qclass": row.get("question_type", "real"), "user_id": uid,
+        "query": str(row["question"]), "expected": str(row["answer"]),
+        "question_date": row.get("question_date"),
+        "answer_session_ids": list(row.get("answer_session_ids") or []),
+    })
+
+
 def load_real(path: str) -> tuple[list[dict], list[dict]]:
     """Load a LongMemEval-derived dataset and normalize it into
     (events, cases) with the same schema as the synthetic generator."""
@@ -140,6 +194,9 @@ def load_real(path: str) -> tuple[list[dict], list[dict]]:
     events: list[dict] = []
     cases: list[dict] = []
     for i, row in enumerate(rows):
+        if isinstance(row, dict) and "haystack_sessions" in row and "question_id" in row:
+            _load_lme_row(row, events, cases)
+            continue
         uid = f"lme{i}"
         sess_events = row.get("session") or row.get("haystack") or row.get("context") or []
         for j, s in enumerate(sess_events):

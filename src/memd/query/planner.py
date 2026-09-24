@@ -19,6 +19,15 @@ PROCEDURAL_RE = re.compile(
     re.I,
 )
 FACTUAL_RE = re.compile(r"\b(what|who|where|which|whose|why)\b", re.I)
+# Recency intent: the only queries the time lane (newest rows, regardless of
+# query) serves. Invoking it for every query injected query-independent rows
+# into fusion; removing it measured +0.048 ndcg@5 on LongMemEval. Broader
+# "when/before/after" questions stay in the temporal CLASS for lane weights.
+RECENCY_RE = re.compile(
+    r"\b(recent|recently|latest|lately|newest|last time|most recent|just now|"
+    r"yesterday|today|this (?:week|morning)|so far)\b",
+    re.I,
+)
 
 
 @dataclass
@@ -31,6 +40,15 @@ class QueryPlan:
     t_event_max: int | None = None
     kinds: tuple[str, ...] | None = None
     notes: list[str] = field(default_factory=list)
+    # invoke the time lane? derived: recency intent or an explicit t_event bound
+    use_time_lane: bool = field(default=False, init=False)
+
+    def __post_init__(self) -> None:
+        self.use_time_lane = bool(
+            RECENCY_RE.search(self.query)
+            or self.t_event_min is not None
+            or self.t_event_max is not None
+        )
 
 
 def classify(query: str) -> str:

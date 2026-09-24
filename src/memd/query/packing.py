@@ -3,9 +3,10 @@
 Rules:
   - dedupe by lineage: never pack a fact AND the raw record it was extracted
     from (evidence counted once)
-  - order by relevance x recency x trust, quantized into stable tiers so
-    incremental sessions keep a prefix-stable block order (KV-cache friendly,
-    D3 §3.7)
+  - order by relevance x recency x trust on the exact score, recency
+    measured against as_of or the newest candidate (never the wall clock),
+    ties broken by t_event then a content hash - identical data always packs
+    in the identical order (KV-cache friendly, D3 §3.7)
   - cut at token budget; emit with per-item provenance tags
   - untrusted items (tool/web/import) render inside data-fencing markup
     (D7 control #2) - never as instruction-position text
@@ -15,8 +16,8 @@ from __future__ import annotations
 import datetime as _dt
 from dataclasses import dataclass, field
 
-from memd.core.schema import MemoryRecord, Source, now_ms
-from memd.query.fusion import FusedItem, recency_boost
+from memd.core.schema import MemoryRecord, Source
+from memd.query.fusion import FusedItem, deterministic_order, recency_boost
 
 UNTRUSTED_SOURCES = {Source.TOOL, Source.WEB, Source.IMPORT}
 
@@ -88,7 +89,13 @@ def pack_context(
     query_class: str = "",
     header: str = "Relevant memories (provenance-tagged; older/superseded facts excluded):",
 ) -> PackedContext:
-    now = now or now_ms()
+    # Recency reference: `now` (the caller's as_of) if given, else the newest
+    # candidate's t_event. It used to be the WALL CLOCK, then quantized with
+    # int(s*10000): for data years old every score shrank ~10x, neighbouring
+    # ranks collapsed into one tier and fell to t_ingested/ULID order - and
+    # the ranking depended on the date the code ran. Data-relative instead.
+    if now is None:
+        now = max((it.record.time.t_event for it in fused), default=0)
     # lineage dedupe: drop raw records whose producing fact is already packed,
     # plus raw evidence demoted by supersedence (fact.meta.demotes) - the
     # stale source turns of updated facts never crowd the budget (D3 §3.6)
@@ -98,7 +105,7 @@ def pack_context(
         if it.record.kind == "fact":
             packed_fact_lineage.update(it.record.provenance.lineage)
             demoted_lineage.update(it.record.meta.get("demotes", []))
-    scored: list[tuple[float, int, FusedItem]] = []
+    scored: list[tuple[float, FusedItem]] = []
     for it in fused:
         r = it.record
         if r.kind == "raw_event" and (r.id in packed_fact_lineage or r.id in demoted_lineage):
@@ -106,15 +113,14 @@ def pack_context(
         s = recency_boost(it.score, r.time.t_event, now)
         if r.kind == "fact":
             s *= 1.25  # consolidated knowledge outranks its own sources
-        tier = int(s * 10_000)  # quantize -> stable ordering under small drift
-        scored.append((s, tier, it))
-    scored.sort(key=lambda t: (-t[1], t[2].record.time.t_ingested, t[2].record.id))
+        scored.append((s, it))
+    scored = deterministic_order(scored, lambda t: t[0], lambda t: t[1].record)
 
     items: list[PackedItem] = []
     rendered: list[str] = []
     used = count_tokens(header)
     truncated = False
-    for s_score, _tier, it in scored:
+    for s_score, it in scored:
         r = it.record
         pitem = PackedItem(
             id=r.id,

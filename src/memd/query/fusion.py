@@ -1,12 +1,44 @@
 """RRF fusion + trust-aware scoring (D3 §3.5 step 3, D7 control #5)."""
 from __future__ import annotations
 
+import hashlib
+from collections import Counter
 from dataclasses import dataclass
+from typing import Callable, TypeVar
 
 from memd.core.schema import MemoryRecord
 from memd.index.sqlite_index import Hit
 
 RRF_K = 60
+
+T = TypeVar("T")
+
+
+def content_sha(content: str) -> str:
+    """Stable content hash for tie-breaks: identical data orders identically
+    no matter when (or in what id order) it was ingested."""
+    return hashlib.blake2b(content.encode(), digest_size=8).hexdigest()
+
+
+def deterministic_order(items: list[T], score: Callable[[T], float],
+                        record: Callable[[T], MemoryRecord]) -> list[T]:
+    """Sort by (-score, -t_event, content_sha, id).
+
+    Ties used to fall to the ULID record id (and ingestion time), which is
+    random within a millisecond: re-ingesting identical data changed the
+    top-10 for ~23% of queries. The content hash is computed lazily - only
+    for items whose (score, t_event) actually collides with another item;
+    for every other item the hash could never be compared, so "" stands in
+    without changing the order."""
+    keyed = [(score(it), record(it), it) for it in items]
+    collide = Counter((s, r.time.t_event) for s, r, _ in keyed)
+
+    def key(t: tuple[float, MemoryRecord, T]) -> tuple:
+        s, r, _ = t
+        h = content_sha(r.content) if collide[(s, r.time.t_event)] > 1 else ""
+        return (-s, -r.time.t_event, h, r.id)
+
+    return [it for _, _, it in sorted(keyed, key=key)]
 
 
 @dataclass
@@ -47,7 +79,7 @@ def rrf_fuse(
                 items[rid] = FusedItem(
                     record=hit.record, score=scores[rid], lanes=[lane], ranks={lane: rank + 1}
                 )
-    ranked = sorted(items.values(), key=lambda it: (-it.score, it.record.id))
+    ranked = deterministic_order(list(items.values()), lambda it: it.score, lambda it: it.record)
     return ranked[:limit]
 
 

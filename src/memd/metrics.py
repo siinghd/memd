@@ -506,7 +506,7 @@ CORE_COUNTERS = {
     "memd_embed_retries_total": "embedding retry attempts",
     "memd_embed_dead_letters_total": "embeddings dropped after retry cap",
     "memd_embed_dropped_on_close_total": "embeddings still pending when the worker stopped",
-    "memd_bm25_window_saturated_total": "bm25 OR scans that filled the bounded window (recall capped)",
+    "memd_bm25_queries_total": "bm25 lane queries (one ranked FTS5 OR query each)",
     "memd_embed_backlog_dropped_total": "embeddings deferred: backlog over capacity (reembed heals)",
     "memd_auto_compactions_total": "opportunistic compactions (self-enforced deadlines)",
     "memd_purges_scheduled_total": "due hard-delete purges handed to background maintenance",

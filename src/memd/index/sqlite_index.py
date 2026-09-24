@@ -705,135 +705,62 @@ class NamespaceIndex:
         return out
 
     def search_bm25(self, query: str, f: IndexFilter, limit: int = 50) -> list[Hit]:
-        """AND-first FTS with OR fallback (minimum-should-match semantics).
+        """One OR query over the content terms, ranked by FTS5 bm25.
 
-        At 50K docs the old all-terms-OR expression matched huge fractions
-        of the corpus on natural-language queries (~155ms/query: bm25 + row
-        join per match). AND over content words returns a small,
-        highest-precision candidate set in milliseconds; when it comes back
-        empty or thin - genuinely disjoint vocabularies, single common terms -
-        we fall back to the OR union so recall-first behavior is preserved.
-        Two bounded FTS queries worst case; O(matches) either way."""
+        This replaced an AND-first tier plus a bounded, UNORDERED OR window
+        re-ranked in Python by distinct query-term coverage. On natural
+        language questions the AND tier almost never fired, so the coverage
+        re-rank decided the lane: it had no IDF and no TF, so a record that
+        happened to share several common query words outranked the one record
+        holding the rare, decisive term (LongMemEval_S ndcg@5 0.739 for the
+        lane vs 0.891 for plain bm25 ordering; 0.241 vs 0.884 on _M). It was
+        also the dominant CPU cost of search (~130-145ms p50 at 10K-150K
+        records): hundreds of rows fetched and string-scanned per query to
+        keep ~40.
+
+        bm25 ordering is not free either: FTS5 scores every row on the posting
+        lists of the query terms, so cost grows with posting-list length for
+        high-document-frequency terms (stopwords are dropped to keep that
+        bounded). A native top-k (block-max / WAND-style) index is the known
+        future item if that becomes the bottleneck."""
         q_all = _fts_escape(query)
-        if not q_all:
+        if not q_all or self._closed:
             return []
-        words = q_all.split()
+        match_expr = " OR ".join(f'"{w}"' for w in q_all.split())
         args: list = []
+        # Filtering stays IN SQL so the LIMIT counts only eligible rows: a
+        # bulk of matching-but-ineligible rows (other scope, tombstoned,
+        # superseded, quarantined, not-yet-valid) must never starve eligible
+        # records out of the lane.
         filt = self._filter_where(f, args)
-
-        def _run(match_expr: str) -> list[Hit]:
-            sql = (
-                # CROSS JOIN pins the join order: fts drives, records is
-                # probed by rowid. Without it the planner drove from `records`
-                # (via ix_rec_valid, because the scope/validity predicates sit
-                # there) and probed the fts index once PER ROW - 10K probes,
-                # turning a 17ms lane into 22 SECONDS at 10K records. The plain
-                # fts5 table happened to cost out the other way; external
-                # content changed the estimate, not the right answer.
-                f"SELECT r.*, bm25(fts) AS rank FROM fts CROSS JOIN records r ON r.rowid = fts.rowid "  # nosec B608
-                f"WHERE fts MATCH ? AND {filt} ORDER BY rank LIMIT ?"
-            )
-            qargs = [match_expr] + args + [limit]
-            with self._read() as _c:
-                rows = _c.execute(sql, qargs).fetchall()
-            hits = []
-            for r in rows:
-                if r["id"] in f.exclude_ids:
-                    continue
-                rec = self._row_to_record(r)
-                rec.namespace = self._ns_hint
-                hits.append(Hit(record=rec, score=-float(r["rank"]), lane="bm25"))
-            return hits
-
-        and_hits: list[Hit] = []
-        if len(words) > 1:
-            and_hits = _run(" AND ".join(f'"{w}"' for w in words))
-            if len(and_hits) >= min(10, limit):
-                METRICS.inc("memd_bm25_and_hits_total",
-                            help="bm25 served by the high-precision AND tier")
-                return and_hits
-        # OR tier, BOUNDED: ranking the full posting list made any query with
-        # a high-document-frequency term O(everything) - ~150ms at 50K docs
-        # when a single stemmed word appeared in all records. Instead take a
-        # bounded window (FTS5 serves it in milliseconds), hydrate, and re-rank
-        # by term coverage in Python - coverage reproduces bm25's multi-match
-        # preference at bounded cost.
-        #
-        # The window is FILTERED IN SQL, not after. Selecting ids with no
-        # predicate and filtering in Python counted PRE-filter rows, so any
-        # older bulk of matching-but-ineligible rows (other scope, tombstoned,
-        # superseded, quarantined, not-yet-valid) consumed the whole window and
-        # starved the eligible records out of the lane entirely - 5 live
-        # in-scope records behind 400 ineligible ones returned ZERO hits, and a
-        # routine bulk delete (which leaves fts rows in place) made the
-        # survivors invisible. Same LIMIT-before-predicate family as pass 1 and
-        # pass 15; the fix is to make the LIMIT count only eligible rows.
-        window = max(limit * 8, 320)
-        or_args: list = []
-        or_filt = self._filter_where(f, or_args)
-        if self._closed:
-            return []
-        # Fetch id + content ONLY. Ranking needs the text; it does not need the
-        # record. Hydrating all `window` rows first meant ~320 full row builds
-        # with three json.loads each per query, to keep `limit` (~40) of them -
-        # 61% of total search latency at 8K records, and pure Python, so it
-        # pinned the GIL and stopped reads scaling past two threads. Rank on
-        # content, then hydrate only the survivors: O(window) cheap string
-        # scans + O(limit) hydrations instead of O(window) hydrations.
-        with self._read() as _c:
-            rows = _c.execute(
-                "SELECT r.id, r.content FROM fts CROSS JOIN records r ON r.rowid = fts.rowid "  # nosec B608
-                f"WHERE fts MATCH ? AND {or_filt} LIMIT ?",
-                [" OR ".join(f'"{w}"' for w in words)] + or_args + [window]).fetchall()
-        if len(rows) >= window:
-            # recall is capped by the window from here on: say so, rather than
-            # letting a silent truncation read as "we found everything"
-            METRICS.inc("memd_bm25_window_saturated_total",
-                        help="bm25 OR scans that filled the bounded window (recall capped)")
-        wset = set(words)
-
-        def _coverage_text(text: str) -> int:
-            toks = set()
-            for t in text.lower().split():
-                t = "".join(ch for ch in t if ch.isalnum() or ch in "_-")
-                if len(t) >= 3 and t not in _FTS_STOPWORDS:
-                    toks.add(t)
-            n = 0
-            for w in wset:
-                if w in toks or any(t.startswith(w) or w.startswith(t) for t in toks):
-                    n += 1
-            return n
-
-        ranked = sorted(
-            ((r[0], _coverage_text(r[1])) for r in rows if r[0] not in f.exclude_ids),
-            key=lambda t: (-t[1], t[0]),
+        sql = (
+            # CROSS JOIN pins the join order: fts drives, records is
+            # probed by rowid. Without it the planner drove from `records`
+            # (via ix_rec_valid, because the scope/validity predicates sit
+            # there) and probed the fts index once PER ROW - 10K probes,
+            # turning a 17ms lane into 22 SECONDS at 10K records. The plain
+            # fts5 table happened to cost out the other way; external
+            # content changed the estimate, not the right answer.
+            f"SELECT r.*, bm25(fts) AS rank FROM fts CROSS JOIN records r ON r.rowid = fts.rowid "  # nosec B608
+            f"WHERE fts MATCH ? AND {filt} ORDER BY rank LIMIT ?"
         )
-        # The AND tier proved these documents match EVERY term and they are
-        # already SQL-filtered. Discarding them because there were fewer than
-        # ten (exactly the high-precision case) and then failing to re-find
-        # them in a saturated window returned a page of one-term matches while
-        # the only document matching the whole query was absent. They rank
-        # first by construction: full term coverage.
-        and_ids = [h.record.id for h in and_hits]
-        by_id = {h.record.id: h.record for h in and_hits}
-        order = and_ids + [rid for rid, _ in ranked if rid not in by_id]
-        if not order:
-            return []
-        # hydrate a bounded head: enough to survive the belt-and-braces filter
-        head = order[: max(limit * 2, limit + 16)]
-        need = [rid for rid in head if rid not in by_id]
-        for rec in self.get_many(need) if need else []:
-            by_id[rec.id] = rec
-        hits = []
-        for rid in head:
-            rec = by_id.get(rid)
-            if rec is None or not self._passes_filter(rec, f):
+        # exclude_ids is applied in Python; over-fetch so it never shrinks the page
+        qargs = [match_expr] + args + [limit + len(f.exclude_ids)]
+        with self._read() as _c:
+            rows = _c.execute(sql, qargs).fetchall()
+        METRICS.inc("memd_bm25_queries_total", help="bm25 lane queries (one ranked FTS5 OR query each)")
+        hits: list[Hit] = []
+        for r in rows:
+            if r["id"] in f.exclude_ids:
                 continue
-            hits.append(Hit(record=rec, score=-float(len(hits)), lane="bm25"))
+            rec = self._row_to_record(r)
+            rec.namespace = self._ns_hint
+            # belt-and-braces: the Python twin of the SQL predicate set
+            if not self._passes_filter(rec, f):
+                continue
+            hits.append(Hit(record=rec, score=-float(r["rank"]), lane="bm25"))
             if len(hits) >= limit:
                 break
-        METRICS.inc("memd_bm25_or_bounded_total",
-                    help="bm25 served by the bounded OR scan")
         return hits
 
 
@@ -975,8 +902,9 @@ class NamespaceIndex:
     def _passes_filter(self, rec: MemoryRecord, f: IndexFilter) -> bool:
         """Python-side twin of _filter_where. Every predicate the SQL path
         enforces must be enforced here too: the lanes that hydrate rows before
-        (or instead of) SQL filtering - the bounded bm25 window, the time
-        lane's recency fetch - reach records through THIS function alone.
+        (or instead of) SQL filtering - the time lane's recency fetch - reach
+        records through THIS function alone, and bm25 re-checks its SQL-
+        filtered rows here as belt-and-braces.
 
         Scope is delegated to Scope.contains rather than re-implemented. The
         open-coded copy that used to live here diverged from it: it applied a
@@ -1002,8 +930,8 @@ class NamespaceIndex:
         if rec.id in f.exclude_ids:
             return False
         # quarantine: single authority for every Python-side filter path
-        # (the bounded bm25 window hydrates rows BEFORE any SQL could exclude
-        # them - without this check an unreviewed record was retrievable)
+        # (a lane that hydrates rows BEFORE any SQL could exclude them - the
+        # old bounded bm25 window did - made an unreviewed record retrievable)
         if not f.include_quarantined and rec.meta.get("quarantined"):
             return False
         if not f.include_invalid:
@@ -1329,15 +1257,16 @@ class NamespaceIndex:
 
 # Stopwords excluded from FTS terms: OR-ing them made every natural-language
 # query match a huge fraction of the corpus (at 50K docs the bm25 lane alone
-# cost ~155ms/query - 74% of end-to-end latency). Mirrors the embedder's
-# list plus standard IR stopwords.
+# cost ~155ms/query - 74% of end-to-end latency). Standard IR stopwords
+# ONLY: words fitted to the synthetic test generator ("later follow ups
+# agreed discussed session number notes") used to live here too, and they
+# silently dropped real query words on real data.
 _FTS_STOPWORDS = frozenset(
     "a an and are as at be but by for from has have i in is it its of on or "
     "that the this to we was were will with you your do does did not no yes "
     "so if then than there their they he she his her them about into over "
     "under again further once here when where why how all any both each few "
-    "more most other some such only own same too very can just should now "
-    "later follow ups agreed discussed session number notes".split()
+    "more most other some such only own same too very can just should now".split()
 )
 
 
