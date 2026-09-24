@@ -82,7 +82,7 @@ class Reranker(Protocol):
     when no judgement is available (the search then keeps its own order).
 
     `calibrated` rerankers return probabilities in [0, 1] that mean the same
-    thing across queries; only those drive gated evidence packing."""
+    thing across queries (what the experimental gated packing thresholds)."""
 
     name: str
     model: str

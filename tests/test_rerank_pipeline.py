@@ -10,7 +10,9 @@ gated evidence packing, shared model cache.
 - Jev (TypeSafe System One) is the default only when TYPESAFE_API_KEY is set
   and the SDK is importable. These tests never touch the network: the SDK is
   replaced by a fake module.
-- A calibrated reranker switches packing to gated evidence packing.
+- Packing stays ranked with every reranker by default; gated evidence
+  packing is an explicit, experimental opt-in (over a top-30 shortlist it
+  dropped second evidence sessions: recall_all@5 0.803 vs 0.928 ranked).
 """
 import logging
 import sys
@@ -432,7 +434,17 @@ def test_jev_timeout_and_errors_return_none_with_a_reason(monkeypatch):
         stage.close()
 
 
-def test_memory_with_jev_reranks_and_packs_gated(tmp_path, monkeypatch):
+def _gardening(m: Memory) -> None:
+    for s in range(3):
+        turns = [f"session {s} turn {t} about gardening plans" for t in range(5)]
+        if s == 1:
+            turns[2] = "session 1 turn 2 the kumquat tree needs repotting in spring gardening"
+        m.add_events([{"content": c, "user_id": "u", "session_id": f"s{s}",
+                       "t_event": T0 + s * DAY} for c in turns])
+    m.flush()
+
+
+def test_memory_with_jev_reranks_and_packs_ranked_by_default(tmp_path, monkeypatch):
     sdk = _FakeSDK()
     monkeypatch.setitem(sys.modules, "typesafe_sdk", sdk.module)
     monkeypatch.setattr(rerank_mod, "typesafe_available", lambda: True)
@@ -440,18 +452,34 @@ def test_memory_with_jev_reranks_and_packs_gated(tmp_path, monkeypatch):
     m = _mem(tmp_path, reranker="auto")
     try:
         assert m.stats()["reranker"]["name"] == "jev"
-        for s in range(3):
-            turns = [f"session {s} turn {t} about gardening plans" for t in range(5)]
-            if s == 1:
-                turns[2] = "session 1 turn 2 the kumquat tree needs repotting in spring gardening"
-            m.add_events([{"content": c, "user_id": "u", "session_id": f"s{s}",
-                           "t_event": T0 + s * DAY} for c in turns])
-        m.flush()
+        assert m.stats()["pack_mode"] == "auto"
+        _gardening(m)
         res = m.search("when should the kumquat tree be repotted? gardening", user_id="u")
         assert sdk.requests, "Jev was not asked"
         # nothing but date/role/text leaves the engine
         sent = next(iter(sdk.requests[0]["state"]["candidates"].values()))
         assert set(sent) == {"date", "role", "text"}
+        assert res.items[0].content.startswith("session 1 turn 2 the kumquat")
+        # ranked (auto): every candidate that fits, in the reranker's order,
+        # not just the gated few - second evidence sessions stay in context
+        assert len(res.items) == 15
+        assert "<session" not in res.packed_context
+        assert m.stats()["reranker"]["calls"] == 1
+    finally:
+        m.close()
+
+
+def test_memory_with_jev_packs_gated_on_opt_in(tmp_path, monkeypatch):
+    sdk = _FakeSDK()
+    monkeypatch.setitem(sys.modules, "typesafe_sdk", sdk.module)
+    monkeypatch.setattr(rerank_mod, "typesafe_available", lambda: True)
+    monkeypatch.setenv("TYPESAFE_API_KEY", "ts-test")
+    monkeypatch.setenv("MEMD_PACK_MODE", "gated")
+    m = _mem(tmp_path, reranker="auto")
+    try:
+        assert m.pack_mode == "gated"
+        _gardening(m)
+        res = m.search("when should the kumquat tree be repotted? gardening", user_id="u")
         assert res.items[0].content.startswith("session 1 turn 2 the kumquat")
         # gated: the one relevant turn plus its neighbours, nothing else
         assert [i.content.split(" about")[0] for i in res.items[1:]] == [
@@ -559,26 +587,27 @@ def test_gated_packing_through_memory_and_its_modes(tmp_path):
         def judge(cands):
             return [0.95 if "kumquat" in c["text"] else 0.05 for c in cands]
 
+        # auto = ranked, even with a calibrated reranker
+        assert m.pack_mode == "auto"
         _set_reranker(m, _Calibrated(judge))
+        res = m.search("planning notes kumquat", user_id="u")
+        assert len(res.items) == 18 and res.items[0].content.endswith("kumquat")
+        assert "<session" not in res.packed_context
+        # gated is an explicit opt-in
+        m.pack_mode = "gated"
+        m._bump_epoch()
         res = m.search("planning notes kumquat", user_id="u")
         assert [i.content for i in res.items] == [
             "s2 t3 planning notes kumquat", "s2 t2 planning notes", "s2 t4 planning notes"]
         assert "<session id=\"s2\"" in res.packed_context
-        # uncalibrated scores do not gate under auto
+        # the opt-in applies to an uncalibrated reranker too; ranked is ranked
         _set_reranker(m, _Fixed(judge))
         m._bump_epoch()
-        res = m.search("planning notes kumquat", user_id="u")
-        assert len(res.items) > 3 and res.items[0].content.endswith("kumquat")
-        assert "<session" not in res.packed_context
-        # explicit modes win
+        assert "<session" in m.search("planning notes kumquat", user_id="u").packed_context
         m.pack_mode = "ranked"
         _set_reranker(m, _Calibrated(judge))
         m._bump_epoch()
         assert "<session" not in m.search("planning notes kumquat", user_id="u").packed_context
-        m.pack_mode = "gated"
-        _set_reranker(m, _Fixed(judge))
-        m._bump_epoch()
-        assert "<session" in m.search("planning notes kumquat", user_id="u").packed_context
     finally:
         m.close()
 
@@ -594,6 +623,7 @@ def test_gated_neighbours_never_cross_users_sharing_a_session_id(tmp_path):
         m.flush()
         _set_reranker(m, _Calibrated(lambda cands: [0.9 if "kumquat" in c["text"] else 0.0
                                                     for c in cands]))
+        m.pack_mode = "gated"
         res = m.search("kumquat", user_id="alice", budget_tokens=4000)
         assert res.items and all("bob" not in i.content for i in res.items)
         assert "bob secret" not in res.packed_context

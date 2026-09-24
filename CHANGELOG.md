@@ -20,12 +20,16 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   `local` is a fastembed cross-encoder (default `BAAI/bge-reranker-base`),
   loaded in the background. LongMemEval_S session ndcg@5: bm25 0.891 ->
   bm25 + Jev 0.954 (lab experiment 015).
-- **Gated evidence packing** (`pack_mode` = `auto | ranked | gated`): with a
-  calibrated reranker (Jev) the context holds the candidates it judges
-  relevant (p >= `rerank_gate`, default 0.5, else the top 3) plus the turn
-  before and after each in the same session, grouped by session under a
-  session-date header, budget-capped, with the same provenance fencing.
-  Lab experiment 018: equal QA accuracy to top-k packing at 27% fewer tokens.
+- **Gated evidence packing**, experimental and opt-in (`pack_mode="gated"`;
+  `auto` = ranked with every reranker): the context holds only the
+  candidates a calibrated reranker judges relevant (p >= `rerank_gate`,
+  default 0.5, else the top 3) plus the turn before and after each in the
+  same session, grouped by session under a session-date header,
+  budget-capped, with the same provenance fencing. Lab 018: equal QA
+  accuracy to top-k packing at 27% fewer tokens over a 100-candidate
+  shortlist; over the product's top-30 it drops second evidence sessions
+  (lab 020/021, Jev: session ndcg@5 0.906 / recall_all@5 0.803 gated vs
+  0.955 / 0.928 ranked), so it is not the default.
 - **tantivy lexical accelerator** (`pip install "memd[fast]"`,
   `lexical_backend` = `auto | fts5 | tantivy`). A derived index fed in the
   background; FTS5 stays the synchronous source of truth, so the write ack

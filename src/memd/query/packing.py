@@ -13,9 +13,10 @@ Rules:
   - with a reranker, the reranked shortlist leads in the reranker's order
     (its score replaces the fused score; the recency tilt still applies),
     then the rest in fused order
-  - gated mode (a CALIBRATED reranker): keep the candidates the reranker
-    judges relevant (p >= gate, else the top 3), each with its neighbouring
-    turns, grouped by session under a session-date header (pack_gated)
+  - gated mode (experimental opt-in, pack_mode="gated"; meant for a
+    calibrated reranker): keep the candidates the reranker judges relevant
+    (p >= gate, else the top 3), each with its neighbouring turns, grouped
+    by session under a session-date header (pack_gated)
 """
 from __future__ import annotations
 
@@ -203,8 +204,11 @@ def pack_gated(
     query_class: str = "",
     header: str = DEFAULT_HEADER,
 ) -> PackedContext:
-    """Gated evidence packing (evidence: experiment 018 - equal QA accuracy
-    to a fixed top-k at 27% fewer context tokens, with a calibrated judge).
+    """Gated evidence packing - EXPERIMENTAL, opt-in (pack_mode="gated").
+    Lab 018: equal QA accuracy to a fixed top-k at 27% fewer context tokens
+    with a calibrated judge over a 100-candidate shortlist; over the
+    product's top-30 it drops second evidence sessions (lab 020/021: session
+    recall_all@5 0.803 vs 0.928 for the same reranker packed ranked).
 
     `kept` (from gate_candidates) is packed in reranker order, each item
     with its neighbouring turns (`neighbours[id]`, already scope-filtered),

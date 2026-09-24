@@ -163,7 +163,7 @@ split-brain loud, not impossible.
   ≥50K-vector namespaces) → RRF fusion with trust-aware tie-breaks →
   optional rerank of the lexical top-30 → validity filter (current/as_of) →
   lineage-deduped, budget-cut packing that keeps prefix-stable order
-  (KV-cache friendly), or gated evidence packing with a calibrated reranker.
+  (KV-cache friendly), or, as an experimental opt-in, gated evidence packing.
   The hash embedder's vector lane is not fused (`fuse_vector`, below).
 - **Extraction** (ADR-6): async, batched, re-runnable. BYO OpenAI-compatible
   key for LLM extraction/embeddings; heuristic provider keeps facts working
@@ -186,8 +186,8 @@ fully functional, honestly degraded, clearly labeled in `stats()`.
 | `reranker` / `MEMD_RERANKER` | `auto` \| `none` \| `jev` \| `local` | `auto`: Jev when `TYPESAFE_API_KEY` is set and `typesafe-sdk` is installed (`pip install "memd[jev]"`), else none |
 | `jev_model`, `rerank_timeout_s`, `rerank_k` | model pin, deadline, shortlist | `jev-latest`, 1.5s (5s local), 30 |
 | `local_rerank_model` | fastembed cross-encoder | `BAAI/bge-reranker-base` |
-| `pack_mode` / `MEMD_PACK_MODE` | `auto` \| `ranked` \| `gated` | `auto`: gated with a calibrated reranker (Jev) |
-| `rerank_gate` | gated-packing threshold | 0.5 |
+| `pack_mode` / `MEMD_PACK_MODE` | `auto` \| `ranked` \| `gated` | `auto` = ranked with every reranker; `gated` is an experimental opt-in |
+| `rerank_gate` | gated-packing threshold (opt-in mode) | 0.5 |
 | `fuse_vector` / `MEMD_FUSE_VECTOR` | `auto` \| `true` \| `false` | `auto`: fuse unless the embedder is the hash embedder |
 | `lexical_backend` / `MEMD_LEXICAL_BACKEND` | `auto` \| `fts5` \| `tantivy` | `auto`: tantivy when installed (`pip install "memd[fast]"`) |
 
@@ -200,10 +200,15 @@ fully functional, honestly degraded, clearly labeled in `stats()`.
   model, calls, fallbacks and p50 latency. **Privacy: with Jev active, the
   query and the top-30 candidate texts of every search are sent to
   TypeSafe's API** (see SECURITY.md). No key, no egress.
-- **Gated packing** (calibrated reranker): the packed context holds the
+- **Gated packing** (`pack_mode="gated"`, experimental opt-in, meant for a
+  calibrated reranker such as Jev): the packed context holds only the
   candidates judged relevant (p ≥ `rerank_gate`, else the top 3), each with
   its neighbouring turns, grouped by session under a session-date header,
-  still capped by `budget_tokens` and with the same provenance fencing.
+  still capped by `budget_tokens` and with the same provenance fencing. It
+  trades recall for tokens: in the lab it matched top-k QA accuracy at 27%
+  fewer tokens over a 100-candidate shortlist, but over the product's top-30
+  it drops second evidence sessions (LongMemEval_S session recall_all@5
+  0.803 gated vs 0.928 ranked, with Jev). The default packs ranked.
 - **tantivy accelerator.** A derived index next to SQLite, fed in the
   background (every 500ms or 512 changes); FTS5 stays the synchronous source
   of truth, so the write ack is unchanged, and writes not yet indexed are

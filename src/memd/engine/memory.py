@@ -8,7 +8,7 @@ embedding on the critical path (SLO: embedded p99 <= 10ms).
 Read path: plan -> fan-out (BM25+entity, time on recency intent, vector
 with a real embedder) -> RRF fuse -> optional rerank of the lexical top-30
 -> validity filter -> budget-aware packing with provenance tags (gated
-evidence packing when the reranker is calibrated).
+evidence packing as an experimental opt-in).
 """
 from __future__ import annotations
 
@@ -519,8 +519,15 @@ def resolve_fuse_vector(config: dict | None, embedder: Embedder) -> bool:
 
 
 def resolve_pack_mode(config: dict | None) -> str:
-    """config["pack_mode"] (or env MEMD_PACK_MODE): "auto" (gated when the
-    active reranker is calibrated, else ranked) | "ranked" | "gated"."""
+    """config["pack_mode"] (or env MEMD_PACK_MODE): "auto" | "ranked" |
+    "gated". "auto" means ranked, for every reranker.
+
+    "gated" is an EXPERIMENTAL opt-in for token savings. In the lab it
+    matched top-k QA accuracy at 27% fewer tokens, but over a 100-candidate
+    shortlist; over the product's top-30 it DROPS second evidence sessions:
+    Jev + gated scored session ndcg@5 0.906 / recall_all@5 0.803 on
+    LongMemEval_S dev (below no reranker's 0.835 recall_all@5), while Jev +
+    ranked scored 0.955 / 0.928 (lab 020/021)."""
     cfg = config or {}
     mode = str(cfg.get("pack_mode") or os.environ.get("MEMD_PACK_MODE") or "auto").strip().lower()
     if mode not in PACK_MODES:
@@ -1230,11 +1237,11 @@ class Memory:
         return [(items[i], vals[i]) for i in order], False
 
     def _pack_mode_for(self, rerank_order) -> str:
+        """Gated only on explicit opt-in, and only with reranker scores to
+        gate on (see resolve_pack_mode for why auto is ranked)."""
         if rerank_order is None or self.rerank is None:
-            return "ranked"  # no probabilities to gate on
-        if self.pack_mode == "gated" or (self.pack_mode == "auto" and self.rerank.calibrated):
-            return "gated"
-        return "ranked"
+            return "ranked"
+        return "gated" if self.pack_mode == "gated" else "ranked"
 
     def _load_reranker(self) -> None:
         try:
