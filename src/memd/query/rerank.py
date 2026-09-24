@@ -38,7 +38,12 @@ from concurrent.futures import wait as _wait_futures
 from typing import Any, Protocol, TypedDict, runtime_checkable
 
 from memd.metrics import METRICS
-from memd.pipeline.embedder import _shared_model, fastembed_available
+from memd.pipeline.embedder import (
+    _shared_model,
+    default_embed_threads,
+    fastembed_available,
+    resolve_embed_threads,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -234,9 +239,10 @@ class LocalCrossEncoderReranker:
     calibrated = False
 
     def __init__(self, model: str = DEFAULT_LOCAL_RERANK_MODEL,
-                 timeout_s: float = DEFAULT_LOCAL_TIMEOUT_S):
+                 timeout_s: float = DEFAULT_LOCAL_TIMEOUT_S, threads: int | None = None):
         self.model = model
         self.timeout_s = float(timeout_s)
+        self.threads = int(threads) if threads else default_embed_threads()
         # the same process-wide cache the local embedder uses, in its own
         # key space: every Memory instance shares one loaded cross-encoder
         self._shared = _shared_model(model, kind="rerank")
@@ -246,7 +252,7 @@ class LocalCrossEncoderReranker:
     def _load_model(self) -> Any:
         from fastembed.rerank.cross_encoder import TextCrossEncoder
 
-        return TextCrossEncoder(model_name=self.model)
+        return TextCrossEncoder(model_name=self.model, threads=self.threads)
 
     def ready(self) -> bool:
         return self._shared.model is not None
@@ -329,7 +335,8 @@ def resolve_reranker(config: dict | None = None) -> Reranker | None:
                           "importable; install memd[local-embeddings] or choose reranker='none'")
     return LocalCrossEncoderReranker(
         model=str(cfg.get("local_rerank_model") or DEFAULT_LOCAL_RERANK_MODEL),
-        timeout_s=float(cfg.get("rerank_timeout_s") or DEFAULT_LOCAL_TIMEOUT_S))
+        timeout_s=float(cfg.get("rerank_timeout_s") or DEFAULT_LOCAL_TIMEOUT_S),
+        threads=resolve_embed_threads(cfg))
 
 
 # ---------------------------------------------------------------- the stage

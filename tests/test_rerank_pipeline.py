@@ -676,6 +676,25 @@ def test_two_memories_share_one_embedding_model(tmp_path, monkeypatch):
         b.close()
 
 
+def test_cross_encoder_caps_onnx_threads(monkeypatch):
+    pytest.importorskip("fastembed")
+    import fastembed.rerank.cross_encoder as xenc
+
+    seen = {}
+
+    class _FakeTextCrossEncoder:
+        def __init__(self, model_name, threads=None, **kw):
+            seen["threads"] = threads
+
+    monkeypatch.setattr(xenc, "TextCrossEncoder", _FakeTextCrossEncoder)
+    monkeypatch.setattr(rerank_mod, "fastembed_available", lambda: True)
+    monkeypatch.setenv("MEMD_EMBED_THREADS", "2")
+    resolve_reranker({"reranker": "local"})._load_model()
+    assert seen["threads"] == 2
+    resolve_reranker({"reranker": "local", "embed_threads": 1})._load_model()
+    assert seen["threads"] == 1
+
+
 def test_local_reranker_serves_nothing_until_loaded(tmp_path, monkeypatch):
     gate = threading.Event()
 

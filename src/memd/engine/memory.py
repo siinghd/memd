@@ -128,6 +128,21 @@ class TaintStore:
 MAX_CONTENT_BYTES = 10 * 1024 * 1024  # engine-side hard cap (REST caps lower)
 MAX_META_BYTES = 64 * 1024  # meta is serialized into WAL + index per record
 MAX_BATCH_EVENTS = 10_000  # single durable-append bound per add_events call
+# Text handed to the embedder is cut here (config embed_max_chars; 0 = off).
+# A local ONNX model pads a batch to its longest member: on LongMemEval turns
+# (mean 1083 chars) raw bge-small managed 1.2 texts/s batched against 3.4
+# one at a time on this host. Truncating the tail and sorting each batch by
+# length bound the padding; the text itself is stored and searched whole.
+DEFAULT_EMBED_MAX_CHARS = 2000
+
+
+def embed_order(batch: dict[str, str], max_chars: int) -> tuple[list[str], list[str]]:
+    """(ids, texts) for one embedding call: texts truncated to max_chars
+    (0 = no cap) and sorted by length so similar lengths share a padded
+    batch. The id list stays aligned with the texts."""
+    items = [(rid, t[:max_chars] if max_chars > 0 else t) for rid, t in batch.items()]
+    items.sort(key=lambda it: len(it[1]))
+    return [rid for rid, _ in items], [t for _, t in items]
 
 
 def _guard_input(content: str, meta: dict[str, Any] | None) -> None:
@@ -161,9 +176,11 @@ class _EmbedWorker:
     heals via reembed() (the ADR-8 degradation story, now memory-safe)."""
 
     def __init__(self, embedder: Embedder, apply_fn, batch_size: int = 32, flush_s: float = 0.5,
-                 max_retries: int = 3, max_queue: int = 5_000):
+                 max_retries: int = 3, max_queue: int = 5_000,
+                 max_chars: int = DEFAULT_EMBED_MAX_CHARS):
         self.embedder = embedder
         self.apply_fn = apply_fn  # callable(ns_name, ids, vecs)
+        self.max_chars = int(max_chars)
         self.q: "queue.Queue[tuple[str, str, str]]" = queue.Queue(maxsize=max(1, max_queue))
         self.retries: dict[tuple[str, str], int] = {}
         self.max_retries = max_retries
@@ -249,8 +266,9 @@ class _EmbedWorker:
     def _embed_one(self, ns_name: str, batch: dict[str, str]) -> None:
         t0 = time.monotonic()
         try:
-            vecs = self.embedder.embed(list(batch.values()))
-            self.apply_fn(ns_name, list(batch.keys()), vecs)
+            ids, texts = embed_order(batch, self.max_chars)
+            vecs = self.embedder.embed(texts)
+            self.apply_fn(ns_name, ids, vecs)
             METRICS.observe("memd_embed_batch_size", len(batch),
                             help="texts per embedding batch",
                             buckets=(1, 4, 8, 16, 32, 64, 128))
@@ -618,11 +636,13 @@ class Memory:
         self._embed_close_drain_s = float(cfg.get("embed_close_drain_s", 30.0))
         self._embed_flush_drain_s = float(cfg.get("embed_flush_drain_s", 60.0))
         self._maint = _MaintenanceWorker(self._run_maintenance)
+        self._embed_max_chars = int(cfg.get("embed_max_chars", DEFAULT_EMBED_MAX_CHARS))
         self._embed_worker = _EmbedWorker(
             self.embedder,
             self._apply_vectors,
             batch_size=int(cfg.get("embed_batch", 32)),
             max_queue=int(cfg.get("embed_max_queue", 5_000)),
+            max_chars=self._embed_max_chars,
         )
         self.audit.append(actor="system", action="open", target=namespace, detail={"embedder": self.embedder.name})
         # which embedder is active decides retrieval AND forget() semantics,
@@ -1883,12 +1903,15 @@ class Memory:
         stale = ns.index.records_missing_embedding(self.embedder.name)
         done = 0
         t0 = time.monotonic()
+        # same text preparation as the embed worker (truncated, and chunks of
+        # similar length so a padded batch wastes little)
+        stale.sort(key=lambda r: len(r.content))
         for i in range(0, len(stale), batch_size):
             chunk = stale[i : i + batch_size]
-            texts = [r.content for r in chunk]
+            ids, texts = embed_order({r.id: r.content for r in chunk}, self._embed_max_chars)
             vecs = self.embedder.embed(texts)
-            for j, rec in enumerate(chunk):
-                ns.index.set_vector(rec.id, vecs[j], self.embedder.name)
+            for j, rid in enumerate(ids):
+                ns.index.set_vector(rid, vecs[j], self.embedder.name)
                 done += 1
         METRICS.observe("memd_reembed_ms", (time.monotonic() - t0) * 1000,
                         help="re-embedding batch duration (ms)", ns=ns.namespace)

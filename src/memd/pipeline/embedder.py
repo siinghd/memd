@@ -164,6 +164,31 @@ class OpenAICompatibleEmbedder(Embedder):
         return np.array([d["embedding"] for d in data], dtype=np.float32)
 
 
+def default_embed_threads() -> int:
+    """ONNX intra-op threads for local models: min(4, cores // 2), at least 1.
+    onnxruntime defaults to every core; with several processes, or next to
+    other load, the sessions oversubscribe the CPU and throughput collapses
+    (measured ~4 vectors/s at load average 35)."""
+    return min(4, (os.cpu_count() or 1) // 2 or 1)
+
+
+def resolve_embed_threads(config: dict | None = None) -> int:
+    """config["embed_threads"], else env MEMD_EMBED_THREADS, else
+    default_embed_threads(). Applies to the local embedder and the local
+    cross-encoder reranker. A model is loaded once per process (see
+    _SharedModel), so the first Memory to load it decides its threads."""
+    cfg = config or {}
+    v = cfg.get("embed_threads")
+    if v is None or v == "":
+        v = os.environ.get("MEMD_EMBED_THREADS") or None
+    if v is None:
+        return default_embed_threads()
+    n = int(v)
+    if n < 1:
+        raise ValueError(f"embed_threads must be >= 1, not {v!r}")
+    return n
+
+
 def fastembed_available() -> bool:
     """Whether the optional `fastembed` extra is installed, WITHOUT importing
     it (the import alone costs ~1s: it pulls in onnxruntime)."""
@@ -227,9 +252,10 @@ class FastEmbedEmbedder(Embedder):
     kind = "fastembed"
     strong_match_cosine = 0.85
 
-    def __init__(self, model: str = "BAAI/bge-small-en-v1.5"):
+    def __init__(self, model: str = "BAAI/bge-small-en-v1.5", threads: int | None = None):
         self.model = model
         self.name = model
+        self.threads = int(threads) if threads else default_embed_threads()
         self._shared = _shared_model(model, kind="embed")
         self._load_error: Exception | None = None
         self._dim: int | None = None
@@ -237,7 +263,7 @@ class FastEmbedEmbedder(Embedder):
     def _load_model(self):
         from fastembed import TextEmbedding
 
-        return TextEmbedding(model_name=self.model)
+        return TextEmbedding(model_name=self.model, threads=self.threads)
 
     def ready(self) -> bool:
         return self._shared.model is not None
@@ -300,7 +326,8 @@ def resolve_embedder(config: dict | None = None) -> Embedder:
                 "embedder 'fastembed' was requested but the `fastembed` package is not "
                 "importable; install the optional extra or choose embedder='hash'")
         # the model itself loads lazily (see FastEmbedEmbedder)
-        emb = FastEmbedEmbedder(cfg.get("local_embedding_model", "BAAI/bge-small-en-v1.5"))
+        emb = FastEmbedEmbedder(cfg.get("local_embedding_model", "BAAI/bge-small-en-v1.5"),
+                                threads=resolve_embed_threads(cfg))
     else:
         emb = HashEmbedder(cfg.get("hash_dim", 384))
     if cfg.get("strong_match_cosine") is not None:

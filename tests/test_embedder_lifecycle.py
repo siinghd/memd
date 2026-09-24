@@ -161,6 +161,89 @@ def test_vectors_from_the_pre_v2_hash_embedder_are_re_embedded_on_open(tmp_path)
         m.close()
 
 
+def test_local_models_cap_onnx_threads(monkeypatch):
+    """onnxruntime defaults to one intra-op thread per core; several
+    processes (or other load) then oversubscribe the CPU and throughput
+    collapses (~4 vectors/s measured at load 35)."""
+    import os
+
+    fastembed = pytest.importorskip("fastembed")
+    seen = {}
+
+    class _FakeTextEmbedding:
+        def __init__(self, model_name, threads=None, **kw):
+            seen["threads"] = threads
+
+    monkeypatch.setattr(fastembed, "TextEmbedding", _FakeTextEmbedding)
+    monkeypatch.delenv("MEMD_EMBED_THREADS", raising=False)
+    for cores, want in ((16, 4), (8, 4), (6, 3), (2, 1), (1, 1), (None, 1)):
+        monkeypatch.setattr(os, "cpu_count", lambda c=cores: c)
+        assert embedder_mod.default_embed_threads() == want, cores
+    monkeypatch.setattr(os, "cpu_count", lambda: 64)
+    monkeypatch.setattr(embedder_mod, "fastembed_available", lambda: True)
+    name = f"test/threads-{uuid.uuid4().hex}"
+    resolve_embedder({"embedder": "fastembed", "local_embedding_model": name})._load_model()
+    assert seen["threads"] == 4
+    resolve_embedder({"embedder": "fastembed", "local_embedding_model": name,
+                      "embed_threads": 3})._load_model()
+    assert seen["threads"] == 3
+    monkeypatch.setenv("MEMD_EMBED_THREADS", "2")
+    resolve_embedder({"embedder": "fastembed", "local_embedding_model": name})._load_model()
+    assert seen["threads"] == 2
+    with pytest.raises(ValueError):
+        embedder_mod.resolve_embed_threads({"embed_threads": 0})
+
+
+class _RecordingEmbedder(HashEmbedder):
+    def __init__(self):
+        super().__init__(384)
+        self.calls: list[list[str]] = []
+
+    def embed(self, texts):
+        self.calls.append(list(texts))
+        return super().embed(texts)
+
+
+def test_embed_batches_are_length_sorted_and_truncated(tmp_path):
+    """A local ONNX model pads a batch to its longest member: raw bge-small
+    managed 1.2 texts/s batched vs 3.4 one at a time on LongMemEval turns."""
+    from memd.engine.memory import embed_order
+
+    ids, texts = embed_order({"a": "x" * 50, "b": "y" * 5, "c": "z" * 12}, 20)
+    assert ids == ["b", "c", "a"] and texts == ["y" * 5, "z" * 12, "x" * 20]
+    assert embed_order({"a": "x" * 50}, 0)[1] == ["x" * 50], "0 disables the cap"
+
+    m = Memory(str(tmp_path / "d"), config={"embedder": "hash", "embed_max_chars": 40})
+    rec = _RecordingEmbedder()
+    m.embedder = rec
+    m._embed_worker.embedder = rec
+    try:
+        lengths = [300, 12, 90, 45, 7, 200]
+        ids = m.add_events([{"content": f"{n:03d} " + "w" * (n - 4), "user_id": "u"} for n in lengths])
+        m.flush()
+        sent = [t for call in rec.calls for t in call]
+        assert sorted(len(t) for t in sent) == sorted(min(40, n) for n in lengths)
+        for call in rec.calls:
+            assert [len(t) for t in call] == sorted(len(t) for t in call), call
+        # each vector landed on its own record despite the reordering
+        h = HashEmbedder(384)
+        m.ns.index.flush()
+        for rid, n in zip(ids, lengths):
+            blob, dim = m.ns.index._con.execute("SELECT vec, dim FROM vectors WHERE id=?", (rid,)).fetchone()
+            want = h.embed([(f"{n:03d} " + "w" * (n - 4))[:40]])[0]
+            got = np.frombuffer(blob, dtype=np.float16).astype(np.float32)
+            assert np.allclose(got, want, atol=1e-2), rid
+        # the re-embed job prepares text the same way
+        rec.calls.clear()
+        m.ns.index._con.execute("DELETE FROM vectors")
+        m.ns.index._con.commit()
+        m.reembed()
+        assert rec.calls and all(len(t) <= 40 for call in rec.calls for t in call)
+        assert [len(t) for t in rec.calls[0]] == sorted(len(t) for t in rec.calls[0])
+    finally:
+        m.close()
+
+
 def test_hash_embedder_keeps_generator_fitted_words():
     feats = HashEmbedder()._feats("later follow up agreed discussed session number notes")
     for w in ("later", "follow", "up", "agreed", "discussed", "session", "number", "notes"):
