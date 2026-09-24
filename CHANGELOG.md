@@ -7,6 +7,36 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
 ## [Unreleased]
 
 ### Added
+- **Reranker plug-in** (`memd.query.rerank`): the top-30 of the bm25 lane
+  (plus the vector lane with a real embedder) is reordered by a relevance
+  judge. `reranker` / `MEMD_RERANKER` = `auto | none | jev | local`; `auto`
+  picks Jev (TypeSafe System One, `pip install "memd[jev]"`) only when
+  `TYPESAFE_API_KEY` is set, otherwise none - no key, no egress. With Jev
+  active the query and the top-30 candidate texts are sent to TypeSafe's API
+  (SECURITY.md). One request per query, one Noul per candidate, chunks of 25
+  issued concurrently, 1.5s total deadline. Any error, timeout or malformed
+  answer keeps the unreranked order and counts
+  `memd_rerank_fallback_total{reason}`; search never fails because of it.
+  `local` is a fastembed cross-encoder (default `BAAI/bge-reranker-base`),
+  loaded in the background. LongMemEval_S session ndcg@5: bm25 0.891 ->
+  bm25 + Jev 0.954 (lab experiment 015).
+- **Gated evidence packing** (`pack_mode` = `auto | ranked | gated`): with a
+  calibrated reranker (Jev) the context holds the candidates it judges
+  relevant (p >= `rerank_gate`, default 0.5, else the top 3) plus the turn
+  before and after each in the same session, grouped by session under a
+  session-date header, budget-capped, with the same provenance fencing.
+  Lab experiment 018: equal QA accuracy to top-k packing at 27% fewer tokens.
+- **tantivy lexical accelerator** (`pip install "memd[fast]"`,
+  `lexical_backend` = `auto | fts5 | tantivy`). A derived index fed in the
+  background; FTS5 stays the synchronous source of truth, so the write ack
+  is unchanged and unindexed writes are served from FTS5. Rebuilt in the
+  background when missing, corrupt, foreign or not closed cleanly; removed
+  on crypto-shred. `bench/lexical_bench.py` measures it filtered, through
+  `Memory.search`.
+- **Nightly real-data gate**: `bench/lme_gate.py` runs 60 fixed LongMemEval_S
+  questions (10 per type, dev split) through `Memory.search` and fails below
+  session ndcg@5 0.80 (hash embedder, no reranker);
+  `.github/workflows/nightly-gate.yml` runs it nightly and skips offline.
 - **S3-compatible object store backend** (`pip install "memd[s3]"`,
   `Memory("s3://bucket/prefix")`) for AWS S3, Cloudflare R2, MinIO and Ceph.
   S3 has no append, so each append is its own immutable object and the logical
@@ -86,6 +116,22 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   computation, stalling every hot path for the duration of a scrape.
 
 ### Changed
+- The hash embedder's "vector" lane is no longer fused into ranking
+  (`fuse_vector` = `auto | true | false`; `auto` fuses only a real
+  embedder). Once bm25 ranked by bm25 it cost ~0.07 ndcg@5 on LongMemEval.
+  Hash vectors are still computed: forget() and dedupe use them.
+- The hash embedder is now `hash-ngram-384-v2`: patch 2 changed its features
+  but not its name, so older vectors were never re-embedded. The open-time
+  vector-health check now flags them and the maintenance thread re-embeds.
+- The process-wide model cache is keyed by (kind, model): the local
+  cross-encoder shares it with the local embedder.
+- Local ONNX models (embedder and cross-encoder) run with
+  `embed_threads` / `MEMD_EMBED_THREADS` intra-op threads, default
+  min(4, cores // 2), instead of every core (throughput collapsed to ~4
+  vectors/s at load 35 from oversubscription). Embedding batches are sorted
+  by length and text is cut at `embed_max_chars` (2000; 0 = off): a batch
+  pads to its longest member, and raw bge-small managed 1.2 turns/s batched
+  vs 3.4 one at a time on LongMemEval turns.
 - Write amplification: FTS5 no longer stores a second copy of every record and
   vectors are stored at half width. 800B records 7.29x -> 5.02x; 4KB 2.80x.
   `02-slos.md`'s flat 3x bar is amended to a record-size-aware one, with the

@@ -157,10 +157,14 @@ split-brain loud, not impossible.
   rate limits catch MINJA-style injection; hash-chained audit log; namespace
   crypto-shred; record-level hard delete with ≤72h physical purge deadline.
 - **Retrieval**: rules-based planner (no reflection loop) → fan-out over
-  BM25 (SQLite FTS5/porter), exact flat vector scan (numpy; IVF-PQ slot
-  reserved for ≥50K-vector namespaces), time/entity lanes → RRF fusion with
-  trust-aware tie-breaks → validity filter (current/as_of) → lineage-deduped,
-  budget-cut packing that keeps prefix-stable order (KV-cache friendly).
+  BM25 (SQLite FTS5/porter, ranked by bm25; optionally accelerated by
+  tantivy), the entity lane, the time lane on recency intent, and an exact
+  flat vector scan with a real embedder (numpy; IVF-PQ slot reserved for
+  ≥50K-vector namespaces) → RRF fusion with trust-aware tie-breaks →
+  optional rerank of the lexical top-30 → validity filter (current/as_of) →
+  lineage-deduped, budget-cut packing that keeps prefix-stable order
+  (KV-cache friendly), or gated evidence packing with a calibrated reranker.
+  The hash embedder's vector lane is not fused (`fuse_vector`, below).
 - **Extraction** (ADR-6): async, batched, re-runnable. BYO OpenAI-compatible
   key for LLM extraction/embeddings; heuristic provider keeps facts working
   with zero keys; local ONNX embeddings via the optional fastembed extra.
@@ -175,11 +179,44 @@ export MEMD_EXTRACTION_API_KEY=...     # optional: LLM fact extraction
 Without them you get deterministic hash embeddings + pattern extraction:
 fully functional, honestly degraded, clearly labeled in `stats()`.
 
+### Retrieval options (`Memory(config={...})` or the env var)
+
+| key / env | values | default |
+|---|---|---|
+| `reranker` / `MEMD_RERANKER` | `auto` \| `none` \| `jev` \| `local` | `auto`: Jev when `TYPESAFE_API_KEY` is set and `typesafe-sdk` is installed (`pip install "memd[jev]"`), else none |
+| `jev_model`, `rerank_timeout_s`, `rerank_k` | model pin, deadline, shortlist | `jev-latest`, 1.5s (5s local), 30 |
+| `local_rerank_model` | fastembed cross-encoder | `BAAI/bge-reranker-base` |
+| `pack_mode` / `MEMD_PACK_MODE` | `auto` \| `ranked` \| `gated` | `auto`: gated with a calibrated reranker (Jev) |
+| `rerank_gate` | gated-packing threshold | 0.5 |
+| `fuse_vector` / `MEMD_FUSE_VECTOR` | `auto` \| `true` \| `false` | `auto`: fuse unless the embedder is the hash embedder |
+| `lexical_backend` / `MEMD_LEXICAL_BACKEND` | `auto` \| `fts5` \| `tantivy` | `auto`: tantivy when installed (`pip install "memd[fast]"`) |
+
+- **Reranker.** The top-30 of the bm25 lane (plus the vector lane with a real
+  embedder) is reordered by a relevance judge; the rest follows in fused
+  order. On LongMemEval_S, Jev reranking took session ndcg@5 from 0.89 to
+  0.95. A failed, slow (> `rerank_timeout_s`) or malformed judgement keeps
+  the unreranked order and counts `memd_rerank_fallback_total{reason}`;
+  search never fails because of it. `stats()["reranker"]` reports name,
+  model, calls, fallbacks and p50 latency. **Privacy: with Jev active, the
+  query and the top-30 candidate texts of every search are sent to
+  TypeSafe's API** (see SECURITY.md). No key, no egress.
+- **Gated packing** (calibrated reranker): the packed context holds the
+  candidates judged relevant (p ≥ `rerank_gate`, else the top 3), each with
+  its neighbouring turns, grouped by session under a session-date header,
+  still capped by `budget_tokens` and with the same provenance fencing.
+- **tantivy accelerator.** A derived index next to SQLite, fed in the
+  background (every 500ms or 512 changes); FTS5 stays the synchronous source
+  of truth, so the write ack is unchanged, and writes not yet indexed are
+  served from FTS5. It is rebuilt in the background when missing, corrupt or
+  not closed cleanly.
+
 ## Ops
 
 ```bash
 python bench/slo_bench.py                        # D2 acceptance numbers
 python -m memd.harness.run --suite all --gate    # quality+cost gate (D5)
+python bench/lme_gate.py                         # real-data gate: LongMemEval_S, 60 q (nightly)
+python bench/lexical_bench.py                    # FTS5 vs tantivy, filtered, 10K-150K records
 memd export --out backup.jsonl                   # anti-lock-in, symmetric
 memd import mem0 --export mem0.json              # migration path
 memd key create --ns acme [--pin-user u1]        # scoped API keys
