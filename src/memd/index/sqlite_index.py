@@ -763,6 +763,52 @@ class NamespaceIndex:
                 break
         return hits
 
+    def session_neighbours(self, ids: list[str], f: IndexFilter,
+                           radius: int = 1) -> tuple[dict[str, list[MemoryRecord]], dict[str, int]]:
+        """For each record id: up to `radius` raw turns before and after it
+        in the SAME session, ordered by (t_event, rowid) - the rowid is the
+        ingestion order, which is what orders turns that share a session date.
+
+        Every neighbour satisfies `f` (SQL, then _passes_filter): a session id
+        is a caller-chosen string that two users can share, so adjacency alone
+        must never pull another scope's row into a packed context.
+
+        Returns ({id: [previous..., next...]}, {record id: rowid}) - the
+        positions cover the anchors and their neighbours."""
+        out: dict[str, list[MemoryRecord]] = {}
+        positions: dict[str, int] = {}
+        if not ids or radius <= 0 or self._closed:
+            return out, positions
+        fargs: list = []
+        filt = self._filter_where(f, fargs)
+        with self._read() as _c:
+            for rid in ids:
+                a = _c.execute("SELECT rowid AS _rowid, scope_session, t_event FROM records WHERE id=?",
+                               (rid,)).fetchone()
+                if a is None:
+                    continue
+                positions[rid] = int(a["_rowid"])
+                if a["scope_session"] is None:
+                    continue
+                got: list[MemoryRecord] = []
+                for cmp, order in (("<", "DESC"), (">", "ASC")):
+                    rows = _c.execute(
+                        f"SELECT rowid AS _rowid, * FROM records WHERE scope_session = ? "  # nosec B608
+                        f"AND kind = 'raw_event' AND (t_event {cmp} ? OR (t_event = ? AND rowid {cmp} ?)) "
+                        f"AND {filt} ORDER BY t_event {order}, rowid {order} LIMIT ?",
+                        [a["scope_session"], a["t_event"], a["t_event"], a["_rowid"], *fargs, radius],
+                    ).fetchall()
+                    if order == "DESC":
+                        rows = list(reversed(rows))
+                    for r in rows:
+                        rec = self._row_to_record(r)
+                        rec.namespace = self._ns_hint
+                        if rec.id in f.exclude_ids or not self._passes_filter(rec, f):
+                            continue
+                        positions[rec.id] = int(r["_rowid"])
+                        got.append(rec)
+                out[rid] = got
+        return out, positions
 
     def _fold_overflow_locked(self) -> None:
         """Fold the overflow block into the main matrix (O(main)); called

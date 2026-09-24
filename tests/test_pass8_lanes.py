@@ -38,7 +38,9 @@ def _vector_rows(path: str) -> tuple[int, int]:
 class TestCrossNamespaceVectors:
     def test_vectors_land_in_own_namespace(self, tmp_path):
         root = str(tmp_path / "data")
-        mem = Memory(root)
+        # vector routing is under test: fuse the lane even for the hash
+        # embedder (not fused by default since patch 3)
+        mem = Memory(root, config={"fuse_vector": True})
         try:
             other_id = mem.add("quantum zebra probe unique tokens", session_id="s1",
                                user_id="u1", namespace="other")[0]

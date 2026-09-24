@@ -466,6 +466,7 @@ CORE_HISTOGRAMS = {
     "memd_embed_apply_ms": ("embed + index apply duration (ms)", DEFAULT_BUCKETS),
     "memd_http_request_ms": ("HTTP request duration (ms)", DEFAULT_BUCKETS),
     "memd_lane_ms": ("per-lane candidate fetch duration (ms)", DEFAULT_BUCKETS),
+    "memd_rerank_ms": ("reranker call duration (ms), including fallbacks", DEFAULT_BUCKETS),
 }
 
 CORE_COUNTERS = {
@@ -533,6 +534,8 @@ CORE_COUNTERS = {
     "memd_store_ops_total": "object-store operations by type",
     "memd_embed_target_missing_total": "embeddings dropped because the target namespace is gone",
     "memd_forgets_total": "query-driven forget sweeps executed",
+    "memd_rerank_calls_total": "searches that asked the reranker",
+    "memd_rerank_fallback_total": "searches that kept the unreranked order: reranker failed, timed out or was not ready",
 }
 
 CORE_GAUGES = {

@@ -102,7 +102,6 @@ class HashEmbedder(Embedder):
         self.dim = dim
         self.name = f"hash-ngram-{dim}-{self.VERSION}"
 
-
     def _feats(self, text: str) -> list[str]:
         words = [w for w in _WORD_RE.findall(text.lower()) if w not in _STOPWORDS]
         feats = list(words)
@@ -172,11 +171,13 @@ def fastembed_available() -> bool:
 
 
 class _SharedModel:
-    """One loaded ONNX model per model name per PROCESS, shared by every
-    FastEmbedEmbedder. Loading one per embed-worker thread and freeing it on
-    close from another thread grew RSS ~67MB per Memory open/close cycle
-    (glibc per-thread malloc arenas are not trimmed back to the OS), and the
-    test suite was OOM-killed; it also paid the load on every open."""
+    """One loaded ONNX model per (kind, model name) per PROCESS, shared by
+    every FastEmbedEmbedder (kind "embed") and every local cross-encoder
+    reranker (kind "rerank", memd.query.rerank). Loading one per embed-worker
+    thread and freeing it on close from another thread grew RSS ~67MB per
+    Memory open/close cycle (glibc per-thread malloc arenas are not trimmed
+    back to the OS), and the test suite was OOM-killed; it also paid the load
+    on every open."""
 
     def __init__(self) -> None:
         self.load_lock = threading.Lock()
@@ -184,15 +185,18 @@ class _SharedModel:
         self.model = None
 
 
-_SHARED_MODELS: dict[str, _SharedModel] = {}
+_SHARED_MODELS: dict[tuple[str, str], _SharedModel] = {}
 _SHARED_MODELS_LOCK = threading.Lock()
 
 
-def _shared_model(model_name: str) -> _SharedModel:
+def _shared_model(model_name: str, kind: str = "embed") -> _SharedModel:
+    """The process-wide slot for one model. Keyed by kind as well as name:
+    an embedding model and a cross-encoder are different objects even if a
+    registry ever gave them the same name."""
     with _SHARED_MODELS_LOCK:
-        entry = _SHARED_MODELS.get(model_name)
+        entry = _SHARED_MODELS.get((kind, model_name))
         if entry is None:
-            entry = _SHARED_MODELS[model_name] = _SharedModel()
+            entry = _SHARED_MODELS[(kind, model_name)] = _SharedModel()
         return entry
 
 
@@ -226,7 +230,7 @@ class FastEmbedEmbedder(Embedder):
     def __init__(self, model: str = "BAAI/bge-small-en-v1.5"):
         self.model = model
         self.name = model
-        self._shared = _shared_model(model)
+        self._shared = _shared_model(model, kind="embed")
         self._load_error: Exception | None = None
         self._dim: int | None = None
 

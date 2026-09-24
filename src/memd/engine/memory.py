@@ -5,8 +5,10 @@ zero external services; hosted mode = same API over HTTP.
 
 Write path: append to WAL -> fsync -> index apply -> ack. No LLM, no
 embedding on the critical path (SLO: embedded p99 <= 10ms).
-Read path: plan -> fan-out (vector+BM25+time+entity) -> RRF fuse ->
-validity filter -> budget-aware packing with provenance tags.
+Read path: plan -> fan-out (BM25+entity, time on recency intent, vector
+with a real embedder) -> RRF fuse -> optional rerank of the lexical top-30
+-> validity filter -> budget-aware packing with provenance tags (gated
+evidence packing when the reranker is calibrated).
 """
 from __future__ import annotations
 
@@ -30,9 +32,16 @@ from memd.metrics import METRICS, auto_dumper_from_env, preset_core
 from memd.pipeline.consolidation import ConsolidationResult, QuarantinePolicy, consolidate_facts
 from memd.pipeline.embedder import Embedder, requested_embedder, resolve_embedder
 from memd.pipeline.extractor import ExtractedFact, Extractor, resolve_extractor
-from memd.query.fusion import rrf_fuse
-from memd.query.packing import PackedContext, count_tokens, pack_context
+from memd.query.fusion import FusedItem, rrf_fuse
+from memd.query.packing import PackedContext, count_tokens, gate_candidates, pack_context, pack_gated
 from memd.query.planner import plan_query
+from memd.query.rerank import (
+    DEFAULT_RERANK_K,
+    RerankStage,
+    candidate_from_record,
+    requested_reranker,
+    resolve_reranker,
+)
 from memd.storage.audit import AuditLog, BufferedAuditLog
 from memd.storage.crypto import LocalKeyEnvelope, NullKeyEnvelope
 from memd.storage.engine import StorageEngine
@@ -456,6 +465,45 @@ class _SearchCache:
             self._bytes = 0
 
 
+PACK_MODES = ("auto", "ranked", "gated")
+DEFAULT_RERANK_GATE = 0.5
+
+
+def resolve_fuse_vector(config: dict | None, embedder: Embedder) -> bool:
+    """Whether the vector lane is fused into ranking: config["fuse_vector"]
+    (or env MEMD_FUSE_VECTOR) = "auto" | true | false.
+
+    auto = fuse unless the embedder is the HashEmbedder. Once the bm25 lane
+    ranked by real bm25, fusing the hash "vector" lane (feature-hashed
+    n-grams - a noisier copy of the lexical signal) into RRF cost ~0.07
+    ndcg@5 on LongMemEval_S. Hash vectors are still computed and stored:
+    forget() and dedupe use them."""
+    cfg = config or {}
+    v = cfg.get("fuse_vector")
+    if v is None:
+        v = os.environ.get("MEMD_FUSE_VECTOR", "auto")
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s == "auto":
+        return embedder.kind != "hash"
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"fuse_vector must be auto|true|false, not {v!r}")
+
+
+def resolve_pack_mode(config: dict | None) -> str:
+    """config["pack_mode"] (or env MEMD_PACK_MODE): "auto" (gated when the
+    active reranker is calibrated, else ranked) | "ranked" | "gated"."""
+    cfg = config or {}
+    mode = str(cfg.get("pack_mode") or os.environ.get("MEMD_PACK_MODE") or "auto").strip().lower()
+    if mode not in PACK_MODES:
+        raise ValueError(f"unknown pack_mode {mode!r}; expected one of {list(PACK_MODES)}")
+    return mode
+
+
 MAX_QUERY_CHARS = 64 * 1024  # embedder-cost guard for engine-side queries
 # find_ids: a vector-only candidate must beat the median of the sweep's
 # vector sample by this much (see Memory._vector_only_floor); the median is
@@ -544,6 +592,12 @@ class Memory:
         self._shredded: "OrderedDict[str, None]" = OrderedDict()
         self.audit = self._audit_for(namespace)  # facade default, never evicted
         self.embedder: Embedder = resolve_embedder(cfg)
+        self.fuse_vector: bool = resolve_fuse_vector(cfg, self.embedder)
+        reranker = resolve_reranker(cfg)
+        self.rerank: RerankStage | None = (
+            RerankStage(reranker, k=int(cfg.get("rerank_k", DEFAULT_RERANK_K))) if reranker else None)
+        self.pack_mode: str = resolve_pack_mode(cfg)
+        self.rerank_gate: float = float(cfg.get("rerank_gate", DEFAULT_RERANK_GATE))
         self.extractor: Extractor = resolve_extractor(cfg)
         self.quarantine = QuarantinePolicy(
             rate_max_writes=int(cfg.get("rate_max_writes", 120)),
@@ -575,6 +629,16 @@ class Memory:
         # and "auto" depends on what happens to be installed: say it once
         _log.info("memd: opened namespace %r with embedder %s (kind=%s, requested=%s)",
                   namespace, self.embedder.name, self.embedder.kind, requested_embedder(cfg))
+        # the reranker decides whether search text leaves the machine: say so
+        _log.info("memd: reranker %s (model=%s, requested=%s, pack_mode=%s); fuse_vector=%s",
+                  self.rerank.name if self.rerank else "none",
+                  self.rerank.model if self.rerank else "-", requested_reranker(cfg),
+                  self.pack_mode, self.fuse_vector)
+        if self.rerank is not None and callable(getattr(self.rerank.reranker, "load", None)):
+            # warm the reranker off the caller's path: a local cross-encoder
+            # takes seconds to load (a first download is ~1GB) and the Jev SDK
+            # ~1s to import - either would eat the first search's deadline
+            threading.Thread(target=self._load_reranker, daemon=True, name="memd-rerank-load").start()
         self._vector_selfheal = bool(cfg.get("vector_selfheal", True))
         self._report_vector_health(self.ns)
 
@@ -998,26 +1062,45 @@ class Memory:
         # graceful degradation (ADR-8): if the embedder is unreachable
         # (BYO-key API outage) or its model is still loading in the embed
         # worker, BM25 + entity lanes still serve - retrieval degrades, it
-        # never dies, and it never waits on a model load
-        if not self.embedder.ready():
-            METRICS.inc("memd_embed_query_not_ready_total", ns=ns.namespace)
-        else:
-            try:
-                _lt0 = time.monotonic()
-                qvec = self.embedder.embed_one(query)
-                lane_hits["vector"] = ns.index.search_vector(qvec, filt, limit=plan.candidate_k)
-                METRICS.observe("memd_lane_ms", (time.monotonic() - _lt0) * 1000,
-                                help="per-lane candidate fetch duration (ms)", ns=ns.namespace, lane="vector")
-            except Exception:
-                METRICS.inc("memd_embed_query_failures_total", ns=ns.namespace)
+        # never dies, and it never waits on a model load. The hash embedder's
+        # lane is not fused at all (see resolve_fuse_vector).
+        if self.fuse_vector:
+            if not self.embedder.ready():
+                METRICS.inc("memd_embed_query_not_ready_total", ns=ns.namespace)
+            else:
+                try:
+                    _lt0 = time.monotonic()
+                    qvec = self.embedder.embed_one(query)
+                    lane_hits["vector"] = ns.index.search_vector(qvec, filt, limit=plan.candidate_k)
+                    METRICS.observe("memd_lane_ms", (time.monotonic() - _lt0) * 1000,
+                                    help="per-lane candidate fetch duration (ms)", ns=ns.namespace,
+                                    lane="vector")
+                except Exception:
+                    METRICS.inc("memd_embed_query_failures_total", ns=ns.namespace)
         _st0 = time.monotonic()
         fused = rrf_fuse(lane_hits, weights=plan.weights, limit=max(plan.candidate_k, 40))
         METRICS.observe("memd_search_stage_ms", (time.monotonic() - _st0) * 1000,
                         help="per-stage search timing (ms): plan/fuse/pack",
                         ns=ns.namespace, stage="fuse")
+        rerank_order, degraded = self._rerank(query, lane_hits, fused, ns.namespace)
+        rerank_scores: dict[str, float] | None = None
+        if rerank_order is not None:
+            rerank_scores = {it.record.id: p for it, p in rerank_order}
+            # the reranked shortlist leads, in the reranker's order; the rest
+            # of the fused list follows in its own order
+            fused = [it for it, _ in rerank_order] + [
+                it for it in fused if it.record.id not in rerank_scores]
         _st0 = time.monotonic()
-        # as_of anchors the recency tilt; without it packing is data-relative
-        packed = pack_context(fused, budget_tokens=budget_tokens, now=as_of, query_class=plan.qclass)
+        if self._pack_mode_for(rerank_order) == "gated":
+            kept = gate_candidates(rerank_order, self.rerank_gate)
+            neighbours, positions = ns.index.session_neighbours(
+                [it.record.id for it, _ in kept if it.record.kind == "raw_event"], filt, radius=1)
+            packed = pack_gated(kept, neighbours, positions, budget_tokens=budget_tokens,
+                                query_class=plan.qclass)
+        else:
+            # as_of anchors the recency tilt; without it packing is data-relative
+            packed = pack_context(fused, budget_tokens=budget_tokens, now=as_of, query_class=plan.qclass,
+                                  rerank_scores=rerank_scores)
         METRICS.observe("memd_search_stage_ms", (time.monotonic() - _st0) * 1000,
                         help="per-stage search timing (ms): plan/fuse/pack",
                         ns=ns.namespace, stage="pack")
@@ -1071,8 +1154,58 @@ class Memory:
             query_class=plan.qclass,
             latency_ms=round(latency, 3),
         )
-        self._qcache.put(cache_key, result)
+        if not degraded:
+            # a result served while the reranker was failing must not
+            # outlive the outage
+            self._qcache.put(cache_key, result)
         return result
+
+    def _rerank(self, query: str, lane_hits: dict[str, list], fused: list[FusedItem],
+                ns_name: str) -> tuple[list[tuple[FusedItem, float]] | None, bool]:
+        """(shortlist in reranker order with scores, degraded?). The
+        shortlist is the top-k of the bm25 lane, then the vector lane when a
+        real embedder is fused, deduped, bm25 first. None: no reranker, or it
+        failed (then degraded=True and the fused order stands)."""
+        if self.rerank is None:
+            return None, False
+        hits = list(lane_hits.get("bm25", []))
+        if self.embedder.kind != "hash":
+            hits += lane_hits.get("vector", [])
+        shortlist, seen = [], set()
+        for h in hits:
+            if h.record.id not in seen:
+                seen.add(h.record.id)
+                shortlist.append(h)
+                if len(shortlist) >= self.rerank.k:
+                    break
+        if not shortlist:
+            return None, False
+        _st0 = time.monotonic()
+        vals = self.rerank.run(query, [candidate_from_record(h.record) for h in shortlist], ns=ns_name)
+        METRICS.observe("memd_search_stage_ms", (time.monotonic() - _st0) * 1000,
+                        help="per-stage search timing (ms): plan/fuse/pack", ns=ns_name, stage="rerank")
+        if vals is None:
+            return None, True
+        by_id = {it.record.id: it for it in fused}
+        items = [by_id.get(h.record.id) or FusedItem(record=h.record, score=0.0, lanes=[h.lane],
+                                                     ranks={h.lane: i + 1})
+                 for i, h in enumerate(shortlist)]
+        order = sorted(range(len(items)), key=lambda i: (-vals[i], i))
+        return [(items[i], vals[i]) for i in order], False
+
+    def _pack_mode_for(self, rerank_order) -> str:
+        if rerank_order is None or self.rerank is None:
+            return "ranked"  # no probabilities to gate on
+        if self.pack_mode == "gated" or (self.pack_mode == "auto" and self.rerank.calibrated):
+            return "gated"
+        return "ranked"
+
+    def _load_reranker(self) -> None:
+        try:
+            self.rerank.reranker.load()
+        except Exception:
+            _log.exception("memd: reranker %s failed to load; searches keep their own order",
+                           self.rerank.name)
 
     def pack(
         self,
@@ -1651,6 +1784,9 @@ class Memory:
         # embeddings queued or mid-batch: non-zero after flush() means the
         # drain timed out and the vector lane is still catching up
         st["embed_pending"] = self._embed_worker._pending()
+        st["fuse_vector"] = self.fuse_vector
+        st["reranker"] = self.rerank.stats() if self.rerank is not None else {"name": "none"}
+        st["pack_mode"] = self.pack_mode
         st["extractor"] = self.extractor.name
         # live gauges so /metrics and stats() agree on current state
         METRICS.set_gauge("memd_records", st.get("records", 0), ns=ns.namespace)
@@ -1805,6 +1941,8 @@ class Memory:
         # discard the vector lane it was asked to persist
         self._embed_worker.stop(drain_timeout_s=float(self._embed_close_drain_s))
         self._maint.stop(drain_timeout_s=float(self._embed_close_drain_s))
+        if self.rerank is not None:
+            self.rerank.close()
         self.ns.index.flush()
         self._flush_all_audits()
         self.ns.close()
