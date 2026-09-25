@@ -1,0 +1,205 @@
+# @memd/client
+
+The official TypeScript client for the [memd](../README-engine.md) REST API.
+
+- Zero runtime dependencies. It uses the platform's `fetch`.
+- Runs on Node ≥ 18, Bun, Deno, Cloudflare Workers, Vercel Edge and browsers. The core uses only web-standard APIs.
+- Ships ESM and CommonJS builds with full `.d.ts` types. The request and response models match the server's exactly, in its snake_case.
+- Maps each HTTP status to a typed error, applies timeouts, and retries idempotent calls only.
+- Uses the same method names and semantics as the Python SDK (`memd.sdk.HostedMemory`).
+
+```bash
+npm install @memd/client
+```
+
+You need a running server (`memd serve --http`) and a key for your namespace:
+
+```bash
+memd key create --namespace acme     # prints {"key": "memd_acme_…"}: store it now
+```
+
+The admin key (`MEMD_ADMIN_KEY`) can reach every namespace. Don't ship it to apps. Give each app a namespace key.
+
+## Quickstart: Node
+
+```ts
+import { MemdClient } from "@memd/client";
+
+const memd = new MemdClient({
+  baseUrl: "http://localhost:8700",
+  apiKey: process.env.MEMD_API_KEY!,
+  namespace: "acme",
+});
+
+// two lines in any agent loop (OpenAI-style messages)
+const withMemory = await memd.pack(messages, { user_id: "u1" }); // inject packed context
+const reply = await callYourLLM(withMemory);
+await memd.observe(messages, reply, { user_id: "u1", session_id: "s1" }); // capture the turn
+
+// or explicitly
+await memd.add("We deploy with `make ship`, never CI", { user_id: "u1", session_id: "s1" });
+await memd.remember("The user prefers dark mode", { user_id: "u1", entity_keys: ["user.theme"] });
+const hits = await memd.search("how do we deploy?", { user_id: "u1", budget_tokens: 1500 });
+console.log(hits.packed_context); // ready to inject
+```
+
+## Quickstart: Next.js route handler
+
+`app/api/chat/route.ts`. The client has no connection state, so a module-level instance is fine on the Node and Edge runtimes.
+
+```ts
+import { MemdClient, RateLimitError } from "@memd/client";
+import OpenAI from "openai";
+
+export const runtime = "edge"; // or "nodejs": the same code works on both
+
+const memd = new MemdClient({
+  baseUrl: process.env.MEMD_URL!,
+  apiKey: process.env.MEMD_API_KEY!,
+  namespace: "acme",
+  timeoutMs: 5_000,
+});
+const openai = new OpenAI();
+
+export async function POST(req: Request) {
+  const { messages, userId, sessionId } = await req.json();
+
+  const packed = await memd.pack(messages, { user_id: userId, signal: req.signal });
+  const completion = await openai.chat.completions.create({ model: "gpt-4o-mini", messages: packed });
+  const reply = completion.choices[0]!.message;
+
+  try {
+    await memd.observe(messages, reply, { user_id: userId, session_id: sessionId });
+  } catch (err) {
+    if (!(err instanceof RateLimitError)) throw err; // memory capture is best-effort here
+  }
+  return Response.json({ reply: reply.content });
+}
+```
+
+## Quickstart: Cloudflare Workers
+
+```ts
+import { MemdClient } from "@memd/client";
+
+interface Env {
+  MEMD_URL: string;
+  MEMD_API_KEY: string; // wrangler secret put MEMD_API_KEY
+}
+
+export default {
+  async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const memd = new MemdClient({ baseUrl: env.MEMD_URL, apiKey: env.MEMD_API_KEY, namespace: "acme" });
+    const { query, userId } = await req.json<{ query: string; userId: string }>();
+
+    const res = await memd.search(query, { user_id: userId, budget_tokens: 1000 });
+    // write-behind: don't make the user wait on capture
+    ctx.waitUntil(memd.add(query, { user_id: userId, role: "user" }));
+    return Response.json({ context: res.packed_context, hits: res.items.length });
+  },
+};
+```
+
+## API
+
+Every method accepts per-call options: `namespace` (overrides the client's), `signal`, `timeoutMs` and `retries`.
+
+| Method | Route | Returns |
+|---|---|---|
+| `add(content, opts?)` | `POST /v1/ns/{ns}/events` | `string[]` (ids) |
+| `addEvents(events, opts?)` | `POST /v1/ns/{ns}/events` (1 to 1000) | `string[]` |
+| `remember(content, opts?)` | `POST /v1/ns/{ns}/memories` | `string` (id) |
+| `search(query, opts?)` | `POST /v1/ns/{ns}/search` | `SearchResult` |
+| `pack(messages, opts?)` | search on the last user message | messages plus one system message |
+| `observe(messages, response, opts?)` | `POST /v1/ns/{ns}/events` | `string[]` |
+| `get(id, { history? })` | `GET /v1/ns/{ns}/memories/{id}` | `MemoryRecord \| null` |
+| `delete(id, { hard? })` | `DELETE /v1/ns/{ns}/memories/{id}` | `boolean` (`false` on 404) |
+| `findIds(query, opts?)` | `POST /v1/ns/{ns}/find_ids` | `string[]` |
+| `forget(query, opts?)` | `POST /v1/ns/{ns}/forget` | `ForgetPreview`, or `string[]` with `confirm: true` |
+| `export(opts?)` | `POST /v1/ns/{ns}/export` | `MemoryRecord[]` |
+| `exportJsonl(opts?)` | same | raw NDJSON `string` |
+| `exportStream(opts?)` | same, streamed | `AsyncGenerator<MemoryRecord>` |
+| `stats(opts?)` | `GET /v1/ns/{ns}/stats` | `NamespaceStats` |
+| `closeSession(sid, opts?)` | `POST /v1/ns/{ns}/sessions/{sid}/close` | `CloseSessionResult` |
+| `compact({ force? })` | `POST /v1/ns/{ns}/compact` | `CompactionReport` |
+| `reembed(opts?)` | `POST /v1/ns/{ns}/reembed` | `ReembedResult` |
+| `destroyNamespace(ns?)` | `DELETE /v1/ns/{ns}` (admin key) | `boolean` |
+| `status(opts?)` | `GET /v1/status` | `ServerStatus` |
+| `health(opts?)` | `GET /health` | `HealthResult` |
+
+Request fields keep the server's names (`user_id`, `session_id`, `budget_tokens`, `entity_keys`, …). `null` and `undefined` both mean "use the server default".
+
+### pack / observe
+
+These take the same messages as the Python SDK: OpenAI-style `{ role, content }`. `content` may be a string or an array of parts, and text parts are used.
+
+- `pack` searches with the last `user` message. When anything matches, it inserts one `{ role: "system", content: packed_context }` after your leading system messages. Otherwise it returns the messages unchanged. The input array is never mutated. A user message longer than the server's 10,000-character query cap is trimmed for the search.
+- `observe` stores every message that has text, plus `response` (a string or a message object) as `assistant`, in one durable batch.
+
+## Errors
+
+Every failure is a `MemdError` with `status`, `code` and `message`. The message is the server's `detail`.
+
+| Status | Class | `code` |
+|---|---|---|
+| 400 | `BadRequestError` | `bad_request` |
+| 401 | `AuthenticationError` | `unauthorized` |
+| 403 | `PermissionDeniedError` | `forbidden` |
+| 404 | `NotFoundError` | `not_found` (`get`/`delete` return `null`/`false` instead) |
+| 409 | `ConflictError` | `conflict` |
+| 410 | `GoneError` | `gone` |
+| 413 | `PayloadTooLargeError` | `payload_too_large` |
+| 422 | `ValidationError` (`.issues`: pydantic's list) | `validation_error` |
+| 429 | `RateLimitError` (`.retryAfter`, in seconds, from `Retry-After`) | `rate_limited` |
+| 5xx | `ServerError` | `server_error` |
+| none | `NetworkError`, `RequestTimeoutError` | `network_error`, `timeout` |
+| none | `RequestAbortedError` (your signal fired) | `aborted` |
+
+```ts
+import { PermissionDeniedError, RateLimitError, ValidationError } from "@memd/client";
+
+try {
+  await memd.search(q, { namespace: "someone-else" });
+} catch (err) {
+  if (err instanceof PermissionDeniedError) {/* key is scoped to another namespace */}
+  else if (err instanceof ValidationError) console.log(err.issues);
+  else if (err instanceof RateLimitError) console.log(err.retryAfter);
+  else throw err;
+}
+```
+
+## Timeouts, retries, cancellation
+
+```ts
+new MemdClient({
+  apiKey,
+  timeoutMs: 30_000,      // per attempt; 0 disables it
+  retries: 2,             // extra attempts for idempotent calls
+  retryBaseDelayMs: 250,  // exponential backoff: 250, 500, 1000 … with jitter
+  retryMaxDelayMs: 8_000,
+  fetch: myFetch,         // inject for tests, proxies or instrumentation
+  headers: { "x-gateway-token": "…" },
+});
+```
+
+- Retries happen on 429, 500, 502, 503 and 504, on timeouts, and on network errors. A `Retry-After` header is honored for waits up to 60 s.
+- Only idempotent calls retry: `get`, `search`, `pack`, `findIds`, `forget` without `confirm`, the exports, `stats`, `status`, `health` and record `delete`. A retried `delete` whose first attempt landed returns `false`.
+- Writes never retry: `add`, `addEvents`, `remember`, `observe`, confirmed `forget`, `closeSession`, `compact`, `reembed` and `destroyNamespace`. The API has no idempotency key, so a retried write could store twice. Handle `RateLimitError` on writes yourself. memd rejects a request with 429 before running it, so retrying after a 429 is safe.
+- Pass `signal` to cancel. The client throws `RequestAbortedError` and never retries after an abort.
+
+## Known server behavior
+
+- `forget(query, { confirm: true })` ignores `as_of` and `kinds`: the server applies them only to the preview. Preview and confirm with query and scope alone if you need the two to match.
+- `delete(id, { hard: true })` on a record that is already soft-deleted returns `false` (404). Soft-deleted records are physically purged at the next compaction (≤ 72 h).
+- memd's 429 responses don't send `Retry-After` today, so `retryAfter` is `undefined` and the client falls back to its backoff.
+
+## Development
+
+```bash
+npm ci
+npm run typecheck      # the core compiles without Node types: no Node-only APIs
+npm test               # unit tests (mocked fetch)
+npm run build          # dist/: ESM + CJS + .d.ts
+npm run smoke          # load the built package via require() and import
+MEMD_PYTHON=python3 npm run test:integration   # starts a real server from ../src
+```

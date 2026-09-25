@@ -141,6 +141,7 @@ split-brain loud, not impossible.
 | Python SDK | `from memd import Memory` | add/search/remember/forget/pack/observe/export |
 | REST | `memd serve --http` (:8700) | `/v1/ns/{ns}/events`, `/memories`, `/search`, `/export`, ... |
 | MCP | `memd serve --mcp` | exactly 4 tools: memory_search / memory_save / memory_forget / memory_status |
+| TypeScript SDK | `npm install @memd/client` ([sdk-ts/](sdk-ts/README.md)) | the REST door, typed, for Node ≥ 18, Bun, Deno and edge runtimes (Workers, Vercel Edge) |
 
 ## What's inside
 
