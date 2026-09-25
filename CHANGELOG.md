@@ -161,6 +161,23 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
   builds: 36, 36 and 44 of 120-124 runs ended with more records than an
   uninterrupted migration; now none.) The same fix covers a downgrade, a
   crash and an upgrade.
+- **An upgrade served hard deletes the older version had lost from durable
+  data** (a compliance failure: the old version's warm open hid them). It
+  recorded a hard delete in its local index by removing the row, so when it
+  was killed between a fold's ops-log delete and its re-append of the
+  pending hard deletes, the delete survived nowhere the migration read. The
+  migration now also reads the namespace's audit ledger - read-only,
+  decoded like the engine reads it (encrypted too), its hash chain verified
+  first - and deletes every record durable data still holds that a
+  `hard_delete` or `delete` entry names, last in history (a delete wins;
+  only a copy ingested after the entry is kept, as a later re-add). A hard
+  delete no durable op still schedules gets a purge due now. Past a break in
+  the chain nothing is applied, and the break is logged as an error. On the
+  verifier's histories that lost one (replayed through the old versions'
+  facade: 2, 2 and 3 runs on the three builds) the upgraded store now serves
+  what the old warm open served, warm and cold, and after a compaction the
+  text is in no file; a cold upgrade also keeps the soft deletes an old
+  rotate dropped, which the local index used to be the only record of.
 - **A cold open served soft deletes acked since the last index snapshot.**
   A snapshot was installed whenever it was newer than the last purge, but a
   compaction retires the tombstones it applies - the records they deleted
@@ -340,9 +357,11 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
   on its first open by this version.
 - **Upgrade on the node that holds the local cache** (`<data>/_cache`, or
   `local_dir` with S3) where you can. Older rotates dropped some deletes
-  from durable data; only the old local index still applies them, and the
-  migration keeps what it proves. A first open without that cache cannot
-  know those deletes (an old cold open served those records again too).
+  and supersedes from durable data; the old local index still applies
+  them, and the migration keeps what it proves. A first open without that
+  cache recovers only the deletes the audit ledger names (see Known
+  limitations), not the supersedes (an old cold open served all of them
+  again too).
 - **No downgrades.** Once this version has opened a namespace, older
   versions stop at its manifest with `ValueError: invalid literal for int()
   ... 'memd store format 2: ... downgrades are not supported'` and change
@@ -360,15 +379,15 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
 - The Jev reranker adds ~1 s per search (network) and sends candidate texts to TypeSafe.
 - Single writer per data root, on every backend. `uvicorn --workers N` with
   N>1 does not work.
-- A hard delete that an older version lost from durable data is served
-  again after the upgrade. Every older version recorded a hard delete in
-  its local index by removing the row - no tombstone or purge marker is
-  left - so when it was killed between a rotate's (or compaction's)
-  ops-log delete and its re-append of the pending hard deletes, the delete
-  survives nowhere the migration can read: a missing row is also what an
-  interrupted rebuild leaves. That version's own cold open served the
-  record too; its warm open hid it. A row the old index still marks deleted
-  is kept deleted.
+- Deletes an older version lost from durable data are recovered from the
+  namespace's audit ledger (see Fixed) only where the ledger has them: a
+  batch delete or `forget()` logged a count, not ids; with the default
+  buffered ledger (`audit_flush_every` 32) a crash can lose the last
+  entries; nothing past a break in the hash chain is applied - including
+  v0.1 encrypted ledgers, whose chain restarted at every reopen (fixed in
+  0.2.0), so only their first session counts (logged as an error); and
+  v0.1 filed every namespace's entries in the facade default namespace's
+  ledger, so only that namespace is covered.
 - With the S3 backend, envelope keys stay local: a second node cannot decrypt
   the bucket. A KMS key provider is not built.
 - BM25 tokenization is `ascii`, so CJK is not indexed by the lexical lane.

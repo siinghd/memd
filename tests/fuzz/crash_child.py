@@ -58,10 +58,16 @@ def write_legacy() -> None:
     unstamped (seq inferred), a seq per frame and per op, rotates that fold
     the WAL + ops log and DROP ops whose target lives in an older segment -
     the old binary's live index had applied them, and is written as the
-    warm cache the migration reads its evidence from."""
+    warm cache the migration reads its evidence from. Hard deletes remove the
+    index row, as the old builds did; a fold re-appends the pending ones
+    after deleting the ops log, and is "killed" there half of the time, so
+    the delete then survives only in the namespace's audit ledger (written
+    like the old facade's: an entry per acked delete, synchronously)."""
     from memd.core.schema import MemoryRecord, Scope, now_ms, records_to_jsonl
     from memd.index.sqlite_index import NamespaceIndex
+    from memd.storage.audit import AuditLog
     from memd.storage.engine import _frame_encode
+    from memd.storage.objectstore import LocalObjectStore
 
     store = os.path.join(root, "d", "store")
     nsdir = os.path.join(store, "ns", "default")
@@ -74,15 +80,20 @@ def write_legacy() -> None:
     recs: dict[str, MemoryRecord] = {}
     sup_of: dict[str, str] = {}
     idx_ops: list[dict] = []
+    ledger = AuditLog(LocalObjectStore(store), "ns/default/audit")
 
     def rotate() -> None:
-        nonlocal wal, ops, base
+        nonlocal wal, ops, base, seq
         fold = {r.id: r for frame in wal for r in frame}
+        pending = []
         for op in ops:  # ops on ids outside this WAL are dropped (the format-1 bug)
+            if op["op"] == "hard_delete" and op["deadline"] > now_ms():
+                pending.append(dict(op))  # its bytes stay until the deadline
+                continue
             r = fold.get(op.get("id") or op.get("old"))
             if r is None:
                 continue
-            if op["op"] == "tombstone":
+            if op["op"] in ("tombstone", "hard_delete"):
                 fold.pop(r.id)
             elif op["op"] == "supersede":
                 r.time.invalidated_at, r.time.superseded_by = op["at"], op["new"]
@@ -92,9 +103,13 @@ def write_legacy() -> None:
             f.write(json.dumps({"_seg": {"fold_seq": seq}}).encode() + b"\n" + body)
         segments.append({"name": name, "records": len(fold), "fold_seq": seq, "reason": "size"})
         wal, ops, base = [], [], seq
+        if pending and rng.random() < 0.5:  # re-appended at new seqs, unless killed
+            for op in pending:
+                seq += 1
+                ops.append(dict(op, seq=seq))
 
     for _ in range(rng.randint(8, 40)):
-        k = rng.choices(["add", "del", "sup", "rotate"], [5, 2, 1, 1])[0]
+        k = rng.choices(["add", "del", "hdel", "sup", "rotate"], [5, 2, 1, 1, 1])[0]
         if k == "add":
             ts = [tok() for _ in range(rng.randint(1, 3))]
             J(t="i", op="add_events", toks=ts)
@@ -105,16 +120,24 @@ def write_legacy() -> None:
             wal.append([MemoryRecord.from_dict(r.to_dict()) for r in batch])
             for r in batch:
                 recs[r.id] = r
+            ledger.append(actor="batch", action="add_events", target=f"{len(batch)} events")
             J(t="a", op="add_events", toks=ts, ids=[r.id for r in batch])
             live += [r.id for r in batch]
-        elif k == "del" and live:
+        elif k in ("del", "hdel") and live:
             rid = rng.choice(live)
-            J(t="i", op="del", ids=[rid])
+            J(t="i", op=k, ids=[rid])
             seq += 1
-            op = {"op": "tombstone", "id": rid, "at": now_ms(), "seq": seq}
+            at = now_ms()
+            op = {"op": "tombstone", "id": rid, "at": at, "seq": seq}
             ops.append(op)
             idx_ops.append(op)
-            J(t="a", op="del", ids=[rid])
+            if k == "hdel":
+                seq += 1
+                op = {"op": "hard_delete", "id": rid, "deadline": at + int(P["deadline"]), "seq": seq}
+                ops.append(op)
+                idx_ops.append(op)
+            ledger.append(actor="api", action="hard_delete" if k == "hdel" else "delete", target=rid)
+            J(t="a", op=k, ids=[rid])
             live.remove(rid)
             sup_of.pop(rid, None)
         elif k == "sup" and len(live) >= 2:
@@ -144,6 +167,8 @@ def write_legacy() -> None:
     for op in idx_ops:  # the old binary's index applied every op live
         if op["op"] == "tombstone":
             idx.tombstone(op["id"], op["at"])
+        elif op["op"] == "hard_delete":
+            idx.hard_delete(op["id"])   # the row goes: no marker is left
         else:
             idx.mark_superseded(op["old"], op["new"], op["at"])
     idx.flush()

@@ -358,3 +358,38 @@ class BufferedAuditLog(AuditLog):
     def verify(self) -> bool:
         self.flush()
         return super().verify()
+
+
+def read_verified(store, key: str, envelope=None) -> tuple[list[dict], bool, int]:
+    """The ledger at `key` up to the last valid link of its hash chain ->
+    (entries, whole chain verified, entries read).
+
+    Read-only, unlike AuditLog(): opening one heals the `.state` sidecar,
+    which a reader that must not change what it reads (a migration before its
+    commit) cannot afford. The window and its anchor come from the sidecar
+    (segments, chain_start) exactly as AuditLog reads them, and an encrypted
+    ledger is decoded with the namespace's envelope the same way. The walk
+    stops at the first entry whose `prev` is not its predecessor's digest or
+    whose own digest does not match its body: nothing past a break is
+    returned."""
+    log = AuditLog.__new__(AuditLog)
+    log.store, log.key, log.envelope = store, key, envelope
+    log._segments, log._pruned, log._chain_start = 0, 0, "0" * 64
+    try:
+        raw = store.get(key + ".state")
+        if raw:
+            st = json.loads(raw.decode())
+            log._segments = int(st.get("segs", 0) or 0)
+            log._chain_start = str(st.get("chain_start") or "0" * 64)
+    except Exception:  # noqa: BLE001 - no usable sidecar: the live object alone, anchored at zero
+        pass
+    entries = log.read()
+    prev = log._chain_start
+    good: list[dict] = []
+    for e in entries:
+        body = json.dumps({k: v for k, v in e.items() if k != "h"}, sort_keys=True).encode()
+        if e.get("prev") != prev or e.get("h") != hashlib.sha256(body).hexdigest():
+            return good, False, len(entries)
+        good.append(e)
+        prev = e["h"]
+    return good, True, len(entries)
