@@ -568,6 +568,68 @@ def test_hard_deleting_the_two_newest_rows_never_hides_the_next_write(tmp_path, 
         m.close()
 
 
+def test_an_older_index_version_is_rebuilt(tmp_path):
+    """v0.2.0 indexes may be missing rows a reused rowid hid, and were built
+    with the 40-byte token cut: an index of an older STATE_VERSION is rebuilt."""
+    root = tmp_path / "d"
+    m = _mem(root)
+    m.add("kumquat orchard", user_id="u")
+    _ready(m)
+    m.close()
+    state_path = os.path.join(_tantivy_dir(root), tl.STATE_FILE)
+    st = json.load(open(state_path))
+    st["version"] = tl.STATE_VERSION - 1
+    json.dump(st, open(state_path, "w"))
+    m = _mem(root)
+    try:
+        assert _lex(m).rebuilds == 1
+        _ready(m)
+        assert _served_by_tantivy(m, "kumquat", IndexFilter(scope=Scope(user="u"))) == ["kumquat orchard"]
+    finally:
+        m.close()
+
+
+SHA1 = "3f786850e387550fdab836ed7e6dc881de23001b"
+SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+CJK = "東京タワーに行きました昨日の夜とても楽しかったです"
+
+
+def test_tokens_of_40_bytes_or_more_are_indexed(tmp_path):
+    """`en_stem` drops every token of 40+ bytes: a commit hash, a digest or an
+    unspaced CJK sentence could not be found through tantivy at all."""
+    m = _mem(tmp_path / "d")
+    try:
+        m.add_events([{"content": f"filler {i} text", "user_id": "u"} for i in range(50)])
+        m.add(f"deployed commit {SHA1} to prod", user_id="u")
+        m.add(f"artifact digest {SHA256}", user_id="u")
+        m.add(CJK, user_id="u")
+        _ready(m)
+        f = IndexFilter(scope=Scope(user="u"))
+        for q in (SHA1, SHA256, CJK):
+            assert len(q.encode()) >= 40
+            got = _served_by_tantivy(m, q, f)
+            assert len(got) == 1 and q in got[0], (q, got)
+            m._bump_epoch()
+            assert any(q in i.content for i in m.search(q, user_id="u").items)
+    finally:
+        m.close()
+
+
+def test_a_query_term_too_long_for_tantivy_goes_to_fts5(tmp_path):
+    # tantivy drops a token over 65530 bytes from the doc itself
+    m = _mem(tmp_path / "d")
+    try:
+        blob = "q" * 70_000
+        m.add(f"payload {blob}", user_id="u")
+        _ready(m)
+        before = _counter("memd_lexical_fallback_total", reason="long_term")
+        hits = m.ns.index.search_bm25(blob, IndexFilter(scope=Scope(user="u")), limit=5)
+        assert [h.record.content for h in hits] == [f"payload {blob}"]
+        assert _counter("memd_lexical_fallback_total", reason="long_term") == before + 1
+    finally:
+        m.close()
+
+
 def test_an_overwritten_id_is_reindexed(tmp_path):
     """An upsert of an existing id (`memd import --native` keeps ids) never
     reached the indexer: the OLD text kept matching and the new text did not,
@@ -625,5 +687,121 @@ def test_a_rescoped_id_moves_to_its_new_owner(tmp_path):
                 ["transferred ocelotine ledger"]
             assert not m.search("ocelotine", user_id="alice").items
             assert [i.id for i in m.search("ocelotine", user_id="bob").items] == [rid]
+    finally:
+        m.close()
+
+
+def _tied_corpus():
+    # three texts, 400 exact copies each: bm25 ties by the hundred; distinct
+    # t_event per record so only the lane's choice among ties can differ
+    return [{"content": f"project {['alpha', 'beta', 'gamma'][i % 3]} shipped item", "user_id": "u",
+             "session_id": f"s{i % 7}", "t_event": T0 + i * 60_000} for i in range(1200)]
+
+
+def _ingest_ordered(root, commits: int):
+    """Ingest the same data, committed to tantivy in `commits` batches (one
+    segment each: tantivy merges only at 8+), and return what search shows."""
+    m = _mem(root, lexical_commit_ms=600_000, lexical_commit_docs=10 ** 6)
+    try:
+        ev = _tied_corpus()
+        step = len(ev) // commits
+        for i in range(0, len(ev), step):
+            m.add_events(ev[i:i + step])
+            m.flush()
+            assert _lex(m).drain(30)
+        f = IndexFilter(scope=Scope(user="u"))
+        out = []
+        for q in ("project alpha shipped", "beta item", "what shipped in gamma"):
+            out.append(_served_by_tantivy(m, q, f, limit=10))
+            lane = [(h.record.content, h.record.time.t_event)
+                    for h in m.ns.index.search_bm25(q, f, limit=10)]
+            m._bump_epoch()
+            res = [(it.content, it.t_event) for it in m.search(q, user_id="u").items[:5]]
+            out.append((lane, res))
+        return out
+    finally:
+        m.close()
+
+
+def test_tied_scores_order_the_same_across_segment_layouts(tmp_path):
+    """Among equal bm25 scores tantivy returned docs in segment order, and
+    segment order follows commit timing (and hashing): re-ingesting the same
+    data gave a different top-5 (FTS5 did not)."""
+    runs = [_ingest_ordered(tmp_path / f"r{k}", commits) for k, commits in enumerate((1, 6, 6, 6))]
+    for r in runs[1:]:
+        assert r == runs[0]
+    # ties go to the newest (fusion's order: score, then -t_event)
+    lane, _ = runs[0][1]
+    assert [t for _, t in lane] == sorted((t for _, t in lane), reverse=True)
+
+
+class _FailingIndex:
+    """Wraps the tantivy Index: parse_query raises `exc` while armed."""
+
+    def __init__(self, inner, exc):
+        self.inner, self.exc, self.armed = inner, exc, True
+
+    def parse_query(self, *a, **k):
+        if self.armed:
+            raise self.exc
+        return self.inner.parse_query(*a, **k)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+def test_a_query_error_is_not_a_rebuild(tmp_path):
+    """Any search-time error used to wipe and rebuild the whole index, and
+    five of them disabled it until restart."""
+    m = _mem(tmp_path / "d")
+    try:
+        m.add_events([{"content": d, "user_id": "u"} for d in _corpus(80)])
+        lex = _ready(m)
+        f = IndexFilter(scope=Scope(user="u"))
+        want = [h.record.id for h in m.ns.index.search_bm25("kumquat mango", f, limit=10)]
+        real = lex._index
+        lex._index = _FailingIndex(real, ValueError("Syntax Error: injected"))
+        before = _counter("memd_lexical_fallback_total", reason="error")
+        for _ in range(8):
+            got = [h.record.id for h in m.ns.index.search_bm25("kumquat mango", f, limit=10)]
+            assert set(got) == set(want)  # FTS5 served it
+        assert _counter("memd_lexical_fallback_total", reason="error") == before + 8
+        lex._index = real
+        st = lex.stats()
+        assert st["ready"] and st["rebuilds"] == 0 and st["failures"] == 0 and not st["disabled"]
+        assert _served_by_tantivy(m, "kumquat mango", f)
+    finally:
+        m.close()
+
+
+def test_damage_rebuilds_with_backoff_and_is_counted(tmp_path, monkeypatch):
+    m = _mem(tmp_path / "d")
+    try:
+        m.add_events([{"content": d, "user_id": "u"} for d in _corpus(80)])
+        lex = _ready(m)
+        f = IndexFilter(scope=Scope(user="u"))
+        damage = ValueError("Failed to open file for read: 'FileDoesNotExist(\"x.store\")'")
+        rebuilds0 = _counter("memd_lexical_rebuilds_total", reason="damaged")
+        waits = []
+        for k in range(1, 8):  # more than the old limit of 5
+            lex._index = _FailingIndex(lex._index, damage)
+            with lex._lock:
+                lex._ready = True  # (as if the rebuild had finished)
+            assert m.ns.index.search_bm25("kumquat mango", f, limit=10), "FTS5 must serve"
+            st = lex.stats()
+            assert not st["ready"] and st["disabled"] and st["failures"] == k
+            waits.append(st["retry_in_s"])
+            assert lex.drain(1) is False, "drain must respect the backoff"
+            lex._index = lex._index.inner
+        assert lex.rebuilds == 1, "one rebuild in flight is one rebuild"
+        assert _counter("memd_lexical_rebuilds_total", reason="damaged") == rebuilds0 + 1
+        assert waits[1] > waits[0] and waits[3] > waits[2], f"not exponential: {waits}"
+        assert waits[-1] <= tl.BACKOFF_MAX_S
+        with lex._lock:
+            lex._retry_at = 0.0  # the backoff has passed
+        assert lex.drain(30), "never disabled for good: the rebuild runs"
+        st = lex.stats()
+        assert st["ready"] and st["failures"] == 0 and not st["disabled"]
+        assert _served_by_tantivy(m, "kumquat mango", f)
     finally:
         m.close()
