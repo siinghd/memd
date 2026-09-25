@@ -827,8 +827,14 @@ class NamespaceIndex:
                    ids_only: bool = False) -> list:
         """The FTS5 bm25 query itself. `rowid_min` / `ids` restrict it to the
         lexical accelerator's tail: rows above its watermark, or rows changed
-        since its last commit. `ids_only` returns [(id, score)] (SQL-filtered,
-        not hydrated) for a caller that hydrates what it keeps."""
+        since its last commit. `ids_only` returns [(id, score, t_event,
+        content key)] (SQL-filtered, not hydrated) for a caller that hydrates
+        what it keeps.
+
+        Equal scores are ordered by fusion's key (score, -t_event, content
+        hash, id), as the tantivy lane orders them, so the backend never
+        changes the order of tied rows. FTS5 alone returned them oldest-first
+        (rowid order) while tantivy returned them newest-first."""
         if self._closed:
             return []
         args: list = []
@@ -864,16 +870,29 @@ class NamespaceIndex:
             # turning a 17ms lane into 22 SECONDS at 10K records. The plain
             # fts5 table happened to cost out the other way; external
             # content changed the estimate, not the right answer.
-            f"SELECT {'r.id' if ids_only else 'r.*'}, bm25(fts) AS rank "  # nosec B608
+            f"SELECT {'r.id, r.t_event, r.content' if ids_only else 'r.*'}, bm25(fts) AS rank "  # nosec B608
             f"FROM fts CROSS JOIN records r ON r.rowid = fts.rowid "
-            f"WHERE fts MATCH ?{extra} AND {filt} ORDER BY rank LIMIT ?"
+            f"WHERE fts MATCH ?{extra} AND {filt}"
         )
+        qargs = [match_expr] + extra_args + args
         # exclude_ids is applied in Python; over-fetch so it never shrinks the page
-        qargs = [match_expr] + extra_args + args + [limit + len(f.exclude_ids)]
+        n = limit + len(f.exclude_ids)
         with self._read() as _c:
-            rows = _c.execute(sql, qargs).fetchall()
+            rows = _c.execute(sql + " ORDER BY rank, r.t_event DESC LIMIT ?", qargs + [n + 1]).fetchall()
+            if n and len(rows) > n and _tie(rows[n]) == _tie(rows[n - 1]):
+                # the cut falls inside a group of equal (score, t_event): only
+                # the content hash orders it, so the whole group is needed
+                b = _tie(rows[n - 1])
+                group = _c.execute(sql + " AND r.t_event = ?", qargs + [b[1]]).fetchall()
+                rows = [r for r in rows if _tie(r) != b] + [r for r in group if _tie(r) == b]
+            else:
+                rows = rows[:n]
+        rows = _lane_order(rows)
         if ids_only:
-            return [(r["id"], -float(r["rank"])) for r in rows if r["id"] not in f.exclude_ids][:limit]
+            from memd.query.fusion import content_sha
+
+            return [(r["id"], -float(r["rank"]), int(r["t_event"]), int(content_sha(r["content"] or ""), 16))
+                    for r in rows if r["id"] not in f.exclude_ids][:limit]
         hits: list[Hit] = []
         for r in rows:
             if r["id"] in f.exclude_ids:
@@ -1456,3 +1475,23 @@ def _fts_escape(query: str) -> str:
             seen.add(tok)
             words.append(tok)
     return " ".join(words)
+
+
+def _tie(row: sqlite3.Row) -> tuple[float, int]:
+    return float(row["rank"]), int(row["t_event"])
+
+
+def _lane_order(rows: list) -> list:
+    """FTS5 rows in the bm25 lane's order: (-score, -t_event, content hash,
+    id), fusion's tie-break. The hash is computed only inside groups of equal
+    (score, t_event), where it can decide something."""
+    from collections import Counter
+
+    from memd.query.fusion import content_sha
+
+    groups = Counter(_tie(r) for r in rows)
+
+    def key(r: sqlite3.Row) -> tuple:
+        rank, t = _tie(r)
+        return (rank, -t, content_sha(r["content"] or "") if groups[(rank, t)] > 1 else "", r["id"])
+    return sorted(rows, key=key)

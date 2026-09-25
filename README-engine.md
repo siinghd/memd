@@ -215,8 +215,15 @@ fully functional, honestly degraded, clearly labeled in `stats()`.
   served from FTS5. It is rebuilt in the background when missing, corrupt or
   not closed cleanly. A search error sends that query to FTS5; only damage
   (I/O, missing or corrupt files) rebuilds it while running, with
-  exponential backoff; `stats()["lexical"]` shows `rebuilds`, `failures`
-  and `retry_in_s`.
+  exponential backoff on a failure history that a successful rebuild does
+  not erase (it decays after 10 minutes without a failure);
+  `stats()["lexical"]` shows `rebuilds`, `failures`, `failures_total` and
+  `retry_in_s`. Tied bm25 scores are ordered the same way on both backends
+  (score, -t_event, content hash, id). With tantivy the top-k is
+  deterministic for the same operation history *and commit schedule*: its
+  BM25 statistics count deleted and superseded docs until their segments
+  merge, so the same history committed in a different rhythm can order two
+  near-equal docs differently.
 
 ## Ops
 

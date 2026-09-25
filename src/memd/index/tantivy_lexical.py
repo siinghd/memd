@@ -23,16 +23,29 @@ Correctness model - FTS5 stays the synchronous source of truth:
              BEFORE the SQL change).
     Every result is hydrated from SQLite and post-checked with
     _passes_filter; if tantivy's window was full but fewer than k survive,
-    the window widens, and past WINDOW_MAX the lane falls back to the FTS5
-    path. Filters the prefilter does not model (as_of, include_invalid,
+    the window widens ONCE (x4, within WINDOW_MAX) and, if that is still
+    short, the lane falls back to the FTS5 path: on templated data a tie
+    group can fill any window, and widening 60 -> 4096 in four steps cost
+    47-54ms before FTS5 answered in 8-16ms anyway. Filters the prefilter
+    does not model (as_of, include_invalid,
     sources, entity keys), sweep-size limits and query terms too long for
     tantivy's term dictionary go to FTS5 directly.
   - ties: a doc's position among equal scores in tantivy depends on how the
     docs are spread over segments, which depends on commit timing, so
     re-ingesting the same data could return a different top-k. Scores are
     quantized (SCORE_QUANTUM) and ties broken by content, as fusion does
-    (score, -t_event, content hash, id); a window whose last score group
-    reaches the cut is widened until that group is whole.
+    (score, -t_event, content hash, id) - the key FTS5 serves the lane with
+    too, and the one the merge with the tail uses, so neither the backend
+    nor whether a row is committed yet changes the order of tied rows. A
+    row in a score group that reaches a full window's edge is not served.
+  - scores are NOT independent of the commit schedule: tantivy's BM25
+    statistics (doc count, doc frequency, average length) include deleted
+    and superseded docs until their segments merge, so the same operation
+    history committed in a different rhythm can score - and order - two
+    near-equal docs differently. Results are deterministic for the same
+    operation history AND commit schedule. Re-scoring the window in FTS5
+    would remove this, but costs 11 ms p50 / 51 ms p95 per query at 20K docs
+    (a 60-row `rowid IN` bm25) against 0.6 ms for the window itself.
   - open: a missing, corrupt, foreign (different SQLite file or an older
     STATE_VERSION) or uncleanly closed index is rebuilt in the background;
     until it has caught up the lane is served by FTS5.
@@ -40,9 +53,14 @@ Correctness model - FTS5 stays the synchronous source of truth:
     corrupt files, a tantivy panic) schedules a rebuild into a fresh
     directory; any other error only sends that query (or delays that batch)
     to FTS5. Retries back off exponentially (BACKOFF_BASE_S doubling up to
-    BACKOFF_MAX_S); nothing disables the accelerator for good. stats()
-    counts every rebuild and shows the failure streak and the backoff.
-Tail merge: tail hits are placed among tantivy's by score. Both are BM25
+    BACKOFF_MAX_S) on a failure history that a success does not erase: it
+    decays only after FAILURE_DECAY_S without a failure. (Resetting it on
+    every successful rebuild meant damage that only shows at search time
+    rebuilt every ~2s: 6 rebuilds in 12s.) Nothing disables the accelerator
+    for good. stats() counts every rebuild and shows the failure history,
+    the lifetime failure count and the backoff.
+Tail merge: tail hits are placed among tantivy's by score (ties by the
+key above). Both are BM25
 (k1 1.2, b 0.75) over the same text, so a rare decisive term scores high in
 either; they differ in IDF floor (FTS5 ~0 for terms in over half the rows,
 tantivy >= ln 2), stemmer and length quantization, so the merge is
@@ -89,12 +107,14 @@ TOUCH_BATCH = 4096           # changed ids re-indexed per step
 WRITER_HEAP = 32_000_000     # tantivy needs >= 15MB per writer thread
 MAX_TANTIVY_LIMIT = 1000     # larger (sweep) limits go to FTS5
 WINDOW_MAX = 4096            # widest tantivy window before FTS5 answers
+WINDOW_WIDENINGS = 1         # x4 widenings of a short window before FTS5 answers
 SCORE_QUANTUM = 1e-4         # scores closer than this are ties
 # tantivy silently drops a token longer than 65530 bytes (its term size
 # limit) from the doc: a query term anywhere near that goes to FTS5
 LONG_TERM_BYTES = 32_000
 BACKOFF_BASE_S = 2.0         # first retry after a failure; doubles per failure
 BACKOFF_MAX_S = 300.0
+FAILURE_DECAY_S = 600.0      # the failure history forgets after this long without one
 MAX_PENDING_TAIL = 8         # changed-and-eligible rows served per query from FTS5
 _I64_MIN = -(2 ** 63)
 # substrings of the errors that mean the index itself is damaged (tantivy
@@ -284,7 +304,10 @@ class TantivyLexical:
         self._need_clear = False
         self._ready = False
         self._closed = False
-        self._failures = 0                   # consecutive failures (0 = healthy)
+        self._failures = 0                   # failure history: sets the backoff (see FAILURE_DECAY_S)
+        self._failures_total = 0
+        self._last_failure = 0.0             # monotonic time of the latest failure
+        self._failing = False                # no successful step since the latest failure
         self._retry_at = 0.0                 # no indexer step before this (backoff)
         self._last_err_log = 0.0
         self._last_step = 0.0
@@ -419,13 +442,23 @@ class TantivyLexical:
         """`disabled`: the indexer is paused, backing off after a failure,
         for another `retry_in_s` (a damaged index is not `ready` meanwhile,
         and FTS5 serves the lane). `rebuilds` counts every rebuild: at open,
-        after a wipe, and after damage found while running."""
+        after a wipe, and after damage found while running. `failures` is
+        the history the backoff grows with (kept across successful steps,
+        forgotten after FAILURE_DECAY_S without one); `failures_total`
+        never decreases."""
         with self._lock:
-            wait = max(0.0, self._retry_at - time.monotonic()) if self._failures else 0.0
+            now = time.monotonic()
+            self._decay_failures(now)
+            wait = max(0.0, self._retry_at - now) if self._failing else 0.0
             return {"backend": "tantivy", "ready": self._ready, "disabled": wait > 0,
                     "watermark": self._w, "pending": len(self._pending) + self._new_rows,
                     "rebuilds": self.rebuilds, "failures": self._failures,
-                    "retry_in_s": round(wait, 1)}
+                    "failures_total": self._failures_total, "retry_in_s": round(wait, 1)}
+
+    def _decay_failures(self, now: float) -> None:
+        """(lock held) Forget the failure history after a quiet period."""
+        if self._failures and not self._failing and now - self._last_failure >= FAILURE_DECAY_S:
+            self._failures = 0
 
     def _due(self, now: float) -> bool:
         with self._lock:
@@ -453,7 +486,10 @@ class TantivyLexical:
             try:
                 more = self._step()
                 with self._lock:
-                    self._failures = 0
+                    # NOT a reset of the history: damage that only shows at
+                    # search time survives a rebuild, and must back off longer
+                    self._failing = False
+                    self._decay_failures(time.monotonic())
                 return more
             except (KeyboardInterrupt, SystemExit):
                 raise
@@ -470,9 +506,14 @@ class TantivyLexical:
         changed nothing: its rows stay pending / above the watermark, the
         tail keeps serving them, and the retry redoes it."""
         with self._lock:
+            now = time.monotonic()
+            self._decay_failures(now)
             self._failures += 1
+            self._failures_total += 1
+            self._last_failure = now
+            self._failing = True
             backoff = min(BACKOFF_MAX_S, BACKOFF_BASE_S * 2 ** min(self._failures - 1, 16))
-            self._retry_at = time.monotonic() + backoff
+            self._retry_at = now + backoff
             rebuild = damaged and not self._need_clear
             if damaged:
                 self._reset_gen += 1  # a batch in flight (search found the damage) is void
@@ -596,7 +637,7 @@ class TantivyLexical:
             if not self._run_step(blocking=True):
                 with self._lock:
                     # (a failed step leaves the index ready but not caught up)
-                    if not self._pending and self._ready and not self._failures:
+                    if not self._pending and self._ready and not self._failing:
                         return True
         return False
 
@@ -699,6 +740,7 @@ class TantivyLexical:
             if live:
                 tail += idx._fts5_bm25(match_expr, f, limit, ids=live, ids_only=True)
         fetch = max(1, limit * 2)
+        widenings = 0
         recs: dict = {}
         while True:
             try:
@@ -711,14 +753,16 @@ class TantivyLexical:
             hits = self._merge(main_ids, len(main_ids) >= fetch, tail, pending, f, limit, recs)
             if hits is not None:
                 break
-            if fetch >= WINDOW_MAX:
+            if widenings >= WINDOW_WIDENINGS or fetch * 4 > WINDOW_MAX:
                 # tantivy's window filled with rows the post-check rejected
                 # (or with one tie group), so eligible rows may lie beyond
-                # it - correctness first
+                # it - correctness first, and FTS5 answers that faster than
+                # more windows would (see the module docstring)
                 METRICS.inc("memd_lexical_fallback_total", ns=self.ns, reason="short")
                 return None
-            fetch = min(WINDOW_MAX, fetch * 4)
-        tail_ids = {rid for rid, _ in tail}
+            widenings += 1
+            fetch *= 4
+        tail_ids = {t[0] for t in tail}
         n_tail = sum(1 for h in hits if h.record.id in tail_ids)
         if n_tail:
             METRICS.inc("memd_lexical_tail_hits_total", n_tail,
@@ -744,7 +788,7 @@ class TantivyLexical:
         return out
 
     def _merge(self, main_ids: list[tuple[str, float, int, int]], saturated: bool,
-               tail: list[tuple[str, float]], pending: set[str], f: "IndexFilter", limit: int,
+               tail: list[tuple[str, float, int, int]], pending: set[str], f: "IndexFilter", limit: int,
                recs: dict) -> "list[Hit] | None":
         """tantivy's window and the FTS5 tail as one list by score, each row
         hydrated and post-checked. None: the window is too narrow to answer."""
@@ -757,16 +801,16 @@ class TantivyLexical:
         edge = _quant(main_ids[-1][1]) if saturated and main_ids else None
         # a pending row's committed doc is stale: the tail serves that row
         main = [m for m in main_ids if m[0] not in pending]
-        # the tie-break fusion uses (score, -t_event, content, id): equal
-        # scores keep one order however the docs are spread over segments
-        main.sort(key=lambda m: (-_quant(m[1]), -m[2], m[3], m[0]))
-        # one list by score (see "Tail merge"), tantivy first on ties
-        ranked = [(_quant(score), 0, i, rid, score) for i, (rid, score, _t, _h) in enumerate(main)]
-        ranked += [(_quant(score), 1, i, rid, score) for i, (rid, score) in enumerate(tail)]
-        ranked.sort(key=lambda t: (-t[0], t[1], t[2]))
+        # one list by score (see "Tail merge"), ties by the key fusion uses
+        # (score, -t_event, content, id) whichever side a row came from:
+        # equal scores keep one order however the docs are spread over
+        # segments, whether they are committed yet, and on either backend
+        ranked = [(_quant(score), t_event, csha, rid, score)
+                  for rid, score, t_event, csha in list(main) + list(tail)]
+        ranked.sort(key=lambda t: (-t[0], -t[1], t[2], t[3]))
         order: list[tuple[str, int, float]] = []
         seen: set[str] = set()
-        for qscore, _src, _i, rid, score in ranked:
+        for qscore, _t, _h, rid, score in ranked:
             if rid not in seen:
                 seen.add(rid)
                 order.append((rid, qscore, score))

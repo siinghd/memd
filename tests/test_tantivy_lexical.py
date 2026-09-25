@@ -692,10 +692,13 @@ def test_a_rescoped_id_moves_to_its_new_owner(tmp_path):
 
 
 def _tied_corpus():
-    # three texts, 400 exact copies each: bm25 ties by the hundred; distinct
-    # t_event per record so only the lane's choice among ties can differ
+    # three texts, 50 exact copies each: bm25 ties by the dozen; distinct
+    # t_event per record so only the lane's choice among ties can differ.
+    # (A tie group larger than the once-widened window is answered by FTS5
+    # by design - test_a_short_window_widens_once_then_fts5_answers - so
+    # larger groups would not exercise tantivy's order at all.)
     return [{"content": f"project {['alpha', 'beta', 'gamma'][i % 3]} shipped item", "user_id": "u",
-             "session_id": f"s{i % 7}", "t_event": T0 + i * 60_000} for i in range(1200)]
+             "session_id": f"s{i % 7}", "t_event": T0 + i * 60_000} for i in range(150)]
 
 
 def _ingest_ordered(root, commits: int):
@@ -801,7 +804,95 @@ def test_damage_rebuilds_with_backoff_and_is_counted(tmp_path, monkeypatch):
             lex._retry_at = 0.0  # the backoff has passed
         assert lex.drain(30), "never disabled for good: the rebuild runs"
         st = lex.stats()
-        assert st["ready"] and st["failures"] == 0 and not st["disabled"]
+        # recovered; the failure history outlives the recovery (it decays
+        # after FAILURE_DECAY_S without a failure, not on the first success)
+        assert st["ready"] and not st["disabled"] and st["failures"] == 7
         assert _served_by_tantivy(m, "kumquat mango", f)
     finally:
         m.close()
+
+
+def test_a_rebuild_does_not_reset_the_failure_history(tmp_path, monkeypatch):
+    """A successful rebuild reset the failure count, so damage that only
+    shows at search time rebuilt every ~2s forever (6 rebuilds in 12s): the
+    backoff never grew."""
+    m = _mem(tmp_path / "d")
+    try:
+        m.add_events([{"content": d, "user_id": "u"} for d in _corpus(80)])
+        lex = _ready(m)
+        f = IndexFilter(scope=Scope(user="u"))
+        damage = ValueError("IoError: failed to open file for read: 'abc.idx'")
+        waits = []
+        for k in (1, 2, 3):
+            lex._index = _FailingIndex(lex._index, damage)
+            assert m.ns.index.search_bm25("kumquat mango", f, limit=10), "FTS5 must serve"
+            st = lex.stats()
+            assert st["failures"] == k and st["failures_total"] == k and st["disabled"]
+            waits.append(st["retry_in_s"])
+            with lex._lock:
+                lex._retry_at = 0.0  # let the rebuild run now...
+            assert lex.drain(30), "the rebuild succeeds"  # ...into a fresh, healthy index
+            st = lex.stats()
+            assert st["ready"] and not st["disabled"] and st["failures"] == k
+        assert waits[0] < waits[1] < waits[2], f"the backoff must grow across rebuilds: {waits}"
+        monkeypatch.setattr(tl, "FAILURE_DECAY_S", 0.0)  # a quiet period passes
+        st = lex.stats()
+        assert st["failures"] == 0 and st["failures_total"] == 3
+    finally:
+        m.close()
+
+
+def test_a_short_window_widens_once_then_fts5_answers(tmp_path):
+    """On templated data one tie group fills any window: the lane widened
+    60 -> 240 -> 960 -> 3840 -> 4096 (the last step redundant) and then fell
+    back to FTS5 anyway, 47-54ms against FTS5's 8-16ms."""
+    m = _mem(tmp_path / "d")
+    try:
+        m.add_events([{"content": "common widget report", "user_id": "u", "t_event": T0 + i}
+                      for i in range(400)])
+        lex = _ready(m)
+        fetches = []
+        real = lex._top
+
+        def top(searcher, terms, f, now, fetch):
+            fetches.append(fetch)
+            return real(searcher, terms, f, now, fetch)
+        lex._top = top
+        before = _counter("memd_lexical_fallback_total", reason="short")
+        hits = m.ns.index.search_bm25("widget", IndexFilter(scope=Scope(user="u")), limit=10)
+        assert fetches == [20, 80], f"one widening, then FTS5: {fetches}"
+        assert _counter("memd_lexical_fallback_total", reason="short") == before + 1
+        # FTS5's answer: the newest ten (ties go to the newest)
+        assert [h.record.time.t_event for h in hits] == [T0 + i for i in range(399, 389, -1)]
+    finally:
+        m.close()
+
+
+def test_tied_rows_order_the_same_on_both_backends(tmp_path):
+    """FTS5 returned equal scores oldest-first (rowid order) and tantivy
+    newest-first, so the backend - or whether a row was committed to tantivy
+    yet - changed the order of tied rows. Both now use fusion's key: score,
+    then -t_event, then content hash, then id - also when the LIMIT cuts a
+    group of equal (score, t_event)."""
+    from memd.query.fusion import content_sha
+
+    words = ["fig", "kiwi", "lime", "pear", "plum", "date", "yam", "okra"]
+    ev = [{"content": f"zebu {w}{i}", "user_id": "u", "t_event": T0 + i * 1000} for i, w in enumerate(words)]
+    ev += [{"content": f"zebu {w}", "user_id": "u", "t_event": T0 + 4500} for w in words[:6]]  # one t_event
+    random.Random(3).shuffle(ev)  # insertion (rowid) order is neither of the above
+    want = [e["content"] for e in sorted(ev, key=lambda e: (-e["t_event"], content_sha(e["content"])))]
+    f = IndexFilter(scope=Scope(user="u"))
+    for backend in ("fts5", "tantivy"):
+        m = _mem(tmp_path / backend, lexical_backend=backend,
+                 lexical_commit_ms=600_000, lexical_commit_docs=10 ** 6)
+        try:
+            m.add_events(ev)
+            phases = ["as written"] + (["committed"] if backend == "tantivy" else [])
+            for phase in phases:
+                if phase == "committed":
+                    assert _ready(m)
+                for limit in (len(ev), 6, 4, 3):  # 6 and 4 cut inside the equal-t_event group
+                    got = [h.record.content for h in m.ns.index.search_bm25("zebu", f, limit=limit)]
+                    assert got == want[:limit], f"{backend} {phase} limit={limit}: {got}"
+        finally:
+            m.close()

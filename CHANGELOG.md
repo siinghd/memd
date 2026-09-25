@@ -16,14 +16,25 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   near tantivy's 65,530-byte term limit is served by FTS5.
 - **tantivy lane: overwriting an existing id** (`memd import --native`) now
   re-indexes it; the old text and scope no longer match.
-- **tantivy lane: tied scores are ordered by content** (score, -t_event,
-  content hash, id), so re-ingesting the same data gives the same top-k
-  however it was split into segments.
+- **bm25 lane: tied scores are ordered by content** (score, -t_event,
+  content hash, id) on both backends, including where the limit cuts a tied
+  group; FTS5 used to return ties oldest-first and tantivy newest-first. With
+  tantivy the top-k is deterministic for the same operation history *and
+  commit schedule*, not across commit rhythms: its BM25 statistics count
+  deleted and superseded docs until their segments merge, so two near-equal
+  docs can swap. (Re-scoring tantivy's window in FTS5 would remove that, at
+  11 ms p50 / 51 ms p95 per query at 20K docs against 0.6 ms for the window.)
+- **tantivy lane: a short window widens once, then FTS5 answers.** On
+  templated data a tie group filled every window, and the lane widened
+  60 -> 240 -> 960 -> 3840 -> 4096 (47-54 ms) before falling back to FTS5
+  (8-16 ms) anyway; the tantivy share is now 2-3 ms.
 - **tantivy failures**: only damage (I/O, missing or corrupt files, a panic)
   rebuilds the index, into a fresh directory, with exponential backoff; other
   errors send that query to FTS5. It is never disabled until restart;
-  `stats()["lexical"]` counts every rebuild and shows `failures` and
-  `retry_in_s`.
+  `stats()["lexical"]` counts every rebuild and shows `failures`,
+  `failures_total` and `retry_in_s`. The failure history survives a
+  successful rebuild and decays after 10 minutes without a failure, so damage
+  that only shows at search time backs off (3 rebuilds in 12 s, not 6).
 - **Reranker calls are bounded**: at most `max_inflight` (default 8) run at
   once, timed-out ones included; past that a search skips reranking
   (`reason="busy"`), and a call whose deadline passed while queued never
