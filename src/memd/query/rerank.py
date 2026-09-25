@@ -28,8 +28,11 @@ A call that misses its deadline cannot be cancelled once it runs (for Jev,
 its request is in flight), so the stage bounds how many calls may be in
 flight at once: past `max_inflight` a search skips reranking at once
 (reason "busy") instead of queueing more work behind the stuck calls. A call
-still queued when its deadline passes never starts, so it never sends the
-candidate texts after its search has returned.
+still queued when its deadline passes never starts, and a Jev request checks
+its deadline again immediately before it is sent, so candidate texts never
+leave after their search has returned. Until the Jev client is built (SDK
+import + construction, ~1-1.5s, started in the background) searches skip
+reranking (reason "warming") rather than build it on their own deadline.
 """
 from __future__ import annotations
 
@@ -68,6 +71,8 @@ CANDIDATE_TEXT_CHARS = 2000
 # Jev fan-out: one Noul per candidate, at most this many per request; the
 # chunks of one query are issued concurrently
 JEV_CHUNK = 25
+# a failed background client build is retried at most this often
+JEV_WARM_RETRY_S = 30.0
 
 # Validated wording (experiments 015/016). `{cid}` is the candidate's key in
 # the request state, e.g. `candidates.c7`.
@@ -159,6 +164,9 @@ class JevReranker:
         self._api_key = api_key
         self._client = client
         self._client_lock = threading.Lock()
+        self._warm_lock = threading.Lock()
+        self._warming = False
+        self._warm_after = 0.0  # monotonic: no new background build before this
         self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="memd-jev")
         self._local = threading.local()
 
@@ -167,11 +175,33 @@ class JevReranker:
         ~1-1.5s: done inside the first search it consumed the whole 1.5s
         deadline, so the first rerank after open always fell back (seen in
         the live smoke check). Memory calls this on a background thread at
-        open; scores() still builds the client itself if it has to."""
+        open; until it is done scores() skips ("warming") and, if no build is
+        running, starts one in the background."""
         self._get_client()
 
     def ready(self) -> bool:
         return self._client is not None
+
+    def _warm(self) -> None:
+        """Build the client on a background thread, one build at a time."""
+        with self._warm_lock:
+            if self._warming or self._client is not None or time.monotonic() < self._warm_after:
+                return
+            self._warming = True
+
+        def build() -> None:
+            try:
+                self._get_client()
+            except Exception as e:  # noqa: BLE001 - searches keep their own order
+                _log.warning("memd: jev client build failed (%s); retrying in %.0fs",
+                             type(e).__name__, JEV_WARM_RETRY_S)
+                with self._warm_lock:
+                    self._warm_after = time.monotonic() + JEV_WARM_RETRY_S
+            finally:
+                with self._warm_lock:
+                    self._warming = False
+
+        threading.Thread(target=build, daemon=True, name="memd-jev-warm").start()
 
     def _get_client(self) -> Any:
         if self._client is None:
@@ -185,19 +215,26 @@ class JevReranker:
         return self._client
 
     def _chunk(self, query: str, cands: list[Candidate], deadline: float) -> list[float]:
-        from typesafe_sdk import Noul
-
         if time.monotonic() >= deadline:
             # queued behind other requests until scores() gave up: never
             # send the texts for a search that has already returned
             raise _Failure("timeout")
+        from typesafe_sdk import Noul
+
         state = {"query": query, "candidates": {f"c{i}": c for i, c in enumerate(cands)}}
         questions = {
             f"c{i}": Noul(instructions=JEV_INSTRUCTIONS.format(cid=f"c{i}"), criteria=JEV_CRITERIA)
             for i in range(len(cands))
         }
-        resp = self._get_client().system_one(state=state, questions=questions, model=self.model,
-                                             timeout=self.timeout_s)
+        client = self._get_client()
+        if time.monotonic() >= deadline:
+            # checked again AFTER everything that can take time and right
+            # before the send: checked only before the client build (~1-1.5s
+            # when cold), texts left the machine 0.7s after their search
+            # had returned
+            raise _Failure("timeout")
+        resp = client.system_one(state=state, questions=questions, model=self.model,
+                                 timeout=self.timeout_s)
         nouls = resp.nouls
         return [float(nouls[f"c{i}"].noul) for i in range(len(cands))]
 
@@ -205,6 +242,11 @@ class JevReranker:
         self._local.reason = None
         if not cands:
             return []
+        if self._client is None:
+            # never build it on a search's deadline (see load())
+            self._warm()
+            self._local.reason = "warming"
+            return None
         try:
             deadline = time.monotonic() + self.timeout_s
             futs = [self._pool.submit(self._chunk, query, cands[i:i + JEV_CHUNK], deadline)

@@ -38,8 +38,12 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
 - **Reranker calls are bounded**: at most `max_inflight` (default 8) run at
   once, timed-out ones included; past that a search skips reranking
   (`reason="busy"`), and a call whose deadline passed while queued never
-  sends its texts. A `BaseException` from a reranker no longer escapes
-  search (KeyboardInterrupt and SystemExit still propagate).
+  sends its texts; a Jev request also re-checks its deadline right before it
+  is sent (checked only before the ~1-1.5 s client build, texts could leave
+  0.7 s after their search returned). Until the Jev client is built, in the
+  background, searches skip reranking (`reason="warming"`). A
+  `BaseException` from a reranker no longer escapes search (KeyboardInterrupt
+  and SystemExit still propagate).
 
 ## [0.2.0] - 2026-09-24
 

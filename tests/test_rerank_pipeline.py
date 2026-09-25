@@ -329,8 +329,9 @@ def test_stats_without_a_reranker(tmp_path):
 class _FakeSDK:
     """Stands in for typesafe_sdk: records requests, answers from a function."""
 
-    def __init__(self, answer=None, delay_s=0.0, error=None):
+    def __init__(self, answer=None, delay_s=0.0, error=None, build_s=0.0):
         self.requests: list[dict] = []
+        self.build_s = build_s  # client construction time (the real SDK's is ~1-1.5s)
         self.answer = answer or (lambda state, i: 0.9 if "kumquat" in
                                  state["candidates"][f"c{i}"]["text"] else 0.1)
         self.delay_s = delay_s
@@ -361,6 +362,8 @@ class _FakeSDK:
         class TypeSafeClient:
             def __init__(self, **kw):
                 self.kw = kw
+                if sdk.build_s:
+                    time.sleep(sdk.build_s)
 
             def system_one(self, state, questions, **kw):
                 with sdk.lock:
@@ -385,6 +388,7 @@ def test_jev_fans_out_in_chunks_of_25_with_the_validated_wording(monkeypatch):
     sdk = _FakeSDK(delay_s=0.05)
     monkeypatch.setitem(sys.modules, "typesafe_sdk", sdk.module)
     jev = JevReranker(api_key="ts-test", timeout_s=1.5)
+    jev.load()  # (a cold client skips with "warming": see the verifier regressions)
     try:
         cands = _cands(30)
         out = jev.scores("where are the kumquats?", cands)
@@ -411,6 +415,7 @@ def test_jev_timeout_and_errors_return_none_with_a_reason(monkeypatch):
     sdk = _FakeSDK(delay_s=1.0)
     monkeypatch.setitem(sys.modules, "typesafe_sdk", sdk.module)
     jev = JevReranker(api_key="ts-test", timeout_s=0.2)
+    jev.load()
     try:
         t0 = time.monotonic()
         assert jev.scores("q", _cands(30)) is None
@@ -425,6 +430,7 @@ def test_jev_timeout_and_errors_return_none_with_a_reason(monkeypatch):
     sdk2 = _FakeSDK(error=TypeSafeRateLimitError("429"))
     monkeypatch.setitem(sys.modules, "typesafe_sdk", sdk2.module)
     jev = JevReranker(api_key="ts-test")
+    jev.load()
     stage = RerankStage(jev)
     try:
         before = _counter("memd_rerank_fallback_total", reason="rate_limited")
@@ -867,3 +873,38 @@ def test_keyboard_interrupt_and_system_exit_are_not_swallowed(exc):
         assert stage.run("q", _cands(2)) == [0.5, 0.5]
     finally:
         stage.close()
+
+
+def test_a_cold_jev_client_skips_reranking_and_never_sends_late(monkeypatch):
+    """The deadline was checked BEFORE the client build (~1-1.5s cold), so a
+    search that had already returned sent its candidate texts ~0.7s later.
+    Until the client is built (in the background) searches skip: "warming"."""
+    sdk = _FakeSDK(build_s=0.6)
+    monkeypatch.setitem(sys.modules, "typesafe_sdk", sdk.module)
+    jev = JevReranker(api_key="ts-test", timeout_s=0.3)
+    stage = RerankStage(jev)
+    try:
+        before = _counter("memd_rerank_fallback_total", reason="warming")
+        t0 = time.monotonic()
+        assert stage.run("cold query", _cands(30)) is None
+        assert time.monotonic() - t0 < 0.25, "a cold client must not cost the search its deadline"
+        assert _counter("memd_rerank_fallback_total", reason="warming") == before + 1
+        time.sleep(1.0)  # the background build finishes meanwhile
+        assert not sdk.requests, "texts were sent after their search had returned"
+        assert jev.ready(), "the client is built in the background"
+        assert stage.run("warm query", _cands(4)) == [0.1, 0.9, 0.1, 0.9]
+        assert [r["state"]["query"] for r in sdk.requests] == ["warm query"]
+    finally:
+        stage.close()
+
+
+def test_a_jev_chunk_rechecks_its_deadline_right_before_the_send(monkeypatch):
+    sdk = _FakeSDK(build_s=0.3)
+    monkeypatch.setitem(sys.modules, "typesafe_sdk", sdk.module)
+    jev = JevReranker(api_key="ts-test", timeout_s=1.0)
+    try:
+        with pytest.raises(Exception):
+            jev._chunk("q", _cands(3), time.monotonic() + 0.1)  # passes by the build's end
+        assert sdk.requests == [], "sent after the deadline had passed"
+    finally:
+        jev.close()
