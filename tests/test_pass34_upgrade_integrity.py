@@ -537,7 +537,10 @@ def test_a_killed_compaction_leaves_no_hard_deleted_bytes_after_reopen(tmp_path)
     m = _manifest(os.path.join(root, "store"), "default")
     orphans = [f for f in os.listdir(nsdir)
                if f.startswith("seg-") and f not in {s["name"] for s in m["segments"]}]
-    stale_snap = m["snapshot_name"]
+    # the compaction's commit unreferenced the snapshot it made stale (it
+    # predates the ops that fold retired); the kill left the object behind
+    assert not m["snapshot_name"]
+    stale_snap = next((f for f in os.listdir(nsdir) if f.startswith("index-")), "")
     # positive controls: the killed compaction committed, but the segment it
     # replaced, the snapshot published before the delete and this node's
     # index cache all still hold the hard-deleted record
@@ -621,7 +624,12 @@ def test_a_snapshot_left_by_a_crash_is_collected_and_a_live_one_kept(tmp_path, m
     ns.compact(force=True)
     second = ns.manifest.snapshot_name
     monkeypatch.setattr(LocalObjectStore, "delete", delete)
+    # the process dies rather than closing cleanly (a clean close collects it)
+    gc_now = storage_engine.NamespaceStore._collect_garbage_now
+    monkeypatch.setattr(storage_engine.NamespaceStore, "_collect_garbage_now",
+                        lambda self, defer_audit: None)
     e.close()
+    monkeypatch.setattr(storage_engine.NamespaceStore, "_collect_garbage_now", gc_now)
     assert first != second and {first, second} <= set(os.listdir(os.path.join(root, "ns", "s")))
     e = StorageEngine(root)
     try:

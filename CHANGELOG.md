@@ -86,6 +86,14 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
   questions (10 per type, dev split) through `Memory.search` and fails below
   session ndcg@5 0.80 (hash embedder, no reranker);
   `.github/workflows/nightly-gate.yml` runs it nightly and skips offline.
+- **Crash oracle** (`tests/fuzz/test_crash_oracle.py`, marked `slow`: skipped
+  unless `MEMD_RUN_SLOW=1` or `-m slow`; `MEMD_CRASH_SEEDS` picks seeds):
+  randomized mixed workloads killed at random store calls - inside rotate,
+  compaction, the format-1 migration, garbage collection, the index scrub,
+  or by SIGKILL on a timer - then checked against an fsync'd journal of
+  what was acknowledged, warm, cold, rebuilt and compacted, through export,
+  and for hard-deleted text left in any file.
+  `.github/workflows/nightly-crash-oracle.yml` runs 30 seeds nightly.
 - **S3-compatible object store backend** (`pip install "memd[s3]"`,
   `Memory("s3://bucket/prefix")`) for AWS S3, Cloudflare R2, MinIO and Ceph.
   S3 has no append, so each append is its own immutable object and the logical
@@ -142,10 +150,32 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
   it - so a delete wins wherever the order is ambiguous (logged as a
   warning). Deletes and supersedes an old rotate dropped from durable data
   but the node's local index still applied are kept too. The migration
-  commits with one manifest put: a crash before it leaves the old layout in
-  force (the next open migrates again), a crash after it only log residue
-  the next open removes. The same fix covers a downgrade, a crash and an
-  upgrade.
+  commits with one manifest put and changes nothing it reads before it -
+  neither the old layout nor the local index: a crash (or a failed put, say
+  ENOSPC, and a retry) before the commit leaves both in force and the next
+  open migrates again to the same result; a crash after it leaves only log
+  residue the next open removes. (It used to wipe the local index before
+  the commit, so a migration killed at its segment or manifest put lost the
+  only record of those deletes and resurrected them for good. Killed at
+  every write of the migrating open, for stores written by three older
+  builds: 36, 36 and 44 of 120-124 runs ended with more records than an
+  uninterrupted migration; now none.) The same fix covers a downgrade, a
+  crash and an upgrade.
+- **A cold open served soft deletes acked since the last index snapshot.**
+  A snapshot was installed whenever it was newer than the last purge, but a
+  compaction retires the tombstones it applies - the records they deleted
+  are simply absent from its output - so an image taken before it still
+  held them as live rows and nothing replayed deleted them again (200 of
+  200 acked deletes back, and reads disagreeing with export, when deletes
+  took a namespace under the 2,000-record snapshot floor so the compaction
+  published no new image; 30 of 30 with a kill between the compaction's
+  commit and its publish). The manifest now records the newest compaction
+  (`compact_seq`); the compaction's commit unreferences the snapshot it
+  outdates, a snapshot is published only if the image covers both the
+  newest compaction and the newest purge (scrubbed to it, too), and open
+  checks the image's own watermark before it replaces the cache. A
+  rotate's checkpoint does not outdate a snapshot: its output carries the
+  effect of every op it retires, and replay catches the image up.
 - **A crash inside a compaction whose output was empty resurrected what it
   deleted**: with no segment referenced, orphan adoption re-adopted every
   segment the compaction had replaced on the next cold open. Adoption now
@@ -155,13 +185,20 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
   unreferenced segment is never read.
 - **A crash inside a compaction kept a hard delete's bytes past the D7
   deadline**: the segments and the index snapshot it had replaced stayed on
-  disk for good. Open now deletes every unreferenced segment and index
-  snapshot provably older than the newest checkpoint (written under an
-  earlier manifest generation; a segment also folded at or below its seq;
-  anything a writer may still own is never touched), under the namespace's
-  lock or lease, with a `segment_gc` / `snapshot_gc` audit entry per
-  deletion and `stats()["segments_collected"]` /
-  `stats()["snapshots_collected"]`.
+  disk for good. Open, every compaction that purges and a clean close now
+  delete every unreferenced segment and index snapshot provably older than
+  the newest checkpoint (written under an earlier manifest generation; a
+  segment also folded at or below its seq; anything a writer may still own
+  is never touched), under the namespace's lock or lease, with a
+  `segment_gc` / `snapshot_gc` audit entry per deletion and
+  `stats()["segments_collected"]` / `stats()["snapshots_collected"]`.
+  Collecting at open only let an orphan a crash left (a segment or snapshot
+  written but never committed - as new as the checkpoint at that open) keep
+  hard-deleted text past the purge that followed until the process
+  restarted. The temp file a put killed before its rename leaves (a
+  segment's records, in plaintext when unencrypted) is deleted the same way:
+  temp names carry a per-process tag, and the owner deletes any that is not
+  its own.
 - **Hard-deleted text survived in the local index cache and its snapshot.**
   Deleting a row left its FTS5 terms in older segments, its bytes in freed
   pages and its page images in the SQLite WAL, and a snapshot published
@@ -295,7 +332,12 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
   rebuilt from durable state and its file vacuumed once (vectors re-embed
   in the background, as after a cache loss), and the old index snapshot is
   dropped (the next compaction
-  publishes a new one). That open costs O(namespace).
+  publishes a new one). That open costs O(namespace) and holds only that
+  namespace's lock: other namespaces open, serve and close meanwhile (the
+  whole open used to run under the engine-wide lock - 25 s at 120K records
+  during which no other namespace could be opened). Its phases are logged at
+  INFO. A local index built by a pre-release format-2 build is rebuilt once
+  on its first open by this version.
 - **Upgrade on the node that holds the local cache** (`<data>/_cache`, or
   `local_dir` with S3) where you can. Older rotates dropped some deletes
   from durable data; only the old local index still applies them, and the
@@ -318,6 +360,15 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
 - The Jev reranker adds ~1 s per search (network) and sends candidate texts to TypeSafe.
 - Single writer per data root, on every backend. `uvicorn --workers N` with
   N>1 does not work.
+- A hard delete that an older version lost from durable data is served
+  again after the upgrade. Every older version recorded a hard delete in
+  its local index by removing the row - no tombstone or purge marker is
+  left - so when it was killed between a rotate's (or compaction's)
+  ops-log delete and its re-append of the pending hard deletes, the delete
+  survives nowhere the migration can read: a missing row is also what an
+  interrupted rebuild leaves. That version's own cold open served the
+  record too; its warm open hid it. A row the old index still marks deleted
+  is kept deleted.
 - With the S3 backend, envelope keys stay local: a second node cannot decrypt
   the bucket. A KMS key provider is not built.
 - BM25 tokenization is `ascii`, so CJK is not indexed by the lexical lane.

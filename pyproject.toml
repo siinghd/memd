@@ -51,6 +51,7 @@ addopts = "-q"
 timeout = 300
 markers = [
   "s3: requires an S3-compatible endpoint (set MEMD_TEST_S3_ENDPOINT; CI runs MinIO)",
+  "slow: minutes-long fuzzing (the crash oracle); skipped unless MEMD_RUN_SLOW=1 or -m slow",
 ]
 
 [tool.bandit]

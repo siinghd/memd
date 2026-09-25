@@ -1,0 +1,53 @@
+name: Nightly crash oracle
+
+# Randomized mixed workloads killed at random store calls - inside rotate,
+# compaction, the format-1 migration, garbage collection, the index scrub, or
+# by SIGKILL on a timer - then checked warm, cold, rebuilt and compacted,
+# through export, and for hard-deleted text left in any file
+# (tests/fuzz/test_crash_oracle.py). Too slow for every push (a few seconds
+# per seed), so the per-PR suite skips it; this job FAILS on any bad seed and
+# keeps the failing stores as an artifact.
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "seeds, e.g. 0-30 or 3,9,12"
+        default: "0-30"
+
+jobs:
+  crash-oracle:
+    name: crash oracle
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      # memd[fast]: a quarter of the seeds run the bm25 lane on tantivy
+      - run: pip install -e ".[dev,fast]"
+      - name: Crash oracle
+        env:
+          MEMD_RUN_SLOW: "1"
+          # a different 30 seeds every night, and the dispatch input when given
+          MEMD_CRASH_SEEDS: ${{ github.event.inputs.seeds || '' }}
+        run: |
+          if [ -z "$MEMD_CRASH_SEEDS" ]; then
+            base=$(( ($(date +%s) / 86400 % 1000) * 30 ))
+            export MEMD_CRASH_SEEDS="$base-$((base + 30))"
+          fi
+          echo "seeds: $MEMD_CRASH_SEEDS"
+          # no -q: pyproject addopts has one (a second hides the summary)
+          python -m pytest tests/fuzz -rf --timeout=1800 --basetemp="$RUNNER_TEMP/oracle"
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: crash-oracle-stores-${{ github.run_number }}
+          path: ${{ runner.temp }}/oracle
+          if-no-files-found: ignore
+          retention-days: 14

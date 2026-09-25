@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import os
+import secrets
 import shutil
 import tempfile
 import threading
@@ -24,6 +25,21 @@ from memd.metrics import METRICS
 # THIS request cost?" - because concurrent work interleaves into the same
 # counter. This context-local tally rides with the request instead.
 _req_io: "contextvars.ContextVar[dict | None]" = contextvars.ContextVar("memd_req_io", default=None)
+
+
+# A put writes a temp file beside its key and renames it into place; a crash
+# in between leaves the temp file - with the payload (a segment's records,
+# say) - for good. Temp names carry this process's tag, so the namespace's
+# owner can delete every one that is not its own (see tmp_is_foreign and
+# NamespaceStore._collect_garbage). Random, not the pid: in a container
+# every incarnation is pid 1.
+TMP_PREFIX = ".tmp-"
+_TMP_TAG = f"{TMP_PREFIX}{os.getpid()}x{secrets.token_hex(4)}-"
+
+
+def tmp_is_foreign(name: str) -> bool:
+    """True for a put's temp file that another (so: dead) process left."""
+    return name.startswith(TMP_PREFIX) and not name.startswith(_TMP_TAG)
 
 
 _TALLY_LOCK = threading.Lock()
@@ -211,7 +227,7 @@ class LocalObjectStore(ObjectStore):
         _count_op("put")
         path = self._path(key)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=_TMP_TAG)
         try:
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
@@ -236,7 +252,7 @@ class LocalObjectStore(ObjectStore):
         _count_op("put_hint")
         path = self._path(key)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=_TMP_TAG)
         try:
             with os.fdopen(fd, "wb") as f:
                 f.write(data)

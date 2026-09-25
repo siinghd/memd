@@ -2009,3 +2009,6 @@ class Memory:
         self._flush_all_audits()
         self.ns.close()
         self.engine.close()
+        # a clean close collects what a crash orphaned (segment_gc /
+        # snapshot_gc entries): make those entries durable too
+        self._flush_all_audits()
