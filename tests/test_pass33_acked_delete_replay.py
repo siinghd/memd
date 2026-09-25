@@ -13,6 +13,7 @@ carries a sequence number, and every consumer - open, rebuild, rotate,
 compact - folds events in that one total order, with a segment standing in
 for every event at or below its fold_seq for the ids it holds.
 """
+import json
 import os
 import shutil
 import signal
@@ -329,6 +330,15 @@ class TestFullReplayIsExact:
         ns.append_ops([{"op": "tombstone", "id": y.id, "at": 1}])
         e.close()
         monkeypatch.undo()
+        # ...and the format-1 manifest that writer kept (see pass 34)
+        mpath = os.path.join(root, "ns", "lg", "manifest.json")
+        with open(mpath) as f:
+            m = json.load(f)
+        m["version"] = m.pop("gen")
+        for k in ("format", "checkpoint", "checkpoint_seq"):
+            m.pop(k)
+        with open(mpath, "w") as f:
+            json.dump(m, f)
         _wipe_cache(root)
         e = StorageEngine(root)
         try:

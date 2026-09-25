@@ -127,8 +127,38 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
   and a due hard delete folded by a rotate was never purged); and frame seqs
   inferred from position hid a frame written after `[frame, op, frame]` and
   a restart from the replay watermark, losing it from the index on a crash.
-  Unstamped WAL frames from older versions replay in the right order, and
-  older versions can still read a stamped WAL.
+  Data written by older versions is migrated once (next entry); older
+  versions refuse the new format (see Upgrade notes).
+- **Upgrading could undo deletes the old version had acked and still hid.**
+  Older WAL frames carry no seq, and the old seq counter was rebuilt from
+  the ops log after a crash, so it reused numbers; filling frame seqs into
+  the gaps the ops leave put frames after their own tombstones (for
+  `[add A, add B | crash | del B, add D, del D]` the first open served A, B
+  and D; the old binary's own warm open served A). Each namespace in the
+  old layout (store format 1) is now migrated on its first open: its WAL and
+  ops log are folded into one segment in the order the seq counts prove -
+  gap-filled when every seq reconciles, otherwise every frame before every
+  op, and never with a record copy ingested before a delete placed after
+  it - so a delete wins wherever the order is ambiguous (logged as a
+  warning). Deletes and supersedes an old rotate dropped from durable data
+  but the node's local index still applied are kept too. The migration
+  commits with one manifest put: a crash before it leaves the old layout in
+  force (the next open migrates again), a crash after it only log residue
+  the next open removes. The same fix covers a downgrade, a crash and an
+  upgrade.
+- **A crash inside a compaction whose output was empty resurrected what it
+  deleted**: with no segment referenced, orphan adoption re-adopted every
+  segment the compaction had replaced on the next cold open. Adoption now
+  requires positive evidence - rotate, compaction and migration commit the
+  name of the segment they wrote in the same manifest put as the segment
+  list (an explicit empty checkpoint when they wrote none) - and any other
+  unreferenced segment is never read.
+- **A torn ops-log tail was never repaired** (only the WAL's was): a delete
+  acked after it was invisible to a cold open and dropped by the next
+  rotate. Open now cuts a torn tail off, durably, before anything is
+  appended; a failed append is cut back before the next op; and ops an
+  older version acked behind a torn record are recovered by resynchronizing
+  on the next frame that parses as a later op.
 - **Two processes on one data root silently destroyed acked data** (8 of 150
   writes lost, measured). A second writer now fails fast with
   `NamespaceBusyError`.
@@ -178,6 +208,16 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
 - A query-plan inversion made the lexical lane 22 seconds at 10K records.
 
 ### Fixed - security
+- **Exports contained deleted records.** `export_jsonl` (`memd export`,
+  `POST /v1/ns/{ns}/export`, the SDK) dumped stored copies with no op
+  applied: soft- and hard-deleted records came back out (444 across 69 of
+  100 crash runs) until a compaction purged their bytes, and superseded
+  facts lost their supersedence. An export now holds exactly what reads
+  serve - deleted and hard-deleted records are left out, including while a
+  purge is pending; superseded and quarantined records stay, with their
+  flags. The other bulk paths were audited: import only writes, re-embed
+  and the index snapshot read the op-applied index, and `load_all_records`
+  is documented as a raw inspection API.
 - **A record captured with only a session id was visible to every other user**
   in the namespace. Session is now the private leaf of the scope hierarchy.
 - Audit entries were filed under the facade's default namespace, putting one
@@ -229,7 +269,30 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
 - Audit ledgers are per-namespace, O(1) to open, and bounded in size.
 - Index schema v1 -> v2, migrated on open. No re-embed required.
 
+### Upgrade notes
+- **The first open of each namespace migrates it** to store format 2, once:
+  its WAL and ops log are folded into a segment, the node's local index is
+  rebuilt from durable state (vectors re-embed in the background, as after
+  a cache loss), and the old index snapshot is dropped (the next compaction
+  publishes a new one). That open costs O(namespace).
+- **Upgrade on the node that holds the local cache** (`<data>/_cache`, or
+  `local_dir` with S3) where you can. Older rotates dropped some deletes
+  from durable data; only the old local index still applies them, and the
+  migration keeps what it proves. A first open without that cache cannot
+  know those deletes (an old cold open served those records again too).
+- **No downgrades.** Once this version has opened a namespace, older
+  versions stop at its manifest with `ValueError: invalid literal for int()
+  ... 'memd store format 2: ... downgrades are not supported'` and change
+  nothing - reading it would ignore the deletes segment headers now carry,
+  and their next compaction would make the resurrection permanent. Back up
+  the data root first if you may need to roll back. A namespace this
+  version never opened stays readable by older versions; a newer format
+  than this version reads raises `StoreFormatError`.
+
 ### Known limitations
+- A crash inside a compaction, after its commit, can leave the segments it
+  replaced on disk: never read again, but not removed, so a hard delete's
+  bytes may outlive its deadline there until they are deleted by hand.
 - Search latency grows with namespace size under FTS5 (p50 15/44/114 ms at
   10K/50K/150K records on real turns); install `memd[fast]` (tantivy: 5.7/7.3/8.8 ms).
 - Multi-session aggregation questions ("how many X did I ...") remain the

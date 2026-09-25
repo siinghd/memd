@@ -5,7 +5,7 @@ Per-namespace layout under the object store:
     {ns}/wal.jsonl      active append log (record batches; fsync'd before ack)
     {ns}/ops.jsonl      mutation ops: tombstone / supersede / quarantine / hard_delete
     {ns}/seg-{ulid}     closed immutable segments (folded state at fold_seq)
-    {ns}/manifest.json  {version, seq, segments[], wal_size, ops_size}
+    {ns}/manifest.json  {format, gen, seq, segments[], checkpoint, wal_size, ops_size}
 
 Invariants:
   - Segments are immutable; corrections arrive as ops; compaction folds.
@@ -19,10 +19,14 @@ Invariants:
     frame, an op) and open / rebuild / rotate / compact all fold events in
     seq order. A segment stands in for every event at or below its fold_seq
     for the ids it holds; nothing else may be skipped or reordered.
+  - One store format per namespace (STORE_FORMAT). An older layout is
+    migrated once, on first open, and older binaries refuse the new one.
 """
 from __future__ import annotations
 
+import itertools
 import json
+import logging
 import os
 import shutil
 import socket
@@ -36,6 +40,8 @@ from memd.metrics import METRICS
 from memd.index.sqlite_index import NamespaceIndex
 from memd.storage.crypto import KeyEnvelope, NullKeyEnvelope
 from memd.storage.objectstore import LocalObjectStore, ObjectStore
+
+_log = logging.getLogger(__name__)
 
 HARD_DELETE_DEADLINE_MS = 72 * 3600 * 1000
 DEFAULT_WAL_ROTATE_BYTES = 8 * 1024 * 1024
@@ -56,9 +62,36 @@ class CompactionReport:
     duration_ms: int = 0
 
 
+# ---------------------------------------------------------------------------
+# Store format.
+#
+# Format 1 (no "format" key) is every layout before this one: WAL frames
+# without a seq, a seq counter persisted lazily and rebuilt from the ops log
+# after a crash, rotates that dropped ops. Format 2 stamps every frame,
+# carries ops in segment headers and records its newest checkpoint. Neither
+# direction reads the other safely:
+#   - a format-1 binary ignores the ops a format-2 segment header carries
+#     (tombstones, hard deletes), serves the records they deleted, and its
+#     next compaction makes that durable;
+#   - format-1 data read by seq alone resurrects deletes: after a crash the
+#     old counter REUSED numbers, so frames and ops do not interleave by seq.
+# A format-1 namespace is therefore migrated once, on first open
+# (_migrate_legacy), and a format-2 manifest fences older binaries out: they
+# parse "version" with int() before anything else, so they stop there with
+# this text instead of misreading the store. Downgrades are not supported.
+STORE_FORMAT = 2
+_FORMAT_FENCE = (
+    "memd store format 2: this namespace was upgraded by a newer memd and this "
+    "version cannot read it safely (downgrades are not supported - upgrade memd)")
+
+
+class StoreFormatError(RuntimeError):
+    """The namespace uses a store format this build cannot read."""
+
+
 @dataclass
 class Manifest:
-    version: int = 0
+    version: int = 0  # generation, bumped on every persist ("gen" on disk)
     seq: int = 0  # monotonic op/batch counter
     segments: list[dict] = field(default_factory=list)  # {name, records, fold_seq}
     wal_size: int = 0
@@ -70,10 +103,19 @@ class Manifest:
     # SLO at ~25K records - because nothing durable held the FOLDED form.
     snapshot_seq: int = 0
     snapshot_name: str = ""
+    format: int = STORE_FORMAT
+    # The newest fold (rotate, compaction, migration): the segment it wrote -
+    # "" when its output was empty - and its fold_seq. The only evidence on
+    # which open re-adopts a segment the list lost (_adopt_orphan_segments).
+    checkpoint: str = ""
+    checkpoint_seq: int = 0
 
     def to_dict(self) -> dict:
         return {
-            "version": self.version,
+            # older binaries int() this first: the fence stops them loudly
+            "version": _FORMAT_FENCE if self.format >= 2 else self.version,
+            "format": self.format,
+            "gen": self.version,
             "seq": self.seq,
             "segments": self.segments,
             "wal_size": self.wal_size,
@@ -81,12 +123,19 @@ class Manifest:
             "wal_base_seq": self.wal_base_seq,
             "snapshot_seq": self.snapshot_seq,
             "snapshot_name": self.snapshot_name,
+            "checkpoint": self.checkpoint,
+            "checkpoint_seq": self.checkpoint_seq,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "Manifest":
+        fmt = int(d.get("format", 1) or 1)
+        if fmt > STORE_FORMAT:
+            raise StoreFormatError(
+                f"namespace store format {fmt} is newer than this memd reads "
+                f"({STORE_FORMAT}): upgrade memd")
         return cls(
-            version=int(d.get("version", 0)),
+            version=int(d.get("gen", 0) if fmt >= 2 else d.get("version", 0)),
             seq=int(d.get("seq", 0)),
             segments=list(d.get("segments") or []),
             wal_size=int(d.get("wal_size", 0)),
@@ -94,6 +143,9 @@ class Manifest:
             snapshot_seq=int(d.get("snapshot_seq", 0) or 0),
             snapshot_name=str(d.get("snapshot_name", "") or ""),
             wal_base_seq=int(d.get("wal_base_seq", 0)),
+            format=fmt,
+            checkpoint=str(d.get("checkpoint", "") or ""),
+            checkpoint_seq=int(d.get("checkpoint_seq", 0) or 0),
         )
 
 
@@ -148,8 +200,9 @@ def _frames_with_offsets(data: bytes):
 
 # The seq rides as an extra key on the frame's first record line, not as a
 # header line: MemoryRecord.from_dict ignores unknown keys, so an older binary
-# still reads a stamped WAL after a downgrade instead of taking the frame for
-# a torn tail and truncating the log behind it.
+# still reads a stamped WAL instead of taking the frame for a torn tail and
+# truncating the log behind it (the format fence refuses such a downgrade
+# outright now - see STORE_FORMAT).
 _WAL_SEQ = b'{"_wal_seq":'
 
 
@@ -170,21 +223,107 @@ def _wal_seq(payload: bytes) -> int | None:
         return None
 
 
-def _legacy_frame_seqs(base: int, n: int, op_seqs: set[int]) -> list[int]:
-    """Seqs for n unstamped frames of a WAL opened at wal_base_seq=base.
-    Each seq above base went to either a frame or an op, in write order, so
-    the frames own exactly the gaps the ops log leaves."""
-    out: list[int] = []
-    s = base
-    while len(out) < n:
-        s += 1
-        if s not in op_seqs:
-            out.append(s)
-    return out
+def _frame_seq(payload: bytes) -> int:
+    """A format-2 frame's seq. Format 2 stamps every frame, so an unstamped
+    one is format-1 residue its migration already folded: 0, below all."""
+    s = _wal_seq(payload)
+    return 0 if s is None else s
+
+
+# Format-1 history (read once, by _migrate_legacy).
+#
+# An unstamped frame's seq has to be inferred. Filling the gaps the ops leave
+# above wal_base_seq is exact only if no number was used twice - and the old
+# counter did reuse them: it was persisted lazily and rebuilt from
+# max(manifest.seq, ops) after a crash, so ops written after a crash took the
+# numbers of frames written before it. Gap-filling [A, B | crash | del B, D,
+# del D] (ops 1 and 3) put the frames at 2, 4 and 5, after their own
+# tombstones, and resurrected B and D - which the old binary itself hid,
+# because its live index had applied every event in real time.
+#
+# If nothing was reused, every event holds its own seq in (wal_base_seq,
+# top], so events = top - wal_base_seq at most. More events than that, or two
+# events on one seq, prove reuse: the frame/op interleaving is then unknown
+# and the conservative reading is taken - every frame first (in log order),
+# then every op (in seq order), so a delete, supersede or quarantine is never
+# undone by a write that may have preceded it. When the counts do reconcile
+# (a manifest.seq that an earlier open inflated can make them reconcile
+# anyway), gap-filling is used, but an unstamped copy still may not undo an
+# op on its id that it lands after unless its record was created after that
+# op: a record ingested before its delete cannot be the re-add that follows it.
+
+
+def _legacy_events(frames: list[tuple[int | None, list[MemoryRecord]]], ops: list[dict],
+                   base: int, floor: int) -> tuple[list[tuple[int, object]], str, int]:
+    """Order a format-1 WAL (frames as (stamp or None, records), in log order)
+    and its ops log into one stream for _fold_events -> (events, how, top).
+
+    how is "exact", "guarded" (some copies were held before an op) or
+    "conservative" (reuse proven); top is the highest seq the stream holds,
+    at least `floor`. Seqs in the result only order it: fold it over an
+    empty base."""
+    op_seqs = [int(o.get("seq", 0)) for o in ops]
+    stamps = [s for s, _ in frames if s is not None]
+    used = op_seqs + stamps
+    top = max([floor, base] + used)
+    fits = (len(set(used)) == len(used) and all(s > base for s in used)
+            and len(frames) + len(op_seqs) <= top - base)
+    seqs: list[int] = []
+    if fits:
+        taken = set(used)
+        gaps = (s for s in itertools.count(base + 1) if s not in taken)
+        for s, _ in frames:
+            s = next(gaps) if s is None else s
+            if seqs and s <= seqs[-1]:
+                fits = False  # a frame can never precede one written before it
+                break
+            seqs.append(s)
+    if not fits:
+        ordered = sorted(ops, key=lambda o: int(o.get("seq", 0)))
+        return ([(0, recs) for _, recs in frames]
+                + [(int(o.get("seq", 0)), o) for o in ordered]), "conservative", top
+    stream = sorted([(s, 0, i, frames[i][1]) for i, s in enumerate(seqs)]
+                    + [(s, 1, j, o) for j, (s, o) in enumerate(zip(op_seqs, ops))],
+                    key=lambda e: (e[0], e[1]))
+    events: list[tuple[int, object]] = []
+    seen: dict[str, list[tuple[int, dict]]] = {}  # id -> (event index, op) so far
+    held: dict[int, list[MemoryRecord]] = {}      # event index -> copies moved before it
+    for s, kind, i, ev in stream:
+        if kind:
+            seen.setdefault(_op_target(ev), []).append((len(events), ev))
+            events.append((s, ev))
+            continue
+        if frames[i][0] is not None:  # stamped: its seq is a fact
+            events.append((s, ev))
+            continue
+        keep = []
+        for r in ev:
+            at = next((pos for pos, op in seen.get(r.id, ())
+                       if _op_at(op) is None or _op_at(op) >= r.time.t_ingested), None)
+            if at is None:
+                keep.append(r)
+            else:
+                held.setdefault(at, []).append(r)
+        events.append((s, keep))
+    if not held:
+        return events, "exact", top
+    out: list[tuple[int, object]] = []
+    for pos, (s, ev) in enumerate(events):
+        if pos in held:
+            out.append((s, held[pos]))
+        out.append((s, ev))
+    return out, "guarded", top
 
 
 def _op_target(op: dict) -> str | None:
     return op.get("id") or op.get("old")
+
+
+def _op_at(op: dict) -> int | None:
+    try:
+        return int(op["at"])
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def _merge_events(
@@ -646,7 +785,11 @@ class NamespaceStore:
             self.manifest = Manifest.from_dict(json.loads(raw))
         else:
             self._persist_manifest()
-        ops = self._read_ops()
+        # repaired before this session can append an op behind a torn record
+        ops = self._read_ops(repair=True)
+        if self.manifest.format < STORE_FORMAT:
+            self._migrate_legacy(ops)
+            ops = []
         # Index-applied watermark: the index records the highest manifest.seq it
         # has folded in. Replay covers segments + wal frames + ops with
         # seq > applied - so a fresh/restored cache rebuilds everything, while
@@ -664,7 +807,8 @@ class NamespaceStore:
         versions, carried, max_fold = self._load_checkpoints(applied, where="segment-replay")
         max_fold = self._adopt_orphan_segments(versions, carried, applied, max_fold)
         wal = self.store.get(self.wal_key) or b""
-        tail, good_end, n_frames, last_seq = self._scan_wal(wal, applied, ops)
+        base = self.manifest.wal_base_seq  # frames at or below it are folded
+        tail, good_end, n_frames, last_seq = self._scan_wal(wal, max(applied, base))
         # ONE order: checkpoints, then every op and frame past the watermark
         # by seq (see _fold_events). Applying the ops log before the WAL
         # records re-created records whose delete had been acked.
@@ -682,8 +826,17 @@ class NamespaceStore:
         if versions or events:
             self._replay_into_index(versions, events)
             self._replayed_at_open = True
-        if good_end < len(wal):
+        if n_frames and last_seq <= base:
+            # every frame is at or below the checkpoint that folded it: the
+            # cleanup of a fold or migration that crashed after its commit
+            self.store.delete(self.wal_key)
+            n_frames = 0
+        elif good_end < len(wal):
             self.store.truncate(self.wal_key, good_end)  # torn-tail repair
+        self.manifest.ops_size = self.store.size(self.ops_key)
+        if not ops and self.manifest.ops_size:
+            self.store.delete(self.ops_key)  # the same cleanup, ops side
+            self.manifest.ops_size = 0
         # Seed the frame counter from what is actually in the WAL. Starting it
         # at zero on every open meant the frame bound did not survive a
         # RESTART: six cycles of 400 writes left 2,400 WAL parts in the bucket
@@ -693,22 +846,213 @@ class NamespaceStore:
         # process that happens to be holding it.
         self._wal_frames = n_frames
         self.manifest.wal_size = self.store.size(self.wal_key)
-        self.manifest.ops_size = sum(4 + len(f) for f in self._read_frames(self.ops_key))
         # commit replayed rows FIRST, only then advance the watermark -
         # otherwise a crash could persist the watermark while losing rows
         self.index.flush()
         self.index.set_meta("applied_seq", str(self.manifest.seq))
         self._persist_manifest()
 
-    def _read_ops(self) -> list[dict]:
-        ops = []
-        for fr in self._read_frames(self.ops_key):
+    # ------------------------------------------------------------------ format 1 -> 2
+
+    def _migrate_legacy(self, ops: list[dict]) -> None:
+        """One-time upgrade of a format-1 namespace (see STORE_FORMAT).
+
+        Folds its WAL + ops log, in the order _legacy_events settles, into
+        one new segment exactly as a rotate would (ops it cannot retire ride
+        in the header), adds what the old binary's own index proves its
+        durable data lost (_legacy_index_evidence), then commits a format-2
+        manifest referencing it and deletes the old logs. The manifest put
+        is the commit point: a crash before it leaves the format-1 namespace
+        as it was (the next open migrates again; an uncommitted segment is
+        never adopted), a crash after it leaves only log events at or below
+        the new wal_base_seq, which open skips and deletes. The local index
+        is rebuilt from the result, so every node serves the same state."""
+        t0 = time.monotonic()
+        m = self.manifest
+        base = m.wal_base_seq
+        frames = self._legacy_wal_frames()
+        top_fold = max((int(s.get("fold_seq", 0)) for s in m.segments), default=0)
+        events, how, top = _legacy_events(frames, ops, base, max(m.seq, top_fold))
+        kept, _pending, _unq, folded, deferred = _fold_events({}, events, now_ms(), force=False)
+        out = _carry_forward(folded, kept)
+        evidence = self._legacy_index_evidence(ops, frames)
+        for i, op in enumerate(evidence, 1):
+            op["seq"] = top + i
+        out.extend(evidence)
+        fold = top + len(evidence)
+        # the index is derived: reset it before the commit, so no format-1
+        # watermark can make a format-2 open skip the new checkpoint
+        self.index.wipe()
+        self.index.set_meta("applied_seq", "0")
+        name = f"seg-{ulid_new()}" if kept or out else ""
+        if name:
+            self._write_segment(name, kept, fold, out, deferred)
+            m.segments.append(self._segment_entry(name, kept, fold, "migrate", out))
+        stale_snapshot = m.snapshot_name  # an image of a format-1 index
+        m.format = STORE_FORMAT
+        m.checkpoint, m.checkpoint_seq = name, fold
+        m.seq = m.wal_base_seq = fold
+        m.snapshot_name, m.snapshot_seq = "", 0
+        m.wal_size = m.ops_size = 0
+        self._persist_manifest()  # commit point
+        self.store.delete(self.wal_key)
+        self.store.delete(self.ops_key)
+        if stale_snapshot:
             try:
-                ops.append(json.loads(self._decrypt_frame(fr)))
-            except json.JSONDecodeError:
-                METRICS.inc("memd_storage_parse_errors_total", where="ops-replay", ns=self.namespace)
+                self.store.delete(self._snapshot_key(stale_snapshot))
+            except Exception:  # noqa: BLE001 - unreferenced now; only costs space
+                pass
+        METRICS.inc("memd_store_migrations_total",
+                    help="namespaces migrated to the current store format",
+                    ns=self.namespace, order=how)
+        if how != "exact":
+            _log.warning(
+                "namespace %s: format-1 WAL (%d frames) and ops log (%d ops) do not "
+                "reconcile with seq %d over wal_base_seq %d; read %s, so a delete "
+                "wins over a write it may have followed", self.namespace, len(frames),
+                len(ops), top, base, how)
+        if evidence:
+            _log.warning(
+                "namespace %s: kept %d delete/supersede op(s) the local index had "
+                "applied but format-1 durable data had lost", self.namespace, len(evidence))
+        _log.info("namespace %s: migrated to store format %d in %d ms",
+                  self.namespace, STORE_FORMAT, int((time.monotonic() - t0) * 1000))
+
+    def _legacy_wal_frames(self) -> list[tuple[int | None, list[MemoryRecord]]]:
+        """A format-1 WAL as (stamp or None, records) per frame, in log order.
+        The first frame that does not parse ends it (torn tail), as a
+        format-1 open truncated it."""
+        data = self.store.get(self.wal_key) or b""
+        raw = [data] if data[:1] == b"{" else [fr for _, fr in _frames_with_offsets(data)]
+        out: list[tuple[int | None, list[MemoryRecord]]] = []
+        for fr in raw:
+            try:
+                payload = self._decrypt_frame(fr)
+                recs = records_from_jsonl(payload)
+            except Exception:  # noqa: BLE001
+                break
+            out.append((_wal_seq(payload), recs))
+        return out
+
+    def _legacy_index_evidence(self, ops: list[dict],
+                               frames: list[tuple[int | None, list[MemoryRecord]]]) -> list[dict]:
+        """Deletes and supersedes the format-1 index proves and its durable
+        data lost.
+
+        A format-1 rotate folded only the WAL, then deleted the ops log: a
+        tombstone or supersede whose target already lived in an older
+        segment was gone from durable state. The old binary's live index had
+        applied it, so its warm open kept hiding the record while a cold
+        open or a rebuild served it again. Where this index reflects the
+        segment holding an id's newest copy (fold_seq <= its applied_seq)
+        and no durable op or frame touches that id, a row it marks deleted
+        or superseded is taken at its word - a delete wins. Only such
+        restrictions count: a MISSING row proves nothing (an interrupted
+        rebuild leaves the watermark over an emptied index)."""
+        try:
+            applied = int(self.index.get_meta("applied_seq") or 0)
+        except ValueError:
+            applied = 0
+        if applied <= 0 or not self.manifest.segments:
+            return []
+        versions, carried, _ = self._load_checkpoints(where="migrate-segment")
+        touched = ({_op_target(o) for o in carried + ops}
+                   | {r.id for _, recs in frames for r in recs})
+        seg = {rid: rec for rid, (rec, held) in versions.items()
+               if held <= applied and rid not in touched}
+        if not seg:
+            return []
+        with self.index._lock:
+            rows = self.index._con.execute(
+                "SELECT id, deleted, superseded_by, invalidated_at FROM records "
+                "WHERE deleted=1 OR superseded_by IS NOT NULL").fetchall()
+        now = now_ms()
+        out: list[dict] = []
+        for rid, deleted, sup, inv in rows:
+            rec = seg.get(rid)
+            if rec is None:
                 continue
+            at = int(inv) if inv is not None else now
+            if deleted:
+                out.append({"op": "tombstone", "id": rid, "at": at})
+            elif sup != rid and not rec.time.superseded_by:
+                out.append({"op": "supersede", "old": rid, "new": sup, "at": at})
+        return out
+
+    def _read_ops(self, repair: bool = False) -> list[dict]:
+        """The ops log, parsed (see _scan_ops). repair=True - open, before
+        this session appends anything - also cuts a damaged tail off,
+        durably, the way the WAL's torn tail is: an op appended behind a torn
+        record was invisible to every reader and lost at the next rotate.
+        Format 2: an op at or below wal_base_seq is one a checkpoint already
+        folded (left by a fold or migration that crashed after its commit)."""
+        data = self.store.get(self.ops_key) or b""
+        ops, good_end = self._scan_ops(data)
+        if repair and good_end < len(data):
+            self.store.truncate(self.ops_key, good_end)
+            METRICS.inc("memd_ops_log_repairs_total",
+                        help="ops logs whose damaged tail was cut off at open",
+                        ns=self.namespace)
+            _log.warning("namespace %s: cut %d damaged byte(s) off the ops log tail",
+                         self.namespace, len(data) - good_end)
+        if self.manifest.format >= STORE_FORMAT:
+            base = self.manifest.wal_base_seq
+            ops = [o for o in ops if int(o.get("seq", 0)) > base]
         return ops
+
+    def _parse_op(self, data: bytes, i: int) -> tuple[dict, int] | None:
+        """The op framed at offset i -> (op, end offset), or None."""
+        if i + 4 > len(data):
+            return None
+        end = i + 4 + int.from_bytes(data[i : i + 4], "big")
+        if end == i + 4 or end > len(data):
+            return None
+        try:
+            op = json.loads(self._decrypt_frame(data[i + 4 : end]))
+        except ValueError:  # JSONDecodeError and UnicodeDecodeError
+            return None
+        if not isinstance(op, dict) or not isinstance(op.get("seq"), int):
+            return None
+        return op, end
+
+    def _scan_ops(self, data: bytes) -> tuple[list[dict], int]:
+        """Parse an ops log -> (ops, end of the last op that parsed).
+
+        A record that does not parse - a torn append, garbage - is skipped by
+        resynchronizing on the next offset that parses as a LATER op. Older
+        versions never repaired this log, so after a torn append they kept
+        appending (and acking) ops behind it; stopping at the tear, as the
+        length framing alone would, hid those acked deletes and the next
+        rotate dropped them. A torn tail has nothing behind it and ends the
+        log."""
+        if data[:1] == b"{":  # legacy single blob
+            try:
+                return [json.loads(self._decrypt_frame(data))], len(data)
+            except ValueError:
+                METRICS.inc("memd_storage_parse_errors_total", where="ops-replay", ns=self.namespace)
+                return [], len(data)
+        ops: list[dict] = []
+        i = good_end = last = 0
+        while i < len(data):
+            got = self._parse_op(data, i)
+            if got is None:
+                METRICS.inc("memd_storage_parse_errors_total", where="ops-replay", ns=self.namespace)
+                for j in range(i + 1, len(data) - 4):
+                    got = self._parse_op(data, j)
+                    if got is not None and got[0]["seq"] > last:
+                        break
+                else:
+                    break  # nothing behind it parses: a torn tail
+                METRICS.inc("memd_ops_log_salvaged_total",
+                            help="ops recovered from behind a damaged ops-log record",
+                            ns=self.namespace)
+                _log.warning("namespace %s: ops log damaged at byte %d; "
+                             "resynchronized at byte %d", self.namespace, i, j)
+            op, i = got
+            ops.append(op)
+            last = max(last, op["seq"])
+            good_end = i
+        return ops, good_end
 
     def _load_checkpoints(self, applied: int = 0, where: str = "segment-load"
                           ) -> tuple[dict[str, tuple[MemoryRecord, int]], list[dict], int]:
@@ -750,22 +1094,7 @@ class NamespaceStore:
                     versions[rec.id] = (rec, _held(rec.id, fold, before))
         return versions, carried, max_fold
 
-    def _frame_seqs(self, n_frames: int, ops: list[dict]):
-        """seq_of(index, plaintext) for this WAL: the stamp, or - for an
-        unstamped pre-0.2 frame - the gap in the ops log it must own."""
-        legacy: list[int] = []
-
-        def seq_of(i: int, payload: bytes) -> int:
-            s = _wal_seq(payload)
-            if s is not None:
-                return s
-            if not legacy:
-                legacy.extend(_legacy_frame_seqs(
-                    self.manifest.wal_base_seq, n_frames, {int(o.get("seq", 0)) for o in ops}))
-            return legacy[i]
-        return seq_of
-
-    def _scan_wal(self, wal: bytes, applied: int, ops: list[dict]
+    def _scan_wal(self, wal: bytes, applied: int
                   ) -> tuple[list[tuple[int, list[MemoryRecord]]], int, int, int]:
         """Frames past the watermark -> (frames, good_end, n_frames, last_seq).
 
@@ -773,12 +1102,11 @@ class NamespaceStore:
         bisection: a warm open decrypts O(log n) frames instead of all of them.
         A frame past it that fails to parse ends the log (torn tail)."""
         frames = list(_frames_with_offsets(wal))
-        seq_of = self._frame_seqs(len(frames), ops)
         probed: dict[int, int] = {}
         lo, hi = 0, len(frames)
         while lo < hi:
             mid = (lo + hi) // 2
-            probed[mid] = seq_of(mid, self._decrypt_frame(frames[mid][1]))
+            probed[mid] = _frame_seq(self._decrypt_frame(frames[mid][1]))
             if probed[mid] <= applied:
                 lo = mid + 1
             else:
@@ -794,25 +1122,26 @@ class NamespaceStore:
                 recs = records_from_jsonl(payload)
             except Exception:
                 break
-            last_seq = seq_of(i, payload)
+            last_seq = _frame_seq(payload)
             out.append((last_seq, recs))
             good_end, n = end, i + 1
         return out, good_end, n, last_seq
 
-    def _wal_events(self, ops: list[dict], where: str) -> list[tuple[int, list[MemoryRecord]]]:
-        """Every parseable WAL frame as (seq, records); bad frames are
-        counted and skipped (fold paths, not the torn-tail repair)."""
-        frames = self._read_frames(self.wal_key)
-        seq_of = self._frame_seqs(len(frames), ops)
+    def _wal_events(self, where: str) -> list[tuple[int, list[MemoryRecord]]]:
+        """Every parseable WAL frame past wal_base_seq as (seq, records); bad
+        frames are counted and skipped (fold paths, not the torn-tail repair)."""
+        base = self.manifest.wal_base_seq
         out: list[tuple[int, list[MemoryRecord]]] = []
-        for i, fr in enumerate(frames):
+        for fr in self._read_frames(self.wal_key):
             try:
                 payload = self._decrypt_frame(fr)
                 recs = records_from_jsonl(payload)
             except Exception:
                 METRICS.inc("memd_storage_parse_errors_total", where=where, ns=self.namespace)
                 continue
-            out.append((seq_of(i, payload), recs))
+            s = _frame_seq(payload)
+            if s > base:
+                out.append((s, recs))
         return out
 
     def _replay_into_index(self, versions: dict[str, tuple[MemoryRecord, int]],
@@ -916,45 +1245,41 @@ class NamespaceStore:
         return ([] if header_only else records_from_jsonl(recs_data)), fold_seq, ops, before
 
     def _adopt_orphan_segments(self, versions: dict, carried: list[dict], applied: int, max_fold: int) -> int:
-        """Heal segments left on disk but never referenced by a persisted
-        manifest (crash inside the old rotate/compact delete window).
+        """Re-reference the segment the manifest names as its newest
+        checkpoint if the segment list lost it.
 
-        Adoption is conservative: only blobs carrying a v2 header whose
-        fold_seq EXCEEDS every referenced segment's fold_seq are adopted -
-        those hold the newest resolved state. Older unreferenced files are
-        cleanup residue from an interrupted compaction and must be ignored
-        (their live content already exists in newer segments; re-folding
-        them could resurrect tombstoned/superseded rows)."""
-        try:
-            all_keys = set(self.store.list(f"{self.prefix}/"))
-        except Exception:
+        Adoption takes POSITIVE evidence. It used to adopt any unreferenced
+        seg-* blob whose fold_seq beat every referenced one - and after a
+        compaction whose output was empty nothing is referenced, so a crash
+        before that compaction deleted the old segments re-adopted all of
+        them on the next cold open and served everything it had deleted.
+        Every rotate, compaction and migration commits its checkpoint's name
+        in the same manifest put as the segment list ("" when it wrote
+        nothing), so an unreferenced blob is either that checkpoint or
+        residue: a fold's uncommitted output (the logs it would have
+        replaced are still there) or segments a committed fold replaced.
+        Residue is never read."""
+        name = self.manifest.checkpoint
+        if not name or any(s["name"] == name for s in self.manifest.segments):
             return max_fold
-        referenced = {f"{self.prefix}/{s['name']}" for s in self.manifest.segments}
-        adopted = 0
-        for key in sorted(all_keys):
-            base = key.rsplit("/", 1)[-1]
-            if key in referenced or not base.startswith("seg-"):
-                continue
-            data = self.store.get(key)
-            if not data:
-                continue
-            try:
-                recs, fold_seq, ops, before = self._segment_parse(data)
-            except Exception:
-                continue  # unreadable/legacy/foreign blob: leave it alone
-            if (not recs and not ops) or fold_seq <= max_fold or fold_seq <= applied:
-                continue
+        data = self.store.get(f"{self.prefix}/{name}")
+        if not data:
+            return max_fold
+        try:
+            recs, fold_seq, ops, before = self._segment_parse(data)
+        except Exception:  # noqa: BLE001 - unreadable: nothing to adopt
+            return max_fold
+        if fold_seq != self.manifest.checkpoint_seq:
+            return max_fold  # not the blob the manifest committed
+        if fold_seq > applied:  # an index at `applied` already reflects it
             for rec in recs:
                 versions[rec.id] = (rec, _held(rec.id, fold_seq, before))
-            carried.extend(ops)
-            self.manifest.segments.append(
-                self._segment_entry(base, recs, fold_seq, "orphan-adopted", ops))
-            max_fold = max(max_fold, fold_seq)
-            adopted += 1
-        if adopted:
-            METRICS.inc("memd_orphan_segments_adopted_total", amount=adopted, ns=self.namespace)
-            self._persist_manifest()
-        return max_fold
+        carried.extend(ops)
+        self.manifest.segments.append(
+            self._segment_entry(name, recs, fold_seq, "orphan-adopted", ops))
+        METRICS.inc("memd_orphan_segments_adopted_total", amount=1, ns=self.namespace)
+        self._persist_manifest()
+        return max(max_fold, fold_seq)
 
     def _read_frames(self, key: str, limit_size: int | None = None) -> list[bytes]:
         data = self.store.get(key) or b""
@@ -1198,7 +1523,13 @@ class NamespaceStore:
                 op["seq"] = self.manifest.seq
                 payload = json.dumps(op, separators=(",", ":")).encode()
                 frames.append(_frame_encode(self.envelope.encrypt(self.namespace, payload)))
-            size = self.store.append(self.ops_key, b"".join(frames))
+            try:
+                size = self.store.append(self.ops_key, b"".join(frames))
+            except BaseException:
+                # A failed append may have left part of its frames behind, and
+                # the next op - acked - would land after that torn record.
+                self._cut_ops_back(self.manifest.ops_size)
+                raise
             self.manifest.ops_size = size
             self._manifest_dirty = True
             # rotate is skipped while a rotation is already folding this log:
@@ -1211,6 +1542,15 @@ class NamespaceStore:
                     self._track_pending_hard(op["id"], int(op.get("deadline", 0)))
             METRICS.set_gauge("memd_pending_purges", len(self._pending_hard), ns=self.namespace)
             self._apply_to_index([], ops)
+
+    def _cut_ops_back(self, size: int) -> None:
+        """Best effort: truncate the ops log to `size` if a failed append
+        grew it (open repairs whatever this cannot)."""
+        try:
+            if self.store.size(self.ops_key) > size:
+                self.store.truncate(self.ops_key, size)
+        except Exception:  # noqa: BLE001 - the append's own error is the one to raise
+            pass
 
     def has_due_deletes(self, now_ms_: int | None = None) -> bool:
         """True when at least one scheduled physical purge has passed its
@@ -1274,7 +1614,7 @@ class NamespaceStore:
         """Fold body (caller holds the ns lock and set _rotating)."""
         METRICS.inc("memd_rotations_total", ns=self.namespace, reason=reason)
         ops = self._read_ops()
-        frames = self._wal_events(ops, "rotate-wal")
+        frames = self._wal_events("rotate-wal")
         kept, _pending, unq_ids, folded, deferred = _fold_events(
             {}, _merge_events(ops, frames), now_ms(), force=False)
         # quarantine decay: restore index visibility for expired flags
@@ -1290,6 +1630,8 @@ class NamespaceStore:
             self._write_segment(name, kept, self.manifest.seq, carried, deferred)
             self.manifest.segments.append(
                 self._segment_entry(name, kept, self.manifest.seq, reason, carried))
+        self.manifest.checkpoint = name if kept or carried else ""
+        self.manifest.checkpoint_seq = self.manifest.seq
         self.index.flush()  # rows durable before advancing watermark
         self.index.set_meta("applied_seq", str(self.manifest.seq))
         self._persist_manifest()
@@ -1314,6 +1656,10 @@ class NamespaceStore:
     # ------------------------------------------------------------------ maintenance
 
     def load_all_records(self) -> tuple[list[MemoryRecord], list[dict]]:
+        """RAW durable content: every record copy (newest per id) and the ops
+        log, with NO op applied - deleted and hard-deleted records included.
+        For inspecting what is physically stored; never serve it (export
+        serves _visible_records)."""
         segs = {}
         for seg in self.manifest.segments:
             data = self.store.get(f"{self.prefix}/{seg['name']}")
@@ -1327,13 +1673,7 @@ class NamespaceStore:
             for rec in recs:
                 segs[rec.id] = rec
         live: dict[str, MemoryRecord] = dict(segs)
-        ops: list[dict] = []
-        for fr in self._read_frames(self.ops_key):
-            try:
-                ops.append(json.loads(self._decrypt_frame(fr)))
-            except json.JSONDecodeError:
-                METRICS.inc("memd_storage_parse_errors_total", where="ops-load", ns=self.namespace)
-                continue
+        ops = self._read_ops()
         for fr in self._read_frames(self.wal_key):
             try:
                 live.update({r.id: r for r in records_from_jsonl(self._decrypt_frame(fr))})
@@ -1368,7 +1708,7 @@ class NamespaceStore:
                 return rep
             versions, carried, _ = self._load_checkpoints()
             ops = self._read_ops()
-            frames = self._wal_events(ops, "load-wal")
+            frames = self._wal_events("load-wal")
             rep.bytes_before = sum(self.store.size(f"{self.prefix}/{s['name']}") for s in self.manifest.segments)
             rep.segments_in = len(self.manifest.segments)
             now = now_ms()
@@ -1394,6 +1734,10 @@ class NamespaceStore:
                 if kept or pending_ops
                 else []
             )
+            # an empty output is committed explicitly too ("" at this seq): the
+            # old segments it replaces must never read as lost checkpoints
+            self.manifest.checkpoint = name if kept or pending_ops else ""
+            self.manifest.checkpoint_seq = self.manifest.seq
             self.index.flush()  # rows durable before advancing the watermark
             self.index.set_meta("applied_seq", str(self.manifest.seq))
             # commit the new-segment-only view BEFORE deleting anything it
@@ -1467,7 +1811,7 @@ class NamespaceStore:
             self._ensure_open()
             versions, carried, _ = self._load_checkpoints()
             ops = self._read_ops()
-            frames = self._wal_events(ops, "load-wal")
+            frames = self._wal_events("load-wal")
             self.index.wipe()
             # the same ordered replay as open (applying every op after every
             # record deleted re-adds and resurrected WAL-resident deletes)
@@ -1489,12 +1833,29 @@ class NamespaceStore:
         in-process fold state; an external sort would be needed to go lower).
         Lock held only for the segment read phase - same completeness
         guarantee as before (a concurrent rotate/compact cannot delete
-        segments mid-read), never across caller consumption."""
+        segments mid-read), never across caller consumption.
+
+        Exports what a read can see (_visible_records). It used to dump the
+        raw stored copies with no op applied: records deleted - soft or hard,
+        acked - came back out of every export until a compaction purged them,
+        and superseded facts lost their supersedence."""
         with self._lock:
-            recs, _ = self.load_all_records()
+            recs = self._visible_records()
         recs.sort(key=lambda r: (r.time.t_ingested, r.id))
         for r in recs:
             yield json.dumps(r.to_dict(), separators=(",", ":")).encode() + b"\n"
+
+    def _visible_records(self) -> list[MemoryRecord]:
+        """Every record a read can see, folded from durable state in the one
+        seq order open and compaction use. Soft- and hard-deleted records are
+        left out - a hard-deleted one also while its purge is pending and its
+        bytes still sit in a segment. Superseded and quarantined records stay
+        (history; the flags travel with them)."""
+        versions, carried, _ = self._load_checkpoints(where="export-segment")
+        frames = self._wal_events("export-wal")
+        kept, _pending, _unq, _folded, deferred = _fold_events(
+            versions, _merge_events(carried + self._read_ops(), frames), now_ms(), force=False)
+        return [r for r in kept if r.id not in deferred]
 
     def export_jsonl(self) -> bytes:
         # buffered variant for CLI/SDK callers that want one blob
