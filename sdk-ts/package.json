@@ -48,7 +48,8 @@
     "test:integration": "vitest run test/integration",
     "test:all": "vitest run",
     "smoke": "node test/smoke/smoke.mjs && node test/smoke/smoke.cjs",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "check:dist": "node scripts/check-dist.mjs"
   },
   "devDependencies": {
     "@types/node": "^20.19.43",
