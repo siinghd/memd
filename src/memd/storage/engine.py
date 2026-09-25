@@ -15,6 +15,10 @@ Invariants:
   - Hard delete: synchronous tombstone + physical purge guaranteed by forced
     compaction within the deadline (72h default, D7 control #8).
   - Namespace deletion = prefix removal + key destruction (crypto-shred).
+  - History has ONE order: manifest.seq numbers every durable event (a WAL
+    frame, an op) and open / rebuild / rotate / compact all fold events in
+    seq order. A segment stands in for every event at or below its fold_seq
+    for the ids it holds; nothing else may be skipped or reordered.
 """
 from __future__ import annotations
 
@@ -120,28 +124,135 @@ def _frames_with_offsets(data: bytes):
         i = end
 
 
-def _apply_ops(
-    recs: list[MemoryRecord], ops: list[dict], now: int, force: bool
-) -> tuple[list[MemoryRecord], list[dict], list[str]]:
-    """Fold mutation ops into record state.
+# ---------------------------------------------------------------------------
+# One order for history.
+#
+# Every durable event takes the next manifest.seq: a WAL frame (one append
+# batch) or an op (one per op). Recovery used to apply the whole ops log
+# FIRST and the WAL records after it, so a record deleted - softly or hard -
+# while still in the WAL was re-created by its own frame on the next open
+# after a crash: an acked delete undone, and hard-deleted content served
+# again. Frames also carried no seq; replay inferred one from position
+# (wal_base_seq + index), which ignores the seqs ops consume, so a frame
+# written after [frame, op, frame] + restart sat "below" the watermark and was
+# never replayed. And a rotate - a partial fold that cannot see older
+# segments - dropped every op whose target lived in one, so a cache wipe,
+# a rebuild or a second node resurrected those records as well.
+#
+# Now: frames are stamped with their seq, ops keep theirs, and every consumer
+# folds one merged, seq-ordered stream. A segment is a checkpoint: its copy
+# of an id reflects every event at or below its fold_seq, so only events
+# ABOVE that are applied to the id. Ops a rotate cannot retire travel in the
+# new segment's header at their ORIGINAL seq, so their place in history
+# never moves; only compaction, which rewrites every copy, retires them.
 
-    Returns (live_records, pending_ops, unquarantined_ids). Pending ops are
-    not-yet-due hard deletes; they must survive folds so the forced-
-    compaction deadline (D7) stays enforceable. unquarantined_ids reports
-    records whose quarantine expired during this fold - callers must clear
-    the index flag so decay actually restores visibility."""
-    by_id = {r.id: r for r in recs}
-    hard_ids: set[str] = set()
-    pending: list[dict] = []
-    unquarantined: list[str] = []
+# The seq rides as an extra key on the frame's first record line, not as a
+# header line: MemoryRecord.from_dict ignores unknown keys, so an older binary
+# still reads a stamped WAL after a downgrade instead of taking the frame for
+# a torn tail and truncating the log behind it.
+_WAL_SEQ = b'{"_wal_seq":'
+
+
+def _wal_stamp(payload: bytes, seq: int) -> bytes:
+    """Stamp a records_to_jsonl() payload with the frame's seq."""
+    if not payload.startswith(b"{"):
+        return payload
+    return _WAL_SEQ + str(int(seq)).encode() + b"," + payload[1:]
+
+
+def _wal_seq(payload: bytes) -> int | None:
+    """The seq a frame was stamped with; None for an unstamped (pre-0.2) frame."""
+    if not payload.startswith(_WAL_SEQ):
+        return None
+    try:
+        return int(payload[len(_WAL_SEQ):payload.find(b",", len(_WAL_SEQ))])
+    except ValueError:
+        return None
+
+
+def _legacy_frame_seqs(base: int, n: int, op_seqs: set[int]) -> list[int]:
+    """Seqs for n unstamped frames of a WAL opened at wal_base_seq=base.
+    Each seq above base went to either a frame or an op, in write order, so
+    the frames own exactly the gaps the ops log leaves."""
+    out: list[int] = []
+    s = base
+    while len(out) < n:
+        s += 1
+        if s not in op_seqs:
+            out.append(s)
+    return out
+
+
+def _op_target(op: dict) -> str | None:
+    return op.get("id") or op.get("old")
+
+
+def _merge_events(
+    ops: list[dict], frames: list[tuple[int, list[MemoryRecord]]], after: int = 0
+) -> list[tuple[int, object]]:
+    """ops (dicts) and WAL frames (record lists) past `after`, as one
+    seq-ordered stream. An op can be on disk twice - carried in a segment
+    header and left in an ops log a crash did not delete - and counts once."""
+    seen: set[int] = set()
+    out: list[tuple[int, int, object]] = []
     for op in ops:
+        s = int(op.get("seq", 0))
+        if s <= after or s in seen:
+            continue
+        seen.add(s)
+        out.append((s, 1, op))
+    out.extend((s, 0, recs) for s, recs in frames if s > after)
+    out.sort(key=lambda e: (e[0], e[1]))
+    return [(s, ev) for s, _, ev in out]
+
+
+def _fold_events(
+    base: dict[str, tuple[MemoryRecord, int]], events: list[tuple[int, object]], now: int, force: bool
+) -> tuple[list[MemoryRecord], list[dict], list[str], list[dict], dict[str, int]]:
+    """Fold seq-ordered events over segment checkpoints into record state
+    (NamespaceStore._replay_into_index applies the same order to the index).
+
+    base maps id -> (record, seq its copy reflects - normally the fold_seq of
+    the newest segment holding it).
+
+    Returns (live_records, pending_ops, unquarantined_ids, folded_ops,
+    deferred). Pending ops are not-yet-due hard deletes; they must survive
+    folds so the forced-compaction deadline (D7) stays enforceable. Their
+    target's bytes may stay until then: deferred maps such a kept id to the
+    hard delete's seq, and the segment must record that its copy PRECEDES it
+    (see _segment_blob) or replay would serve it again. unquarantined_ids
+    reports records whose quarantine expired during this fold - callers must
+    clear the index flag so decay actually restores visibility."""
+    state = {rid: rec for rid, (rec, _) in base.items()}
+    held = {rid: fold for rid, (_, fold) in base.items()}
+    pending: list[dict] = []
+    folded: list[dict] = []
+    deferred: dict[str, int] = {}
+    unquarantined: list[str] = []
+    for seq, ev in events:
+        if not isinstance(ev, dict):
+            for r in ev:
+                if held.get(r.id, -1) < seq:
+                    state[r.id] = r
+                    deferred.pop(r.id, None)  # a re-add is not under the delete
+            continue
+        op = ev
+        folded.append(op)
         kind = op.get("op")
-        target = by_id.get(op.get("id") or op.get("old"))
+        rid = _op_target(op)
+        due = force or op.get("deadline", 0) <= now
+        if kind == "hard_delete" and not due:
+            pending.append(op)
+        if held.get(rid, -1) >= seq:
+            continue  # the checkpoint's copy of this id already reflects it
+        target = state.get(rid)
         if kind == "hard_delete":
-            if force or op.get("deadline", 0) <= now:
-                hard_ids.add(op["id"])
-            else:
-                pending.append(op)
+            # at its place in history, so a LATER re-add survives
+            if due:
+                state.pop(rid, None)
+                deferred.pop(rid, None)
+            elif target is not None:
+                deferred[rid] = seq
         elif kind == "tombstone" and target is not None:
             target.deleted = True
             if target.time.invalidated_at is None:
@@ -159,9 +270,7 @@ def _apply_ops(
                 target.meta.pop("quarantined", None)
                 target.meta.pop("quarantine_expires", None)
     kept: list[MemoryRecord] = []
-    for r in recs:
-        if r.id in hard_ids:
-            continue
+    for r in state.values():
         if r.deleted:
             continue
         qexp = r.meta.get("quarantine_expires")
@@ -171,7 +280,26 @@ def _apply_ops(
             r.meta["quarantine_expired"] = True
             unquarantined.append(r.id)
         kept.append(r)
-    return kept, pending, unquarantined
+    kept_ids = {r.id for r in kept}
+    return kept, pending, unquarantined, folded, {k: v for k, v in deferred.items() if k in kept_ids}
+
+
+def _carry_forward(folded: list[dict], kept: list[MemoryRecord]) -> list[dict]:
+    """Ops a ROTATE must keep: it folds only the current WAL, so an op whose
+    target is not in its output may still apply to a copy in an older
+    segment. Hard deletes always stay - the older bytes must be purged by the
+    deadline, and only compaction rewrites them."""
+    kept_ids = {r.id for r in kept}
+    return [op for op in folded
+            if op.get("op") == "hard_delete"
+            or (op.get("op") in ("tombstone", "supersede", "quarantine")
+                and _op_target(op) not in kept_ids)]
+
+
+def _held(rid: str, fold: int, before: dict[str, int]) -> int:
+    """The seq a segment's copy of rid reflects: its fold, or - for a copy a
+    not-yet-due hard delete kept - just before that delete."""
+    return min(fold, before[rid] - 1) if rid in before else fold
 
 
 # ---------------------------------------------------------------------------
@@ -519,8 +647,6 @@ class NamespaceStore:
         else:
             self._persist_manifest()
         ops = self._read_ops()
-        if ops:
-            self.manifest.seq = max(self.manifest.seq, max(o.get("seq", 0) for o in ops))
         # Index-applied watermark: the index records the highest manifest.seq it
         # has folded in. Replay covers segments + wal frames + ops with
         # seq > applied - so a fresh/restored cache rebuilds everything, while
@@ -535,59 +661,26 @@ class NamespaceStore:
             # existing watermark logic replay only the tail past it.
             applied = self._install_index_snapshot()
             self._replayed_at_open = True
-        seg_records: dict[str, MemoryRecord] = {}
-        max_fold = 0
-        for seg in self.manifest.segments:
-            data = self.store.get(f"{self.prefix}/{seg['name']}")
-            if data is None:
-                continue
-            fold = int(seg.get("fold_seq", 0))
-            max_fold = max(max_fold, fold)
-            if fold <= applied and applied > 0:
-                continue  # already reflected in this index
-            # NOTE: _segment_records returns a (records, fold_seq) TUPLE.
-            # This site used to iterate the tuple directly, so every segment
-            # replay raised AttributeError, was silently swallowed below, and
-            # fresh-cache recovery recovered NOTHING from segments - node
-            # loss silently reduced the namespace to its WAL tail. Unpack
-            # explicitly; parse failures degrade per-segment, never crash.
-            try:
-                recs, _fold_seq = self._segment_records(data)
-                for rec in recs:
-                    seg_records[rec.id] = rec
-            except Exception as ex:  # noqa: BLE001 - corrupt segment: skip, count, survive
-                METRICS.inc("memd_storage_parse_errors_total",
-                            where="segment-replay", ns=self.namespace,
-                            detail=type(ex).__name__)
-                continue
-        max_fold = self._adopt_orphan_segments(seg_records, applied, max_fold)
-        pending_ops = [o for o in ops if o.get("seq", 0) > max(applied, max((s.get("fold_seq", 0) for s in self.manifest.segments), default=0))]
-        self._pending_hard = [
-            (o["id"], int(o.get("deadline", 0))) for o in ops
-            if o.get("op") == "hard_delete" and o.get("id")
-        ]
-        self._pending_hard_ids = {rid for rid, _ in self._pending_hard}
-        self._apply_to_index(list(seg_records.values()), pending_ops, from_replay=True)
-        if seg_records or pending_ops:
-            self._replayed_at_open = True
+        versions, carried, max_fold = self._load_checkpoints(applied, where="segment-replay")
+        max_fold = self._adopt_orphan_segments(versions, carried, applied, max_fold)
         wal = self.store.get(self.wal_key) or b""
-        base = self.manifest.wal_base_seq
-        recs = []
-        good_end = 0
-        idx = 0
-        for end, fr in _frames_with_offsets(wal):
-            frame_seq = base + idx + 1
-            idx += 1
-            if frame_seq <= applied:
-                good_end = end
-                continue
-            try:
-                recs.extend(records_from_jsonl(self._decrypt_frame(fr)))
-                good_end = end
-            except Exception:
-                break
-        if recs:
-            self._apply_to_index(recs, [], from_replay=True)
+        tail, good_end, n_frames, last_seq = self._scan_wal(wal, applied, ops)
+        # ONE order: checkpoints, then every op and frame past the watermark
+        # by seq (see _fold_events). Applying the ops log before the WAL
+        # records re-created records whose delete had been acked.
+        events = _merge_events(carried + ops, tail, after=applied)
+        self._pending_hard = []
+        self._pending_hard_ids = set()
+        for o in carried + ops:
+            if o.get("op") == "hard_delete" and o.get("id"):
+                self._track_pending_hard(o["id"], int(o.get("deadline", 0)))
+        # The counter must clear every seq already on disk. The manifest is
+        # persisted lazily, so after a crash it can trail the WAL; handing a
+        # new frame an old seq would slot it into the past.
+        self.manifest.seq = max([self.manifest.seq, applied, max_fold, last_seq]
+                                + [int(o.get("seq", 0)) for o in carried + ops])
+        if versions or events:
+            self._replay_into_index(versions, events)
             self._replayed_at_open = True
         if good_end < len(wal):
             self.store.truncate(self.wal_key, good_end)  # torn-tail repair
@@ -598,7 +691,7 @@ class NamespaceStore:
         # without bound across restarts and cold open went back to being
         # O(records). The bound has to be a property of the log, not of the
         # process that happens to be holding it.
-        self._wal_frames = idx
+        self._wal_frames = n_frames
         self.manifest.wal_size = self.store.size(self.wal_key)
         self.manifest.ops_size = sum(4 + len(f) for f in self._read_frames(self.ops_key))
         # commit replayed rows FIRST, only then advance the watermark -
@@ -617,49 +710,212 @@ class NamespaceStore:
                 continue
         return ops
 
+    def _load_checkpoints(self, applied: int = 0, where: str = "segment-load"
+                          ) -> tuple[dict[str, tuple[MemoryRecord, int]], list[dict], int]:
+        """Segment state for a fold -> (versions, carried ops, max fold_seq).
+
+        versions maps id -> (record, fold_seq) for the NEWEST segment holding
+        it, over segments an index at `applied` does not reflect yet (all of
+        them when applied is 0). carried = ops earlier rotates could not
+        retire; the headers of already-reflected segments are read too when
+        they hold hard deletes, because those are the purge schedule."""
+        versions: dict[str, tuple[MemoryRecord, int]] = {}
+        src_fold: dict[str, int] = {}  # newest segment wins, by fold_seq
+        carried: list[dict] = []
+        max_fold = 0
+        for seg in self.manifest.segments:
+            data = self.store.get(f"{self.prefix}/{seg['name']}")
+            if data is None:
+                continue
+            fold = int(seg.get("fold_seq", 0))
+            max_fold = max(max_fold, fold)
+            reflected = applied > 0 and fold <= applied
+            if reflected and not seg.get("purges"):
+                continue  # already reflected in this index
+            # NOTE: segment parsing returns a TUPLE. A site that once iterated
+            # it directly raised AttributeError on every segment, was silently
+            # swallowed, and fresh-cache recovery recovered NOTHING from
+            # segments. Unpack explicitly; parse failures degrade per-segment.
+            try:
+                recs, _fold_seq, ops, before = self._segment_parse(data, header_only=reflected)
+            except Exception as ex:  # noqa: BLE001 - corrupt segment: skip, count, survive
+                METRICS.inc("memd_storage_parse_errors_total",
+                            where=where, ns=self.namespace,
+                            detail=type(ex).__name__)
+                continue
+            carried.extend(ops)
+            for rec in recs:
+                if src_fold.get(rec.id, -1) <= fold:
+                    src_fold[rec.id] = fold
+                    versions[rec.id] = (rec, _held(rec.id, fold, before))
+        return versions, carried, max_fold
+
+    def _frame_seqs(self, n_frames: int, ops: list[dict]):
+        """seq_of(index, plaintext) for this WAL: the stamp, or - for an
+        unstamped pre-0.2 frame - the gap in the ops log it must own."""
+        legacy: list[int] = []
+
+        def seq_of(i: int, payload: bytes) -> int:
+            s = _wal_seq(payload)
+            if s is not None:
+                return s
+            if not legacy:
+                legacy.extend(_legacy_frame_seqs(
+                    self.manifest.wal_base_seq, n_frames, {int(o.get("seq", 0)) for o in ops}))
+            return legacy[i]
+        return seq_of
+
+    def _scan_wal(self, wal: bytes, applied: int, ops: list[dict]
+                  ) -> tuple[list[tuple[int, list[MemoryRecord]]], int, int, int]:
+        """Frames past the watermark -> (frames, good_end, n_frames, last_seq).
+
+        Seqs grow along the log, so the first frame past `applied` is found by
+        bisection: a warm open decrypts O(log n) frames instead of all of them.
+        A frame past it that fails to parse ends the log (torn tail)."""
+        frames = list(_frames_with_offsets(wal))
+        seq_of = self._frame_seqs(len(frames), ops)
+        probed: dict[int, int] = {}
+        lo, hi = 0, len(frames)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            probed[mid] = seq_of(mid, self._decrypt_frame(frames[mid][1]))
+            if probed[mid] <= applied:
+                lo = mid + 1
+            else:
+                hi = mid
+        good_end = frames[lo - 1][0] if lo else 0
+        last_seq = probed[lo - 1] if lo else 0
+        n = lo
+        out: list[tuple[int, list[MemoryRecord]]] = []
+        for i in range(lo, len(frames)):
+            end, fr = frames[i]
+            try:
+                payload = self._decrypt_frame(fr)
+                recs = records_from_jsonl(payload)
+            except Exception:
+                break
+            last_seq = seq_of(i, payload)
+            out.append((last_seq, recs))
+            good_end, n = end, i + 1
+        return out, good_end, n, last_seq
+
+    def _wal_events(self, ops: list[dict], where: str) -> list[tuple[int, list[MemoryRecord]]]:
+        """Every parseable WAL frame as (seq, records); bad frames are
+        counted and skipped (fold paths, not the torn-tail repair)."""
+        frames = self._read_frames(self.wal_key)
+        seq_of = self._frame_seqs(len(frames), ops)
+        out: list[tuple[int, list[MemoryRecord]]] = []
+        for i, fr in enumerate(frames):
+            try:
+                payload = self._decrypt_frame(fr)
+                recs = records_from_jsonl(payload)
+            except Exception:
+                METRICS.inc("memd_storage_parse_errors_total", where=where, ns=self.namespace)
+                continue
+            out.append((seq_of(i, payload), recs))
+        return out
+
+    def _replay_into_index(self, versions: dict[str, tuple[MemoryRecord, int]],
+                           events: list[tuple[int, object]]) -> None:
+        """The index side of _fold_events: checkpoint copies first, then the
+        events strictly in seq order, skipping what a newer checkpoint of the
+        same id already reflects. Consecutive frames still go in one
+        upsert_batch; ops use the same index calls the write path made."""
+        self._apply_to_index([rec for rec, _ in versions.values()], [], from_replay=True)
+        held = {rid: fold for rid, (_, fold) in versions.items()}
+        recs: list[MemoryRecord] = []
+        ops: list[dict] = []
+        for seq, ev in events:
+            if isinstance(ev, dict):
+                if held.get(_op_target(ev), -1) >= seq:
+                    continue
+                if recs:
+                    self._apply_to_index(recs, [], from_replay=True)
+                    recs = []
+                ops.append(ev)
+            else:
+                fresh = [r for r in ev if held.get(r.id, -1) < seq]
+                if fresh and ops:
+                    self._apply_to_index([], ops, from_replay=True)
+                    ops = []
+                recs.extend(fresh)
+        self._apply_to_index(recs, ops, from_replay=True)  # at most one is non-empty
+
     # ------------------------------------------------------- segment blob format
     #
     # v2 blob (one put() payload):
-    #   line 1: {"_seg": {"fold_seq": N}}          <- header, enables orphan adoption
+    #   line 1: {"_seg": {"fold_seq": N, "ops": [...]}}   <- header, enables orphan adoption
     #   lines 2+: resolved record JSONL
+    # "ops" (optional) holds the ops a fold could not retire, at their
+    # original seqs (see _carry_forward); the manifest entry counts them
+    # ("carried") and the hard deletes among them ("purges"). "before"
+    # (optional) maps an id whose bytes a not-yet-due hard delete keeps to
+    # that delete's seq: the copy precedes it, so replay still applies it.
     # The whole payload is envelope-encrypted when encryption is enabled
     # (segments are the durable source of truth - they must satisfy the same
     # at-rest guarantee as the WAL). Legacy v1 blobs are bare plaintext JSONL;
     # _segment_records falls back for them so old stores keep reading.
 
     @staticmethod
-    def _segment_blob(kept: list[MemoryRecord], fold_seq: int) -> bytes:
-        header = json.dumps({"_seg": {"fold_seq": fold_seq}}, separators=(",", ":"))
+    def _segment_blob(kept: list[MemoryRecord], fold_seq: int, carried: list[dict] = (),
+                      before: dict[str, int] | None = None) -> bytes:
+        seg: dict = {"fold_seq": fold_seq}
+        if carried:
+            seg["ops"] = list(carried)
+        if before:
+            seg["before"] = dict(before)
+        header = json.dumps({"_seg": seg}, separators=(",", ":"))
         body = records_to_jsonl(kept)
         return header.encode() + b"\n" + body if body.strip() else header.encode() + b"\n"
 
-    def _write_segment(self, name: str, kept: list[MemoryRecord], fold_seq: int) -> bytes:
-        data = self._segment_blob(kept, fold_seq)
+    def _write_segment(self, name: str, kept: list[MemoryRecord], fold_seq: int,
+                       carried: list[dict] = (), before: dict[str, int] | None = None) -> bytes:
+        data = self._segment_blob(kept, fold_seq, carried, before)
         if self.envelope.enabled:
             data = self.envelope.encrypt(self.namespace, data)
         self.store.put(f"{self.prefix}/{name}", data)
         return data
 
+    @staticmethod
+    def _segment_entry(name: str, kept: list, fold_seq: int, reason: str, carried: list[dict]) -> dict:
+        entry = {"name": name, "records": len(kept), "fold_seq": fold_seq, "reason": reason}
+        if carried:
+            entry["carried"] = len(carried)
+            purges = sum(1 for op in carried if op.get("op") == "hard_delete")
+            if purges:
+                entry["purges"] = purges
+        return entry
+
     def _segment_records(self, data: bytes) -> tuple[list[MemoryRecord], int]:
         """Parse a segment blob -> (records, fold_seq). Tolerates legacy
         plaintext blobs and encrypted v2 blobs; fold_seq defaults to 0 when
         absent (legacy), which disables that blob's orphan eligibility."""
+        recs, fold_seq, _ops, _before = self._segment_parse(data)
+        return recs, fold_seq
+
+    def _segment_parse(self, data: bytes, header_only: bool = False
+                       ) -> tuple[list[MemoryRecord], int, list[dict], dict[str, int]]:
+        """_segment_records plus the header's carried ops and "before" map."""
         raw = self._decrypt_frame(data)
         first_nl = raw.find(b"\n")
         head = raw[:first_nl] if first_nl != -1 else b""
         fold_seq = 0
+        ops: list[dict] = []
+        before: dict[str, int] = {}
         recs_data = raw
         if head.startswith(b"{"):
             try:
                 h = json.loads(head)
                 if isinstance(h.get("_seg"), dict):
                     fold_seq = int(h["_seg"].get("fold_seq", 0))
+                    ops = [op for op in h["_seg"].get("ops") or [] if isinstance(op, dict)]
+                    before = {str(k): int(v) for k, v in (h["_seg"].get("before") or {}).items()}
                     recs_data = raw[first_nl + 1 :]
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, AttributeError):
                 pass  # legacy single-record blob starting with '{'
-        return records_from_jsonl(recs_data), fold_seq
+        return ([] if header_only else records_from_jsonl(recs_data)), fold_seq, ops, before
 
-    def _adopt_orphan_segments(self, seg_records: dict, applied: int, max_fold: int) -> int:
+    def _adopt_orphan_segments(self, versions: dict, carried: list[dict], applied: int, max_fold: int) -> int:
         """Heal segments left on disk but never referenced by a persisted
         manifest (crash inside the old rotate/compact delete window).
 
@@ -683,16 +939,16 @@ class NamespaceStore:
             if not data:
                 continue
             try:
-                recs, fold_seq = self._segment_records(data)
+                recs, fold_seq, ops, before = self._segment_parse(data)
             except Exception:
                 continue  # unreadable/legacy/foreign blob: leave it alone
-            if recs == [] or fold_seq <= max_fold or fold_seq <= applied:
+            if (not recs and not ops) or fold_seq <= max_fold or fold_seq <= applied:
                 continue
             for rec in recs:
-                seg_records[rec.id] = rec
+                versions[rec.id] = (rec, _held(rec.id, fold_seq, before))
+            carried.extend(ops)
             self.manifest.segments.append(
-                {"name": base, "records": len(recs), "fold_seq": fold_seq, "reason": "orphan-adopted"}
-            )
+                self._segment_entry(base, recs, fold_seq, "orphan-adopted", ops))
             max_fold = max(max_fold, fold_seq)
             adopted += 1
         if adopted:
@@ -783,11 +1039,12 @@ class NamespaceStore:
         payload = records_to_jsonl(records)
         with self._lock:
             self._ensure_open()
-            frame = _frame_encode(self.envelope.encrypt(self.namespace, payload))
+            seq = self.manifest.seq + 1  # the frame's place in history, stamped in it
+            frame = _frame_encode(self.envelope.encrypt(self.namespace, _wal_stamp(payload, seq)))
             my_end, my_gen = self._wal_write(frame)
             self._wal_frames += 1
             self.manifest.wal_size = my_end
-            self.manifest.seq += 1
+            self.manifest.seq = seq
             self._manifest_dirty = True
             qflags = {r.id: bool(r.meta.get("quarantined")) for r in records}
             self.index.upsert_batch([(r, None, "") for r in records], qflags)
@@ -1016,24 +1273,23 @@ class NamespaceStore:
     def _rotate_locked(self, reason: str) -> str:
         """Fold body (caller holds the ns lock and set _rotating)."""
         METRICS.inc("memd_rotations_total", ns=self.namespace, reason=reason)
-        recs: list[MemoryRecord] = []
-        for fr in self._read_frames(self.wal_key):
-            try:
-                recs.extend(records_from_jsonl(self._decrypt_frame(fr)))
-            except Exception:
-                METRICS.inc("memd_storage_parse_errors_total", where="rotate-wal", ns=self.namespace)
-                continue
         ops = self._read_ops()
-        kept, pending_ops, unq_ids = _apply_ops(recs, ops, now_ms(), force=False)
+        frames = self._wal_events(ops, "rotate-wal")
+        kept, _pending, unq_ids, folded, deferred = _fold_events(
+            {}, _merge_events(ops, frames), now_ms(), force=False)
         # quarantine decay: restore index visibility for expired flags
         for rid_ in unq_ids:
             self.index.mark_quarantined(rid_, False)
+        # Ops this partial fold cannot retire ride in the new segment's header
+        # at their original seqs - written atomically with it, so no crash
+        # between deleting the ops log and re-appending them can lose one.
+        # (They used to be dropped, or re-appended at NEW seqs afterwards.)
+        carried = _carry_forward(folded, kept)
         name = f"seg-{ulid_new()}"
-        if kept:
-            self._write_segment(name, kept, self.manifest.seq)
+        if kept or carried:
+            self._write_segment(name, kept, self.manifest.seq, carried, deferred)
             self.manifest.segments.append(
-                {"name": name, "records": len(kept), "fold_seq": self.manifest.seq, "reason": reason}
-            )
+                self._segment_entry(name, kept, self.manifest.seq, reason, carried))
         self.index.flush()  # rows durable before advancing watermark
         self.index.set_meta("applied_seq", str(self.manifest.seq))
         self._persist_manifest()
@@ -1047,10 +1303,11 @@ class NamespaceStore:
         self._synced_pos = 0
         self._written_pos = 0
         self._persist_manifest()
-        # rebuild pending-purge tracking with only still-pending (not-due) ops
-        self._pending_hard = []
-        self._pending_hard_ids = set()
-        self.append_ops(pending_ops)  # one fsync; _rotating guard blocks nested folds
+        # every hard delete stays scheduled - due ones included: their older
+        # copies are only purged by the compaction the schedule triggers
+        for op in carried:
+            if op.get("op") == "hard_delete" and op.get("id"):
+                self._track_pending_hard(op["id"], int(op.get("deadline", 0)))
         METRICS.set_gauge("memd_pending_purges", len(self._pending_hard), ns=self.namespace)
         return name
 
@@ -1109,26 +1366,32 @@ class NamespaceStore:
                 rep.segments_in = rep.segments_out = len(self.manifest.segments)
                 rep.duration_ms = int((time.monotonic() - t0) * 1000)
                 return rep
-            recs, ops = self.load_all_records()
+            versions, carried, _ = self._load_checkpoints()
+            ops = self._read_ops()
+            frames = self._wal_events(ops, "load-wal")
             rep.bytes_before = sum(self.store.size(f"{self.prefix}/{s['name']}") for s in self.manifest.segments)
             rep.segments_in = len(self.manifest.segments)
             now = now_ms()
-            pre_ids = {r.id for r in recs}
-            kept, pending_ops, unq_ids = _apply_ops(recs, ops, now, force=force)
+            pre_ids = set(versions) | {r.id for _, recs in frames for r in recs}
+            kept, pending_ops, unq_ids, folded, deferred = _fold_events(
+                versions, _merge_events(carried + ops, frames), now, force=force)
             # quarantine decay: restore index visibility for expired flags
             for rid_ in unq_ids:
                 self.index.mark_quarantined(rid_, False)
             purged_ids = pre_ids - {r.id for r in kept}
             rep.records_purged = len(purged_ids)
-            rep.hard_deleted_purged = sum(1 for op in ops if op.get("op") == "hard_delete" and op.get("id") in purged_ids)
-            # write folded segment
+            rep.hard_deleted_purged = len({op["id"] for op in folded
+                                           if op.get("op") == "hard_delete" and op.get("id") in purged_ids})
+            # write folded segment; the one fold that sees every copy retires
+            # every op except the not-yet-due hard deletes, which keep their
+            # original seqs in its header (atomic with it - never re-appended)
             old_names = [s["name"] for s in self.manifest.segments]
             name = f"seg-{ulid_new()}"
-            if kept:
-                self._write_segment(name, kept, self.manifest.seq)
+            if kept or pending_ops:
+                self._write_segment(name, kept, self.manifest.seq, pending_ops, deferred)
             self.manifest.segments = (
-                [{"name": name, "records": len(kept), "fold_seq": self.manifest.seq, "reason": "compact"}]
-                if kept
+                [self._segment_entry(name, kept, self.manifest.seq, "compact", pending_ops)]
+                if kept or pending_ops
                 else []
             )
             self.index.flush()  # rows durable before advancing the watermark
@@ -1147,16 +1410,17 @@ class NamespaceStore:
             self.manifest.ops_size = 0
             self.manifest.wal_base_seq = self.manifest.seq  # next frame = base+1
             self._reset_wal_frames()
-            # rebuild pending-purge tracking with only still-pending (not-due)
-            # ops, re-persisted in ONE durable append
+            # rebuild pending-purge tracking with only still-pending (not-due) ops
             self._pending_hard = []
             self._pending_hard_ids = set()
-            self.append_ops(pending_ops)
+            for op in pending_ops:
+                if op.get("id"):
+                    self._track_pending_hard(op["id"], int(op.get("deadline", 0)))
             self._persist_manifest()
             METRICS.set_gauge("memd_pending_purges", len(self._pending_hard), ns=self.namespace)
             rep.segments_out = len(self.manifest.segments)
             rep.records_folded = len(kept)
-            rep.bytes_after = self.store.size(f"{self.prefix}/{name}") if kept else 0
+            rep.bytes_after = self.store.size(f"{self.prefix}/{name}") if kept or pending_ops else 0
             self.index.invalidate_vec_cache()  # fold dead rows out of the scan matrix
         # Compaction is the natural snapshot point: the index has just been
         # folded and stamped with this manifest.seq, and compaction already
@@ -1201,12 +1465,16 @@ class NamespaceStore:
         # searches must never observe a wiped (partial) index
         with self._lock:
             self._ensure_open()
-            recs, ops = self.load_all_records()
+            versions, carried, _ = self._load_checkpoints()
+            ops = self._read_ops()
+            frames = self._wal_events(ops, "load-wal")
             self.index.wipe()
-            self._apply_to_index(recs, ops)
+            # the same ordered replay as open (applying every op after every
+            # record deleted re-adds and resurrected WAL-resident deletes)
+            self._replay_into_index(versions, _merge_events(carried + ops, frames))
             self.index.flush()
             self.index.set_meta("applied_seq", str(self.manifest.seq))
-        return len(recs)
+        return len(set(versions) | {r.id for _, recs in frames for r in recs})
 
     # ------------------------------------------------------------------ exports / stats
 

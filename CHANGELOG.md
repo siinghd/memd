@@ -99,6 +99,21 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
   self-heal.
 
 ### Fixed - data integrity
+- **A crash after an acked delete undid it** (soft or hard, single or batch;
+  predates this release): recovery replayed the whole ops log before the WAL
+  records, so a record deleted while still in the WAL was re-created by its
+  own frame on the next open - hard-deleted content served again. Recovery
+  now reproduces the acknowledged history in one order: every WAL frame is
+  stamped with its seq (ops already carried theirs), and open, rebuild,
+  rotate and compaction all fold one seq-ordered stream, a segment standing
+  in for every event at or below its fold_seq. The same order fixes three
+  siblings: a rotate dropped ops whose target lived in an older segment (a
+  cache wipe, `rebuild_index` or a second node resurrected those records,
+  and a due hard delete folded by a rotate was never purged); and frame seqs
+  inferred from position hid a frame written after `[frame, op, frame]` and
+  a restart from the replay watermark, losing it from the index on a crash.
+  Unstamped WAL frames from older versions replay in the right order, and
+  older versions can still read a stamped WAL.
 - **Two processes on one data root silently destroyed acked data** (8 of 150
   writes lost, measured). A second writer now fails fast with
   `NamespaceBusyError`.
