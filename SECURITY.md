@@ -53,9 +53,12 @@ any probe fails the build.
 - **With the Jev reranker active, search text leaves the machine.** For every
   search, the query and the top-30 candidate texts (date, role and the first
   2,000 characters of each; no ids, scopes or metadata) are sent to
-  TypeSafe's API. `reranker="auto"` (the default) selects Jev only when
-  `TYPESAFE_API_KEY` is set in the environment and `typesafe-sdk` is
-  installed; with no key, nothing leaves the machine. Set
+  TypeSafe's API. `reranker="auto"` (the default) selects Jev only when a
+  TypeSafe key is configured and `typesafe-sdk` is installed; with no key,
+  nothing leaves the machine. A key counts from EITHER source:
+  `TYPESAFE_API_KEY` in the environment, or `typesafe_api_key` in the
+  `Memory(config=...)` dict - so passing the key in config for some other
+  purpose also turns on this egress unless `reranker` is set explicitly. Set
   `MEMD_RERANKER=none` (or `local`, a cross-encoder that runs in-process) to
   keep a keyed deployment local. In hosted mode the key is read from the
   server's environment only; clients never send one.

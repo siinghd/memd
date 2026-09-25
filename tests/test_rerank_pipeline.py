@@ -744,3 +744,126 @@ def test_local_reranker_serves_nothing_until_loaded(tmp_path, monkeypatch):
     finally:
         gate.set()
         m.close()
+
+
+# ------------------------------------------------------------ v0.2.0 verifier regressions
+
+class _Blocking:
+    """A reranker that hangs until released, counting the calls it STARTED."""
+    name = "blocking"
+    model = "b-1"
+    calibrated = True
+    timeout_s = 0.05
+
+    def __init__(self):
+        self.release = threading.Event()
+        self.started = 0
+        self.lock = threading.Lock()
+
+    def scores(self, query, cands):
+        with self.lock:
+            self.started += 1
+        self.release.wait(timeout=10)
+        return [0.5] * len(cands)
+
+
+def test_timed_out_reranker_calls_are_bounded_not_queued():
+    """A timed-out call is not cancelled (for Jev its request is in flight),
+    and every later search queued one more behind it: 40 searches that all
+    fell back still started 40 reranker calls - sending the candidate texts
+    after each search had returned - and the backlog had no bound."""
+    slow = _Blocking()
+    stage = RerankStage(slow, timeout_s=0.05, max_workers=8)
+    try:
+        busy0 = _counter("memd_rerank_fallback_total", reason="busy")
+        t0 = time.monotonic()
+        for i in range(40):
+            assert stage.run(f"q{i}", _cands(2)) is None
+        took = time.monotonic() - t0
+        assert took < 8 * 0.05 + 1.0, f"searches queued behind stuck calls ({took:.2f}s)"
+        assert slow.started <= stage.max_inflight == 8
+        assert _counter("memd_rerank_fallback_total", reason="busy") == busy0 + 40 - slow.started
+        slow.release.set()
+        time.sleep(0.5)
+        assert slow.started <= 8, "abandoned calls started after their searches returned"
+        # the slots free up once the stuck calls return
+        assert stage.run("again", _cands(2)) == [0.5, 0.5]
+    finally:
+        slow.release.set()
+        stage.close()
+
+
+def test_a_call_queued_past_its_deadline_never_starts():
+    slow = _Blocking()
+    # one worker, two slots: the second call queues behind the first
+    stage = RerankStage(slow, timeout_s=0.05, max_workers=1, max_inflight=2)
+    try:
+        assert stage.run("first", _cands(2)) is None   # holds the only worker
+        assert stage.run("second", _cands(2)) is None  # queued, then abandoned
+        slow.release.set()
+        time.sleep(0.3)
+        assert slow.started == 1, "a call whose search had returned still started"
+    finally:
+        slow.release.set()
+        stage.close()
+
+
+def test_a_jev_chunk_past_its_deadline_sends_nothing(monkeypatch):
+    sdk = _FakeSDK()
+    monkeypatch.setitem(sys.modules, "typesafe_sdk", sdk.module)
+    jev = JevReranker(api_key="ts-test", timeout_s=1.0)
+    try:
+        with pytest.raises(Exception):
+            jev._chunk("q", _cands(3), time.monotonic() - 0.01)
+        assert sdk.requests == []
+        assert jev._chunk("q", _cands(3), time.monotonic() + 5) == [0.1, 0.9, 0.1]
+    finally:
+        jev.close()
+
+
+class _Raising:
+    name = "raising"
+    model = "r-1"
+    calibrated = True
+    timeout_s = 1.0
+
+    def __init__(self, exc):
+        self.exc = exc
+
+    def scores(self, query, cands):
+        raise self.exc
+
+
+class _NativePanic(BaseException):
+    """Like pyo3's PanicException: a BaseException that is not an Exception."""
+
+
+@pytest.mark.parametrize("exc", [_NativePanic("rust panicked"), GeneratorExit()])
+def test_a_base_exception_from_the_reranker_is_contained(tmp_path, exc):
+    m = _mem(tmp_path)
+    try:
+        _seed(m)
+        base = [i.id for i in m.search("kumquat", user_id="u", budget_tokens=4000).items]
+        _set_reranker(m, _Raising(exc))
+        m._bump_epoch()
+        before = _counter("memd_rerank_fallback_total", reason="error")
+        res = m.search("kumquat", user_id="u", budget_tokens=4000)
+        assert [i.id for i in res.items] == base
+        assert _counter("memd_rerank_fallback_total", reason="error") == before + 1
+    finally:
+        m.close()
+
+
+@pytest.mark.parametrize("exc", [KeyboardInterrupt, SystemExit])
+def test_keyboard_interrupt_and_system_exit_are_not_swallowed(exc):
+    """Deliberately re-raised: containing them would make the process
+    unstoppable from inside a reranker. They are the only two that escape."""
+    stage = RerankStage(_Raising(exc()), timeout_s=1.0)
+    try:
+        with pytest.raises(exc):
+            stage.run("q", _cands(2))
+        # the slot was released: the stage still works
+        stage.reranker = _Fixed(lambda cands: [0.5] * len(cands))
+        assert stage.run("q", _cands(2)) == [0.5, 0.5]
+    finally:
+        stage.close()

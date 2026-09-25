@@ -7,9 +7,10 @@ collapses to 0.557, so the gain is the query-candidate judgement, not the
 reshuffle.
 
 Selection: config["reranker"] (or env MEMD_RERANKER) is one of
-  "auto" (default) - "jev" when TYPESAFE_API_KEY is set AND typesafe-sdk is
-                     importable, otherwise "none". No key means no data
-                     leaves the machine.
+  "auto" (default) - "jev" when a TypeSafe key is configured (env
+                     TYPESAFE_API_KEY, or config["typesafe_api_key"]) AND
+                     typesafe-sdk is importable, otherwise "none". No key
+                     means no data leaves the machine.
   "none"           - no reranking.
   "jev"            - TypeSafe System One (Jev). PRIVACY: the top-30 candidate
                      texts of every search are sent to TypeSafe's API.
@@ -20,7 +21,15 @@ An explicit choice that cannot be honoured raises; it never falls back.
 
 A reranker must never take search down: RerankStage runs it under a hard
 deadline, and on any error, timeout or malformed answer the search keeps the
-unreranked order and counts memd_rerank_fallback_total{reason}.
+unreranked order and counts memd_rerank_fallback_total{reason}. Only
+KeyboardInterrupt and SystemExit raised inside a reranker propagate.
+
+A call that misses its deadline cannot be cancelled once it runs (for Jev,
+its request is in flight), so the stage bounds how many calls may be in
+flight at once: past `max_inflight` a search skips reranking at once
+(reason "busy") instead of queueing more work behind the stuck calls. A call
+still queued when its deadline passes never starts, so it never sends the
+candidate texts after its search has returned.
 """
 from __future__ import annotations
 
@@ -175,9 +184,13 @@ class JevReranker:
                         retry=RetryPolicy(max_retries=0), timeout=self.timeout_s)
         return self._client
 
-    def _chunk(self, query: str, cands: list[Candidate]) -> list[float]:
+    def _chunk(self, query: str, cands: list[Candidate], deadline: float) -> list[float]:
         from typesafe_sdk import Noul
 
+        if time.monotonic() >= deadline:
+            # queued behind other requests until scores() gave up: never
+            # send the texts for a search that has already returned
+            raise _Failure("timeout")
         state = {"query": query, "candidates": {f"c{i}": c for i, c in enumerate(cands)}}
         questions = {
             f"c{i}": Noul(instructions=JEV_INSTRUCTIONS.format(cid=f"c{i}"), criteria=JEV_CRITERIA)
@@ -193,7 +206,8 @@ class JevReranker:
         if not cands:
             return []
         try:
-            futs = [self._pool.submit(self._chunk, query, cands[i:i + JEV_CHUNK])
+            deadline = time.monotonic() + self.timeout_s
+            futs = [self._pool.submit(self._chunk, query, cands[i:i + JEV_CHUNK], deadline)
                     for i in range(0, len(cands), JEV_CHUNK)]
             done, pending = _wait_futures(futs, timeout=self.timeout_s)
             if pending:
@@ -342,19 +356,28 @@ def resolve_reranker(config: dict | None = None) -> Reranker | None:
 # ---------------------------------------------------------------- the stage
 
 class RerankStage:
-    """Runs a reranker for search under a hard deadline. Never raises.
+    """Runs a reranker for search under a hard deadline. Never raises
+    (except KeyboardInterrupt / SystemExit from inside the reranker).
 
     The call runs on a small pool so a reranker that ignores its own timeout
     (or blocks in C) cannot hold the search past the deadline; the late
-    answer is discarded. Every fallback is counted by reason."""
+    answer is discarded. At most `max_inflight` calls (default: the pool
+    size) run at once, abandoned ones included: past that, reranking is
+    skipped at once ("busy"), so a stuck reranker costs a bounded number of
+    threads and requests, never a growing backlog. Every fallback is
+    counted by reason."""
 
     def __init__(self, reranker: Reranker, *, timeout_s: float | None = None,
-                 k: int = DEFAULT_RERANK_K, max_workers: int = 8):
+                 k: int = DEFAULT_RERANK_K, max_workers: int = 8, max_inflight: int | None = None):
         self.reranker = reranker
         self.timeout_s = float(timeout_s if timeout_s is not None
                                else getattr(reranker, "timeout_s", DEFAULT_JEV_TIMEOUT_S))
         self.k = int(k)
         self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="memd-rerank")
+        # a slot is held from submit until the call RETURNS, not until its
+        # search stops waiting: abandoned calls still count
+        self.max_inflight = max(1, int(max_inflight if max_inflight is not None else max_workers))
+        self._slots = threading.BoundedSemaphore(self.max_inflight)
         self._lock = threading.Lock()
         self._calls = 0
         self._fallbacks = 0
@@ -372,13 +395,27 @@ class RerankStage:
     def calibrated(self) -> bool:
         return bool(getattr(self.reranker, "calibrated", False))
 
-    def _invoke(self, query: str, cands: list[Candidate]) -> tuple[list[float] | None, str | None]:
+    def _invoke(self, query: str, cands: list[Candidate],
+                deadline: float) -> tuple[list[float] | None, str | None]:
         """Runs on the pool thread: scores() and its failure reason are read
         on the same thread (the reason is thread-local on the reranker)."""
         try:
-            out = self.reranker.scores(query, cands)
-        except Exception as e:  # noqa: BLE001 - a reranker must never fail search
-            return None, _failure_reason(e)
+            if time.monotonic() >= deadline:
+                # its search already returned (queued behind abandoned calls):
+                # starting now would only send the texts for nothing
+                return None, "timeout"
+            try:
+                out = self.reranker.scores(query, cands)
+            except (KeyboardInterrupt, SystemExit):
+                raise  # deliberately not contained: the process is being stopped
+            except BaseException as e:  # noqa: BLE001 - a reranker must never fail search
+                # (BaseException: a native panic or a stray GeneratorExit too)
+                return None, _failure_reason(e)
+            return self._validate(out, cands)
+        finally:
+            self._slots.release()
+
+    def _validate(self, out: Any, cands: list[Candidate]) -> tuple[list[float] | None, str | None]:
         if out is None:
             why = getattr(self.reranker, "last_failure_reason", None)
             return None, (why() if callable(why) else None) or "unavailable"
@@ -396,13 +433,27 @@ class RerankStage:
             return []
         t0 = time.monotonic()
         reason: str | None
-        try:
-            fut = self._pool.submit(self._invoke, query, cands)
-            vals, reason = fut.result(timeout=self.timeout_s)
-        except _FutureTimeout:
-            vals, reason = None, "timeout"
-        except Exception as e:  # noqa: BLE001 - pool shut down, etc.
-            vals, reason = None, _failure_reason(e)
+        if not self._slots.acquire(blocking=False):
+            # max_inflight calls are still running (timed out, most likely):
+            # skip at once rather than queue behind them
+            vals, reason = None, "busy"
+        else:
+            try:
+                fut = self._pool.submit(self._invoke, query, cands, t0 + self.timeout_s)
+            except BaseException as e:  # noqa: BLE001 - pool shut down, etc.
+                self._slots.release()  # never submitted: _invoke will not release it
+                if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                    raise
+                vals, reason = None, _failure_reason(e)
+            else:
+                try:
+                    vals, reason = fut.result(timeout=self.timeout_s)
+                except _FutureTimeout:
+                    vals, reason = None, "timeout"
+                except (KeyboardInterrupt, SystemExit):
+                    raise  # raised inside the reranker, re-raised on purpose (see _invoke)
+                except BaseException as e:  # noqa: BLE001 - cancelled, etc.
+                    vals, reason = None, _failure_reason(e)
         ms = (time.monotonic() - t0) * 1000
         with self._lock:
             self._calls += 1
@@ -427,7 +478,7 @@ class RerankStage:
         p50 = round(lat[len(lat) // 2], 3) if lat else None
         return {"name": self.name, "model": self.model, "calibrated": self.calibrated,
                 "calls": calls, "fallbacks": fallbacks, "p50_ms": p50,
-                "timeout_s": self.timeout_s, "k": self.k}
+                "timeout_s": self.timeout_s, "k": self.k, "max_inflight": self.max_inflight}
 
     def close(self) -> None:
         self._pool.shutdown(wait=False, cancel_futures=True)
