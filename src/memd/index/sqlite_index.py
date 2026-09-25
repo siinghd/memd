@@ -139,6 +139,11 @@ class NamespaceIndex:
         self._con.execute("PRAGMA temp_store=MEMORY")
         self._con.execute("PRAGMA busy_timeout=5000")
         self._migrate()
+        # rowids are never reused (see _note_rowid_hwm): the highest rowid
+        # ever handed out, and whether MAX(rowid) may have fallen below it
+        row = self._con.execute("SELECT v FROM meta WHERE k='rowid_hwm'").fetchone()
+        self._rowid_hwm = int(row[0]) if row else 0
+        self._rowid_gap = self._rowid_hwm > 0
 
     def _migrate(self) -> None:
         c = self._con
@@ -305,13 +310,20 @@ class NamespaceIndex:
                 return
             c = self._con
             try:
+                if self.lexical is not None:
+                    # an upsert that overwrites an existing id (a native
+                    # import keeps ids) changes a row the accelerator may
+                    # already hold: its content, scope or flags must be
+                    # re-indexed, not just rows above the watermark
+                    self._lex_touch(self._existing_ids(c, [rec.id for rec, _, _ in items]))
+                rowid = self._next_rowid_locked(c)
                 for rec, vec, model in items:
                     p = rec.provenance
                     c.execute(
-                        """INSERT INTO records(id,kind,content,scope_org,scope_agent,scope_user,scope_session,
+                        """INSERT INTO records(rowid,id,kind,content,scope_org,scope_agent,scope_user,scope_session,
                              source,actor_id,prov_session,lineage,extractor,t_event,t_ingested,valid_from,
                              invalidated_at,superseded_by,entity_keys,embedding_version,meta,quarantined,deleted)
-                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                            ON CONFLICT(id) DO UPDATE SET
                              kind=excluded.kind, content=excluded.content,
                              scope_org=excluded.scope_org, scope_agent=excluded.scope_agent,
@@ -324,7 +336,7 @@ class NamespaceIndex:
                              embedding_version=excluded.embedding_version, meta=excluded.meta,
                              quarantined=excluded.quarantined, deleted=excluded.deleted""",
                         (
-                            rec.id, rec.kind, rec.content,
+                            rowid, rec.id, rec.kind, rec.content,
                             rec.scope.org, rec.scope.agent, rec.scope.user, rec.scope.session,
                             int(p.source), p.actor_id, p.session_id,
                             json.dumps(p.lineage),
@@ -335,6 +347,8 @@ class NamespaceIndex:
                             json.dumps(rec.meta), int(quarantined.get(rec.id, False)), int(rec.deleted),
                         ),
                     )
+                    if rowid is not None:
+                        rowid += 1  # (an overwrite leaves a gap: harmless)
                     c.execute("DELETE FROM entities WHERE record_id=?", (rec.id,))
                     c.executemany(
                         "INSERT OR IGNORE INTO entities(entity_key, record_id) VALUES(?,?)",
@@ -484,19 +498,44 @@ class NamespaceIndex:
         if self.lexical is not None:
             self.lexical.touch(list(ids))
 
-    def _lex_before_hard_delete(self, c: sqlite3.Connection, record_id: str) -> None:
-        """SQLite reuses the highest rowid once its row is deleted, which
-        would put the next insert BELOW the lexical watermark: lower the
-        accelerator's scan floor so the tail still serves (and it re-indexes)
-        whatever lands there."""
-        if self.lexical is None:
-            return
-        row = c.execute("SELECT rowid FROM records WHERE id=?", (record_id,)).fetchone()
-        if row is None:
-            return
+    @staticmethod
+    def _existing_ids(c: sqlite3.Connection, ids: list[str]) -> list[str]:
+        out: list[str] = []
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            out += [r[0] for r in c.execute(
+                f"SELECT id FROM records WHERE id IN ({','.join('?' * len(chunk))})",  # nosec B608
+                chunk).fetchall()]
+        return out
+
+    def _note_rowid_hwm(self, c: sqlite3.Connection) -> None:
+        """Rowids are never reused. Called BEFORE a physical delete, inside
+        its transaction: remember the highest rowid ever handed out.
+
+        SQLite gives a new row MAX(rowid)+1, so deleting the newest rows
+        hands their rowids out again. The lexical accelerator indexes by
+        rowid order (everything above its watermark is new), and a reused
+        rowid lands below the watermark, where nothing rescans: the record
+        was missing from the bm25 lane for good. The mark is written in the
+        same transaction as the delete, so no crash can separate the two,
+        and upsert_batch places new rows above it (AUTOINCREMENT semantics
+        without rebuilding the table)."""
         top = c.execute("SELECT MAX(rowid) FROM records").fetchone()[0]
-        if top is not None and int(row[0]) >= int(top):
-            self.lexical.lower_floor(int(row[0]) - 1)
+        if top is not None and int(top) > self._rowid_hwm:
+            self._rowid_hwm = int(top)
+            c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('rowid_hwm',?)", (str(self._rowid_hwm),))
+        self._rowid_gap = self._rowid_hwm > 0
+
+    def _next_rowid_locked(self, c: sqlite3.Connection) -> int | None:
+        """The rowid for the next inserted row, or None to let SQLite pick
+        (its MAX(rowid)+1 is then already above every rowid ever used)."""
+        if not self._rowid_gap:
+            return None
+        top = c.execute("SELECT MAX(rowid) FROM records").fetchone()[0] or 0
+        if int(top) >= self._rowid_hwm:
+            self._rowid_gap = False
+            return None
+        return self._rowid_hwm + 1
 
     def mark_superseded(self, old_id: str, new_id: str, at_ms: int) -> None:
         with self._lock:
@@ -543,7 +582,7 @@ class NamespaceIndex:
         """Physical removal inside the index (compaction deadline path)."""
         with self._lock:
             self._lex_touch([record_id])
-            self._lex_before_hard_delete(self._con, record_id)
+            self._note_rowid_hwm(self._con)
             cur = self._con.execute("DELETE FROM records WHERE id=?", (record_id,))
             self._hard_delete_rows(self._con, record_id)
             self._con.commit()
@@ -582,6 +621,8 @@ class NamespaceIndex:
                              if (op.get("id") or op.get("old"))
                              and op.get("op") in ("tombstone", "supersede", "quarantine", "hard_delete")])
             try:
+                if any(op.get("op") == "hard_delete" for op in ops):
+                    self._note_rowid_hwm(c)
                 for op in ops:
                     kind = op.get("op")
                     rid = op.get("id") or op.get("old")
@@ -615,7 +656,6 @@ class NamespaceIndex:
                         )
                         c.execute("UPDATE records SET embedding_version=? WHERE id=?", (op.get("model", ""), rid))
                     elif kind == "hard_delete":
-                        self._lex_before_hard_delete(c, rid)
                         c.execute("DELETE FROM records WHERE id=?", (rid,))
                         self._hard_delete_rows(c, rid)
                 c.commit()
@@ -1365,7 +1405,9 @@ class NamespaceIndex:
     def wipe(self) -> None:
         with self._lock:
             if self.lexical is not None:
-                self.lexical.reset()  # rowids restart: the watermark is void
+                self.lexical.reset()  # every row is replaced: the watermark is void
+            self._note_rowid_hwm(self._con)
+            # (executescript COMMITs first, so the mark is durable before the delete)
             self._con.executescript(
                 "DELETE FROM vectors; DELETE FROM entities; "
                 "DELETE FROM entity_segments; DELETE FROM links; DELETE FROM records;"

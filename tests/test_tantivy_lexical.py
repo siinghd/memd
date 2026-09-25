@@ -511,3 +511,119 @@ def test_write_path_is_not_blocked_by_the_indexer(tmp_path):
                                           limit=50)) == 20
     finally:
         m.close()
+
+
+# ------------------------------------------------------------ v0.2.0 verifier regressions
+
+def _rowid(m: Memory, rid: str) -> int:
+    with m.ns.index._read() as c:
+        return int(c.execute("SELECT rowid FROM records WHERE id=?", (rid,)).fetchone()[0])
+
+
+def _served_by_tantivy(m: Memory, query: str, f: IndexFilter, limit: int = 10) -> list[str]:
+    """The lane's answer, asserting tantivy (not the FTS5 fallback) gave it."""
+    before = _counter("memd_lexical_searches_total")
+    got = [h.record.content for h in m.ns.index.search_bm25(query, f, limit=limit)]
+    assert _counter("memd_lexical_searches_total") == before + 1, "served by the FTS5 fallback"
+    return got
+
+
+@pytest.mark.parametrize("mode", ["single", "batch"])
+def test_hard_deleting_the_two_newest_rows_never_hides_the_next_write(tmp_path, mode):
+    """Only a delete of THE max rowid lowered the scan floor, and only to
+    rowid-1: deleting the two newest rows (lower one first) left the floor
+    above the rowid SQLite handed out next, so that record was missing from
+    the bm25 lane for good - after flush and after reopen too."""
+    root = tmp_path / "d"
+    m = _mem(root, lexical_commit_ms=50)
+    f = IndexFilter(scope=Scope(user="u"))
+    try:
+        m.add_events([{"content": f"filler note {i} about groceries", "user_id": "u"} for i in range(20)])
+        a = m.add("second newest walrusine", user_id="u")[0]
+        b = m.add("newest walrusine", user_id="u")[0]
+        top = _rowid(m, b)
+        _ready(m)
+        if mode == "single":
+            m.delete(a, hard=True)
+            m.delete(b, hard=True)
+        else:
+            m.delete_many([a, b], hard=True)
+        c = m.add("fresh narwhalic record", user_id="u")[0]
+        assert _rowid(m, c) > top, "a rowid was handed out twice"
+        assert _served_by_tantivy(m, "narwhalic", f) == ["fresh narwhalic record"]  # tail
+        _ready(m)
+        assert _served_by_tantivy(m, "narwhalic", f) == ["fresh narwhalic record"]  # committed
+        assert not _served_by_tantivy(m, "walrusine", f)
+    finally:
+        m.close()
+    m = _mem(root, lexical_commit_ms=50)
+    try:
+        assert _lex(m).ready(), "a cleanly closed index must be reused"
+        assert _served_by_tantivy(m, "narwhalic", f) == ["fresh narwhalic record"]
+        d = m.add("after reopen: dugongish", user_id="u")[0]
+        assert _rowid(m, d) > top
+        _ready(m)
+        assert _served_by_tantivy(m, "dugongish", f) == ["after reopen: dugongish"]
+    finally:
+        m.close()
+
+
+def test_an_overwritten_id_is_reindexed(tmp_path):
+    """An upsert of an existing id (`memd import --native` keeps ids) never
+    reached the indexer: the OLD text kept matching and the new text did not,
+    even after flush and reopen."""
+    import dataclasses
+
+    root = tmp_path / "d"
+    m = _mem(root)
+    f = IndexFilter(scope=Scope(user="u"))
+    try:
+        m.add_events([{"content": f"filler {i}", "user_id": "u"} for i in range(20)])
+        rid = m.add("original wombatrix sensitive", user_id="u")[0]
+        _ready(m)
+        rec = m.ns.index.get_by_id(rid)
+        new = dataclasses.replace(rec, content="redacted placeholder kiwiberry")
+        new.namespace = "default"
+        m._ns_for("default").append([new])  # what cli._import_native does
+        # before the batcher runs: the pending row is served from FTS5
+        assert not _served_by_tantivy(m, "wombatrix", f)
+        assert _served_by_tantivy(m, "kiwiberry", f) == ["redacted placeholder kiwiberry"]
+        _ready(m)
+        assert not _served_by_tantivy(m, "wombatrix", f)
+        assert _served_by_tantivy(m, "kiwiberry", f) == ["redacted placeholder kiwiberry"]
+    finally:
+        m.close()
+    m = _mem(root)
+    try:
+        assert _lex(m).ready()
+        assert not _served_by_tantivy(m, "wombatrix", f)
+        assert _served_by_tantivy(m, "kiwiberry", f) == ["redacted placeholder kiwiberry"]
+        assert not [i for i in m.search("wombatrix", user_id="u").items]
+    finally:
+        m.close()
+
+
+def test_a_rescoped_id_moves_to_its_new_owner(tmp_path):
+    import dataclasses
+
+    m = _mem(tmp_path / "d")
+    try:
+        m.add_events([{"content": f"filler {i}", "user_id": "alice"} for i in range(20)])
+        rid = m.add("transferred ocelotine ledger", user_id="alice")[0]
+        _ready(m)
+        rec = m.ns.index.get_by_id(rid)
+        moved = dataclasses.replace(rec, scope=Scope(user="bob"))
+        moved.namespace = "default"
+        m._ns_for("default").append([moved])
+        m._bump_epoch()
+        for committed in (False, True):
+            if committed:
+                _ready(m)
+                m._bump_epoch()
+            assert not _served_by_tantivy(m, "ocelotine", IndexFilter(scope=Scope(user="alice")))
+            assert _served_by_tantivy(m, "ocelotine", IndexFilter(scope=Scope(user="bob"))) == \
+                ["transferred ocelotine ledger"]
+            assert not m.search("ocelotine", user_id="alice").items
+            assert [i.id for i in m.search("ocelotine", user_id="bob").items] == [rid]
+    finally:
+        m.close()
