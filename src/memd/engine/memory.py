@@ -609,13 +609,11 @@ class Memory:
                                         "commit_docs": int(cfg.get("lexical_commit_docs", DEFAULT_COMMIT_DOCS)),
                                     })
         self.namespace_name = namespace
-        self.ns = self.engine.namespace(namespace)
-        # the facade holds a direct reference to this store for its lifetime:
-        # pin it so LRU churn of other namespaces can't close it underneath us
-        self.engine.pin_namespace(namespace)
         # D7 #7 ledgers are PER NAMESPACE. They are held in an LRU keyed by
         # namespace (mirroring the engine's namespace table) and routed by the
-        # OPERATION's target namespace - see _audit_for().
+        # OPERATION's target namespace - see _audit_for(). Set up before any
+        # namespace opens: opening one can already produce audit events
+        # (segments a crashed compaction left, collected at open).
         self._audit_flush_every = int(cfg.get("audit_flush_every", 32))
         self._audit_max_open = int(cfg.get("audit_max_open", 64))
         self._audit_lock = threading.Lock()
@@ -628,6 +626,11 @@ class Memory:
         # snapshot widened that window) was enough. Bounded; cleared when the
         # namespace legitimately exists again.
         self._shredded: "OrderedDict[str, None]" = OrderedDict()
+        self.engine.audit_hook = self._audit_engine_event
+        self.ns = self.engine.namespace(namespace)
+        # the facade holds a direct reference to this store for its lifetime:
+        # pin it so LRU churn of other namespaces can't close it underneath us
+        self.engine.pin_namespace(namespace)
         self.audit = self._audit_for(namespace)  # facade default, never evicted
         self.embedder: Embedder = resolve_embedder(cfg)
         self.fuse_vector: bool = resolve_fuse_vector(cfg, self.embedder)
@@ -993,6 +996,12 @@ class Memory:
                 except Exception:
                     METRICS.inc("memd_audit_flush_failures_total", ns=victim_name)
             return log
+
+    def _audit_engine_event(self, ns_name: str, action: str, target: str, detail: dict) -> None:
+        """StorageEngine.audit_hook: engine-initiated events land in the
+        ledger this facade owns, so its hash chain stays one chain."""
+        self._audit_for(ns_name).append(actor="maintenance", action=action, target=target,
+                                        detail=detail)
 
     def _flush_all_audits(self) -> None:
         with self._audit_lock:

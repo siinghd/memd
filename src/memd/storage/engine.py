@@ -109,6 +109,9 @@ class Manifest:
     # which open re-adopts a segment the list lost (_adopt_orphan_segments).
     checkpoint: str = ""
     checkpoint_seq: int = 0
+    # the manifest generation that committed it: a segment stamped with an
+    # older generation and referenced by no one is garbage (_collect_segments)
+    checkpoint_gen: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -125,6 +128,7 @@ class Manifest:
             "snapshot_name": self.snapshot_name,
             "checkpoint": self.checkpoint,
             "checkpoint_seq": self.checkpoint_seq,
+            "checkpoint_gen": self.checkpoint_gen,
         }
 
     @classmethod
@@ -146,6 +150,7 @@ class Manifest:
             format=fmt,
             checkpoint=str(d.get("checkpoint", "") or ""),
             checkpoint_seq=int(d.get("checkpoint_seq", 0) or 0),
+            checkpoint_gen=int(d.get("checkpoint_gen", 0) or 0),
         )
 
 
@@ -600,6 +605,8 @@ class NamespaceStore:
         self._pending_hard_ids: set[str] = set()
         self._rotating = False  # re-entrancy guard for rotate-inside-append_ops
         self._replayed_at_open = False
+        self.segments_collected = 0
+        self._collected: list[dict] = []
         self._open()
         self._attach_lexical(lexical)
 
@@ -851,6 +858,58 @@ class NamespaceStore:
         self.index.flush()
         self.index.set_meta("applied_seq", str(self.manifest.seq))
         self._persist_manifest()
+        self._collect_segments()
+
+    def _collect_segments(self) -> None:
+        """Delete segments a committed checkpoint replaced.
+
+        A crash between a compaction's commit and its deletes left the
+        segments it replaced on disk for good: never read again (adoption
+        needs the manifest to name them), but never removed - a hard delete's
+        bytes outlived the D7 purge deadline there. Open now deletes every
+        seg-* object the manifest does not reference that is provably OLDER
+        than the newest checkpoint: stamped with an earlier manifest
+        generation (older versions stamped none) and folded at or below its
+        seq. A segment a writer is still producing carries its current
+        generation - at least the checkpoint's - so it is never touched;
+        neither is a blob without a readable header. Only the namespace's
+        lock or lease holder collects (not with MEMD_ALLOW_MULTI_PROCESS).
+        Each deletion is counted, logged and handed to the audit ledger
+        (StorageEngine.namespace)."""
+        m = self.manifest
+        if m.checkpoint_gen <= 0 or not (self._owner_path or self._owner_lease):
+            return
+        live = {s["name"] for s in m.segments} | {m.checkpoint}
+        try:
+            keys = self.store.list(f"{self.prefix}/")
+        except Exception:  # noqa: BLE001 - collection is retried on every open
+            return
+        for key in keys:
+            name = key.rsplit("/", 1)[-1]
+            if not name.startswith("seg-") or name in live:
+                continue
+            try:
+                raw = self._decrypt_frame(self.store.get(key) or b"")
+                head = json.loads(raw[:raw.find(b"\n")])["_seg"]
+                gen, fold = int(head.get("gen", 0)), int(head["fold_seq"])
+            except Exception:  # noqa: BLE001 - not provably ours or old: keep
+                continue
+            if gen >= m.checkpoint_gen or fold > m.checkpoint_seq:
+                continue  # as new as the checkpoint: a writer may own it
+            self.store.delete(key)
+            self.segments_collected += 1
+            self._collected.append({"segment": name, "fold_seq": fold, "gen": gen,
+                                    "checkpoint_gen": m.checkpoint_gen})
+            METRICS.inc("memd_segments_collected_total",
+                        help="unreferenced segments a newer checkpoint replaced, deleted at open",
+                        ns=self.namespace)
+            _log.info("namespace %s: deleted segment %s (gen %d, fold %d), replaced by "
+                      "checkpoint gen %d", self.namespace, name, gen, fold, m.checkpoint_gen)
+
+    def take_collected(self) -> list[dict]:
+        """Segment deletions since the last call, for the audit ledger."""
+        out, self._collected = self._collected, []
+        return out
 
     # ------------------------------------------------------------------ format 1 -> 2
 
@@ -891,6 +950,7 @@ class NamespaceStore:
         stale_snapshot = m.snapshot_name  # an image of a format-1 index
         m.format = STORE_FORMAT
         m.checkpoint, m.checkpoint_seq = name, fold
+        m.checkpoint_gen = m.version + 1  # the generation the commit writes
         m.seq = m.wal_base_seq = fold
         m.snapshot_name, m.snapshot_seq = "", 0
         m.wal_size = m.ops_size = 0
@@ -1187,8 +1247,10 @@ class NamespaceStore:
 
     @staticmethod
     def _segment_blob(kept: list[MemoryRecord], fold_seq: int, carried: list[dict] = (),
-                      before: dict[str, int] | None = None) -> bytes:
+                      before: dict[str, int] | None = None, gen: int | None = None) -> bytes:
         seg: dict = {"fold_seq": fold_seq}
+        if gen is not None:
+            seg["gen"] = gen
         if carried:
             seg["ops"] = list(carried)
         if before:
@@ -1199,7 +1261,10 @@ class NamespaceStore:
 
     def _write_segment(self, name: str, kept: list[MemoryRecord], fold_seq: int,
                        carried: list[dict] = (), before: dict[str, int] | None = None) -> bytes:
-        data = self._segment_blob(kept, fold_seq, carried, before)
+        # stamped with the manifest generation it was written under: older
+        # than the checkpoint that replaces it, never older than one a
+        # writer committed before writing it (see _collect_segments)
+        data = self._segment_blob(kept, fold_seq, carried, before, gen=self.manifest.version)
         if self.envelope.enabled:
             data = self.envelope.encrypt(self.namespace, data)
         self.store.put(f"{self.prefix}/{name}", data)
@@ -1632,6 +1697,7 @@ class NamespaceStore:
                 self._segment_entry(name, kept, self.manifest.seq, reason, carried))
         self.manifest.checkpoint = name if kept or carried else ""
         self.manifest.checkpoint_seq = self.manifest.seq
+        self.manifest.checkpoint_gen = self.manifest.version + 1  # the commit's
         self.index.flush()  # rows durable before advancing watermark
         self.index.set_meta("applied_seq", str(self.manifest.seq))
         self._persist_manifest()
@@ -1738,6 +1804,7 @@ class NamespaceStore:
             # old segments it replaces must never read as lost checkpoints
             self.manifest.checkpoint = name if kept or pending_ops else ""
             self.manifest.checkpoint_seq = self.manifest.seq
+            self.manifest.checkpoint_gen = self.manifest.version + 1  # the commit's
             self.index.flush()  # rows durable before advancing the watermark
             self.index.set_meta("applied_seq", str(self.manifest.seq))
             # commit the new-segment-only view BEFORE deleting anything it
@@ -1869,6 +1936,7 @@ class NamespaceStore:
         st["segment_bytes"] = sum(
             self.store.size(f"{self.prefix}/{s['name']}") for s in self.manifest.segments
         )
+        st["segments_collected"] = self.segments_collected
         return st
 
     def close(self) -> None:
@@ -1933,6 +2001,11 @@ class StorageEngine:
         self._pinned: set[str] = set()
         self.max_open_namespaces = max(1, int(max_open_namespaces))
         self._lock = threading.RLock()
+        # audit_hook(ns, action, target, detail): where engine-initiated events
+        # (segment collection at open) are audited. The Memory facade routes
+        # them into the ledger it owns; without one they are appended to the
+        # namespace's ledger directly.
+        self.audit_hook = None
 
     def pin_namespace(self, ns: str) -> None:
         """Mark a namespace as process-resident (never LRU-evicted). The
@@ -1992,7 +2065,22 @@ class StorageEngine:
                 self._evict_locked()
             else:
                 self._namespaces.move_to_end(ns)
-            return nstore
+            collected = nstore.take_collected()
+        for ev in collected:  # outside the engine lock: the hook takes its own
+            self._audit(ns, "segment_gc", ev["segment"], ev)
+        return nstore
+
+    def _audit(self, ns: str, action: str, target: str, detail: dict) -> None:
+        try:
+            if self.audit_hook is not None:
+                self.audit_hook(ns, action, target, detail)
+            else:
+                from memd.storage.audit import AuditLog
+
+                AuditLog(self.store, f"ns/{ns}/audit", self.envelope).append(
+                    actor="maintenance", action=action, target=target, detail=detail)
+        except Exception as ex:  # noqa: BLE001 - the deletion itself already happened
+            METRICS.inc("memd_audit_flush_failures_total", ns=ns, detail=type(ex).__name__)
 
     def peek_namespace(self, ns: str) -> "NamespaceStore | None":
         """Existing open store, or None - NEVER materializes one.

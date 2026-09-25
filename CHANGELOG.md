@@ -153,6 +153,13 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
   name of the segment they wrote in the same manifest put as the segment
   list (an explicit empty checkpoint when they wrote none) - and any other
   unreferenced segment is never read.
+- **A crash inside a compaction kept a hard delete's bytes past the D7
+  deadline**: the segments it had replaced stayed on disk for good. Open now
+  deletes every unreferenced segment provably older than the newest
+  checkpoint (stamped with an earlier manifest generation and folded at or
+  below its seq; a segment a writer may still own is never touched), under
+  the namespace's lock or lease, with a `segment_gc` audit entry per
+  deletion and `stats()["segments_collected"]`.
 - **A torn ops-log tail was never repaired** (only the WAL's was): a delete
   acked after it was invisible to a cold open and dropped by the next
   rotate. Open now cuts a torn tail off, durably, before anything is
@@ -290,9 +297,6 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
   than this version reads raises `StoreFormatError`.
 
 ### Known limitations
-- A crash inside a compaction, after its commit, can leave the segments it
-  replaced on disk: never read again, but not removed, so a hard delete's
-  bytes may outlive its deadline there until they are deleted by hand.
 - Search latency grows with namespace size under FTS5 (p50 15/44/114 ms at
   10K/50K/150K records on real turns); install `memd[fast]` (tantivy: 5.7/7.3/8.8 ms).
 - Multi-session aggregation questions ("how many X did I ...") remain the

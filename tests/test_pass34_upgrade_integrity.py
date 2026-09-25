@@ -19,6 +19,7 @@ the current format held; compatibility and some older paths did not:
 import json
 import os
 import shutil
+import subprocess
 import sys
 
 import pytest
@@ -380,6 +381,8 @@ def test_a_crash_inside_an_empty_compaction_does_not_readopt_its_input(tmp_path,
         assert _live(e2.namespace("p")) == [], "residue of the compaction was re-adopted"
     finally:
         e2.close()
+    assert not any(f.startswith("seg-") for f in os.listdir(os.path.join(root, "ns", "p"))), \
+        "the residue must be collected at open"
     m = _manifest(root, "p")
     assert m["segments"] == [] and m.get("checkpoint") == "" and m.get("checkpoint_seq", 0) > 0, \
         "an empty compaction commits an explicit empty checkpoint"
@@ -463,3 +466,96 @@ class TestOpsLogRepair:
             assert _live(e.namespace("o")) == [a.id]
         finally:
             e.close()
+
+
+# --------------------------------------------------------------- segment GC
+
+MARKER = "PURGE-GC-7q3v-zebu"
+GC_CHILD = r"""
+import os, sys
+sys.path.insert(0, {src!r})
+from memd.engine.memory import Memory
+from memd.storage import objectstore
+
+root, ack = sys.argv[1:3]
+m = Memory(root, encrypt=False, config={cfg!r})
+victim = m.add("record {marker}", user_id="u")[0]
+keep = m.add("unrelated keeper note", user_id="u")[0]
+m.ns.rotate("probe")                      # the victim's bytes now sit in a segment
+m.delete(victim, hard=True)               # acked hard delete; purge pending
+with open(ack, "w") as f:
+    f.write(victim + " " + keep)
+    f.flush()
+    os.fsync(f.fileno())
+real = objectstore.LocalObjectStore.delete
+def delete(self, key):
+    if "/seg-" in key:
+        os._exit(9)                       # killed after the commit, before the old segment goes
+    return real(self, key)
+objectstore.LocalObjectStore.delete = delete
+m.ns.compact(force=True)                  # purges the victim from its output
+os._exit(3)                               # never reached
+"""
+
+
+def _store_bytes(root: str) -> bytes:
+    """Every durable object of the data root (the derived index cache aside)."""
+    out = []
+    for dirpath, dirs, files in os.walk(os.path.join(root, "store", "ns")):
+        for fn in files:
+            with open(os.path.join(dirpath, fn), "rb") as f:
+                out.append(f.read())
+    return b"".join(out)
+
+
+def test_a_killed_compaction_leaves_no_hard_deleted_bytes_after_reopen(tmp_path):
+    root, ack = str(tmp_path / "data"), str(tmp_path / "ack")
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
+    child = subprocess.run(
+        [sys.executable, "-c", GC_CHILD.format(src=src, cfg=CFG, marker=MARKER), root, ack],
+        capture_output=True, timeout=120)
+    assert child.returncode == 9, child.stderr.decode()[-2000:]
+    victim, keep = open(ack).read().split()
+    nsdir = os.path.join(root, "store", "ns", "default")
+    m = _manifest(os.path.join(root, "store"), "default")
+    orphans = [f for f in os.listdir(nsdir)
+               if f.startswith("seg-") and f not in {s["name"] for s in m["segments"]}]
+    # positive control: the killed compaction committed, but the segment it
+    # replaced - holding the hard-deleted record - is still on disk
+    assert orphans, "precondition: the kill left the replaced segment behind"
+    assert MARKER.encode() in _store_bytes(root), "precondition: the marker is on disk"
+
+    mem = Memory(root, encrypt=False, config=CFG)
+    try:
+        assert mem.get(victim) is None and mem.get(keep) is not None
+        collected = mem.stats().get("segments_collected")
+        mem.audit.flush()
+        gc = sorted(e["target"] for e in mem.audit.read() if e["action"] == "segment_gc")
+    finally:
+        mem.close()
+    assert MARKER.encode() not in _store_bytes(root), "hard-deleted bytes survived the reopen"
+    left = [f for f in os.listdir(nsdir) if f.startswith("seg-")]
+    assert left == [s["name"] for s in _manifest(os.path.join(root, "store"), "default")["segments"]]
+    assert collected == len(orphans)
+    assert gc == sorted(orphans), "each deletion must be in the audit ledger"
+
+
+def test_collection_never_touches_a_segment_newer_than_the_checkpoint(tmp_path):
+    """An unreferenced segment stamped with the current generation may be a
+    writer's uncommitted output (a crashed rotate's, here): it stays."""
+    root = str(tmp_path / "store")
+    e = StorageEngine(root)
+    ns = e.namespace("n")
+    ns.append([_rec("n", "a")])
+    ns.compact(force=True)                               # checkpoint at gen G
+    ns.append([_rec("n", "b")])
+    fresh = "seg-ZZZZZZZZZZZZZZZZZZZZZZZZZZ"
+    ns._write_segment(fresh, [_rec("n", "b copy")], ns.manifest.seq)  # gen >= G, never committed
+    e.close()
+    e = StorageEngine(root)
+    try:
+        ns = e.namespace("n")
+        assert fresh in os.listdir(os.path.join(root, "ns", "n"))
+        assert ns.stats().get("segments_collected", 0) == 0
+    finally:
+        e.close()
