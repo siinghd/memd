@@ -183,7 +183,7 @@ fully functional, honestly degraded, clearly labeled in `stats()`.
 
 | key / env | values | default |
 |---|---|---|
-| `reranker` / `MEMD_RERANKER` | `auto` \| `none` \| `jev` \| `local` | `auto`: Jev when `TYPESAFE_API_KEY` is set and `typesafe-sdk` is installed (`pip install "memd[jev]"`), else none |
+| `reranker` / `MEMD_RERANKER` | `auto` \| `none` \| `jev` \| `local` | `auto`: Jev when a TypeSafe key is set (`TYPESAFE_API_KEY`, or config `typesafe_api_key`) and `typesafe-sdk` is installed (`pip install "memd[jev]"`), else none |
 | `jev_model`, `rerank_timeout_s`, `rerank_k` | model pin, deadline, shortlist | `jev-latest`, 1.5s (5s local), 30 |
 | `local_rerank_model` | fastembed cross-encoder | `BAAI/bge-reranker-base` |
 | `pack_mode` / `MEMD_PACK_MODE` | `auto` \| `ranked` \| `gated` | `auto` = ranked with every reranker; `gated` is an experimental opt-in |
@@ -213,7 +213,10 @@ fully functional, honestly degraded, clearly labeled in `stats()`.
   background (every 500ms or 512 changes); FTS5 stays the synchronous source
   of truth, so the write ack is unchanged, and writes not yet indexed are
   served from FTS5. It is rebuilt in the background when missing, corrupt or
-  not closed cleanly.
+  not closed cleanly. A search error sends that query to FTS5; only damage
+  (I/O, missing or corrupt files) rebuilds it while running, with
+  exponential backoff; `stats()["lexical"]` shows `rebuilds`, `failures`
+  and `retry_in_s`.
 
 ## Ops
 

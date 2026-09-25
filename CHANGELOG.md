@@ -6,6 +6,30 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
 
 ## [Unreleased]
 
+### Fixed
+- **tantivy lane: a write after hard-deleting the newest rows was never
+  indexed.** SQLite reused their rowids below the accelerator's watermark.
+  Rowids are now never reused (a high-water mark committed with the delete);
+  indexes of the previous version are rebuilt once on open.
+- **tantivy lane: tokens of 40+ bytes were dropped** (`en_stem`'s length
+  filter): hashes, long ids and unspaced CJK are now indexed; a query term
+  near tantivy's 65,530-byte term limit is served by FTS5.
+- **tantivy lane: overwriting an existing id** (`memd import --native`) now
+  re-indexes it; the old text and scope no longer match.
+- **tantivy lane: tied scores are ordered by content** (score, -t_event,
+  content hash, id), so re-ingesting the same data gives the same top-k
+  however it was split into segments.
+- **tantivy failures**: only damage (I/O, missing or corrupt files, a panic)
+  rebuilds the index, into a fresh directory, with exponential backoff; other
+  errors send that query to FTS5. It is never disabled until restart;
+  `stats()["lexical"]` counts every rebuild and shows `failures` and
+  `retry_in_s`.
+- **Reranker calls are bounded**: at most `max_inflight` (default 8) run at
+  once, timed-out ones included; past that a search skips reranking
+  (`reason="busy"`), and a call whose deadline passed while queued never
+  sends its texts. A `BaseException` from a reranker no longer escapes
+  search (KeyboardInterrupt and SystemExit still propagate).
+
 ## [0.2.0] - 2026-09-24
 
 First release evaluated on real data: LongMemEval (ICLR 2025), not memd's synthetic
