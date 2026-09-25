@@ -470,19 +470,26 @@ class TestOpsLogRepair:
 
 # --------------------------------------------------------------- segment GC
 
-MARKER = "PURGE-GC-7q3v-zebu"
+# one lowercase token without a stemmable suffix: FTS5 and tantivy keep it
+# verbatim as a term, so a grep finds it in their files as well as in rows
+MARKER = "q7x9k2w5zgc"
 GC_CHILD = r"""
 import os, sys
 sys.path.insert(0, {src!r})
 from memd.engine.memory import Memory
 from memd.storage import objectstore
+from memd.storage.engine import NamespaceStore
 
+NamespaceStore.SNAPSHOT_MIN_RECORDS = 1   # publish snapshots at test scale
 root, ack = sys.argv[1:3]
 m = Memory(root, encrypt=False, config={cfg!r})
-victim = m.add("record {marker}", user_id="u")[0]
+victim = m.add("record {marker} for erasure", user_id="u")[0]
 keep = m.add("unrelated keeper note", user_id="u")[0]
+m.flush()
 m.ns.rotate("probe")                      # the victim's bytes now sit in a segment
+m.ns.compact(force=True)                  # ...and in a published index snapshot
 m.delete(victim, hard=True)               # acked hard delete; purge pending
+m.flush()
 with open(ack, "w") as f:
     f.write(victim + " " + keep)
     f.flush()
@@ -498,14 +505,24 @@ os._exit(3)                               # never reached
 """
 
 
-def _store_bytes(root: str) -> bytes:
-    """Every durable object of the data root (the derived index cache aside)."""
+def _files_with(root: str, needle: bytes) -> list[str]:
+    """Every file under root holding needle (index snapshots decompressed)."""
+    import gzip
+
     out = []
-    for dirpath, dirs, files in os.walk(os.path.join(root, "store", "ns")):
+    for dirpath, _dirs, files in os.walk(root):
         for fn in files:
-            with open(os.path.join(dirpath, fn), "rb") as f:
-                out.append(f.read())
-    return b"".join(out)
+            path = os.path.join(dirpath, fn)
+            with open(path, "rb") as f:
+                data = f.read()
+            if fn.endswith(".snap"):
+                try:
+                    data += gzip.decompress(data)
+                except OSError:
+                    pass
+            if needle in data:
+                out.append(os.path.relpath(path, root))
+    return sorted(out)
 
 
 def test_a_killed_compaction_leaves_no_hard_deleted_bytes_after_reopen(tmp_path):
@@ -520,24 +537,100 @@ def test_a_killed_compaction_leaves_no_hard_deleted_bytes_after_reopen(tmp_path)
     m = _manifest(os.path.join(root, "store"), "default")
     orphans = [f for f in os.listdir(nsdir)
                if f.startswith("seg-") and f not in {s["name"] for s in m["segments"]}]
-    # positive control: the killed compaction committed, but the segment it
-    # replaced - holding the hard-deleted record - is still on disk
-    assert orphans, "precondition: the kill left the replaced segment behind"
-    assert MARKER.encode() in _store_bytes(root), "precondition: the marker is on disk"
+    stale_snap = m["snapshot_name"]
+    # positive controls: the killed compaction committed, but the segment it
+    # replaced, the snapshot published before the delete and this node's
+    # index cache all still hold the hard-deleted record
+    assert orphans and stale_snap, "precondition: the kill left the replaced objects behind"
+    before = _files_with(root, MARKER.encode())
+    assert any(f.startswith("store/ns/default/seg-") for f in before), before
+    assert f"store/ns/default/{stale_snap}" in before, before
+    assert any(f.startswith("store/_cache/") for f in before), before
 
     mem = Memory(root, encrypt=False, config=CFG)
     try:
         assert mem.get(victim) is None and mem.get(keep) is not None
-        collected = mem.stats().get("segments_collected")
+        st = mem.stats()
+        mem.flush()
         mem.audit.flush()
-        gc = sorted(e["target"] for e in mem.audit.read() if e["action"] == "segment_gc")
+        gc = sorted((e["action"], e["target"]) for e in mem.audit.read()
+                    if e["action"] in ("segment_gc", "snapshot_gc"))
     finally:
         mem.close()
-    assert MARKER.encode() not in _store_bytes(root), "hard-deleted bytes survived the reopen"
-    left = [f for f in os.listdir(nsdir) if f.startswith("seg-")]
+    assert _files_with(root, MARKER.encode()) == [], "hard-deleted bytes survived the reopen"
+    left = [f for f in os.listdir(nsdir) if f.startswith(("seg-", "index-"))]
     assert left == [s["name"] for s in _manifest(os.path.join(root, "store"), "default")["segments"]]
-    assert collected == len(orphans)
-    assert gc == sorted(orphans), "each deletion must be in the audit ledger"
+    assert st.get("segments_collected") == len(orphans)
+    assert st.get("snapshots_collected") == 1
+    assert gc == sorted([("segment_gc", o) for o in orphans] + [("snapshot_gc", stale_snap)]), \
+        "each deletion must be in the audit ledger"
+
+
+@pytest.mark.parametrize("created_before_this_build", [False, True])
+def test_index_scrub_leaves_no_hard_deleted_text_in_the_file(tmp_path, created_before_this_build):
+    """Deleting a row does not erase its text: FTS5 keeps its terms in older
+    segments, freed pages keep their bytes, the WAL keeps page images."""
+    import sqlite3
+
+    path = str(tmp_path / "ix.sqlite")
+    if created_before_this_build:  # auto_vacuum could not be set any more
+        con = sqlite3.connect(path)
+        con.execute("CREATE TABLE placeholder(x)")
+        con.commit()
+        con.close()
+    idx = NamespaceIndex(path)
+    try:
+        victim = _rec("s", f"record {MARKER} for erasure")
+        idx.upsert_batch([(victim, None, "")] + [(_rec("s", f"filler note {i}"), None, "")
+                                                  for i in range(50)])
+        idx.flush()
+        idx._con.execute("PRAGMA wal_checkpoint(TRUNCATE)")   # the text reaches the main file
+        idx.hard_delete(victim.id)
+        leftovers = _files_with(str(tmp_path), MARKER.encode())
+        assert leftovers, "precondition: a plain delete leaves the text in the file"
+        idx.scrub()
+        assert _files_with(str(tmp_path), MARKER.encode()) == []
+        assert idx.search_bm25("filler", _no_filter(), limit=5), "the index still serves"
+    finally:
+        idx.close()
+
+
+def _no_filter():
+    from memd.index.sqlite_index import IndexFilter
+
+    return IndexFilter()
+
+
+def test_a_snapshot_left_by_a_crash_is_collected_and_a_live_one_kept(tmp_path, monkeypatch):
+    root = str(tmp_path / "store")
+    monkeypatch.setattr(storage_engine.NamespaceStore, "SNAPSHOT_MIN_RECORDS", 1)
+    e = StorageEngine(root)
+    ns = e.namespace("s")
+    ns.append([_rec("s", "a"), _rec("s", "b")])
+    ns.compact(force=True)
+    first = ns.manifest.snapshot_name
+    delete = LocalObjectStore.delete
+
+    def keep_snapshots(self, key):
+        if "/index-" in key:
+            return  # killed before the replaced snapshot was deleted
+        return delete(self, key)
+
+    monkeypatch.setattr(LocalObjectStore, "delete", keep_snapshots)
+    ns.append([_rec("s", "c")])
+    ns.compact(force=True)
+    second = ns.manifest.snapshot_name
+    monkeypatch.setattr(LocalObjectStore, "delete", delete)
+    e.close()
+    assert first != second and {first, second} <= set(os.listdir(os.path.join(root, "ns", "s")))
+    e = StorageEngine(root)
+    try:
+        ns = e.namespace("s")
+        names = set(os.listdir(os.path.join(root, "ns", "s")))
+        assert first not in names and second in names
+        assert ns.stats()["snapshots_collected"] == 1
+    finally:
+        e.close()
 
 
 def test_collection_never_touches_a_segment_newer_than_the_checkpoint(tmp_path):

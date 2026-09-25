@@ -154,12 +154,25 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
   list (an explicit empty checkpoint when they wrote none) - and any other
   unreferenced segment is never read.
 - **A crash inside a compaction kept a hard delete's bytes past the D7
-  deadline**: the segments it had replaced stayed on disk for good. Open now
-  deletes every unreferenced segment provably older than the newest
-  checkpoint (stamped with an earlier manifest generation and folded at or
-  below its seq; a segment a writer may still own is never touched), under
-  the namespace's lock or lease, with a `segment_gc` audit entry per
-  deletion and `stats()["segments_collected"]`.
+  deadline**: the segments and the index snapshot it had replaced stayed on
+  disk for good. Open now deletes every unreferenced segment and index
+  snapshot provably older than the newest checkpoint (written under an
+  earlier manifest generation; a segment also folded at or below its seq;
+  anything a writer may still own is never touched), under the namespace's
+  lock or lease, with a `segment_gc` / `snapshot_gc` audit entry per
+  deletion and `stats()["segments_collected"]` /
+  `stats()["snapshots_collected"]`.
+- **Hard-deleted text survived in the local index cache and its snapshot.**
+  Deleting a row left its FTS5 terms in older segments, its bytes in freed
+  pages and its page images in the SQLite WAL, and a snapshot published
+  before the purge kept serving it to cold nodes. Index connections now run
+  with `secure_delete=ON` and new cache files with incremental auto-vacuum;
+  a compaction that purges hard deletes then merges the FTS5 index, vacuums
+  the freed pages, truncates the WAL and rebuilds the tantivy copy, and
+  drops a snapshot older than the purge. A node whose cache or snapshot
+  predates a purge (a kill mid-compaction, a node that was offline) does
+  the same on open. Write ack unchanged (`add_events` of 50: p50 11.4-12.0
+  ms before, 11.6-12.0 ms after); the scrub costs 70 ms at 20K records.
 - **A torn ops-log tail was never repaired** (only the WAL's was): a delete
   acked after it was invisible to a cold open and dropped by the next
   rotate. Open now cuts a torn tail off, durably, before anything is
@@ -279,8 +292,9 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
 ### Upgrade notes
 - **The first open of each namespace migrates it** to store format 2, once:
   its WAL and ops log are folded into a segment, the node's local index is
-  rebuilt from durable state (vectors re-embed in the background, as after
-  a cache loss), and the old index snapshot is dropped (the next compaction
+  rebuilt from durable state and its file vacuumed once (vectors re-embed
+  in the background, as after a cache loss), and the old index snapshot is
+  dropped (the next compaction
   publishes a new one). That open costs O(namespace).
 - **Upgrade on the node that holds the local cache** (`<data>/_cache`, or
   `local_dir` with S3) where you can. Older rotates dropped some deletes

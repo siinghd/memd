@@ -112,6 +112,9 @@ class Manifest:
     # the manifest generation that committed it: a segment stamped with an
     # older generation and referenced by no one is garbage (_collect_segments)
     checkpoint_gen: int = 0
+    # seq of the newest fold that purged hard-deleted records: an index cache
+    # or snapshot older than it may still hold their text (see _scrub_caches)
+    scrub_seq: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -129,6 +132,7 @@ class Manifest:
             "checkpoint": self.checkpoint,
             "checkpoint_seq": self.checkpoint_seq,
             "checkpoint_gen": self.checkpoint_gen,
+            "scrub_seq": self.scrub_seq,
         }
 
     @classmethod
@@ -151,6 +155,7 @@ class Manifest:
             checkpoint=str(d.get("checkpoint", "") or ""),
             checkpoint_seq=int(d.get("checkpoint_seq", 0) or 0),
             checkpoint_gen=int(d.get("checkpoint_gen", 0) or 0),
+            scrub_seq=int(d.get("scrub_seq", 0) or 0),
         )
 
 
@@ -606,7 +611,9 @@ class NamespaceStore:
         self._rotating = False  # re-entrancy guard for rotate-inside-append_ops
         self._replayed_at_open = False
         self.segments_collected = 0
+        self.snapshots_collected = 0
         self._collected: list[dict] = []
+        self._audit_sink = None  # set by StorageEngine once the store is open
         self._open()
         self._attach_lexical(lexical)
 
@@ -669,6 +676,7 @@ class NamespaceStore:
                 return False
             if self.index.stats().get("records", 0) < self.SNAPSHOT_MIN_RECORDS:
                 return False
+            scrub_seq = self.manifest.scrub_seq
             self.index.flush()
             fd, tmp = _tf.mkstemp(prefix="memd-snap-", suffix=".sqlite")
             os.close(fd)
@@ -700,11 +708,6 @@ class NamespaceStore:
                         os.unlink(tmp + suffix)
                     except OSError:
                         pass
-            # deliberately NOT named *.sqlite*: it lives in the namespace
-            # prefix beside segments, and anything sweeping "sqlite files"
-            # (an operator, a cleanup script, a test fixture - this bit me
-            # while benchmarking) would delete the durable folded index
-            name = f"index-{ulid_new()}.snap"
             # The expensive part (backup + gzip) ran WITHOUT the namespace lock
             # on purpose. Publishing must take it: a destroy racing this would
             # otherwise put() an object under a crypto-SHREDDED namespace and,
@@ -717,6 +720,17 @@ class NamespaceStore:
                     METRICS.inc("memd_index_snapshot_failures_total",
                                 ns=self.namespace, detail="namespace_gone")
                     return False
+                if self.manifest.scrub_seq != scrub_seq:
+                    # a purge ran during the backup: the image may hold its text
+                    METRICS.inc("memd_index_snapshot_failures_total",
+                                ns=self.namespace, detail="purged_meanwhile")
+                    return False
+                # deliberately NOT named *.sqlite*: it lives in the namespace
+                # prefix beside segments, and anything sweeping "sqlite files"
+                # (an operator, a cleanup script, a test fixture - this bit me
+                # while benchmarking) would delete the durable folded index.
+                # The manifest generation in the name dates it for collection.
+                name = f"index-{ulid_new()}.g{self.manifest.version}.snap"
                 payload = self.envelope.encrypt(self.namespace, blob) if self.envelope.enabled else blob
                 self.store.put(self._snapshot_key(name), payload)
                 old = self.manifest.snapshot_name
@@ -805,7 +819,7 @@ class NamespaceStore:
             applied = int(self.index.get_meta("applied_seq") or 0)
         except ValueError:
             applied = 0
-        if applied == 0 and self.manifest.snapshot_seq > 0:
+        if applied == 0 and self.manifest.snapshot_seq >= max(1, self.manifest.scrub_seq):
             # Fresh local cache (node restore, wiped volume, first open on this
             # machine) and a folded image exists: install it and let the
             # existing watermark logic replay only the tail past it.
@@ -858,35 +872,100 @@ class NamespaceStore:
         self.index.flush()
         self.index.set_meta("applied_seq", str(self.manifest.seq))
         self._persist_manifest()
-        self._collect_segments()
+        self._scrub_caches()
+        self._collect_garbage()
 
-    def _collect_segments(self) -> None:
-        """Delete segments a committed checkpoint replaced.
+    def _scrub_caches(self) -> None:
+        """Bring this node's derived copies up to the newest purge (D7).
+
+        A compaction that purges hard-deleted records scrubs the local index
+        and republishes the snapshot; if it was killed first, or this node's
+        cache or the referenced snapshot predates the purge, the text is still
+        there. The snapshot is dropped (a full replay is always correct); the
+        index is scrubbed unless it was created by this open from durable
+        data alone, and the tantivy copy is rebuilt."""
+        m = self.manifest
+        if m.snapshot_name and m.snapshot_seq < m.scrub_seq:
+            self._drop_snapshot("predates a purge")
+        try:
+            done = int(self.index.get_meta("scrubbed_seq") or 0)
+        except ValueError:
+            done = 0
+        if m.scrub_seq <= done:
+            return
+        if not self.index.created:
+            self._replayed_at_open = True  # tantivy is rebuilt from the scrubbed rows
+            if not self.index.scrub():
+                return  # a reader held the WAL: the next open scrubs again
+        self.index.set_meta("scrubbed_seq", str(m.scrub_seq))
+
+    def _drop_snapshot(self, reason: str) -> None:
+        """Unreference and delete the index snapshot (a replay replaces it)."""
+        with self._lock:
+            name = self.manifest.snapshot_name
+            if not name:
+                return
+            self.manifest.snapshot_name, self.manifest.snapshot_seq = "", 0
+            self._persist_manifest()
+        try:
+            self.store.delete(self._snapshot_key(name))
+        except Exception:  # noqa: BLE001 - unreferenced now: collected at a later open
+            return
+        self.snapshots_collected += 1
+        self._note_collected("snapshot_gc", name, {"reason": reason})
+
+    def _note_collected(self, action: str, target: str, detail: dict) -> None:
+        detail = dict(detail, action=action, target=target)
+        METRICS.inc("memd_segments_collected_total" if action == "segment_gc"
+                    else "memd_snapshots_collected_total",
+                    help="unreferenced objects a newer checkpoint replaced, deleted",
+                    ns=self.namespace)
+        _log.info("namespace %s: %s %s %s", self.namespace, action, target, detail)
+        if self._audit_sink is not None:
+            self._audit_sink(action, target, detail)
+        else:
+            self._collected.append(detail)  # audited by StorageEngine.namespace
+
+    def _collect_garbage(self) -> None:
+        """Delete segments and index snapshots a committed checkpoint replaced.
 
         A crash between a compaction's commit and its deletes left the
         segments it replaced on disk for good: never read again (adoption
         needs the manifest to name them), but never removed - a hard delete's
-        bytes outlived the D7 purge deadline there. Open now deletes every
-        seg-* object the manifest does not reference that is provably OLDER
-        than the newest checkpoint: stamped with an earlier manifest
-        generation (older versions stamped none) and folded at or below its
-        seq. A segment a writer is still producing carries its current
+        bytes outlived the D7 purge deadline there. The same holds for an
+        index snapshot replaced between its successor's publish and its
+        delete. Open now deletes every seg-* / index-*.snap object the
+        manifest does not reference that is provably OLDER than the newest
+        checkpoint: written under an earlier manifest generation (older
+        versions stamped none) and, for a segment, folded at or below its
+        seq. An object a writer is still producing carries its current
         generation - at least the checkpoint's - so it is never touched;
-        neither is a blob without a readable header. Only the namespace's
+        neither is a segment without a readable header. Only the namespace's
         lock or lease holder collects (not with MEMD_ALLOW_MULTI_PROCESS).
-        Each deletion is counted, logged and handed to the audit ledger
-        (StorageEngine.namespace)."""
+        Each deletion is counted, logged and audited."""
         m = self.manifest
         if m.checkpoint_gen <= 0 or not (self._owner_path or self._owner_lease):
             return
-        live = {s["name"] for s in m.segments} | {m.checkpoint}
+        live = {s["name"] for s in m.segments} | {m.checkpoint, m.snapshot_name}
         try:
             keys = self.store.list(f"{self.prefix}/")
         except Exception:  # noqa: BLE001 - collection is retried on every open
             return
         for key in keys:
             name = key.rsplit("/", 1)[-1]
-            if not name.startswith("seg-") or name in live:
+            if name in live:
+                continue
+            if name.startswith("index-") and name.endswith(".snap"):
+                g = _re.search(r"\.g(\d+)\.snap$", name)
+                gen = int(g.group(1)) if g else 0
+                if gen >= m.checkpoint_gen:
+                    continue  # published after the checkpoint: maybe in flight
+                self.store.delete(key)
+                self.snapshots_collected += 1
+                self._note_collected("snapshot_gc", name, {"gen": gen,
+                                                           "checkpoint_gen": m.checkpoint_gen})
+                continue
+            if not name.startswith("seg-"):
                 continue
             try:
                 raw = self._decrypt_frame(self.store.get(key) or b"")
@@ -898,16 +977,11 @@ class NamespaceStore:
                 continue  # as new as the checkpoint: a writer may own it
             self.store.delete(key)
             self.segments_collected += 1
-            self._collected.append({"segment": name, "fold_seq": fold, "gen": gen,
-                                    "checkpoint_gen": m.checkpoint_gen})
-            METRICS.inc("memd_segments_collected_total",
-                        help="unreferenced segments a newer checkpoint replaced, deleted at open",
-                        ns=self.namespace)
-            _log.info("namespace %s: deleted segment %s (gen %d, fold %d), replaced by "
-                      "checkpoint gen %d", self.namespace, name, gen, fold, m.checkpoint_gen)
+            self._note_collected("segment_gc", name, {"fold_seq": fold, "gen": gen,
+                                                      "checkpoint_gen": m.checkpoint_gen})
 
     def take_collected(self) -> list[dict]:
-        """Segment deletions since the last call, for the audit ledger."""
+        """Collections (segments, snapshots) since the last call, for the audit ledger."""
         out, self._collected = self._collected, []
         return out
 
@@ -951,6 +1025,7 @@ class NamespaceStore:
         m.format = STORE_FORMAT
         m.checkpoint, m.checkpoint_seq = name, fold
         m.checkpoint_gen = m.version + 1  # the generation the commit writes
+        m.scrub_seq = fold  # a format-1 cache freed pages without zeroing them
         m.seq = m.wal_base_seq = fold
         m.snapshot_name, m.snapshot_seq = "", 0
         m.wal_size = m.ops_size = 0
@@ -1805,6 +1880,10 @@ class NamespaceStore:
             self.manifest.checkpoint = name if kept or pending_ops else ""
             self.manifest.checkpoint_seq = self.manifest.seq
             self.manifest.checkpoint_gen = self.manifest.version + 1  # the commit's
+            # a purge of hard-deleted records: every cache of them must follow
+            purged = sum(1 for op in folded if op.get("op") == "hard_delete") > len(pending_ops)
+            if purged:
+                self.manifest.scrub_seq = self.manifest.seq
             self.index.flush()  # rows durable before advancing the watermark
             self.index.set_meta("applied_seq", str(self.manifest.seq))
             # commit the new-segment-only view BEFORE deleting anything it
@@ -1828,6 +1907,10 @@ class NamespaceStore:
                 if op.get("id"):
                     self._track_pending_hard(op["id"], int(op.get("deadline", 0)))
             self._persist_manifest()
+            # the text is gone from durable data; now from this cache (an
+            # incomplete scrub is redone by the next open)
+            if purged and self.index.scrub():
+                self.index.set_meta("scrubbed_seq", str(self.manifest.scrub_seq))
             METRICS.set_gauge("memd_pending_purges", len(self._pending_hard), ns=self.namespace)
             rep.segments_out = len(self.manifest.segments)
             rep.records_folded = len(kept)
@@ -1844,6 +1927,8 @@ class NamespaceStore:
         # 900s on `with self._lock` in append). It reads a consistent image via
         # sqlite's online backup API, so it needs no such exclusion.
         self.write_index_snapshot()
+        if self.manifest.snapshot_name and self.manifest.snapshot_seq < self.manifest.scrub_seq:
+            self._drop_snapshot("predates a purge")  # (not replaced: below the size floor)
         rep.duration_ms = int((time.monotonic() - t0) * 1000)
         return rep
 
@@ -1937,6 +2022,7 @@ class NamespaceStore:
             self.store.size(f"{self.prefix}/{s['name']}") for s in self.manifest.segments
         )
         st["segments_collected"] = self.segments_collected
+        st["snapshots_collected"] = self.snapshots_collected
         return st
 
     def close(self) -> None:
@@ -2066,8 +2152,11 @@ class StorageEngine:
             else:
                 self._namespaces.move_to_end(ns)
             collected = nstore.take_collected()
+            if nstore._audit_sink is None:
+                nstore._audit_sink = lambda action, target, detail, _ns=ns: self._audit(
+                    _ns, action, target, detail)
         for ev in collected:  # outside the engine lock: the hook takes its own
-            self._audit(ns, "segment_gc", ev["segment"], ev)
+            self._audit(ns, ev["action"], ev["target"], ev)
         return nstore
 
     def _audit(self, ns: str, action: str, target: str, detail: dict) -> None:

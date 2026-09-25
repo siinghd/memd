@@ -89,6 +89,10 @@ class TestSelfEnforcingPurge:
         rid = mem.remember("restart persistence", user_id="u1")
         mem.delete(rid, hard=True)
         pending_before = mem.ns.pending_hard_deletes
+        # the embed worker's vector write commits lazily and would hold the
+        # index's write lock against the second store below (a race whenever
+        # the model is already loaded): settle it first
+        mem.flush()
         # fresh NamespaceStore over the same store: rebuilt from ops replay
         ns2 = NamespaceStore(
             "default", mem.engine.store, mem.engine.cache_dir, None,

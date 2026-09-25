@@ -92,6 +92,8 @@ class NamespaceIndex:
     def __init__(self, path: str):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         self.path = path
+        # a new file holds only what is written from now on (see scrub())
+        self.created = not os.path.exists(path)
         try:
             os.chmod(path, 0o600)  # records may be sensitive; local file only
         except OSError:
@@ -134,6 +136,11 @@ class NamespaceIndex:
         # optional lexical accelerator (TantivyLexical); every mutation below
         # tells it which rows changed BEFORE the change becomes visible
         self.lexical = None
+        # Hard-deleted text must not survive in this file (D7): zero every
+        # freed cell and page, and keep the freelist vacuumable (auto_vacuum
+        # only takes effect before the first table exists - see scrub()).
+        self._con.execute("PRAGMA secure_delete=ON")
+        self._con.execute("PRAGMA auto_vacuum=INCREMENTAL")
         self._con.execute("PRAGMA journal_mode=WAL")
         self._con.execute("PRAGMA synchronous=NORMAL")
         self._con.execute("PRAGMA temp_store=MEMORY")
@@ -443,6 +450,7 @@ class NamespaceIndex:
             con = sqlite3.connect(self.path, check_same_thread=False)
             con.row_factory = sqlite3.Row
             con.execute("PRAGMA busy_timeout=5000")
+            con.execute("PRAGMA secure_delete=ON")
             self._local.con = con
             with self._reader_lock:
                 self._reader_cons.append(con)
@@ -577,6 +585,38 @@ class NamespaceIndex:
             self._con.commit()
             self._invalidate_stats()
             return cur.rowcount > 0
+
+    def scrub(self) -> bool:
+        """Remove what deleted rows left behind in the FILE (D7).
+
+        Deleting a row is not erasing its text: FTS5 keeps a deleted row's
+        terms in its older segments until they merge, pages freed before
+        secure_delete was on keep their bytes, and the WAL keeps earlier page
+        images. Run when a hard-delete purge happened: merge the FTS index
+        into one segment, vacuum every free page out of the file (one full
+        VACUUM for a file created before auto_vacuum was set), truncate the
+        WAL, and rebuild the tantivy copy from the rows that remain. False
+        when a reader kept the WAL from being truncated: scrub again later."""
+        with self._lock:
+            if self._closed:
+                return False
+            self.flush()
+            c = self._con
+            c.execute("INSERT INTO fts(fts) VALUES('optimize')")
+            c.commit()
+            if int(c.execute("PRAGMA auto_vacuum").fetchone()[0]) != 2:
+                c.execute("PRAGMA auto_vacuum=INCREMENTAL")
+                c.execute("VACUUM")
+            else:
+                c.execute("PRAGMA incremental_vacuum").fetchall()
+            busy = c.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+            self._invalidate_stats()
+        if self.lexical is not None:
+            self.lexical.reset()
+        METRICS.inc("memd_index_scrubs_total",
+                    help="index caches scrubbed of hard-deleted content",
+                    ns=getattr(self, "_ns_hint", ""), complete=str(not busy).lower())
+        return not busy
 
     def hard_delete(self, record_id: str) -> bool:
         """Physical removal inside the index (compaction deadline path)."""
