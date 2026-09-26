@@ -38,6 +38,14 @@ any probe fails the build.
   `NamespaceBusyError`; a lease older than the TTL is reclaimable so a crashed
   node cannot wedge a namespace. It makes split-brain loud, not impossible.
   Do not run two writers and rely on it.
+- **The local data directory is trusted.** Derived caches under it (the
+  SQLite index, the tantivy and usearch sidecars) are checksummed or
+  rebuildable against accidental damage, not against someone who can write
+  there: a crafted, checksum-valid usearch file is an adversarial local
+  file. memd bounds what one can do - a graph that crashes the process
+  during its probation is rebuilt at the next open, one whose structure or
+  first answers disagree with SQLite is rebuilt - but does not make usearch
+  safe to load it. Protect the data directory like the key directory.
 - **Audit retention is bounded** (16 sealed segments, 64MB each by default).
   Past that the oldest is dropped and the hash chain is re-anchored, so
   `verify()` proves tamper-evidence over the *retained window*.

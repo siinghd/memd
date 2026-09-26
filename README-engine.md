@@ -450,11 +450,17 @@ fully functional, honestly degraded, clearly labeled in `stats()`.
   Files and published images carry a blake2b checksum, verified before
   usearch reads them (usearch trusts what it loads: a file corrupted in
   place crashed the process in search); a failed check, or a process that
-  died while usearch was loading, rebuilds it from SQLite. At least 100
+  died while a loaded graph was still on probation (until it has served
+  200 searches or 300 s; a clean close ends it), rebuilds it from SQLite.
+  A loaded graph's bookkeeping is checked at load and its first answers
+  against the exact scan (recall < 0.8 rebuilds it). A checksum-valid
+  file that memd did not write takes write access to the data directory:
+  an adversarial local file, outside the threat model (see SECURITY.md). At least 100
   candidates are re-ranked by exact cosine, writes still queued for the
   index are searched exactly (read-your-writes), and after each build
-  poorly linked nodes are re-inserted, so independent rebuilds give the
-  same top-10. Every vector path admits only live rows, whatever
+  poorly linked nodes are re-inserted (a duplicate vector's too, when a
+  search reaches only its identical twin), so independent rebuilds give
+  the same top-10 and a scoped search that drops the twin still finds it. Every vector path admits only live rows, whatever
   `include_quarantined` / `include_invalid` ask, and sweeps beside the
   sidecar stream exactly from SQLite.
 - **While the sidecar is not serving** (loading at open, rebuilding, or

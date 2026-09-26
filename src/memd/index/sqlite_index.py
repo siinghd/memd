@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -35,6 +36,8 @@ from memd.metrics import METRICS
 
 # entity segments are dot-parts of normalize_entity_key output: [a-z0-9_-]+
 _SEG_CHARS = re.compile(r"[^a-z0-9_-]")
+
+_log = logging.getLogger(__name__)
 
 # Minimum cosine for the vector lane to report a hit: kills zero-evidence
 # matches that are harmless in ranked search but dangerous for unbounded
@@ -66,6 +69,41 @@ def _vec_from_blob(blob: bytes, dim: int) -> "np.ndarray":
     """Decode one stored vector, tolerating pre-v2 float32 blobs."""
     dtype = VEC_DTYPE if dim and len(blob) == dim * 2 else np.float32
     return np.frombuffer(blob, dtype=dtype).astype(np.float32)
+
+
+class ImageAborted(RuntimeError):
+    """A pinned image was given up (or refused): a hard-delete purge is
+    scrubbing the index, and an image older than that scrub may hold the
+    erased text - it could not be published anyway."""
+
+
+class ImagePin:
+    """A read transaction on the index file as committed when it was pinned
+    (NamespaceIndex.pin_image), copied with no lock held. While it is open
+    the WAL cannot be checkpointed past it, so a purge's scrub aborts it:
+    the copy stops at its next step (ImageAborted). The caller closes it."""
+
+    STEP_PAGES = 1024  # pages copied per backup step: how soon an abort is noticed
+
+    def __init__(self, index: "NamespaceIndex", con: sqlite3.Connection):
+        self._index, self.con = index, con
+        self.aborted = threading.Event()
+
+    def backup(self, dst: sqlite3.Connection) -> None:
+        """Copy the pinned image into `dst` (WAL snapshot isolation: exactly
+        that image, whatever is written meanwhile)."""
+        def step(_status, _remaining, _total):
+            if self.aborted.is_set():
+                raise ImageAborted("a purge is scrubbing the index")
+        step(0, 0, 0)
+        self.con.backup(dst, pages=self.STEP_PAGES, progress=step)
+
+    def close(self) -> None:
+        """End the read transaction (idempotent)."""
+        try:
+            self.con.close()
+        finally:
+            self._index._unpin(self)
 
 
 @dataclass(frozen=True)
@@ -104,10 +142,18 @@ class NamespaceIndex:
         # vector cache: main matrix + bounded overflow block. Per-query cost is
         # O(main) scan + O(overflow); overflow folds into main when it exceeds
         # OVERFLOW_MAX rows, so write bursts never trigger O(total) copies.
+        # It holds exactly the live rows' vectors: every eligibility change
+        # moves a row in (overflow) or out (a dead mark in main, removal from
+        # overflow) - see _vec_note_locked. Dead rows fold out with the
+        # overflow, or once they pass a bound of their own.
         self._main_mat: np.ndarray = np.zeros((0, 0), dtype=np.float32)
         self._main_ids: list[str] = []
+        self._main_pos: dict[str, int] = {}
+        self._main_dead: np.ndarray = np.zeros(0, dtype=bool)
+        self._n_dead = 0
         self._ovf_ids: list[str] = []
         self._ovf_vecs: list[np.ndarray] = []
+        self._ovf_pos: dict[str, int] = {}
         self._vec_loaded = False
         self.OVERFLOW_MAX = 4096
         self._con = sqlite3.connect(path, check_same_thread=False)
@@ -129,6 +175,11 @@ class NamespaceIndex:
         # so concurrency is unaffected.
         self._readers_active = 0
         self._readers_gone = threading.Condition(self._reader_lock)
+        # images pinned for a snapshot copy (pin_image), and purge scrubs in
+        # progress: a scrub aborts the pins, and none is taken while it runs
+        self._pins: set[ImagePin] = set()
+        self._pins_cv = threading.Condition()
+        self._scrubbing = 0
         self._pending = False  # writes committed lazily, not yet visible cross-connection
         self._lazy_commits = 0
         self._commit_threshold = 64
@@ -140,7 +191,7 @@ class NamespaceIndex:
         self.lexical = None
         # optional ANN sidecar (UsearchSidecar); every mutation that can
         # change the (rowid -> vector) set it mirrors bumps vec_wm in its
-        # own transaction and queues the rows' new state (see _ann_note_locked)
+        # own transaction and queues the rows' new state (see _vec_note_locked)
         self.ann = None
         # set when a sidecar is configured (set_vector_limits): above
         # flat_max_vectors the exact scan's float32 matrix is never loaded
@@ -317,6 +368,54 @@ class NamespaceIndex:
             self._con.commit()
         return old
 
+    def pin_image(self) -> ImagePin:
+        """(write lock held, just committed) A read-only connection of its
+        own, holding a read transaction on this file as committed now. A
+        backup from it copies exactly that image - WAL snapshot isolation -
+        while writes and searches go on, with no lock held; the caller
+        closes it (that ends the transaction). A purge's scrub aborts it,
+        and none is pinned while one runs (ImageAborted): see scrub()."""
+        from urllib.parse import quote
+
+        if self._scrubbing:
+            raise ImageAborted("a purge is scrubbing the index")
+        con = sqlite3.connect(f"file:{quote(os.path.abspath(self.path))}?mode=ro", uri=True,
+                              isolation_level=None, check_same_thread=False)
+        try:
+            con.execute("PRAGMA busy_timeout=5000")
+            con.execute("BEGIN")
+            con.execute("SELECT COUNT(*) FROM meta").fetchone()  # the snapshot is taken here
+        except BaseException:
+            con.close()
+            raise
+        pin = ImagePin(self, con)
+        with self._pins_cv:
+            self._pins.add(pin)
+        return pin
+
+    def _unpin(self, pin: ImagePin) -> None:
+        with self._pins_cv:
+            self._pins.discard(pin)
+            self._pins_cv.notify_all()
+
+    def _abort_pins(self) -> None:
+        """(scrub) Tell every pinned image's copy to stop at its next step."""
+        with self._pins_cv:
+            for pin in self._pins:
+                pin.aborted.set()
+
+    def _wait_unpinned(self) -> bool:
+        """(scrub, index lock NOT held: a copy never needs it to let go)
+        Abort every pinned image and wait until each is closed. False when
+        the index was closed first."""
+        self._abort_pins()
+        with self._pins_cv:
+            while self._pins:
+                if self._closed:
+                    return False
+                self._pins_cv.wait(0.1)
+        return not self._closed
+
     def set_vector_limits(self, flat_max: int, exact_max: int) -> None:
         """A sidecar is configured: while it is not serving, a namespace over
         `flat_max` vectors answers only what it can exactly without the
@@ -374,7 +473,7 @@ class NamespaceIndex:
             try:
                 ann_on = self.ann is not None and self.ann.tracking()
                 existing = (self._existing_ids(c, [rec.id for rec, _, _ in items])
-                            if self.lexical is not None or ann_on else [])
+                            if self.lexical is not None or ann_on or self._vec_loaded else [])
                 if self.lexical is not None:
                     # an upsert that overwrites an existing id (a native
                     # import keeps ids) changes a row the accelerator may
@@ -440,12 +539,13 @@ class NamespaceIndex:
                 if self.lexical is not None:
                     self.lexical.note_new(len(items))
                 # a new row has no vector yet (the embed worker adds it); an
-                # overwritten one may have changed its vector or liveness
+                # overwritten one may have changed its vector or liveness (a
+                # re-add of a deleted id restores it)
                 changed = set(existing) | {rec.id for rec, vec, _ in items if vec is not None}
                 queued = False
                 if changed:
                     self._bump_vec_wm_locked(c)
-                    queued = self._ann_note_locked(c, sorted(changed))
+                    queued = self._vec_note_locked(c, sorted(changed))
                 # no per-batch commit: lazy via _maybe_commit (replay-safe)
             except Exception:
                 self.flush()  # don't leave a broken transaction open
@@ -542,46 +642,25 @@ class NamespaceIndex:
         hold, one watermark bump, one ANN sidecar change."""
         if not record_ids:
             return
-        items = []
-        for rid, vec in zip(record_ids, vecs):
-            # the in-RAM cache keeps float32 (BLAS scans it); only the DURABLE
-            # copy is halved, so search precision is untouched
-            v = np.asarray(vec, dtype=np.float32).ravel()
-            _n = float(np.linalg.norm(v))
-            if _n > 0:
-                v = v / _n
-            items.append((rid, v, _vec_blob(vec)))
+        items = [(rid, int(np.asarray(vec).size), _vec_blob(vec)) for rid, vec in zip(record_ids, vecs)]
         with self._lock:
             if self._closed:
                 METRICS.inc("memd_index_write_after_close_total", ns=self._ns_hint)
                 return
             c = self._con
-            for record_id, v, blob in items:
-                # durable store write always happens; the in-memory cache append
-                # is skipped only when the cache has not been built yet (the next
-                # search loads everything from sqlite)
+            for record_id, dim, blob in items:
                 c.execute(
                     "INSERT OR REPLACE INTO vectors(id,dim,model,vec) VALUES(?,?,?,?)",
-                    (record_id, int(v.shape[0]), model, blob),
+                    (record_id, dim, model, blob),
                 )
                 c.execute("UPDATE records SET embedding_version=? WHERE id=?", (model, record_id))
-                if self._vec_loaded:
-                    dim = self._main_mat.shape[1] if self._main_mat.size else int(v.shape[0])
-                    if int(v.shape[0]) == dim or self._main_mat.size == 0:
-                        # v is already unit-norm; overflow append is O(P), P
-                        # bounded by fold threshold - never O(total) per write
-                        self._ovf_ids.append(record_id)
-                        self._ovf_vecs.append(v)
-                        if len(self._ovf_ids) >= self.OVERFLOW_MAX:
-                            self._fold_overflow_locked()
-                    else:
-                        self.invalidate_vec_cache()
             self._bump_vec_wm_locked(c)
-            if self.ann is not None:
-                if self.ann.tracking():
-                    self._ann_note_locked(c, [rid for rid, _, _ in items])
-                else:
-                    self.ann.count_hint(len(items))
+            if self.ann is not None and not self.ann.tracking():
+                self.ann.count_hint(len(items))
+            # the flat matrix (when loaded) takes the stored copy - what a
+            # reload would read - and only for live rows; a re-embedded row's
+            # old vector leaves it
+            self._vec_note_locked(c, [rid for rid, _, _ in items])
         self._invalidate_stats()
         self._maybe_commit()
         self._ann_apply()
@@ -594,33 +673,98 @@ class NamespaceIndex:
         self._vec_wm += 1
         c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('vec_wm',?)", (str(self._vec_wm),))
 
-    def _ann_note_locked(self, c: sqlite3.Connection, ids: list[str],
-                         removed_rowids: list[int] = ()) -> bool:
-        """(write lock held, after the change) Queue these records' state for
-        the ANN sidecar: the vector of each live one, a removal for the rest
-        (and for `removed_rowids`, rows a hard delete already took away).
+    def _vec_note_locked(self, c: sqlite3.Connection, ids: list[str],
+                         removed_rowids: list[int] = (), removed_ids: list[str] = ()) -> bool:
+        """(write lock held, after the change) Mirror these records' new state
+        into both derived vector views - each live one's stored vector in, the
+        rest out (and `removed_rowids` / `removed_ids`, rows a hard delete
+        already took away): queued for the ANN sidecar, and applied at once
+        to the flat scan's matrix when it is loaded. Every change that can
+        make a row (in)eligible - quarantine and its expiry, unquarantine,
+        supersede, delete, hard delete, a re-add restoring a deleted id, a
+        new vector - comes through here; the matrix used to see only new
+        vectors, so a row live again after it loaded stayed invisible to the
+        flat lane and its sweeps, and dead rows crowded its windows.
         Read through the writer connection, so it sees the uncommitted change.
         True when something was queued: the caller applies it (_ann_apply)."""
         ann = self.ann
-        if ann is None or not ann.tracking():
+        ann_on = ann is not None and ann.tracking()
+        flat_on = self._vec_loaded
+        if not ann_on and not flat_on:
             return False
         removes: list[int] = [int(r) for r in removed_rowids]
         adds: list[tuple[int, bytes, int]] = []
+        for rid in removed_ids:
+            self._flat_drop_locked(rid)
         for i in range(0, len(ids), 500):
             chunk = ids[i:i + 500]
+            seen: set[str] = set()
             for r in c.execute(
                     "SELECT r.rowid, r.deleted, r.quarantined, r.invalidated_at, r.superseded_by, "
-                    "v.vec, v.dim FROM records r LEFT JOIN vectors v ON v.id = r.id "
+                    "v.vec, v.dim, r.id FROM records r LEFT JOIN vectors v ON v.id = r.id "
                     f"WHERE r.id IN ({','.join('?' * len(chunk))})", chunk).fetchall():  # nosec B608
+                seen.add(r[7])
                 live = (not r[1] and not r[2] and r[3] is None and r[4] is None)
                 if live and r[5] is not None:
-                    adds.append((int(r[0]), bytes(r[5]), int(r[6])))
+                    if ann_on:
+                        adds.append((int(r[0]), bytes(r[5]), int(r[6])))
+                    self._flat_put_locked(r[7], bytes(r[5]), int(r[6]))
                 else:
-                    removes.append(int(r[0]))
-        if removes or adds:
+                    if ann_on:
+                        removes.append(int(r[0]))
+                    self._flat_drop_locked(r[7])
+            for rid in chunk:
+                if rid not in seen:  # no such row (any more)
+                    self._flat_drop_locked(rid)
+        if self._vec_loaded and self._n_dead >= max(self.OVERFLOW_MAX, len(self._main_ids) // 8):
+            self._fold_overflow_locked()  # dead rows past their bound: compact
+        if ann_on and (removes or adds):
             ann.note(self._vec_wm, removes, adds)
             return True
         return False
+
+    def _flat_drop_locked(self, rid: str) -> None:
+        """(write lock held) Take a record out of the flat matrix, if loaded:
+        a dead mark in main (its score is masked), a removal from overflow."""
+        if not self._vec_loaded:
+            return
+        p = self._main_pos.pop(rid, None)
+        if p is not None:
+            self._main_dead[p] = True
+            self._n_dead += 1
+        p = self._ovf_pos.pop(rid, None)
+        if p is not None:
+            last = len(self._ovf_ids) - 1
+            if p != last:  # move the last entry into the hole: O(1)
+                self._ovf_ids[p] = self._ovf_ids[last]
+                self._ovf_vecs[p] = self._ovf_vecs[last]
+                self._ovf_pos[self._ovf_ids[p]] = p
+            self._ovf_ids.pop()
+            self._ovf_vecs.pop()
+
+    def _flat_put_locked(self, rid: str, blob: bytes, dim: int) -> None:
+        """(write lock held) A live record's stored vector into the flat
+        matrix, if loaded, replacing any earlier one: decoded and normalised
+        as _load_vectors_locked does, so an incremental matrix scores exactly
+        like a reloaded one. Overflow append is O(1); a fold every
+        OVERFLOW_MAX of them keeps it amortized O(1) - never O(total) per write."""
+        if not self._vec_loaded:
+            return
+        self._flat_drop_locked(rid)
+        v = _vec_from_blob(blob, dim)
+        mdim = self._main_mat.shape[1] if self._main_mat.size else (
+            int(self._ovf_vecs[0].shape[0]) if self._ovf_vecs else int(v.shape[0]))
+        if int(v.shape[0]) != mdim:
+            self.invalidate_vec_cache()  # another model's dimension: reload lazily
+            return
+        n = float(np.linalg.norm(v))
+        if n > 0:
+            v = v / n
+        self._ovf_pos[rid] = len(self._ovf_ids)
+        self._ovf_ids.append(rid)
+        self._ovf_vecs.append(v.astype(np.float32))
+        if len(self._ovf_ids) >= self.OVERFLOW_MAX:
+            self._fold_overflow_locked()
 
     def _rowids_of(self, c: sqlite3.Connection, ids: list[str]) -> list[int]:
         out: list[int] = []
@@ -691,7 +835,7 @@ class NamespaceIndex:
                 (at_ms, new_id, old_id),
             )
             self._bump_vec_wm_locked(self._con)
-            queued = self._ann_note_locked(self._con, [old_id])
+            queued = self._vec_note_locked(self._con, [old_id])
             self._con.commit()
             self._invalidate_stats()
         self._ann_apply(queued)
@@ -713,9 +857,10 @@ class NamespaceIndex:
                     "WHERE id=?",
                     (record_id,),
                 )
-            # an unquarantined record's vector goes back into the sidecar
+            # an unquarantined record's vector goes back into the sidecar and
+            # the flat matrix (this is also the rotate/compaction-time expiry)
             self._bump_vec_wm_locked(self._con)
-            queued = self._ann_note_locked(self._con, [record_id])
+            queued = self._vec_note_locked(self._con, [record_id])
             self._con.commit()
             self._invalidate_stats()
         self._ann_apply(queued)
@@ -728,7 +873,7 @@ class NamespaceIndex:
                 (at_ms, record_id),
             )
             self._bump_vec_wm_locked(self._con)
-            queued = self._ann_note_locked(self._con, [record_id])
+            queued = self._vec_note_locked(self._con, [record_id])
             self._con.commit()
             self._invalidate_stats()
         self._ann_apply(queued)
@@ -743,28 +888,66 @@ class NamespaceIndex:
         images. Run when a hard-delete purge happened: merge the FTS index
         into one segment, vacuum every free page out of the file (one full
         VACUUM for a file created before auto_vacuum was set), truncate the
-        WAL, and rebuild the tantivy copy from the rows that remain. False
-        when a reader kept the WAL from being truncated: scrub again later."""
+        WAL, and rebuild the tantivy copy from the rows that remain.
+
+        The WAL is truncated only once no reader holds a snapshot older than
+        the scrub. A snapshot publish's pinned image (pin_image) is one for
+        as long as its copy runs - longer than the busy timeout on a big
+        index - and that image predates the purge, so it could never be
+        published: the scrub aborts it (no image is pinned until the scrub
+        is done), waits for the copy to let go WITHOUT the index lock (a
+        search or a write never waits for the copy), and checkpoints again
+        until the WAL is truncated. It used to give up after the busy
+        timeout, leaving the erased bytes in the file until the next open.
+        False only when the index was closed first: the next open scrubs."""
         with self._lock:
             if self._closed:
                 return False
-            self.flush()
-            c = self._con
-            c.execute("INSERT INTO fts(fts) VALUES('optimize')")
-            c.commit()
-            if int(c.execute("PRAGMA auto_vacuum").fetchone()[0]) != 2:
-                c.execute("PRAGMA auto_vacuum=INCREMENTAL")
-                c.execute("VACUUM")
-            else:
-                c.execute("PRAGMA incremental_vacuum").fetchall()
-            busy = c.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
-            self._invalidate_stats()
+            self._scrubbing += 1
+        done = False
+        try:
+            self._abort_pins()  # their copies stop while the file is vacuumed
+            with self._lock:
+                if self._closed:
+                    return False
+                self.flush()
+                c = self._con
+                c.execute("INSERT INTO fts(fts) VALUES('optimize')")
+                c.commit()
+                if int(c.execute("PRAGMA auto_vacuum").fetchone()[0]) != 2:
+                    c.execute("PRAGMA auto_vacuum=INCREMENTAL")
+                    c.execute("VACUUM")
+                else:
+                    c.execute("PRAGMA incremental_vacuum").fetchall()
+                self._invalidate_stats()
+            t0 = warned = time.monotonic()
+            while True:
+                if not self._wait_unpinned():
+                    return False
+                with self._lock:
+                    if self._closed:
+                        return False
+                    self.flush()  # a write since the vacuum may have left its transaction open
+                    done = not self._con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+                if done:
+                    break
+                # another reader (a search, a streamed scan) still holds an
+                # older snapshot; each attempt already waited the busy timeout
+                now = time.monotonic()
+                if now - warned >= 60.0:
+                    warned = now
+                    _log.warning("memd: scrubbing %s of purged content: a reader has kept its WAL "
+                                 "from being truncated for %d s; still retrying", self.path, int(now - t0))
+                time.sleep(0.05)
+        finally:
+            with self._lock:
+                self._scrubbing -= 1
+            METRICS.inc("memd_index_scrubs_total",
+                        help="index caches scrubbed of hard-deleted content",
+                        ns=getattr(self, "_ns_hint", ""), complete=str(done).lower())
         if self.lexical is not None:
             self.lexical.reset()
-        METRICS.inc("memd_index_scrubs_total",
-                    help="index caches scrubbed of hard-deleted content",
-                    ns=getattr(self, "_ns_hint", ""), complete=str(not busy).lower())
-        return not busy
+        return True
 
     def hard_delete(self, record_id: str) -> bool:
         """Physical removal inside the index (compaction deadline path)."""
@@ -775,7 +958,7 @@ class NamespaceIndex:
             cur = self._con.execute("DELETE FROM records WHERE id=?", (record_id,))
             self._hard_delete_rows(self._con, record_id)
             self._bump_vec_wm_locked(self._con)
-            queued = self._ann_note_locked(self._con, [], removed_rowids=gone)
+            queued = self._vec_note_locked(self._con, [], removed_rowids=gone, removed_ids=[record_id])
             self._con.commit()
             self._invalidate_stats()
         self._ann_apply(queued)
@@ -854,11 +1037,11 @@ class NamespaceIndex:
                         c.execute("DELETE FROM records WHERE id=?", (rid,))
                         self._hard_delete_rows(c, rid)
                 self._bump_vec_wm_locked(c)
-                queued = self._ann_note_locked(
+                queued = self._vec_note_locked(
                     c, sorted({op.get("id") or op.get("old") for op in ops
                                if (op.get("id") or op.get("old"))
                                and op.get("op") in ("tombstone", "supersede", "quarantine", "set_vector")}),
-                    removed_rowids=gone)
+                    removed_rowids=gone, removed_ids=hard)
                 c.commit()
             except Exception:
                 self.flush()  # don't leave a broken transaction open
@@ -1157,21 +1340,26 @@ class NamespaceIndex:
         return out, positions
 
     def _fold_overflow_locked(self) -> None:
-        """Fold the overflow block into the main matrix (O(main)); called
-        only when overflow exceeds OVERFLOW_MAX so amortized cost per vector
-        stays O(1)."""
-        if not self._ovf_ids:
-            self._ovf_vecs = []
-            return
-        dim = self._main_mat.shape[1] if self._main_mat.size else len(self._ovf_vecs[0])
-        add = [v for v in self._ovf_vecs if v.shape[0] == dim]
-        if add:
-            block = np.stack(add).astype(np.float32)
-            m = self._main_mat
-            self._main_mat = block if m.size == 0 else np.vstack([m, block])
-            self._main_ids.extend(self._ovf_ids)
-        self._ovf_ids = []
-        self._ovf_vecs = []
+        """Fold the overflow block into the main matrix, dropping main's dead
+        rows (O(main)); called only when overflow exceeds OVERFLOW_MAX or the
+        dead rows their bound, so amortized cost per change stays O(1)."""
+        m, ids = self._main_mat, self._main_ids
+        if self._n_dead:
+            keep = ~self._main_dead
+            m = m[keep]
+            ids = [rid for rid, k in zip(ids, keep.tolist()) if k]
+        if self._ovf_ids:
+            dim = m.shape[1] if m.size else len(self._ovf_vecs[0])
+            add = [j for j, v in enumerate(self._ovf_vecs) if v.shape[0] == dim]
+            if add:
+                block = np.stack([self._ovf_vecs[j] for j in add]).astype(np.float32)
+                m = block if m.size == 0 else np.vstack([m, block])
+                ids = ids + [self._ovf_ids[j] for j in add]
+        self._main_mat, self._main_ids = m, ids
+        self._main_pos = {rid: i for i, rid in enumerate(ids)}
+        self._main_dead = np.zeros(len(ids), dtype=bool)
+        self._n_dead = 0
+        self._ovf_ids, self._ovf_vecs, self._ovf_pos = [], [], {}
 
 
     def _load_vectors_locked(self) -> None:
@@ -1181,6 +1369,7 @@ class NamespaceIndex:
                  AND r.invalidated_at IS NULL AND r.superseded_by IS NULL"""
         ).fetchall()
         ids = [r[0] for r in rows]
+        self._flat_clear_locked()
         if rows:
             # decode per row so a store holding pre-v2 float32 blobs alongside
             # v2 float16 ones still loads (dim tells us which each is)
@@ -1190,6 +1379,8 @@ class NamespaceIndex:
             mat = mat / norms
             self._main_mat = mat.astype(np.float32)
             self._main_ids = ids
+            self._main_pos = {rid: i for i, rid in enumerate(ids)}
+            self._main_dead = np.zeros(len(ids), dtype=bool)
 
     _RESTRICTIVE_FILTER_FIELDS = ("scope", "kinds", "sources", "entity_keys",
                                   "t_event_min", "t_event_max", "as_of")
@@ -1343,11 +1534,10 @@ class NamespaceIndex:
         scored: list[tuple[float, int]] = []
         full = False
         # read-your-writes: vectors queued but not yet in the index (the
-        # writer could not take the apply lock) are candidates too
-        pending = ann.pending_rowids()
-        if pending:
-            seen.update(pending)
-            scored += self._scored_rowids(q, f, pending)
+        # writer could not take the apply lock) are candidates too. Taken
+        # BEFORE the index is searched: a row applied in between is then in
+        # one or the other, never in neither
+        pending = ann.pending_vectors()
         for attempt in range(2):
             got = ann.knn(q, k)
             if got is None:
@@ -1373,8 +1563,48 @@ class NamespaceIndex:
         if len(scored) < need and full:
             ann.note_fallback("short")
             return self._exact_vector(q, f, limit)
+        # (the exact answers above read the pending rows from SQLite)
+        scored += self._pending_scored(pending, q, f, scored, seen, need)
         ann.note_search()
-        return self._hits_from_scored(f, scored, limit)
+        hits = self._hits_from_scored(f, scored, limit)
+        if ann.verify_due():
+            # a graph loaded from a file or snapshot: its first answers are
+            # checked against the exact scan (in the background)
+            ann.verify_later(q, f, limit, [h.record.id for h in hits])
+        return hits
+
+    _PENDING_CHUNK = 64
+
+    def _pending_scored(self, pending: list, q: np.ndarray, f: IndexFilter, scored: list[tuple[float, int]],
+                        seen: set[int], need: int) -> list[tuple[float, int]]:
+        """Of the sidecar's pending rows (ann.pending_vectors(): queued or
+        being applied, not yet searchable in it - the writer could not take
+        the apply lock: a snapshot publish, another writer's batch), those
+        that can make the page.
+        The queue holds each row's stored vector, so all of them are scored
+        in one numpy pass; only those at or above the need-th best score
+        found so far are filtered (and re-scored) in SQL, best-first, until
+        the page is decided. Filtering EVERY queued row in SQL on every
+        search - tens of thousands behind a bulk writer - cost seconds per
+        query."""
+        pend = [r for r in pending if r[0] not in seen and int(r[2]) == q.shape[0]]
+        if not pend:
+            return []
+        sc = _cosines(pend, q)
+        best = sorted((s for s, _ in scored), reverse=True)
+        floor = max(MIN_COSINE, best[need - 1] - _VEC_QUANTUM if len(best) >= need else MIN_COSINE)
+        order = [int(i) for i in np.argsort(-sc, kind="stable") if sc[i] >= floor]
+        out: list[tuple[float, int]] = []
+        step = self._PENDING_CHUNK
+        for s in range(0, len(order), step):
+            chunk = [int(pend[i][0]) for i in order[s:s + step]]
+            seen.update(chunk)
+            out += self._scored_rowids(q, f, chunk)
+            if len(out) >= need and s + step < len(order):
+                kth = sorted((x for x, _ in out), reverse=True)[need - 1]
+                if sc[order[s + step]] < kth - _VEC_QUANTUM:
+                    break  # every row left scores below the page (ties at the cut are kept)
+        return out
 
     def _scored_rowids(self, q: np.ndarray, f: IndexFilter, rowids: list[int]) -> list[tuple[float, int]]:
         """(exact cosine, rowid) of the candidate rows that pass the SQL
@@ -1483,7 +1713,10 @@ class NamespaceIndex:
             ids: list[str] = list(self._main_ids)
             parts = []
             if self._main_mat.size:
-                parts.append(self._main_mat @ q)
+                s = self._main_mat @ q
+                if self._n_dead:
+                    s[self._main_dead] = -np.inf  # rows no longer live: never candidates
+                parts.append(s)
             if self._ovf_ids:
                 ovf = np.stack(self._ovf_vecs).astype(np.float32)
                 ids.extend(self._ovf_ids)
@@ -1495,19 +1728,19 @@ class NamespaceIndex:
 
         def _collect(rows: np.ndarray, seen: set[str], hits: list[Hit]) -> None:
             cand = [(ids[i], float(scores[i])) for i in rows]
-            fresh = [(cid, cs) for cid, cs in cand if cid not in seen]
+            # below MIN_COSINE: a no-evidence match (noise in ranked search,
+            # poison in sweeps) or a masked dead row - never hydrated
+            fresh = [(cid, cs) for cid, cs in cand if cs >= MIN_COSINE and cid not in seen]
             if not fresh:
                 return
             seen.update(cid for cid, _ in fresh)
             recs = {r.id: r for r in self.get_many([cid for cid, _ in fresh])}
             for cid, cscore in fresh:
-                if cscore < MIN_COSINE:
-                    continue  # no-evidence match: noise in ranked search, poison in sweeps
                 if cid in f.exclude_ids:
                     continue
                 r = recs.get(cid)
                 if r is None or not _vector_live(r) or not self._passes_filter(r, f):
-                    continue  # (the matrix is not refreshed when a row stops being live)
+                    continue  # (a change committed since the matrix was read)
                 hits.append(Hit(record=r, score=cscore, lane="vector"))
 
         # phase 1: speculative widening windows (cheap when the filter is
@@ -1903,10 +2136,7 @@ class NamespaceIndex:
             self._con.commit()
             if self.ann is not None:
                 self.ann.note_reset(self._vec_wm)
-            self._main_mat = np.zeros((0, 0), dtype=np.float32)
-            self._main_ids = []
-            self._ovf_ids = []
-            self._ovf_vecs = []
+            self._flat_clear_locked()
             self._vec_loaded = True
             self._vcount = (0, -1e18)
         self._ann_apply()
@@ -1916,10 +2146,17 @@ class NamespaceIndex:
         reloads the full matrix from sqlite."""
         with self._lock:
             self._vec_loaded = False
-            self._main_mat = np.zeros((0, 0), dtype=np.float32)
-            self._main_ids = []
-            self._ovf_ids = []
-            self._ovf_vecs = []
+            self._flat_clear_locked()
+
+    def _flat_clear_locked(self) -> None:
+        self._main_mat = np.zeros((0, 0), dtype=np.float32)
+        self._main_ids = []
+        self._main_pos = {}
+        self._main_dead = np.zeros(0, dtype=bool)
+        self._n_dead = 0
+        self._ovf_ids = []
+        self._ovf_vecs = []
+        self._ovf_pos = {}
 
 
 # Stopwords excluded from FTS terms: OR-ing them made every natural-language

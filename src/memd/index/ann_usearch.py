@@ -42,6 +42,24 @@ Contract - SQLite (the vectors and records tables) stays the source of truth:
     state is switched the same way, then the old file is deleted. A kill at
     any point leaves the old file (still named by the state) or the new one;
     temp files and unnamed files are deleted at open.
+  - trusting a file: a blake2b checksum (in the state, or the snapshot
+    header) rejects accidental damage before usearch reads a byte. usearch
+    trusts what it loads, so a loaded graph is on probation: the loading
+    marker is written before usearch reads it and stays until the graph has
+    served MARKER_SEARCHES searches or MARKER_SECONDS without damage (a
+    clean close also clears it); a process that dies meanwhile - a crash or
+    an OOM inside usearch, in the load or in a real query - leaves it, and
+    the next open rebuilds from SQLite instead of loading the file into the
+    same crash. At load the graph's own bookkeeping (count, dims,
+    connectivity, scalar kind, metric, capacity, levels and their edge
+    counts) must match what was saved, and its first VERIFY_QUERIES answers
+    are checked against the exact scan in the background: a recall below
+    VERIFY_MIN_RECALL rebuilds it. A file that passes its checksum without
+    being memd's (checksum-valid tampering) takes someone who can write the
+    data directory - an adversarial local file, outside the threat model,
+    like the SQLite index beside it. These checks bound what such a file can
+    do (no crash loop, no silently wrong lane); they do not make usearch
+    safe to feed a crafted file.
   - off the request path: opening a namespace only counts its vectors and
     starts a journal; loading the file (else the published snapshot, else a
     rebuild) runs on the sidecar's worker thread, and the final save of a
@@ -77,6 +95,7 @@ import hashlib
 import importlib.util
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -103,14 +122,19 @@ METRIC = "cos"
 STATE_FILE = "state.json"
 # 2: the state carries a blake2b of the file, checked before usearch reads it
 STATE_VERSION = 2
-LOADING_MARKER = "loading"   # present while usearch reads a file: a crash there must not loop
+LOADING_MARKER = "loading"   # present from a load until the graph served cleanly: a crash must not loop
+MARKER_SEARCHES = 200        # searches a loaded graph serves before its marker goes...
+MARKER_SECONDS = 300.0       # ...or seconds it serves without damage
+VERIFY_QUERIES = 4           # first searches of a loaded graph re-answered exactly (in the background)
+VERIFY_MIN_RECALL = 0.8      # below this share of the exact top hits the loaded graph is rebuilt
+LEVEL_SLACK = 8              # HNSW levels above log_M(nodes) a sane graph never reaches (P ~ M^-8)
 SNAPSHOT_MAGIC = b"MEMDVEC2"
 MIN_WINDOW = 100             # fewest candidates re-ranked exactly, whatever the limit
 REPAIR_EXPANSION = 16        # search depth of the post-build self-check (see _repair)
 DEFAULT_EXPANSION_SEARCH = 128
 BUILD_CHUNK = 50_000         # rows read (and added) per build step
 JOURNAL_CATCHUP = 256        # journal entries left for the final, locked replay
-ADD_SLICE = 64               # vectors added per write-lock hold (bounds a search's wait)
+ADD_SLICE = 16               # vectors added per write-lock hold: a search waits for at most one (~11 ms at 60K x 64)
 SWEEP_LIMIT = 1024           # limits at or above this are sweeps: answered exactly
 BACKOFF_BASE_S = 2.0
 BACKOFF_MAX_S = 300.0
@@ -231,20 +255,35 @@ class _Aborted(Exception):
 
 class _RWLock:
     """Readers (searches) share; a writer (any mutation of the usearch index)
-    excludes them. Writer-preferring: writers hold it only for short slices
-    (ADD_SLICE vectors), so a steady stream of searches cannot starve them."""
+    excludes them. Phase-fair: a waiting writer holds back NEW readers, so a
+    steady stream of searches cannot starve it, and the readers already
+    waiting when a writer lets go enter before the next writer does, so a
+    steady stream of write slices (ADD_SLICE vectors each) cannot starve
+    searches. Writer-preferring alone let an applier draining a backlog -
+    the queue a snapshot publish held back, behind a bulk writer - re-take
+    the lock slice after slice while every search waited for the whole
+    drain (p99 12-16 s)."""
 
     def __init__(self) -> None:
         self._c = threading.Condition(threading.Lock())
         self._readers = 0
         self._writer = False
-        self._waiting = 0
+        self._waiting = 0      # writers waiting
+        self._rwaiting = 0     # readers waiting
+        self._rturn = 0        # of those, how many a released writer let in ahead of the next
 
     @contextlib.contextmanager
     def read(self):
         with self._c:
-            while self._writer or self._waiting:
-                self._c.wait()
+            if self._writer or (self._waiting and not self._rturn):
+                self._rwaiting += 1
+                try:
+                    while self._writer or (self._waiting and not self._rturn):
+                        self._c.wait()
+                finally:
+                    self._rwaiting -= 1
+                if self._rturn:
+                    self._rturn -= 1
             self._readers += 1
         try:
             yield
@@ -258,15 +297,18 @@ class _RWLock:
     def write(self):
         with self._c:
             self._waiting += 1
-            while self._writer or self._readers:
-                self._c.wait()
-            self._waiting -= 1
+            try:
+                while self._writer or self._readers or self._rturn:
+                    self._c.wait()
+            finally:
+                self._waiting -= 1
             self._writer = True
         try:
             yield
         finally:
             with self._c:
                 self._writer = False
+                self._rturn = self._rwaiting
                 self._c.notify_all()
 
 
@@ -326,6 +368,9 @@ class UsearchSidecar:
         self._ready = False                    # self._ix reflects SQLite (up to the queue)
         self._queue: deque = deque()           # (wm, removes, adds) not yet applied
         self._inflight: list = []              # entries being applied right now (off the queue)
+        # rowid -> (wm, vector or None, dim): the newest queued or in-flight
+        # change of each row not yet applied (see pending_vectors)
+        self._pending: dict[int, tuple[int, bytes | None, int]] = {}
         self._journal: list | None = None      # entries applied while a load or build runs
         self._applied_wm = 0
         self._saved_wm: int | None = None
@@ -355,6 +400,9 @@ class UsearchSidecar:
         self.fallback_exact = 0
         self.searches = 0
         self.loaded_from = ""                  # "file" | "snapshot" | "build"
+        self._marker_live = False              # the loading marker is on disk (see _restore)
+        self._marker_armed: tuple[float, int] | None = None  # (since, searches) of the loaded graph serving
+        self._verify: dict | None = None       # the recall self-check of the loaded graph (see verify_later)
         os.makedirs(path, mode=0o700, exist_ok=True)
 
     # ------------------------------------------------------------ open
@@ -480,11 +528,10 @@ class UsearchSidecar:
                 if src is None:
                     self._note_corrupt("file")
                     return None, None, "corrupt"
-                ix = self._restore(src)
-            except Exception:  # noqa: BLE001 - truncated or garbage: rebuild
+                ix = self._restore(src, st)
+            except Exception:  # noqa: BLE001 - truncated, garbage or misshapen: rebuild
                 return None, None, "corrupt"
-        if (ix is None or int(ix.ndim) != int(st.get("ndim", -1))
-                or len(ix) != int(st.get("count", -1))):
+        if ix is None:
             return None, None, "corrupt"
         return ix, st, ""
 
@@ -510,18 +557,23 @@ class UsearchSidecar:
             return data if self._digest(data) == want else None
         return path if self._digest_file(path) == want else None
 
-    def _note_corrupt(self, source: str) -> None:
-        _log.warning("memd: the usearch sidecar %s for %r failed its checksum; rebuilding it "
-                     "from SQLite", source, self.ns)
+    def _note_corrupt(self, source: str, why: str = "failed its checksum") -> None:
+        _log.warning("memd: the usearch sidecar %s for %r %s; rebuilding it from SQLite",
+                     source, self.ns, why)
         METRICS.inc("memd_vector_index_corrupt_total",
                     help="sidecar files and snapshots rejected as corrupt (rebuilt from SQLite)",
                     ns=self.ns, source=source)
 
-    def _restore(self, src) -> Any:
+    def _restore(self, src, expect: dict) -> Any:
         """(file lock held) Index.restore of verified bytes (the GIL held for
-        a memory copy) or, over BUFFER_MAX_BYTES, of a verified path. The
-        loading marker brackets it and a smoke search: if usearch crashes the
-        process meanwhile, the next open rebuilds instead of looping."""
+        a memory copy) or, over BUFFER_MAX_BYTES, of a verified path, then
+        the structural check against `expect` (the state or snapshot header)
+        and a few smoke searches. The loading marker is written first and
+        STAYS: a graph usearch cannot walk may crash the process here or only
+        in a real query, and may OOM it; until the loaded graph has served
+        MARKER_SEARCHES searches or MARKER_SECONDS without damage (see
+        _marker_check) a crash leaves the marker, and the next open rebuilds
+        from SQLite instead of loading the file again (a crash loop)."""
         if not self._may_touch_files(False):
             raise _Aborted()
         marker = os.path.join(self.path, LOADING_MARKER)
@@ -530,16 +582,83 @@ class UsearchSidecar:
             f.flush()
             os.fsync(f.fileno())
         _fsync_dir(self.path)
+        with self._mu:
+            self._marker_live = True
+            self._marker_armed = None
         t0 = time.monotonic()
         ix = self._Index.restore(src)
         self._note_gil("load", t0)
         if ix is not None:
+            why = self._structure(ix, expect)
+            if why:
+                self._note_corrupt("structure", f"is not the graph that was saved ({why})")
+                raise ValueError(f"usearch sidecar image misshapen: {why}")
             if self.expansion_search:
                 ix.expansion_search = self.expansion_search
             self._smoke(ix)
-        os.unlink(marker)
-        _fsync_dir(self.path)
+        if self._closed:
+            # closed meanwhile: this load is never installed, and it did not
+            # crash - the next open need not rebuild
+            self._clear_marker_locked()
         return ix
+
+    def _structure(self, ix: Any, expect: dict) -> str:
+        """Why the graph usearch just loaded is not what was saved, judged
+        from its own bookkeeping (no vector is read), or "". The checksum
+        proves the bytes are the ones written, not that this code wrote them:
+        a checksum-valid file of another shape can only come from someone
+        who can write the data directory (an adversarial local file - see
+        the module docstring); it is rebuilt, never searched."""
+        n = len(ix)
+        if int(ix.ndim) != int(expect.get("ndim", -1)) or n != int(expect.get("count", -1)):
+            return "count"
+        if (int(ix.connectivity) != CONNECTIVITY or ix.dtype.name.lower() != self.dtype
+                or ix.metric_kind.name.lower() != METRIC or ix.multi):
+            return "kind"
+        levels = list(ix.levels_stats)
+        slots = int(levels[0].nodes) if levels else 0  # live and removed-marked nodes
+        if not n <= slots <= int(ix.capacity):
+            return "size"
+        top = int(ix.max_level)
+        if slots and (int(ix.nlevels) != len(levels) or top != len(levels) - 1 or top > math.ceil(
+                math.log(max(slots, 2), CONNECTIVITY)) + LEVEL_SLACK):
+            return "levels"
+        prev = slots
+        for lv in levels:
+            nodes, edges = int(lv.nodes), int(lv.edges)
+            if not 0 < nodes <= prev or not 0 <= edges <= int(lv.max_edges):
+                return "levels"
+            prev = nodes
+        if slots > 1 and int(levels[0].edges) == 0:
+            return "edges"
+        return ""
+
+    def _clear_marker_locked(self) -> None:
+        """(file lock held) The loaded graph is trusted: the marker goes."""
+        with self._mu:
+            live, self._marker_live, self._marker_armed = self._marker_live, False, None
+        if live and not self._cancel.is_set():  # (a destroy removes the directory)
+            try:
+                os.unlink(os.path.join(self.path, LOADING_MARKER))
+                _fsync_dir(self.path)
+            except OSError:
+                pass
+
+    def _marker_check(self) -> None:
+        """Remove the loading marker once the loaded graph has served
+        MARKER_SEARCHES searches, or MARKER_SECONDS, without damage - and
+        no recall self-check of it is outstanding."""
+        if not self._marker_live or self._closed:
+            return  # (a close clears it after its final save)
+        with self._mu:
+            armed, v = self._marker_armed, self._verify
+            if armed is None or (v is not None and (v["queue"] or v["running"])):
+                return
+            since, base = armed
+            if self.searches - base < MARKER_SEARCHES and time.monotonic() - since < MARKER_SECONDS:
+                return
+        with self._file_lock:
+            self._clear_marker_locked()
 
     @staticmethod
     def _smoke(ix: Any) -> None:
@@ -580,9 +699,8 @@ class UsearchSidecar:
             self._note_corrupt("snapshot")
             raise ValueError("vector snapshot failed its checksum")
         with self._file_lock:
-            ix = self._restore(body)
-        if (ix is None or int(ix.ndim) != int(head.get("ndim", -1))
-                or len(ix) != int(head.get("count", -1))):
+            ix = self._restore(body, head)
+        if ix is None:
             raise ValueError("vector snapshot unreadable")
         return ix, head
 
@@ -634,6 +752,8 @@ class UsearchSidecar:
             _fsync_dir(self.path)
             self._file = None
             self._saved_wm = None
+            with self._mu:
+                self._marker_live, self._marker_armed = False, None
 
     def _write_state(self, fn: str, meta: dict) -> None:
         st = dict(meta, version=STATE_VERSION, file=fn,
@@ -760,6 +880,10 @@ class UsearchSidecar:
             if self._closed or not self._active:
                 return
             self._queue.append((int(wm), removes, adds))
+            for k in removes:
+                self._pending[int(k)] = (int(wm), None, 0)
+            for k, blob, dim in adds:
+                self._pending[int(k)] = (int(wm), blob, int(dim))
 
     def note_reset(self, wm: int) -> None:
         """The SQLite index was wiped: every vector is gone."""
@@ -767,6 +891,7 @@ class UsearchSidecar:
             if self._closed or not self._active:
                 return
             self._queue.append((int(wm), _RESET, None))
+            self._pending.clear()
 
     def count_hint(self, n: int) -> None:
         """Vectors written while not kept: the auto threshold watches this."""
@@ -777,6 +902,7 @@ class UsearchSidecar:
         """Apply queued changes, unless another thread is doing so (it
         re-checks the queue after it lets go, so nothing is stranded)."""
         self._maybe_activate()
+        self._marker_check()
         while True:
             with self._mu:
                 if not self._queue:
@@ -797,7 +923,7 @@ class UsearchSidecar:
             yield
         self.apply_pending()
 
-    frozen = _exclusive  # held across an index snapshot: nothing is applied
+    frozen = _exclusive  # held while an index snapshot pins its image and takes ours: nothing is applied
 
     def _drain_locked(self, upto: int | None = None) -> None:
         """(apply lock held) Apply the queue in order, up to `upto`."""
@@ -813,15 +939,31 @@ class UsearchSidecar:
                 live = self._ready
                 self._applied_wm = batch[-1][0]
                 if live:
-                    self._inflight = batch  # searchable (pending_rowids) until applied
+                    self._inflight = batch  # searchable (pending_vectors) until applied
+                else:
+                    self._unpend_locked(batch)
             if live:
                 try:
                     self._apply_entries(batch, live=True)
                 finally:
                     with self._mu:
                         self._inflight = []
+                        self._unpend_locked(batch)
             # not ready and no build journal: the rows are in SQLite, and the
             # build that makes the index ready reads them there
+
+    def _unpend_locked(self, batch: list) -> None:
+        """(mu held) These entries are applied (or not needed: the index is
+        not serving): their rows leave the pending map, unless a newer
+        change of the same row is still queued."""
+        top = batch[-1][0]
+        for _wm, removes, adds in batch:
+            if removes is _RESET:
+                continue
+            for k in list(removes) + [a[0] for a in adds]:
+                cur = self._pending.get(int(k))
+                if cur is not None and cur[0] <= top:
+                    del self._pending[int(k)]
 
     def _apply_entries(self, batch: list, *, live: bool, target: Any = None) -> Any:
         """Apply queue entries to the live index (under the search lock) or
@@ -1076,7 +1218,16 @@ class UsearchSidecar:
         the same rows then answered some queries differently (a true top-10
         row unreachable in one of them). After this pass both find them
         (200/200 identical top-10s, recall 1.0 at 60K clustered). Costs about
-        a quarter of the build time. Returns the nodes re-inserted."""
+        a quarter of the build time. A search answered by a node holding the
+        very same vector (a duplicate record: the same text embedded twice)
+        proves only that the TWIN is reachable - k=1 returns one of the tied
+        twins - so such a node is searched again, top-REPAIR_EXPANSION, and
+        counts as found only if that returns the node itself. (Counting the
+        twin as enough left the few unreachable duplicates unreachable: a
+        scoped search that drops the twin - another user's copy, or one
+        quarantined or deleted since - never saw them. Re-inserting every
+        duplicate instead doubled the build at 30% duplicates.) Returns the
+        nodes re-inserted."""
         n = len(ix)
         if not n:
             return 0
@@ -1089,8 +1240,24 @@ class UsearchSidecar:
                 self._check_open()
                 ks = keys[s:s + BUILD_CHUNK]
                 got = np.asarray(ix.search(_stored(ix, ks), 1, threads=self.build_threads).keys)
-                got = got.reshape(len(ks), -1)[:, 0]
-                bad.extend(ks[got != ks].tolist())
+                got = got.reshape(len(ks), -1)[:, 0].astype(np.uint64)
+                miss = got != ks
+                if miss.any():
+                    mk, mg = ks[miss], got[miss]
+                    twin = np.asarray(ix.contains(mg), dtype=bool).reshape(-1)
+                    if twin.any():
+                        # compared as stored (the index's own scalar type)
+                        twin[twin] = np.all(np.asarray(ix.get(mk[twin])).reshape(int(twin.sum()), -1)
+                                            == np.asarray(ix.get(mg[twin])).reshape(int(twin.sum()), -1),
+                                            axis=1)
+                    if twin.any():
+                        # a tied twin answered: found only if the node itself is reachable
+                        tk = mk[twin]
+                        wide = np.asarray(ix.search(_stored(ix, tk), REPAIR_EXPANSION,
+                                                    threads=self.build_threads).keys)
+                        wide = wide.reshape(len(tk), -1).astype(np.uint64)
+                        twin[twin] = (wide == tk[:, None]).any(axis=1)
+                    bad.extend(mk[~twin].tolist())
             if bad:
                 b = np.asarray(bad, dtype=np.uint64)
                 v = self._cast(_stored(ix, b))
@@ -1132,12 +1299,22 @@ class UsearchSidecar:
             # serving) is dead weight from the swap on: freed around it, not
             # after the save below (seconds, at the matrix's full size)
             self.index.invalidate_vec_cache()
+            loaded = source in ("file", "snapshot")
             with self._rw.write():
                 with self._mu:
                     self._ix = new
                     self._ready = True
                     self._journal = None
                     self._scrub_built = scrub
+                    # a loaded graph is on probation: its marker stays until
+                    # it has served cleanly, and its first searches are
+                    # checked against the exact scan (a built one is ours)
+                    self._marker_armed = (time.monotonic(), self.searches) if loaded else None
+                    self._verify = ({"left": VERIFY_QUERIES, "queue": deque(), "running": False,
+                                     "hits": 0, "total": 0} if loaded and VERIFY_QUERIES else None)
+            if not loaded and self._marker_live:
+                with self._file_lock:  # the loaded graph it replaces is gone
+                    self._clear_marker_locked()
             self.index.invalidate_vec_cache()  # (a search may have reloaded it meanwhile)
             if saved is not None:
                 with self._file_lock:
@@ -1190,18 +1367,19 @@ class UsearchSidecar:
         ix = self._ix
         return len(ix) if ix is not None else 0
 
-    def pending_rowids(self) -> list[int]:
-        """Rowids whose vectors are queued or being applied but not yet in
-        the index (the writer could not take the apply lock - a snapshot
-        publish, another writer's batch): searched exactly, so a write is
-        visible to the search that follows it (read-your-writes)."""
+    def pending_vectors(self) -> list[tuple[int, bytes, int]]:
+        """(rowid, stored vector, dim) of each row whose latest queued or
+        in-flight change adds a vector not yet searchable in the index (the
+        writer could not take the apply lock - a snapshot publish, another
+        writer's batch): searched exactly, so a write is visible to the
+        search that follows it (read-your-writes)."""
         with self._mu:
-            entries = list(self._inflight) + list(self._queue)
-        out: set[int] = set()
-        for _wm, _removes, adds in entries:
-            if adds:
-                out.update(int(k) for k, _b, _d in adds)
-        return sorted(out)
+            items = list(self._pending.items())
+        return [(k, v[1], v[2]) for k, v in items if v[1] is not None]
+
+    def pending_rowids(self) -> list[int]:
+        """The rowids of pending_vectors()."""
+        return sorted(k for k, _b, _d in self.pending_vectors())
 
     def knn(self, q: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray] | None:
         """The approximate top-k: (rowids, cosine distances), or None when the
@@ -1223,6 +1401,70 @@ class UsearchSidecar:
         self.searches += 1
         METRICS.inc("memd_vector_index_searches_total",
                     help="vector-lane queries served by the usearch sidecar", ns=self.ns)
+        self._marker_check()
+
+    def verify_due(self) -> bool:
+        """Whether this search's answer should be checked (see verify_later)."""
+        v = self._verify
+        return v is not None and v["left"] > 0
+
+    def verify_later(self, q: np.ndarray, f: Any, limit: int, ids: list[str]) -> None:
+        """Check an answer of a LOADED graph against the exact scan, on a
+        background thread (an exact scan is O(namespace); the request does
+        not wait for it). A file or snapshot can pass its checksum and the
+        structural check and still hold a graph that does not answer for
+        these vectors - one written by something other than this code, or
+        damaged in a way its bookkeeping does not show. After VERIFY_QUERIES
+        answers, a recall below VERIFY_MIN_RECALL rebuilds it from SQLite;
+        meanwhile the lane is answered as while any rebuild runs."""
+        with self._mu:
+            v = self._verify
+            if v is None or v["left"] <= 0 or self._closed:
+                return
+            v["left"] -= 1
+            v["queue"].append((np.array(q, dtype=np.float32), f, int(limit), list(ids)))
+            if v["running"]:
+                return
+            v["running"] = True
+            self._bg += 1
+        threading.Thread(target=self._verify_run, args=(v,), daemon=True, name="memd-ann-verify").start()
+
+    def _verify_run(self, v: dict) -> None:
+        verdict = False
+        try:
+            while True:
+                with self._mu:
+                    if not v["queue"] or self._closed or self._verify is not v:
+                        v["running"] = False
+                        verdict = v["left"] <= 0 and not v["queue"] and self._verify is v
+                        break
+                    q, f, limit, ids = v["queue"].popleft()
+                try:
+                    exact = [h.record.id for h in self.index._exact_vector(q, f, limit)]
+                except Exception:  # noqa: BLE001 - the index closed: nothing to judge
+                    exact = []
+                v["hits"] += len(set(ids) & set(exact))
+                v["total"] += len(exact)
+            if verdict and v["total"] and v["hits"] < VERIFY_MIN_RECALL * v["total"]:
+                self._on_bad_recall(v)
+            else:
+                self._marker_check()
+        finally:
+            self._bg_done()
+
+    def _on_bad_recall(self, v: dict) -> None:
+        _log.warning("memd: the usearch sidecar for %r (loaded from its %s) returned %d of %d exact "
+                     "top hits; rebuilding it from SQLite", self.ns, self.loaded_from, v["hits"], v["total"])
+        METRICS.inc("memd_vector_index_corrupt_total", ns=self.ns, source="recall")
+        with self._rw.write():
+            with self._mu:
+                if self._verify is not v or self._closed:
+                    return
+                self._ix = None
+                self._ready = False
+                self._verify = None
+        self._discard_files()
+        self.request_build("recall")
 
     def note_fallback(self, reason: str) -> None:
         self.fallback_exact += 1
@@ -1326,7 +1568,9 @@ class UsearchSidecar:
         with self._rw.write():
             self._ix = None  # (the saver holds its own reference)
         with self._mu:
-            if cap is not None:
+            # a clean close: the loaded graph did not crash the process, so
+            # its marker goes (after the final save, which could still)
+            if cap is not None or self._marker_live:
                 self._bg += 1
                 self._saver = threading.Thread(target=self._final_save, args=(cap,), daemon=True,
                                                name="memd-ann-save")
@@ -1340,9 +1584,12 @@ class UsearchSidecar:
             # own remaining work would otherwise wait for it too
             self._saver.start()
 
-    def _final_save(self, cap: tuple) -> None:
+    def _final_save(self, cap: tuple | None) -> None:
         try:
-            self._persist(cap, final=True)
+            if cap is not None:
+                self._persist(cap, final=True)
+            with self._file_lock:
+                self._clear_marker_locked()
         except Exception as e:  # noqa: BLE001 - a missing or stale file is rebuilt at open
             _log.warning("memd: saving the usearch sidecar for %r failed (%s); it is rebuilt "
                          "at the next open", self.ns, e)
