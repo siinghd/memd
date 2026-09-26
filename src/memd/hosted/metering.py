@@ -83,11 +83,13 @@ class Admission:
     """What the operation may do, and at most what it may record:
     `allow_rerank` (the reranked-search quota), `extract_limit` (raw records
     the extractor may see) and `max_facts` (facts a session close may
-    write). None: unlimited. Every recorded quantity stays within what was
-    reserved."""
+    write: None, or a callable the engine calls with the number of facts
+    extracted, which reserves and returns how many may be written). None:
+    unlimited. Every recorded quantity stays within what was reserved."""
 
     def __init__(self, metering: "Metering", p: Any, ns: str, reservation: str | None, *,
-                 allow_rerank: bool = True, extract_limit: int | None = None, max_facts: int | None = None):
+                 allow_rerank: bool = True, extract_limit: int | None = None,
+                 max_facts: "int | Callable[[int], int] | None" = None):
         self.metering, self.p, self.ns, self.reservation = metering, p, ns, reservation
         self.allow_rerank, self.extract_limit, self.max_facts = allow_rerank, extract_limit, max_facts
         self.recorded = False
@@ -122,9 +124,6 @@ class Metering:
     # a reservation outliving this (and no longer held by a running request
     # of this process) belongs to a crashed request
     RESERVATION_TTL_S = 600.0
-    # facts a session close may write when the memories cap is hard: all of
-    # the remaining allowance near the cap, at most this much far from it
-    CLOSE_FACT_RESERVE = 10_000
 
     def __init__(self, store: AdminStore, plans: Plans, engine: Any,
                  clock: Callable[[], float] = time.time):
@@ -174,6 +173,13 @@ class Metering:
             METRICS.inc("memd_authz_denials_total", help="namespace authorization denials", reason="org")
             raise Forbidden(f"key not valid for namespace {ns!r}")
 
+    def require_memory(self, p: Any) -> None:
+        """/v1/status, /metrics, /v1/metrics/json describe a namespace's
+        data and traffic: `memory` scope (or the operator key). A `billing`
+        key reads /v1/billing/* only."""
+        if getattr(p, "org_id", None) is not None and "memory" not in p.scopes:
+            raise Forbidden("key lacks the 'memory' scope")
+
     # ---------------------------------------------------------- entitlements
 
     def read_only(self, org: dict, now: float | None = None) -> bool:
@@ -218,7 +224,7 @@ class Metering:
 
         # (meter, want, minimum, limit)
         checks: list[tuple[str, float, float, float]] = []
-        extract_limit = max_facts = None
+        extract_limit = None
         if writes:
             checks += [(m, writes, writes, hard(m)) for m in (MEMORIES_STORED, WRITES) if hard(m) is not None]
         if searches and hard(SEARCHES) is not None:
@@ -229,8 +235,10 @@ class Metering:
                 # at least 1 of a non-empty session, or nothing to reserve
                 checks.append((EXTRACTIONS_OUR_KEY, size, min(size, 1), hard(EXTRACTIONS_OUR_KEY)))
             if hard(MEMORIES_STORED) is not None:
-                # a close writes facts: like any write it needs room for one
-                checks.append((MEMORIES_STORED, self.CLOSE_FACT_RESERVE, 1, hard(MEMORIES_STORED)))
+                # a close writes facts: like any write it needs room for one.
+                # Only that one is held while the extractor runs; the facts
+                # are reserved once their number is known (_reserve_facts)
+                checks.append((MEMORIES_STORED, 1, 1, hard(MEMORIES_STORED)))
         period = period_of(now)
         rid: str | None = None
         granted: dict[str, float] = {}
@@ -249,11 +257,8 @@ class Metering:
                 raise QuotaDenied("quota_exceeded", f"{plan.name} plan limit reached for {denied['meter']}",
                                   meter=denied["meter"], limit=denied["limit"], used=denied["used"],
                                   plan=plan.name)
-            if extract:
-                if EXTRACTIONS_OUR_KEY in granted:
-                    extract_limit = int(granted[EXTRACTIONS_OUR_KEY])
-                if MEMORIES_STORED in granted:
-                    max_facts = int(granted[MEMORIES_STORED])
+            if extract and EXTRACTIONS_OUR_KEY in granted:
+                extract_limit = int(granted[EXTRACTIONS_OUR_KEY])
         allow_rerank = True
         if searches and getattr(self.engine, "rerank", None) is not None and hard(RERANKED_SEARCHES) is not None:
             # a spent reranked quota never refuses the search: it is served
@@ -266,8 +271,26 @@ class Metering:
                 METRICS.inc("memd_quota_denials_total", meter=RERANKED_SEARCHES, **_OPS)
             else:
                 rid = rrid
-        return Admission(self, p, ns, rid, allow_rerank=allow_rerank, extract_limit=extract_limit,
-                         max_facts=max_facts)
+        adm = Admission(self, p, ns, rid, allow_rerank=allow_rerank, extract_limit=extract_limit)
+        if extract and hard(MEMORIES_STORED) is not None:
+            limit = float(hard(MEMORIES_STORED))
+            adm.max_facts = lambda n: self._reserve_facts(adm, org_id, period, limit, n)
+        return adm
+
+    def _reserve_facts(self, adm: "Admission", org_id: str, period: str, limit: float, n: int) -> int:
+        """Called by the engine once extraction finished: resize the close's
+        memories reservation to exactly the facts it may write - min(facts
+        extracted, remaining headroom) - and return that number. Until this
+        point the close held room for one, so writes alongside a running
+        close are not starved by a guess."""
+        with self._stored_lock:
+            base = self.stored_records(org_id, adm.ns)
+            _, denied, granted = self.store.reserve(
+                org_id, period, [(MEMORIES_STORED, max(0, int(n)), 0, limit, base)],
+                now=self.clock(), ttl_s=self.RESERVATION_TTL_S, live=self._live_ids(), rid=adm.reservation)
+        if denied is not None:
+            return 0
+        return int(granted.get(MEMORIES_STORED, 0))
 
     # -------------------------------------------------------------- usage
 

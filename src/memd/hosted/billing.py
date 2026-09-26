@@ -469,11 +469,21 @@ class Billing:
             if org is not None and not org.get("stripe_customer_id") and customer:
                 pre["customer_org"] = self._customer_org_id(customer)
         elif etype.startswith("customer.subscription.") and customer:
-            if self.store.org_by_customer(customer) is None:
+            org = self.store.org_by_customer(customer)
+            if org is None:
                 oid = (obj.get("metadata") or {}).get("memd_org_id")
-                org = self.store.get_org(str(oid)) if oid else None
-                if org is not None and not org.get("stripe_customer_id"):
+                cand = self.store.get_org(str(oid)) if oid else None
+                if cand is not None and not cand.get("stripe_customer_id"):
                     pre["customer_org"] = self._customer_org_id(customer)
+            else:
+                status = "canceled" if etype.endswith(".deleted") else str(obj.get("status") or "")
+                if (status in DEAD_STATUSES and obj.get("id") == org.get("stripe_subscription_id")
+                        and self.store.duplicates(org["id"])):
+                    # the current subscription ends while duplicates are
+                    # listed: Stripe's CURRENT copy of each decides which,
+                    # if any, survives to become the org's subscription
+                    pre["survivors"] = {d: self.svc.subscriptions.retrieve(d).to_dict()
+                                        for d in self.store.duplicates(org["id"])}
         return pre
 
     @staticmethod
@@ -546,7 +556,8 @@ class Billing:
             sub = dict(obj)
             if etype.endswith(".deleted"):
                 sub["status"] = "canceled"
-            return self._sync_subscription(con, org, sub, created, etype, customer, grace_s, now)
+            return self._sync_subscription(con, org, sub, created, etype, customer, grace_s, now,
+                                           survivors=pre.get("survivors"))
 
         if etype in ("invoice.payment_failed", "invoice.payment_succeeded", "invoice.paid"):
             org = self._org(con, customer=customer)
@@ -574,15 +585,18 @@ class Billing:
         return {"handled": False, "type": etype, "reason": "ignored"}
 
     def _sync_subscription(self, con, org: dict, sub: Mapping[str, Any], created: int, etype: str,
-                           customer: str | None, grace_s: int, now: int) -> dict:
+                           customer: str | None, grace_s: int, now: int,
+                           survivors: Mapping[str, Mapping[str, Any]] | None = None) -> dict:
         """Apply a subscription's state to its org - one subscription per org.
 
         Only active/trialing grant the plan its prices bill; past_due keeps
         it while the grace clock runs; incomplete, unpaid, paused and the dead
-        statuses grant nothing. A second live subscription is flagged (its
-        metered usage would be billed twice, so pushes are held) instead of
-        replacing the current one, and a non-current subscription ending
-        never downgrades the org. Re-ordered older events are ignored."""
+        statuses grant nothing. Every other live subscription is listed as a
+        duplicate (its metered usage would be billed twice, so pushes are
+        held while ANY is listed) instead of replacing the current one; a
+        non-current subscription ending never downgrades the org; when the
+        current one ends, a duplicate Stripe reports live is promoted to
+        current. Re-ordered older events are ignored."""
         sid = str(sub.get("id") or "")
         status = str(sub.get("status") or "")
         if created and created < int(org.get("last_event_created") or 0):
@@ -590,21 +604,26 @@ class Billing:
         cur = org.get("stripe_subscription_id")
         if cur != sid and (status not in LIVE_SUB_STATUSES or (cur and org.get("status") in LIVE_SUB_STATUSES)):
             if status in LIVE_SUB_STATUSES:
-                if org.get("duplicate_subscription_id") != sid:
-                    self.store.update_org(org["id"], con, duplicate_subscription_id=sid)
+                if AdminStore.set_duplicate(con, org["id"], sid, True):
                     AdminStore.log(con, org["id"], "duplicate_subscription", {"current": cur, "duplicate": sid})
                     METRICS.inc("memd_billing_duplicate_subscriptions_total", **_OPS)
-                    _log.warning("memd billing: org %s has a second live subscription %s (current %s): metered "
-                                 "pushes held until one is canceled", org["id"], sid, cur)
+                    _log.warning("memd billing: org %s has another live subscription %s (current %s): metered "
+                                 "pushes held until it is canceled", org["id"], sid, cur)
                 return {"handled": False, "type": etype, "org_id": org["id"], "reason": "duplicate_subscription"}
-            if org.get("duplicate_subscription_id") == sid:
-                self.store.update_org(org["id"], con, duplicate_subscription_id=None)
-                AdminStore.log(con, org["id"], "duplicate_resolved", {"subscription": sid})
+            if AdminStore.set_duplicate(con, org["id"], sid, False):
+                left = AdminStore.duplicates_in(con, org["id"])
+                AdminStore.log(con, org["id"], "duplicate_resolved", {"subscription": sid, "still_listed": left})
                 return {"handled": True, "type": etype, "org_id": org["id"], "reason": "duplicate_resolved"}
             AdminStore.log(con, org["id"], "noncurrent_subscription", {"subscription": sid, "status": status})
             return {"handled": False, "type": etype, "org_id": org["id"], "reason": "noncurrent_subscription"}
 
         dead = status in DEAD_STATUSES
+        if dead and sid == cur and AdminStore.duplicates_in(con, org["id"]):
+            promoted = self._promote_survivor(con, org, customer, survivors or {})
+            if promoted is not None:
+                sub, sid, status, dead = promoted, str(promoted["id"]), str(promoted["status"]), False
+        if not dead:
+            AdminStore.set_duplicate(con, org["id"], sid, False)  # current is never also a duplicate
         if status in PAID_SUB_STATUSES or status in GRACE_SUB_STATUSES:
             plan = self.cfg.plan_for_prices(_price_ids(sub), self.plans)
             if plan is None and (sub.get("metadata") or {}).get("plan") in self.plans.paid_names():
@@ -619,15 +638,34 @@ class Billing:
             stripe_subscription_id=None if dead else sid,
             current_period_end=None if dead else _period_end(sub),
             last_event_created=max(created, int(org.get("last_event_created") or 0)))
-        if dead and org.get("duplicate_subscription_id"):
-            # the current one ended while a duplicate is live: its next event
-            # makes it current; until then usage is no longer held
-            AdminStore.log(con, org["id"], "duplicate_left", {"duplicate": org["duplicate_subscription_id"]})
-            fields["duplicate_subscription_id"] = None
         self.store.update_org(org["id"], con, **fields)
         AdminStore.log(con, org["id"], etype.rsplit(".", 1)[1] + "_subscription",
                        {"plan": plan, "status": status, "subscription": sid})
         return {"handled": True, "type": etype, "org_id": org["id"], "plan": plan, "status": status}
+
+    @staticmethod
+    def _promote_survivor(con, org: dict, customer: str | None,
+                          survivors: Mapping[str, Mapping[str, Any]]) -> dict | None:
+        """The org's current subscription ended: the first listed duplicate
+        that Stripe (re-read just before) reports live becomes current.
+        Duplicates Stripe reports dead leave the list; one that could not be
+        re-read stays listed (and held) until its own next event."""
+        owner = org.get("stripe_customer_id") or customer
+        chosen = None
+        for d in AdminStore.duplicates_in(con, org["id"]):
+            s = survivors.get(d)
+            if s is None:
+                continue
+            if _customer_id(s) != owner or str(s.get("status") or "") not in LIVE_SUB_STATUSES:
+                AdminStore.set_duplicate(con, org["id"], d, False)
+                continue
+            if chosen is None:
+                chosen = dict(s)
+        if chosen is not None:
+            AdminStore.set_duplicate(con, org["id"], str(chosen["id"]), False)
+            AdminStore.log(con, org["id"], "duplicate_promoted", {"subscription": chosen["id"],
+                                                                  "status": chosen.get("status")})
+        return chosen
 
     # ------------------------------------------------------------ meter push
 

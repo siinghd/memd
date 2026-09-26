@@ -143,6 +143,9 @@ class _Unmetered:
     def authorize(self, p, ns) -> None:
         pass
 
+    def require_memory(self, p) -> None:
+        pass
+
     def admit(self, p, ns, **kw) -> "_Unmetered":
         return self
 
@@ -404,13 +407,16 @@ def create_app(
         noisy-neighbour containment D6 asks for evaporates. The namespace
         bucket is the tenancy-level ceiling; the key bucket still contains a
         single runaway client inside a tenant."""
+        # labelled with the key's AUTHORIZED namespace, never the path's: this
+        # runs for requests being denied too, and a path namespace would let
+        # any key mint unbounded series (and show its strings to operators)
         if not limiter.allow(p.key_id, p.rate_limit_per_min):
-            METRICS.inc("memd_rate_limited_total", ns=ns, scope="key")
+            METRICS.inc("memd_rate_limited_total", ns=p.namespace, scope="key")
             raise _rate_limited("rate limit exceeded",
                                 limiter.retry_after(p.key_id, p.rate_limit_per_min))
         owner = p.namespace if p.namespace != "*" else (ns or "*")
         if owner != "*" and not ns_limiter.allow(f"ns:{owner}", ns_rate_limit_per_min):
-            METRICS.inc("memd_rate_limited_total", ns=owner, scope="namespace")
+            METRICS.inc("memd_rate_limited_total", ns=p.namespace, scope="namespace")
             raise _rate_limited("namespace rate limit exceeded",
                                 ns_limiter.retry_after(f"ns:{owner}", ns_rate_limit_per_min))
 
@@ -684,6 +690,7 @@ def create_app(
                 METRICS.inc("memd_auth_failures_total", reason="metrics")
                 raise HTTPException(401, "missing or invalid bearer key")
             failures.record_success(client)
+            bill.require_memory(p)  # hosted: operational data is `memory`-scoped
             # rendering the registry is O(series); leaving the one route
             # without a budget made it the cheapest way to burn server CPU
             if not limiter.allow(f"metrics:{p.key_id}", 60):
@@ -703,6 +710,7 @@ def create_app(
 
         from memd.metrics import METRICS
 
+        bill.require_memory(p)
         snap = METRICS.snapshot(ns_filter=None if p.namespace == "*" else {p.namespace})
         snap["_epoch_ms"] = int(_t.time() * 1000)
         return snap
@@ -711,6 +719,7 @@ def create_app(
     def status(p: Principal = Depends(auth)):
         # authenticated AND scoped: the namespace inventory is tenant
         # information, so a key bound to one namespace sees only that one
+        bill.require_memory(p)
         return engine.status(ns_filter=None if p.namespace == "*" else p.namespace)
 
     if hosted_ctx is not None:

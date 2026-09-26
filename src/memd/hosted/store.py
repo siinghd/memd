@@ -38,8 +38,8 @@ CREATE TABLE IF NOT EXISTS org (
   -- newest Stripe subscription event applied: re-ordered deliveries must
   -- not roll the plan back to an older state
   last_event_created INTEGER NOT NULL DEFAULT 0,
-  -- a second live subscription for the same customer: metered usage would
-  -- be billed by both, so pushes for the org are held until it is gone
+  -- the oldest listed duplicate subscription (see org_duplicate_subscription),
+  -- NULL when none: pushes for the org are held while it is set
   duplicate_subscription_id TEXT,
   -- the one Checkout Session in flight (one subscription per org)
   checkout_session_id TEXT,
@@ -137,6 +137,14 @@ CREATE TABLE IF NOT EXISTS processed_events (
   result TEXT,
   processed_at INTEGER NOT NULL
 );
+-- every live subscription of an org's customer other than the current one:
+-- while ANY is listed, the org's metered usage is held (each would bill it)
+CREATE TABLE IF NOT EXISTS org_duplicate_subscription (
+  org_id TEXT NOT NULL REFERENCES org(id),
+  subscription_id TEXT NOT NULL,
+  created INTEGER NOT NULL,
+  PRIMARY KEY (org_id, subscription_id)
+);
 CREATE TABLE IF NOT EXISTS billing_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts INTEGER NOT NULL,
@@ -194,7 +202,7 @@ def validate_namespace(ns: str) -> str:
 
     if not isinstance(ns, str) or ns == "*":
         raise ValueError("hosted keys are bound to one namespace ('*' is the operator key)")
-    return _validate_ns(ns)
+    return _validate_ns(ns)  # a full match of the grammar (no trailing newline)
 
 
 def parse_scopes(scopes: str | list[str] | None) -> list[str]:
@@ -458,7 +466,9 @@ class AdminStore:
         """try_reserve() generalized: each check is (meter, want, minimum,
         limit, live_base) and reserves as much of `want` as fits, refusing
         (the whole reservation) when less than `minimum` does. Returns
-        (reservation id, denial, {meter: granted})."""
+        (reservation id, denial, {meter: granted}). With an existing `rid`,
+        a meter's row is RESIZED to the new grant (its own current hold does
+        not count against it; a grant of 0 drops the row)."""
         rid = rid or str(uuid.uuid4())
         granted: dict[str, float] = {}
         try:
@@ -474,8 +484,8 @@ class AdminStore:
                                           " AND period = ?", (org_id, meter, period)).fetchone()
                         used = float(row["quantity"]) if row else 0.0
                     held = float(con.execute("SELECT COALESCE(SUM(quantity), 0) FROM usage_reservation"
-                                             " WHERE org_id = ? AND meter = ? AND period = ?",
-                                             (org_id, meter, rperiod)).fetchone()[0])
+                                             " WHERE org_id = ? AND meter = ? AND period = ? AND id != ?",
+                                             (org_id, meter, rperiod, rid)).fetchone()[0])
                     grant = min(float(want), max(0.0, float(limit) - used - held))
                     if grant < float(minimum):
                         # raising rolls back the reservations made so far
@@ -485,6 +495,8 @@ class AdminStore:
                         con.execute("INSERT OR REPLACE INTO usage_reservation (id, org_id, meter, period,"
                                     " quantity, created) VALUES (?, ?, ?, ?, ?, ?)",
                                     (rid, org_id, meter, rperiod, grant, now))
+                    else:
+                        con.execute("DELETE FROM usage_reservation WHERE id = ? AND meter = ?", (rid, meter))
         except _Denied as d:
             return None, d.info, {}
         return rid, None, granted
@@ -744,6 +756,35 @@ class AdminStore:
 
     def processed_event(self, event_id: str) -> dict | None:
         return self._one("SELECT * FROM processed_events WHERE id = ?", (event_id,))
+
+    # --------------------------------------------- duplicate subscriptions
+
+    def duplicates(self, org_id: str) -> list[str]:
+        return [r["subscription_id"] for r in self._all(
+            "SELECT subscription_id FROM org_duplicate_subscription WHERE org_id = ? ORDER BY created, subscription_id",
+            (org_id,))]
+
+    @staticmethod
+    def duplicates_in(con: sqlite3.Connection, org_id: str) -> list[str]:
+        return [r[0] for r in con.execute(
+            "SELECT subscription_id FROM org_duplicate_subscription WHERE org_id = ?"
+            " ORDER BY created, subscription_id", (org_id,)).fetchall()]
+
+    @staticmethod
+    def set_duplicate(con: sqlite3.Connection, org_id: str, sid: str, present: bool) -> bool:
+        """Add or remove one duplicate; keep org.duplicate_subscription_id
+        (the hold flag) = the oldest listed one. True when the set changed."""
+        if present:
+            cur = con.execute("INSERT OR IGNORE INTO org_duplicate_subscription (org_id, subscription_id, created)"
+                              " VALUES (?, ?, ?)", (org_id, sid, int(time.time())))
+        else:
+            cur = con.execute("DELETE FROM org_duplicate_subscription WHERE org_id = ? AND subscription_id = ?",
+                              (org_id, sid))
+        first = con.execute("SELECT subscription_id FROM org_duplicate_subscription WHERE org_id = ?"
+                            " ORDER BY created, subscription_id LIMIT 1", (org_id,)).fetchone()
+        con.execute("UPDATE org SET duplicate_subscription_id = ? WHERE id = ?",
+                    (first[0] if first else None, org_id))
+        return cur.rowcount > 0
 
     @staticmethod
     def log(con: sqlite3.Connection, org_id: str | None, kind: str, detail: dict | None = None) -> None:

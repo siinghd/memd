@@ -22,7 +22,7 @@ from collections import OrderedDict
 from dataclasses import replace as _dc_replace
 from contextlib import ExitStack as _ExitStack
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -1359,7 +1359,7 @@ class Memory:
         user_id: str | None = None,
         namespace: str | None = None,
         extract_limit: int | None = None,
-        max_facts: int | None = None,
+        max_facts: "int | Callable[[int], int] | None" = None,
     ) -> dict:
         """Segment-close boundary: extract facts, consolidate, rotate segment.
         Consolidation resolves at session end, never deferred past it.
@@ -1369,7 +1369,9 @@ class Memory:
         Quota limits (hosted mode): at most `extract_limit` raw records go to
         the extractor (the rest stay raw-only: searchable, never extracted -
         `raw_skipped`), and at most `max_facts` facts are written
-        (`facts_capped`). The raw lane is never touched by either."""
+        (`facts_capped`); a callable `max_facts` is asked, once extraction
+        finished, how many of the n extracted facts may be written. The raw
+        lane is never touched by either."""
         impl = self._hosted()
         if impl is not None:
             return impl.close_session(session_id, user_id=user_id, namespace=namespace)
@@ -1392,6 +1394,8 @@ class Memory:
                               target=session_id, detail={"error": str(ex)[:200]})
             extracted = []
         facts_capped = 0
+        if callable(max_facts):
+            max_facts = max_facts(len(extracted))
         if max_facts is not None and len(extracted) > max(0, int(max_facts)):
             facts_capped = len(extracted) - max(0, int(max_facts))
             extracted = extracted[:max(0, int(max_facts))]
