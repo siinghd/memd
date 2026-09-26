@@ -6,6 +6,8 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-26
+
 ### Added
 - **Key providers (ADR-12).** `MEMD_KEY_PROVIDER=local|aws-kms|vault-transit`
   (`Memory(config={"key_provider": ...})`). `local` stays the default and
@@ -148,6 +150,12 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   independent rebuilds answer identically.
 
 ### Fixed - data integrity / security
+- **A crash inside a namespace key shred no longer bricks the name.** The key
+  file was overwritten in place and then unlinked; a crash in between left
+  random bytes as `ns-<ns>.key`, and every later open of that namespace name
+  failed as a wrong root key. The file is now renamed out of its name before
+  it is overwritten, and interrupted shreds are finished when the keys
+  directory is next loaded (crash oracle seed 15).
 - **A wrong encryption key destroyed the data it could not read**
   (predates this release). A valid key that is not the one the data was
   written with - another deployment's `keys/` directory restored over this
