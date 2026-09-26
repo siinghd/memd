@@ -5,23 +5,25 @@ Generated 2026-08-13 from web research; **implemented 2026-08-21** (see
 
 **Thesis in three lines:** Object storage is the source of truth; RAM/NVMe are stateless caches (not RAM→FS→S3 demotion). Raw interaction data is the durable record; LLM extraction is an async, re-runnable derived index. The market wedge is capability-complete, Apache-2.0, embedded-first memory — the ground every incumbent just vacated.
 
-## Implementation status (Phase 0 + Phase 1 complete)
+## Implementation status (v0.2.0)
 
 | Deliverable | Status | Where |
 |---|---|---|
 | Record schema, bitemporal supersedence, trust tiers (ADR-1/4) | done | `src/memd/core/schema.py` |
-| WAL/segments/manifest storage, compaction, crypto-shred (ADR-2) | done | `src/memd/storage/` |
-| Hybrid retrieval: BM25 + flat vector + time/entity + RRF + packing (ADR-5) | done | `src/memd/index/`, `src/memd/query/` |
-| Fact lane: extraction, entity clusters, consolidation (ADR-6) | done | `src/memd/pipeline/` |
+| WAL/segments/manifest storage, compaction, crypto-shred (ADR-2) | done; S3/R2 backend, single writer | `src/memd/storage/` |
+| Retrieval: FTS5-bm25 lane, gated time lane, optional dense lane, optional reranker (Jev/local), budget packing | done | `src/memd/index/`, `src/memd/query/` |
+| Optional tantivy lexical accelerator (`memd[fast]`) | done | `src/memd/index/` |
+| Fact lane: extraction, entity clusters, consolidation (ADR-6) | done (regex extractor by default; LLM extractor unevaluated) | `src/memd/pipeline/` |
 | Security controls D7: quarantine, taint, audit, hard delete, keys | done | `src/memd/storage/{audit,crypto}.py`, `server/auth.py` |
 | REST / SDK / MCP three doors (D4) | done | `server/http.py`, `sdk/`, `server/mcp_server.py`, `cli.py` |
-| Eval harness with frozen hash + adversarial gate (D5) | done | `src/memd/harness/` |
-| SLO acceptance numbers (D2) | passing | `bench/slo_bench.py` |
-| Dockerfile + 10-minute CI story | done | `Dockerfile`, `scripts/ten_minute_test.sh` |
+| Real-data evaluation (LongMemEval), nightly gate | done | [BENCHMARKS.md](BENCHMARKS.md), `bench/lme_gate.py` |
+| Multi-writer, KMS keys, TS SDK, hosted metering | not built | see CHANGELOG "Known limitations" |
 
-Gate results (`make gate`, harness_version stamped): memd = full-context
-accuracy at **7.5% of full-context tokens**, beats plain-RAG by +17pts,
-HaluMem-style update ops **1.0** (target ≥0.95), adversarial probes 6/6.
+**Quality, measured on real data** (LongMemEval_S dev split, public `Memory.search`; details and caveats in
+[BENCHMARKS.md](BENCHMARKS.md)): session retrieval ndcg@5 **0.866** with zero keys and zero network
+(0.1.0 scored 0.727), **0.955** with the optional Jev reranker. The synthetic suite under `src/memd/harness/`
+remains a regression and adversarial gate; it is *not* evidence of quality (its data is templated and
+full-context also scores 1.0 on it).
 
 | File | Deliverable |
 |---|---|

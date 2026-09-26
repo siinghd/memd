@@ -61,8 +61,8 @@ of an otherwise authenticated API). Set `MEMD_ENABLE_DOCS=1` for development.
 
 ### 4. Docker
 ```bash
-docker build -t memd/memd:0.1.0 .
-docker run -d -p 8700:8700 -e MEMD_ADMIN_KEY=... -v memddata:/data memd/memd:0.1.0 serve --http
+docker build -t memd/memd:0.2.0 .
+docker run -d -p 8700:8700 -e MEMD_ADMIN_KEY=... -v memddata:/data memd/memd:0.2.0 serve --http
 ```
 The image runs as **uid 10001**, so a *named volume* (above) works but a
 **bind mount does not** unless you either pass `--user "$(id -u):$(id -g)"` or
@@ -141,6 +141,7 @@ split-brain loud, not impossible.
 | Python SDK | `from memd import Memory` | add/search/remember/forget/pack/observe/export |
 | REST | `memd serve --http` (:8700) | `/v1/ns/{ns}/events`, `/memories`, `/search`, `/export`, ... |
 | MCP | `memd serve --mcp` | exactly 4 tools: memory_search / memory_save / memory_forget / memory_status |
+| TypeScript SDK | `npm install @memd/client` ([sdk-ts/](sdk-ts/README.md)) | the REST door, typed, for Node ≥ 18, Bun, Deno and edge runtimes (Workers, Vercel Edge) |
 
 ## What's inside
 
@@ -157,10 +158,14 @@ split-brain loud, not impossible.
   rate limits catch MINJA-style injection; hash-chained audit log; namespace
   crypto-shred; record-level hard delete with ≤72h physical purge deadline.
 - **Retrieval**: rules-based planner (no reflection loop) → fan-out over
-  BM25 (SQLite FTS5/porter), exact flat vector scan (numpy; IVF-PQ slot
-  reserved for ≥50K-vector namespaces), time/entity lanes → RRF fusion with
-  trust-aware tie-breaks → validity filter (current/as_of) → lineage-deduped,
-  budget-cut packing that keeps prefix-stable order (KV-cache friendly).
+  BM25 (SQLite FTS5/porter, ranked by bm25; optionally accelerated by
+  tantivy), the entity lane, the time lane on recency intent, and an exact
+  flat vector scan with a real embedder (numpy; IVF-PQ slot reserved for
+  ≥50K-vector namespaces) → RRF fusion with trust-aware tie-breaks →
+  optional rerank of the lexical top-30 → validity filter (current/as_of) →
+  lineage-deduped, budget-cut packing that keeps prefix-stable order
+  (KV-cache friendly), or, as an experimental opt-in, gated evidence packing.
+  The hash embedder's vector lane is not fused (`fuse_vector`, below).
 - **Extraction** (ADR-6): async, batched, re-runnable. BYO OpenAI-compatible
   key for LLM extraction/embeddings; heuristic provider keeps facts working
   with zero keys; local ONNX embeddings via the optional fastembed extra.
@@ -175,13 +180,62 @@ export MEMD_EXTRACTION_API_KEY=...     # optional: LLM fact extraction
 Without them you get deterministic hash embeddings + pattern extraction:
 fully functional, honestly degraded, clearly labeled in `stats()`.
 
+### Retrieval options (`Memory(config={...})` or the env var)
+
+| key / env | values | default |
+|---|---|---|
+| `reranker` / `MEMD_RERANKER` | `auto` \| `none` \| `jev` \| `local` | `auto`: Jev when a TypeSafe key is set (`TYPESAFE_API_KEY`, or config `typesafe_api_key`) and `typesafe-sdk` is installed (`pip install "memd[jev]"`), else none |
+| `jev_model`, `rerank_timeout_s`, `rerank_k` | model pin, deadline, shortlist | `jev-latest`, 1.5s (5s local), 30 |
+| `local_rerank_model` | fastembed cross-encoder | `BAAI/bge-reranker-base` |
+| `pack_mode` / `MEMD_PACK_MODE` | `auto` \| `ranked` \| `gated` | `auto` = ranked with every reranker; `gated` is an experimental opt-in |
+| `rerank_gate` | gated-packing threshold (opt-in mode) | 0.5 |
+| `fuse_vector` / `MEMD_FUSE_VECTOR` | `auto` \| `true` \| `false` | `auto`: fuse unless the embedder is the hash embedder |
+| `lexical_backend` / `MEMD_LEXICAL_BACKEND` | `auto` \| `fts5` \| `tantivy` | `auto`: tantivy when installed (`pip install "memd[fast]"`) |
+
+- **Reranker.** The top-30 of the bm25 lane (plus the vector lane with a real
+  embedder) is reordered by a relevance judge; the rest follows in fused
+  order. On LongMemEval_S, Jev reranking took session ndcg@5 from 0.89 to
+  0.95. A failed, slow (> `rerank_timeout_s`) or malformed judgement keeps
+  the unreranked order and counts `memd_rerank_fallback_total{reason}`;
+  search never fails because of it. `stats()["reranker"]` reports name,
+  model, calls, fallbacks and p50 latency. **Privacy: with Jev active, the
+  query and the top-30 candidate texts of every search are sent to
+  TypeSafe's API** (see SECURITY.md). No key, no egress.
+- **Gated packing** (`pack_mode="gated"`, experimental opt-in, meant for a
+  calibrated reranker such as Jev): the packed context holds only the
+  candidates judged relevant (p ≥ `rerank_gate`, else the top 3), each with
+  its neighbouring turns, grouped by session under a session-date header,
+  still capped by `budget_tokens` and with the same provenance fencing. It
+  trades recall for tokens: in the lab it matched top-k QA accuracy at 27%
+  fewer tokens over a 100-candidate shortlist, but over the product's top-30
+  it drops second evidence sessions (LongMemEval_S session recall_all@5
+  0.803 gated vs 0.928 ranked, with Jev). The default packs ranked.
+- **tantivy accelerator.** A derived index next to SQLite, fed in the
+  background (every 500ms or 512 changes); FTS5 stays the synchronous source
+  of truth, so the write ack is unchanged, and writes not yet indexed are
+  served from FTS5. It is rebuilt in the background when missing, corrupt or
+  not closed cleanly. A search error sends that query to FTS5; only damage
+  (I/O, missing or corrupt files) rebuilds it while running, with
+  exponential backoff on a failure history that a successful rebuild does
+  not erase (it decays after 10 minutes without a failure);
+  `stats()["lexical"]` shows `rebuilds`, `failures`, `failures_total` and
+  `retry_in_s`. Tied bm25 scores are ordered the same way on both backends
+  (score, -t_event, content hash, id). With tantivy the top-k is
+  deterministic for the same operation history *and commit schedule*: its
+  BM25 statistics count deleted and superseded docs until their segments
+  merge, so the same history committed in a different rhythm can order two
+  near-equal docs differently.
+
 ## Ops
 
 ```bash
 python bench/slo_bench.py                        # D2 acceptance numbers
 python -m memd.harness.run --suite all --gate    # quality+cost gate (D5)
+python bench/lme_gate.py                         # real-data gate: LongMemEval_S, 60 q (nightly)
+python bench/lexical_bench.py                    # FTS5 vs tantivy, filtered, 10K-150K records
 memd export --out backup.jsonl                   # anti-lock-in, symmetric
 memd import mem0 --export mem0.json              # migration path
+memd migrate --report ./memd-data                # store-format upgrade: preview / what it did (JSON)
 memd key create --ns acme [--pin-user u1]        # scoped API keys
 ```
 

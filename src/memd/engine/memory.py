@@ -5,12 +5,15 @@ zero external services; hosted mode = same API over HTTP.
 
 Write path: append to WAL -> fsync -> index apply -> ack. No LLM, no
 embedding on the critical path (SLO: embedded p99 <= 10ms).
-Read path: plan -> fan-out (vector+BM25+time+entity) -> RRF fuse ->
-validity filter -> budget-aware packing with provenance tags.
+Read path: plan -> fan-out (BM25+entity, time on recency intent, vector
+with a real embedder) -> RRF fuse -> optional rerank of the lexical top-30
+-> validity filter -> budget-aware packing with provenance tags (gated
+evidence packing as an experimental opt-in).
 """
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import threading
@@ -25,17 +28,32 @@ import numpy as np
 
 from memd.core.schema import ExtractorInfo, Kind, MemoryRecord, Scope, Source, now_ms
 from memd.index.sqlite_index import IndexFilter
+from memd.index.tantivy_lexical import (
+    DEFAULT_COMMIT_DOCS,
+    DEFAULT_COMMIT_MS,
+    requested_lexical_backend,
+    resolve_lexical_backend,
+)
 from memd.metrics import METRICS, auto_dumper_from_env, preset_core
 from memd.pipeline.consolidation import ConsolidationResult, QuarantinePolicy, consolidate_facts
-from memd.pipeline.embedder import Embedder, resolve_embedder
+from memd.pipeline.embedder import Embedder, requested_embedder, resolve_embedder
 from memd.pipeline.extractor import ExtractedFact, Extractor, resolve_extractor
-from memd.query.fusion import rrf_fuse
-from memd.query.packing import PackedContext, count_tokens, pack_context
+from memd.query.fusion import FusedItem, rrf_fuse
+from memd.query.packing import PackedContext, count_tokens, gate_candidates, pack_context, pack_gated
 from memd.query.planner import plan_query
+from memd.query.rerank import (
+    DEFAULT_RERANK_K,
+    RerankStage,
+    candidate_from_record,
+    requested_reranker,
+    resolve_reranker,
+)
 from memd.storage.audit import AuditLog, BufferedAuditLog
 from memd.storage.crypto import LocalKeyEnvelope, NullKeyEnvelope
 from memd.storage.engine import StorageEngine
 from memd.storage.objectstore import count_io
+
+_log = logging.getLogger(__name__)
 
 DEFAULT_BUDGET_TOKENS = 2000
 HARD_DELETE_PURGE_MS = 72 * 3600 * 1000  # D7 #8 default physical-purge window
@@ -116,6 +134,21 @@ class TaintStore:
 MAX_CONTENT_BYTES = 10 * 1024 * 1024  # engine-side hard cap (REST caps lower)
 MAX_META_BYTES = 64 * 1024  # meta is serialized into WAL + index per record
 MAX_BATCH_EVENTS = 10_000  # single durable-append bound per add_events call
+# Text handed to the embedder is cut here (config embed_max_chars; 0 = off).
+# A local ONNX model pads a batch to its longest member: on LongMemEval turns
+# (mean 1083 chars) raw bge-small managed 1.2 texts/s batched against 3.4
+# one at a time on this host. Truncating the tail and sorting each batch by
+# length bound the padding; the text itself is stored and searched whole.
+DEFAULT_EMBED_MAX_CHARS = 2000
+
+
+def embed_order(batch: dict[str, str], max_chars: int) -> tuple[list[str], list[str]]:
+    """(ids, texts) for one embedding call: texts truncated to max_chars
+    (0 = no cap) and sorted by length so similar lengths share a padded
+    batch. The id list stays aligned with the texts."""
+    items = [(rid, t[:max_chars] if max_chars > 0 else t) for rid, t in batch.items()]
+    items.sort(key=lambda it: len(it[1]))
+    return [rid for rid, _ in items], [t for _, t in items]
 
 
 def _guard_input(content: str, meta: dict[str, Any] | None) -> None:
@@ -149,9 +182,11 @@ class _EmbedWorker:
     heals via reembed() (the ADR-8 degradation story, now memory-safe)."""
 
     def __init__(self, embedder: Embedder, apply_fn, batch_size: int = 32, flush_s: float = 0.5,
-                 max_retries: int = 3, max_queue: int = 5_000):
+                 max_retries: int = 3, max_queue: int = 5_000,
+                 max_chars: int = DEFAULT_EMBED_MAX_CHARS):
         self.embedder = embedder
         self.apply_fn = apply_fn  # callable(ns_name, ids, vecs)
+        self.max_chars = int(max_chars)
         self.q: "queue.Queue[tuple[str, str, str]]" = queue.Queue(maxsize=max(1, max_queue))
         self.retries: dict[tuple[str, str], int] = {}
         self.max_retries = max_retries
@@ -163,6 +198,8 @@ class _EmbedWorker:
         # still in flight and flush() inherited that broken promise.
         self._inflight = 0
         self._inflight_lock = threading.Lock()
+        # set once the embedder's load() has returned or raised
+        self._load_done = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True, name="memd-embed")
         self._thread.start()
 
@@ -177,7 +214,29 @@ class _EmbedWorker:
         METRICS.set_gauge("memd_embed_queue_depth", self.q.qsize(), help="pending embedding texts")
         return True
 
+    def _load_embedder(self) -> None:
+        """Warm the embedder HERE, on the worker's own thread. A local ONNX
+        model costs seconds to import and load; built inside Memory() it sat
+        ahead of the first write ack (the pass-19 SIGKILL test saw nothing
+        acked within 0.5s). Writes queue meanwhile, and search serves from the
+        lanes that need no query vector until embedder.ready() flips."""
+        try:
+            self.embedder.load()
+        except Exception:
+            # every batch now fails against it and dead-letters; the bm25 and
+            # entity lanes still serve, and reembed() heals the vector lane
+            # once a working embedder is configured
+            _log.exception("memd: embedder %s failed to load; the vector lane is degraded",
+                           self.embedder.name)
+        finally:
+            self._load_done.set()
+
+    def wait_ready(self, timeout_s: float) -> bool:
+        """Wait (bounded) for the embedder load to finish; True if it did."""
+        return self._load_done.wait(timeout=max(0.0, timeout_s))
+
     def _run(self) -> None:
+        self._load_embedder()
         while not self._stop.is_set():
             try:
                 ns_name, rid, text = self.q.get(timeout=self.flush_s)
@@ -213,8 +272,9 @@ class _EmbedWorker:
     def _embed_one(self, ns_name: str, batch: dict[str, str]) -> None:
         t0 = time.monotonic()
         try:
-            vecs = self.embedder.embed(list(batch.values()))
-            self.apply_fn(ns_name, list(batch.keys()), vecs)
+            ids, texts = embed_order(batch, self.max_chars)
+            vecs = self.embedder.embed(texts)
+            self.apply_fn(ns_name, ids, vecs)
             METRICS.observe("memd_embed_batch_size", len(batch),
                             help="texts per embedding batch",
                             buckets=(1, 4, 8, 16, 32, 64, 128))
@@ -296,6 +356,18 @@ class _NullAuditLog:
 
     def verify(self) -> bool:
         return True
+
+
+def forget_fingerprint(ids: list[str]) -> str:
+    """Identifies the exact set of ids a forget() preview showed: a confirm
+    that passes it back deletes nothing unless it would delete that set."""
+    import hashlib
+
+    return hashlib.sha256("\n".join(sorted(ids)).encode()).hexdigest()[:32]
+
+
+class ForgetPreviewMismatch(Exception):
+    """A confirmed forget() would delete a different set than its preview."""
 
 
 class _MaintenanceWorker:
@@ -429,7 +501,58 @@ class _SearchCache:
             self._bytes = 0
 
 
+PACK_MODES = ("auto", "ranked", "gated")
+DEFAULT_RERANK_GATE = 0.5
+
+
+def resolve_fuse_vector(config: dict | None, embedder: Embedder) -> bool:
+    """Whether the vector lane is fused into ranking: config["fuse_vector"]
+    (or env MEMD_FUSE_VECTOR) = "auto" | true | false.
+
+    auto = fuse unless the embedder is the HashEmbedder. Once the bm25 lane
+    ranked by real bm25, fusing the hash "vector" lane (feature-hashed
+    n-grams - a noisier copy of the lexical signal) into RRF cost ~0.07
+    ndcg@5 on LongMemEval_S. Hash vectors are still computed and stored:
+    forget() and dedupe use them."""
+    cfg = config or {}
+    v = cfg.get("fuse_vector")
+    if v is None:
+        v = os.environ.get("MEMD_FUSE_VECTOR", "auto")
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s == "auto":
+        return embedder.kind != "hash"
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"fuse_vector must be auto|true|false, not {v!r}")
+
+
+def resolve_pack_mode(config: dict | None) -> str:
+    """config["pack_mode"] (or env MEMD_PACK_MODE): "auto" | "ranked" |
+    "gated". "auto" means ranked, for every reranker.
+
+    "gated" is an EXPERIMENTAL opt-in for token savings. In the lab it
+    matched top-k QA accuracy at 27% fewer tokens, but over a 100-candidate
+    shortlist; over the product's top-30 it DROPS second evidence sessions:
+    Jev + gated scored session ndcg@5 0.906 / recall_all@5 0.803 on
+    LongMemEval_S dev (below no reranker's 0.835 recall_all@5), while Jev +
+    ranked scored 0.955 / 0.928 (lab 020/021)."""
+    cfg = config or {}
+    mode = str(cfg.get("pack_mode") or os.environ.get("MEMD_PACK_MODE") or "auto").strip().lower()
+    if mode not in PACK_MODES:
+        raise ValueError(f"unknown pack_mode {mode!r}; expected one of {list(PACK_MODES)}")
+    return mode
+
+
 MAX_QUERY_CHARS = 64 * 1024  # embedder-cost guard for engine-side queries
+# find_ids: a vector-only candidate must beat the median of the sweep's
+# vector sample by this much (see Memory._vector_only_floor); the median is
+# only trusted once the sample has a few points in it
+_VECTOR_ONLY_MEDIAN_MARGIN = 0.1
+_VECTOR_ONLY_MIN_SAMPLE = 5
 
 
 class Memory:
@@ -487,17 +610,22 @@ class Memory:
                        or os.path.join(".memd-local", bucket, s3_prefix or "_"))
         os.makedirs(path, exist_ok=True)
         envelope = LocalKeyEnvelope(os.path.join(path, "keys")) if encrypt else NullKeyEnvelope()
+        # resolved before any namespace opens: the accelerator attaches at open
+        self.lexical_backend = resolve_lexical_backend(cfg)
         self.engine = StorageEngine(os.path.join(path, "store"), envelope=envelope,
                                     store=store,
-                                    cache_dir=os.path.join(path, "_cache") if store else None)
+                                    cache_dir=os.path.join(path, "_cache") if store else None,
+                                    lexical={
+                                        "backend": self.lexical_backend,
+                                        "commit_ms": int(cfg.get("lexical_commit_ms", DEFAULT_COMMIT_MS)),
+                                        "commit_docs": int(cfg.get("lexical_commit_docs", DEFAULT_COMMIT_DOCS)),
+                                    })
         self.namespace_name = namespace
-        self.ns = self.engine.namespace(namespace)
-        # the facade holds a direct reference to this store for its lifetime:
-        # pin it so LRU churn of other namespaces can't close it underneath us
-        self.engine.pin_namespace(namespace)
         # D7 #7 ledgers are PER NAMESPACE. They are held in an LRU keyed by
         # namespace (mirroring the engine's namespace table) and routed by the
-        # OPERATION's target namespace - see _audit_for().
+        # OPERATION's target namespace - see _audit_for(). Set up before any
+        # namespace opens: opening one can already produce audit events
+        # (segments a crashed compaction left, collected at open).
         self._audit_flush_every = int(cfg.get("audit_flush_every", 32))
         self._audit_max_open = int(cfg.get("audit_max_open", 64))
         self._audit_lock = threading.Lock()
@@ -510,8 +638,20 @@ class Memory:
         # snapshot widened that window) was enough. Bounded; cleared when the
         # namespace legitimately exists again.
         self._shredded: "OrderedDict[str, None]" = OrderedDict()
+        self.engine.audit_hook = self._audit_engine_event
+        self.ns = self.engine.namespace(namespace)
+        # the facade holds a direct reference to this store for its lifetime:
+        # pin it so LRU churn of other namespaces can't close it underneath us
+        self.engine.pin_namespace(namespace)
         self.audit = self._audit_for(namespace)  # facade default, never evicted
         self.embedder: Embedder = resolve_embedder(cfg)
+        self.fuse_vector: bool = resolve_fuse_vector(cfg, self.embedder)
+        reranker = resolve_reranker(cfg)
+        self.rerank: RerankStage | None = (
+            RerankStage(reranker, k=int(cfg.get("rerank_k", DEFAULT_RERANK_K))) if reranker else None)
+        self.pack_mode: str = resolve_pack_mode(cfg)
+        self.rerank_gate: float = float(cfg.get("rerank_gate", DEFAULT_RERANK_GATE))
+        self._lexical_flush_drain_s = float(cfg.get("lexical_flush_drain_s", 60.0))
         self.extractor: Extractor = resolve_extractor(cfg)
         self.quarantine = QuarantinePolicy(
             rate_max_writes=int(cfg.get("rate_max_writes", 120)),
@@ -530,14 +670,39 @@ class Memory:
         self._qcache = _SearchCache()
         self._qepochs: dict[str, int] = {}
         self._embed_close_drain_s = float(cfg.get("embed_close_drain_s", 30.0))
+        self._embed_flush_drain_s = float(cfg.get("embed_flush_drain_s", 60.0))
         self._maint = _MaintenanceWorker(self._run_maintenance)
+        # D7 #8 at open, too: a purge that came due while the process was down
+        # - or one the format-1 migration recovered from the audit ledger, due
+        # at once - is scheduled as the namespace opens, not left on disk
+        # until the next write there happens to check the deadline
+        self.engine.open_hook = lambda _name, store: self._enforce_purge_deadlines(store)
+        self._enforce_purge_deadlines(self.ns)
+        self._embed_max_chars = int(cfg.get("embed_max_chars", DEFAULT_EMBED_MAX_CHARS))
         self._embed_worker = _EmbedWorker(
             self.embedder,
             self._apply_vectors,
             batch_size=int(cfg.get("embed_batch", 32)),
             max_queue=int(cfg.get("embed_max_queue", 5_000)),
+            max_chars=self._embed_max_chars,
         )
         self.audit.append(actor="system", action="open", target=namespace, detail={"embedder": self.embedder.name})
+        # which embedder is active decides retrieval AND forget() semantics,
+        # and "auto" depends on what happens to be installed: say it once
+        _log.info("memd: opened namespace %r with embedder %s (kind=%s, requested=%s)",
+                  namespace, self.embedder.name, self.embedder.kind, requested_embedder(cfg))
+        # the reranker decides whether search text leaves the machine: say so
+        _log.info("memd: reranker %s (model=%s, requested=%s, pack_mode=%s); "
+                  "lexical backend %s (requested=%s); fuse_vector=%s",
+                  self.rerank.name if self.rerank else "none",
+                  self.rerank.model if self.rerank else "-", requested_reranker(cfg),
+                  self.pack_mode, self.lexical_backend, requested_lexical_backend(cfg),
+                  self.fuse_vector)
+        if self.rerank is not None and callable(getattr(self.rerank.reranker, "load", None)):
+            # warm the reranker off the caller's path: a local cross-encoder
+            # takes seconds to load (a first download is ~1GB) and the Jev SDK
+            # ~1s to import - either would eat the first search's deadline
+            threading.Thread(target=self._load_reranker, daemon=True, name="memd-rerank-load").start()
         self._vector_selfheal = bool(cfg.get("vector_selfheal", True))
         self._report_vector_health(self.ns)
 
@@ -850,6 +1015,12 @@ class Memory:
                     METRICS.inc("memd_audit_flush_failures_total", ns=victim_name)
             return log
 
+    def _audit_engine_event(self, ns_name: str, action: str, target: str, detail: dict) -> None:
+        """StorageEngine.audit_hook: engine-initiated events land in the
+        ledger this facade owns, so its hash chain stays one chain."""
+        self._audit_for(ns_name).append(actor="maintenance", action=action, target=target,
+                                        detail=detail)
+
     def _flush_all_audits(self) -> None:
         with self._audit_lock:
             logs = list(self._audits.values())
@@ -896,6 +1067,9 @@ class Memory:
             (user_id, session_id, agent_id, org_id),
             budget_tokens, as_of, tuple(kinds) if kinds else None,
             include_quarantined, self._qepochs.get(ns_name, 0),
+            # a result served before the model loaded has no vector lane: it
+            # must not outlive the load
+            self.embedder.ready(),
         )
         cached = self._qcache.get(cache_key)
         if cached is not None:
@@ -937,39 +1111,66 @@ class Memory:
         filt = IndexFilter(**filt_kwargs)
         lane_hits: dict[str, list] = {}
         tokens = [t for t in query.lower().split() if len(t) >= 3]
-        # per-lane stage timing: end-to-end latency alone can't show WHICH
-        # lane regressed (SLO triage needs the breakdown)
-        for lane_name, lane_fn in (
+        lanes = [
             ("bm25", lambda: ns.index.search_bm25(query, filt, limit=plan.candidate_k)),
             ("entity", lambda: ns.index.search_by_entity_tokens(tokens, filt, limit=20)),
+        ]
+        if plan.use_time_lane:
             # the documented third fan-out (D3 architecture: time/entity btree
-            # scan): planner weights a "time" lane but nothing produced one -
-            # temporal queries had NO recency-proximate candidates and relied
-            # on lexical similarity surfacing fresh records by luck
-            ("time", lambda: ns.index.search_time_lane(filt, limit=plan.candidate_k)),
-        ):
+            # scan). It returns the newest rows REGARDLESS of the query, so it
+            # runs only on recency intent or an explicit time bound: invoked
+            # unconditionally it injected query-independent rows into fusion
+            # (measured -0.048 ndcg@5 on LongMemEval)
+            lanes.append(("time", lambda: ns.index.search_time_lane(filt, limit=plan.candidate_k)))
+        # per-lane stage timing: end-to-end latency alone can't show WHICH
+        # lane regressed (SLO triage needs the breakdown)
+        for lane_name, lane_fn in lanes:
             _lt0 = time.monotonic()
             lane_hits[lane_name] = lane_fn()
             METRICS.observe("memd_lane_ms", (time.monotonic() - _lt0) * 1000,
                             help="per-lane candidate fetch duration (ms)", ns=ns.namespace, lane=lane_name)
         # graceful degradation (ADR-8): if the embedder is unreachable
-        # (BYO-key API outage), BM25 + entity lanes still serve - retrieval
-        # degrades, it never dies
-        try:
-            _lt0 = time.monotonic()
-            qvec = self.embedder.embed_one(query)
-            lane_hits["vector"] = ns.index.search_vector(qvec, filt, limit=plan.candidate_k)
-            METRICS.observe("memd_lane_ms", (time.monotonic() - _lt0) * 1000,
-                            help="per-lane candidate fetch duration (ms)", ns=ns.namespace, lane="vector")
-        except Exception:
-            METRICS.inc("memd_embed_query_failures_total", ns=ns.namespace)
+        # (BYO-key API outage) or its model is still loading in the embed
+        # worker, BM25 + entity lanes still serve - retrieval degrades, it
+        # never dies, and it never waits on a model load. The hash embedder's
+        # lane is not fused at all (see resolve_fuse_vector).
+        if self.fuse_vector:
+            if not self.embedder.ready():
+                METRICS.inc("memd_embed_query_not_ready_total", ns=ns.namespace)
+            else:
+                try:
+                    _lt0 = time.monotonic()
+                    qvec = self.embedder.embed_one(query)
+                    lane_hits["vector"] = ns.index.search_vector(qvec, filt, limit=plan.candidate_k)
+                    METRICS.observe("memd_lane_ms", (time.monotonic() - _lt0) * 1000,
+                                    help="per-lane candidate fetch duration (ms)", ns=ns.namespace,
+                                    lane="vector")
+                except Exception:
+                    METRICS.inc("memd_embed_query_failures_total", ns=ns.namespace)
         _st0 = time.monotonic()
         fused = rrf_fuse(lane_hits, weights=plan.weights, limit=max(plan.candidate_k, 40))
         METRICS.observe("memd_search_stage_ms", (time.monotonic() - _st0) * 1000,
                         help="per-stage search timing (ms): plan/fuse/pack",
                         ns=ns.namespace, stage="fuse")
+        rerank_order, degraded = self._rerank(query, lane_hits, fused, ns.namespace)
+        rerank_scores: dict[str, float] | None = None
+        if rerank_order is not None:
+            rerank_scores = {it.record.id: p for it, p in rerank_order}
+            # the reranked shortlist leads, in the reranker's order; the rest
+            # of the fused list follows in its own order
+            fused = [it for it, _ in rerank_order] + [
+                it for it in fused if it.record.id not in rerank_scores]
         _st0 = time.monotonic()
-        packed = pack_context(fused, budget_tokens=budget_tokens, query_class=plan.qclass)
+        if self._pack_mode_for(rerank_order) == "gated":
+            kept = gate_candidates(rerank_order, self.rerank_gate)
+            neighbours, positions = ns.index.session_neighbours(
+                [it.record.id for it, _ in kept if it.record.kind == "raw_event"], filt, radius=1)
+            packed = pack_gated(kept, neighbours, positions, budget_tokens=budget_tokens,
+                                query_class=plan.qclass)
+        else:
+            # as_of anchors the recency tilt; without it packing is data-relative
+            packed = pack_context(fused, budget_tokens=budget_tokens, now=as_of, query_class=plan.qclass,
+                                  rerank_scores=rerank_scores)
         METRICS.observe("memd_search_stage_ms", (time.monotonic() - _st0) * 1000,
                         help="per-stage search timing (ms): plan/fuse/pack",
                         ns=ns.namespace, stage="pack")
@@ -1023,8 +1224,58 @@ class Memory:
             query_class=plan.qclass,
             latency_ms=round(latency, 3),
         )
-        self._qcache.put(cache_key, result)
+        if not degraded:
+            # a result served while the reranker was failing must not
+            # outlive the outage
+            self._qcache.put(cache_key, result)
         return result
+
+    def _rerank(self, query: str, lane_hits: dict[str, list], fused: list[FusedItem],
+                ns_name: str) -> tuple[list[tuple[FusedItem, float]] | None, bool]:
+        """(shortlist in reranker order with scores, degraded?). The
+        shortlist is the top-k of the bm25 lane, then the vector lane when a
+        real embedder is fused, deduped, bm25 first. None: no reranker, or it
+        failed (then degraded=True and the fused order stands)."""
+        if self.rerank is None:
+            return None, False
+        hits = list(lane_hits.get("bm25", []))
+        if self.embedder.kind != "hash":
+            hits += lane_hits.get("vector", [])
+        shortlist, seen = [], set()
+        for h in hits:
+            if h.record.id not in seen:
+                seen.add(h.record.id)
+                shortlist.append(h)
+                if len(shortlist) >= self.rerank.k:
+                    break
+        if not shortlist:
+            return None, False
+        _st0 = time.monotonic()
+        vals = self.rerank.run(query, [candidate_from_record(h.record) for h in shortlist], ns=ns_name)
+        METRICS.observe("memd_search_stage_ms", (time.monotonic() - _st0) * 1000,
+                        help="per-stage search timing (ms): plan/fuse/pack", ns=ns_name, stage="rerank")
+        if vals is None:
+            return None, True
+        by_id = {it.record.id: it for it in fused}
+        items = [by_id.get(h.record.id) or FusedItem(record=h.record, score=0.0, lanes=[h.lane],
+                                                     ranks={h.lane: i + 1})
+                 for i, h in enumerate(shortlist)]
+        order = sorted(range(len(items)), key=lambda i: (-vals[i], i))
+        return [(items[i], vals[i]) for i in order], False
+
+    def _pack_mode_for(self, rerank_order) -> str:
+        """Gated only on explicit opt-in, and only with reranker scores to
+        gate on (see resolve_pack_mode for why auto is ranked)."""
+        if rerank_order is None or self.rerank is None:
+            return "ranked"
+        return "gated" if self.pack_mode == "gated" else "ranked"
+
+    def _load_reranker(self) -> None:
+        try:
+            self.rerank.reranker.load()
+        except Exception:
+            _log.exception("memd: reranker %s failed to load; searches keep their own order",
+                           self.rerank.name)
 
     def pack(
         self,
@@ -1059,17 +1310,24 @@ class Memory:
         out.insert(insert_at, block)
         return out
 
-    def get(self, record_id: str, *, history: bool = False, namespace: str | None = None) -> dict | None:
+    def get(self, record_id: str, *, history: bool = False, include_deleted: bool = False,
+            namespace: str | None = None) -> dict | None:
+        """One record, or None. history=True adds its supersedence chain.
+        A deleted record - and a deleted version in a chain - is served only
+        with include_deleted (an administrative read: `history` used to serve
+        soft-deleted content until compaction purged it)."""
         impl = self._hosted()
         if impl is not None:
-            return impl.get(record_id, history=history, namespace=namespace)
+            return impl.get(record_id, history=history, include_deleted=include_deleted,
+                            namespace=namespace)
         ns = self._ns_for(namespace)
         rec = ns.index.get_by_id(record_id, include_deleted=True)
-        if rec is None or (rec.deleted and not history):
+        if rec is None or (rec.deleted and not include_deleted):
             return None
         d = rec.to_dict()
         if history:
-            d["history"] = [h.to_dict() for h in ns.index.history(record_id)]
+            d["history"] = [h.to_dict() for h in ns.index.history(record_id)
+                            if include_deleted or not h.deleted]
         return d
 
     # ------------------------------------------------------------------ lifecycle
@@ -1403,12 +1661,18 @@ class Memory:
         )
         # no packing budget here: a delete-by-query sweep must see every match
         sweep_limit = 10_000
-        try:
-            qvec = self.embedder.embed_one(query)
-            vector_hits = ns.index.search_vector(qvec, filt, limit=sweep_limit)
-        except Exception:
-            METRICS.inc("memd_embed_query_failures_total", ns=ns.namespace)
-            vector_hits = []
+        vector_hits = []
+        if not self.embedder.ready():
+            # model still loading: sweep on lexical evidence only (the
+            # conservative direction for a delete)
+            METRICS.inc("memd_embed_query_not_ready_total", ns=ns.namespace)
+        else:
+            try:
+                qvec = self.embedder.embed_one(query)
+                vector_hits = ns.index.search_vector(qvec, filt, limit=sweep_limit)
+            except Exception:
+                METRICS.inc("memd_embed_query_failures_total", ns=ns.namespace)
+                vector_hits = []
         lane_hits = {
             "bm25": ns.index.search_bm25(query, filt, limit=sweep_limit),
             "vector": vector_hits,
@@ -1420,7 +1684,7 @@ class Memory:
         # grounding (bm25/entity lane) OR a strong vector match. Vector-only
         # weak similarity must never drive mass deletion.
         vec_scores = {h.record.id: h.score for h in lane_hits["vector"]}
-        strong_vec = 0.35
+        strong_vec = self._vector_only_floor(list(vec_scores.values()))
         ids = []
         for it in fused:
             lexical = bool(set(it.lanes) & {"bm25", "entity"})
@@ -1432,6 +1696,25 @@ class Memory:
         METRICS.inc("memd_find_ids_matched_total", len(ids), ns=ns.namespace)
         return ids
 
+    def _vector_only_floor(self, scores: list[float]) -> float:
+        """Minimum cosine for a vector-ONLY candidate in a destructive sweep.
+
+        Absolute part: the embedder's strong_match_cosine. A fixed 0.35 was
+        calibrated on the hash embedder, where unrelated strings score ~0;
+        bge-small scores unrelated short strings ~0.5-0.6, so the same
+        number had forget() delete 120 records instead of 60.
+        Relative part: the candidate must also beat the median similarity of
+        the sweep's own vector sample by a margin, so a namespace whose
+        records all sit close together in embedding space (a homogeneous
+        corpus, or a model with an unusually high baseline) cannot be swept
+        wholesale on vector evidence. The sample is the scoped top
+        `sweep_limit`, which only biases the median upward - more
+        conservative, never less."""
+        floor = float(self.embedder.strong_match_cosine)
+        if len(scores) >= _VECTOR_ONLY_MIN_SAMPLE:
+            floor = max(floor, float(np.median(scores)) + _VECTOR_ONLY_MEDIAN_MARGIN)
+        return floor
+
     def forget(
         self,
         query: str,
@@ -1440,20 +1723,33 @@ class Memory:
         session_id: str | None = None,
         agent_id: str | None = None,
         org_id: str | None = None,
+        as_of: int | None = None,
+        kinds: list[str] | None = None,
+        expected: str | None = None,
         actor: str = "api",
         namespace: str | None = None,
     ) -> list[str]:
         """User-driven deletion by query. Uses find_ids (unbounded), NOT the
-        budget-capped packed view - partial destruction is unacceptable."""
+        budget-capped packed view - partial destruction is unacceptable.
+
+        Deletes exactly what find_ids returns for the SAME filters (as_of,
+        kinds, scope) - a preview's. `expected`: the preview's
+        forget_fingerprint(); if what would be deleted now differs, nothing
+        is deleted and ForgetPreviewMismatch is raised."""
         impl = self._hosted()
         if impl is not None:
             return impl.forget(query, confirm=True, user_id=user_id,
                                session_id=session_id, agent_id=agent_id,
-                               org_id=org_id, namespace=namespace)
+                               org_id=org_id, as_of=as_of, kinds=kinds,
+                               fingerprint=expected, namespace=namespace)
         ids = self.find_ids(
             query, user_id=user_id, session_id=session_id, agent_id=agent_id,
-            org_id=org_id, namespace=namespace,
+            org_id=org_id, as_of=as_of, kinds=kinds, namespace=namespace,
         )
+        if expected is not None and forget_fingerprint(ids) != expected:
+            raise ForgetPreviewMismatch(
+                f"the query now matches {len(ids)} record(s), not the previewed set: "
+                "preview again and confirm that")
         # one durable batch for the whole sweep (delete_many), not an
         # fsync-per-id loop
         self.delete_many(ids, actor=actor, namespace=namespace)
@@ -1461,6 +1757,13 @@ class Memory:
             actor=actor, action="forget",
             target=self._audit_target_for_query(query), detail={"deleted": len(ids)})
         return ids
+
+    def has_namespace(self, namespace: str) -> bool:
+        """True if `namespace` exists; never creates it."""
+        impl = self._hosted()
+        if impl is not None:
+            raise RuntimeError("has_namespace is embedded-only")
+        return self.engine.has_namespace(namespace)
 
     def destroy_namespace(self, namespace: str | None = None, actor: str = "api") -> bool:
         impl = self._hosted()
@@ -1573,6 +1876,16 @@ class Memory:
         st = ns.stats()
         st["namespace"] = ns.namespace
         st["embedder"] = self.embedder.name
+        st["embedder_kind"] = self.embedder.kind
+        st["embedder_ready"] = self.embedder.ready()
+        # embeddings queued or mid-batch: non-zero after flush() means the
+        # drain timed out and the vector lane is still catching up
+        st["embed_pending"] = self._embed_worker._pending()
+        st["fuse_vector"] = self.fuse_vector
+        st["reranker"] = self.rerank.stats() if self.rerank is not None else {"name": "none"}
+        st["pack_mode"] = self.pack_mode
+        lex = ns.index.lexical
+        st["lexical"] = lex.stats() if lex is not None else {"backend": "fts5"}
         st["extractor"] = self.extractor.name
         # live gauges so /metrics and stats() agree on current state
         METRICS.set_gauge("memd_records", st.get("records", 0), ns=ns.namespace)
@@ -1599,7 +1912,7 @@ class Memory:
                 "default_namespace": ns_filter,
                 "embedder": self.embedder.name,
                 "extractor": self.extractor.name,
-                "version": "0.1.0",
+                "version": __import__("memd").__version__,
             }
         names = self.engine.list_namespaces()
         return {
@@ -1608,7 +1921,7 @@ class Memory:
             "default_namespace": self.namespace_name,
             "embedder": self.embedder.name,
             "extractor": self.extractor.name,
-            "version": "0.1.0",
+            "version": __import__("memd").__version__,
         }
 
     # ------------------------------------------------------------------ internals
@@ -1669,12 +1982,15 @@ class Memory:
         stale = ns.index.records_missing_embedding(self.embedder.name)
         done = 0
         t0 = time.monotonic()
+        # same text preparation as the embed worker (truncated, and chunks of
+        # similar length so a padded batch wastes little)
+        stale.sort(key=lambda r: len(r.content))
         for i in range(0, len(stale), batch_size):
             chunk = stale[i : i + batch_size]
-            texts = [r.content for r in chunk]
+            ids, texts = embed_order({r.id: r.content for r in chunk}, self._embed_max_chars)
             vecs = self.embedder.embed(texts)
-            for j, rec in enumerate(chunk):
-                ns.index.set_vector(rec.id, vecs[j], self.embedder.name)
+            for j, rid in enumerate(ids):
+                ns.index.set_vector(rid, vecs[j], self.embedder.name)
                 done += 1
         METRICS.observe("memd_reembed_ms", (time.monotonic() - t0) * 1000,
                         help="re-embedding batch duration (ms)", ns=ns.namespace)
@@ -1697,9 +2013,29 @@ class Memory:
         impl = self._hosted()
         if impl is not None:
             return None  # hosted mode: nothing buffered locally
-        self._embed_worker.drain(timeout_s=60)
+        budget = self._embed_flush_drain_s
+        deadline = time.monotonic() + budget
+        left = self._embed_worker.drain(timeout_s=budget)
+        # nothing queued does not mean the vector lane is serving: the model
+        # may still be loading. flush() is the caller's "make it consistent"
+        # point, so it waits for that too (within the same budget).
+        self._embed_worker.wait_ready(deadline - time.monotonic())
+        if left:
+            # drain() gave up with work still queued or mid-batch: the
+            # vector lane is incomplete (it keeps draining in the background)
+            # and "flushed" must not silently claim otherwise
+            METRICS.inc("memd_flush_embed_pending_total",
+                        help="flushes that returned with embeddings still pending")
+            _log.warning("memd: flush() returned with %d embedding(s) still pending after %.1fs; "
+                         "the vector lane is incomplete until the embed worker catches up",
+                         left, budget)
         self._maint.drain(timeout_s=60)
         self.ns.index.flush()
+        lex = self.ns.index.lexical
+        if lex is not None:
+            # the tantivy accelerator is derived and serves its tail from
+            # FTS5 meanwhile, so this is about speed, not visibility
+            lex.drain(timeout_s=self._lexical_flush_drain_s)
         self._flush_all_audits()
 
     def close(self) -> None:
@@ -1712,7 +2048,12 @@ class Memory:
         # discard the vector lane it was asked to persist
         self._embed_worker.stop(drain_timeout_s=float(self._embed_close_drain_s))
         self._maint.stop(drain_timeout_s=float(self._embed_close_drain_s))
+        if self.rerank is not None:
+            self.rerank.close()
         self.ns.index.flush()
         self._flush_all_audits()
         self.ns.close()
         self.engine.close()
+        # a clean close collects what a crash orphaned (segment_gc /
+        # snapshot_gc entries): make those entries durable too
+        self._flush_all_audits()

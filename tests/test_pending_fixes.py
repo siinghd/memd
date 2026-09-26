@@ -18,6 +18,9 @@ def test_reembed_restores_vector_lane_after_cache_loss(tmp_path):
     import shutil, os
     cache = os.path.join(d, "store", "_cache")
     for f in os.listdir(cache):
+        if os.path.isdir(os.path.join(cache, f)):  # the tantivy index (memd[fast])
+            shutil.rmtree(os.path.join(cache, f))
+            continue
         for suf in ("", "-wal", "-shm"):
             try:
                 os.unlink(os.path.join(cache, f + suf))

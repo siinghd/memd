@@ -466,12 +466,15 @@ CORE_HISTOGRAMS = {
     "memd_embed_apply_ms": ("embed + index apply duration (ms)", DEFAULT_BUCKETS),
     "memd_http_request_ms": ("HTTP request duration (ms)", DEFAULT_BUCKETS),
     "memd_lane_ms": ("per-lane candidate fetch duration (ms)", DEFAULT_BUCKETS),
+    "memd_rerank_ms": ("reranker call duration (ms), including fallbacks", DEFAULT_BUCKETS),
+    "memd_lexical_commit_ms": ("tantivy indexer batch: read + index + commit (ms)", DEFAULT_BUCKETS),
 }
 
 CORE_COUNTERS = {
     "memd_source_downgrades_total": "client trust-tier claims downgraded",
     "memd_oversized_requests_total": "requests rejected by body-size cap",
     "memd_embed_query_failures_total": "query-embedding failures (degraded mode)",
+    "memd_embed_query_not_ready_total": "queries served without the vector lane: embedder model still loading",
     "memd_extraction_failures_total": "extraction runs that failed",
     "memd_extraction_chunks_failed_total": "extraction chunks lost to provider errors",
     "memd_writes_total": "raw/explicit lane writes",
@@ -506,7 +509,8 @@ CORE_COUNTERS = {
     "memd_embed_retries_total": "embedding retry attempts",
     "memd_embed_dead_letters_total": "embeddings dropped after retry cap",
     "memd_embed_dropped_on_close_total": "embeddings still pending when the worker stopped",
-    "memd_bm25_window_saturated_total": "bm25 OR scans that filled the bounded window (recall capped)",
+    "memd_flush_embed_pending_total": "flushes that returned with embeddings still pending",
+    "memd_bm25_queries_total": "bm25 lane queries (one ranked FTS5 OR query each)",
     "memd_embed_backlog_dropped_total": "embeddings deferred: backlog over capacity (reembed heals)",
     "memd_auto_compactions_total": "opportunistic compactions (self-enforced deadlines)",
     "memd_purges_scheduled_total": "due hard-delete purges handed to background maintenance",
@@ -531,6 +535,15 @@ CORE_COUNTERS = {
     "memd_store_ops_total": "object-store operations by type",
     "memd_embed_target_missing_total": "embeddings dropped because the target namespace is gone",
     "memd_forgets_total": "query-driven forget sweeps executed",
+    "memd_rerank_calls_total": "searches that asked the reranker",
+    "memd_rerank_fallback_total": "searches that kept the unreranked order: reranker failed, timed out or was not ready",
+    "memd_lexical_searches_total": "bm25-lane queries served by tantivy",
+    "memd_lexical_fallback_total": "bm25-lane queries served by FTS5 instead of tantivy",
+    "memd_lexical_tail_hits_total": "bm25-lane hits served from the FTS5 tail (not yet in tantivy)",
+    "memd_lexical_rebuilds_total": "tantivy lexical index rebuilds",
+    "memd_lexical_indexed_total": "rows (re)indexed into tantivy",
+    "memd_lexical_index_failures_total": "tantivy indexer steps that failed (the lane serves from FTS5)",
+    "memd_lexical_attach_failures_total": "namespaces opened without the tantivy accelerator (FTS5 serves)",
 }
 
 CORE_GAUGES = {
@@ -544,6 +557,7 @@ CORE_GAUGES = {
     "memd_vectors_missing": "live records with no current-version vector",
     "memd_quarantined": "quarantined record count",
     "memd_pending_purges": "scheduled physical purges not yet due",
+    "memd_lexical_lag": "changes not yet in the tantivy index (served from FTS5)",
 }
 
 

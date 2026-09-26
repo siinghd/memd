@@ -1,0 +1,9 @@
+{
+  // Tests and tooling may use Node APIs (the integration suite spawns a
+  // real memd server); the SDK source is still type-checked against them.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"]
+  },
+  "include": ["src", "test", "tsup.config.ts", "vitest.config.ts"]
+}

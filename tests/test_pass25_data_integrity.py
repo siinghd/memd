@@ -236,7 +236,7 @@ def test_destroy_racing_close_does_not_deadlock(tmp_path, monkeypatch):
 # ------------------------------------------------------------ embed durability
 
 class _SlowEmbedder:
-    name = "hash-ngram-384"
+    name = "hash-ngram-384-v2"
     dim = 384
 
     def embed(self, texts):

@@ -147,6 +147,30 @@ class TestDurability:
         finally:
             m2.close()
 
+    def test_acked_deletes_stay_deleted_on_a_second_node(self, tmp_path, prefix):
+        """Replay applied the ops log before the WAL records, so a node that
+        rebuilt from the bucket re-created every record whose delete was still
+        behind it in the log - on S3 as on local disk (same replay path)."""
+        m = _mem(tmp_path, prefix, local_dir=str(tmp_path / "node-a"))
+        try:
+            soft = m.add("second node soft victim", user_id="u1")[0]
+            hard = m.add_events([{"content": f"second node hard victim {i}", "user_id": "u1"}
+                                 for i in range(3)])
+            kept = m.add("second node survivor", user_id="u1")[0]
+            m.delete(soft)
+            m.delete_many(hard, hard=True)
+            m.add("written after the deletes", user_id="u1")
+        finally:
+            m.close()
+        m2 = _mem(tmp_path, prefix, local_dir=str(tmp_path / "node-b"))
+        try:
+            back = [rid for rid in [soft, *hard] if m2.get(rid) is not None]
+            assert not back, f"acked deletes resurrected on a second node: {back}"
+            assert m2.get(kept) is not None
+            assert not any("victim" in i.content for i in m2.search("second node victim", user_id="u1").items)
+        finally:
+            m2.close()
+
 
 class TestSingleWriter:
     def test_a_second_process_is_refused(self, tmp_path, prefix):

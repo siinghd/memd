@@ -50,6 +50,22 @@ any probe fails the build.
   the OpenAPI schema enumerates every route of an otherwise authenticated API.
 - **Trust tiers are advisory to the model, not a sandbox.** Fencing marks
   untrusted content as data; it cannot force a model to respect that.
+- **With the Jev reranker active, search text leaves the machine.** For every
+  search, the query and the top-30 candidate texts (date, role and the first
+  2,000 characters of each; no ids, scopes or metadata) are sent to
+  TypeSafe's API. `reranker="auto"` (the default) selects Jev only when a
+  TypeSafe key is configured and `typesafe-sdk` is installed; with no key,
+  nothing leaves the machine. A key counts from EITHER source:
+  `TYPESAFE_API_KEY` in the environment, or `typesafe_api_key` in the
+  `Memory(config=...)` dict - so passing the key in config for some other
+  purpose also turns on this egress unless `reranker` is set explicitly. Set
+  `MEMD_RERANKER=none` (or `local`, a cross-encoder that runs in-process) to
+  keep a keyed deployment local. In hosted mode the key is read from the
+  server's environment only; clients never send one.
+- **The derived indexes hold plaintext.** The SQLite index and, with
+  `memd[fast]`, the tantivy index (`<ns>.tantivy/` beside it) contain record
+  text unencrypted, with owner-only permissions. Both are deleted on
+  crypto-shred and are rebuildable from the (encrypted) log.
 
 ## Hardening checklist for a real deployment
 

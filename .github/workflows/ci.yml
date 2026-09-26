@@ -15,14 +15,22 @@ env:
 
 jobs:
   test:
-    name: tests (py${{ matrix.python }})
+    name: tests (py${{ matrix.python }}, ${{ matrix.lexical }})
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        # 3.12 matches the Dockerfile; 3.11 is the declared floor.
-        python: ["3.11", "3.12"]
+        include:
+          # 3.11 is the declared floor: the core install, bm25 lane on FTS5
+          - python: "3.11"
+            extras: "dev,mcp"
+            lexical: fts5
+          # 3.12 matches the Dockerfile, with memd[fast]: without it every
+          # tantivy test skips and the accelerator ships untested
+          - python: "3.12"
+            extras: "dev,mcp,fast"
+            lexical: tantivy
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -31,9 +39,24 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
       - name: Install
-        run: pip install -e ".[dev,mcp]"
+        run: pip install -e ".[${{ matrix.extras }}]"
+      - name: Assert the lexical backend under test
+        run: |
+          python -c "from memd.index.tantivy_lexical import resolve_lexical_backend as r; \
+          got = r({}); assert got == '${{ matrix.lexical }}', got; print('lexical backend:', got)"
       - name: Unit + regression suite
         run: python -m pytest tests/ -q --timeout=600
+      - name: Assert the tantivy tests actually ran
+        if: matrix.lexical == 'tantivy'
+        run: |
+          # no explicit -q: pyproject's addopts supplies one (see the s3 job)
+          out=$(python -m pytest tests/test_tantivy_lexical.py --no-header 2>&1)
+          echo "$out" | tail -3
+          if echo "$out" | grep -qE "[0-9]+ skipped"; then
+            echo "::error::tantivy tests were SKIPPED - memd[fast] is not exercised"
+            exit 1
+          fi
+          echo "$out" | grep -qE "[0-9]+ passed" || { echo "::error::no tantivy tests ran"; exit 1; }
       - name: Eval gate (accuracy, cost, adversarial zero-regression)
         run: python -m memd.harness.run --suite all --gate
       - name: Eval gate at other seeds and scales
@@ -46,7 +69,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: harness-results-py${{ matrix.python }}
+          name: harness-results-py${{ matrix.python }}-${{ matrix.lexical }}
           path: harness-results/
           if-no-files-found: ignore
           retention-days: 14

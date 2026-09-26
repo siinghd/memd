@@ -2,14 +2,73 @@
 
 Nearly free on immutable segments; exportable for SIEM. Each entry commits
 to the previous entry's digest: tampering breaks the chain.
+
+The chain is KEYED when the namespace is encrypted: each digest is an
+HMAC-SHA256 under a key derived from the namespace's envelope data key, and
+the entry says so (`"alg": "hmac-sha256"`). A plain SHA-256 chain proves
+nothing against someone who can write the store - they re-chain a forged
+entry, or put a plaintext ledger where the encrypted one was, and it
+verifies - and older versions acted on ledger entries (the format-1
+migration's recovered deletes). Without encryption there is no key to use,
+so the chain stays unkeyed SHA-256: tamper-EVIDENT against damage and naive
+edits only. Ledgers written before this (every entry without "alg") still
+verify by the unkeyed rule; once a keyed entry is in the chain, an unkeyed
+one after it is a break (a downgrade), and so is a plaintext ledger object
+in an encrypted namespace, which no version ever wrote.
 """
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import threading
+from typing import Callable, NamedTuple
 
 from memd.core.schema import now_ms
+
+CHAIN_KEYED = "hmac-sha256"
+_CHAIN_LABEL = b"memd/audit-chain/v1"
+
+
+def chain_key(envelope, ns: str) -> bytes | None:
+    """The key `ns`'s ledger chains with: derived from its envelope data key,
+    or None when encryption is off (plain SHA-256)."""
+    if envelope is None or not getattr(envelope, "enabled", False):
+        return None
+    return hmac.new(envelope.data_key(ns), _CHAIN_LABEL, hashlib.sha256).digest()
+
+
+def _body(e: dict) -> bytes:
+    return json.dumps({k: v for k, v in e.items() if k != "h"}, sort_keys=True).encode()
+
+
+def _verified_prefix(entries: list[dict], start: str,
+                     key: Callable[[], bytes | None], plain_at: int | None = None) -> int:
+    """How many leading entries chain from `start`: each `prev` is its
+    predecessor's digest and its own digest matches its body - HMAC for a
+    keyed entry, SHA-256 for an unkeyed one before any keyed entry. Entries
+    from `plain_at` on came from a plaintext object in an encrypted
+    namespace and do not count."""
+    prev, keyed, k = start, False, None
+    end = len(entries) if plain_at is None else min(plain_at, len(entries))
+    for n, e in enumerate(entries[:end]):
+        if e.get("prev") != prev:
+            return n
+        alg = e.get("alg")
+        if alg == CHAIN_KEYED:
+            if k is None:
+                k = key()
+            if k is None or not hmac.compare_digest(
+                    str(e.get("h")), hmac.new(k, _body(e), hashlib.sha256).hexdigest()):
+                return n
+            keyed = True
+        elif alg is None and not keyed:
+            if e.get("h") != hashlib.sha256(_body(e)).hexdigest():
+                return n
+        else:
+            return n  # an unknown rule, or an unkeyed entry after a keyed one
+        prev = e["h"]
+    return end
 
 
 class AuditLog:
@@ -114,6 +173,38 @@ class AuditLog:
     def _ns(self) -> str:
         return self.key.split("/")[1] if "/" in self.key else ""
 
+    def _chain_key(self) -> bytes | None:
+        """This ledger's HMAC key (None: unkeyed), derived once."""
+        ck = getattr(self, "_ckey", False)
+        if ck is False:
+            ck = self._ckey = chain_key(self.envelope, self._ns())
+        return ck
+
+    def _seal(self, actor: str, action: str, target: str, detail: dict | None) -> bytes:
+        """The next entry, chained to the tail and framed for the store;
+        advances the tail. Caller holds the lock."""
+        entry = {
+            "ts": now_ms(),
+            "actor": actor,
+            "action": action,
+            "target": target,
+            "detail": detail or {},
+            "prev": self._tail_hash,
+        }
+        key = self._chain_key()
+        if key is not None:
+            entry["alg"] = CHAIN_KEYED
+            entry["h"] = hmac.new(key, _body(entry), hashlib.sha256).hexdigest()
+        else:
+            entry["h"] = hashlib.sha256(_body(entry)).hexdigest()
+        payload = json.dumps(entry, separators=(",", ":")).encode() + b"\n"
+        if self.envelope is not None and self.envelope.enabled:
+            enc = self.envelope.encrypt(self._ns(), payload)
+            # frame the CIPHERTEXT length - read() walks [len][ciphertext]
+            payload = len(enc).to_bytes(4, "big") + enc
+        self._tail_hash = entry["h"]
+        return payload
+
     def _decode(self, data: bytes) -> bytes:
         """Envelope-framed `[len][ciphertext]...` -> plaintext NDJSON.
 
@@ -123,14 +214,21 @@ class AuditLog:
         ns = self._ns()
         dec: list[bytes] = []
         i = 0
+        bad = 0
         while i + 4 <= len(data):
             ln = int.from_bytes(data[i : i + 4], "big")
             chunk = data[i + 4 : i + 4 + ln]
             try:
                 dec.append(self.envelope.decrypt(ns, chunk))
             except Exception:
-                pass  # torn/garbled frame: skip; chain verify will flag gaps
+                # A frame cut short by a crash (the tail) is expected and skipped.
+                # A COMPLETE frame that does not decrypt is tampering or junk -
+                # skipping it silently let appended garbage leave verify() True
+                # (the chain has no gap at the end), so count it.
+                if len(chunk) == ln:
+                    bad += 1
             i += 4 + ln
+        self._undecryptable_frames = getattr(self, "_undecryptable_frames", 0) + bad
         return b"".join(dec)
 
     def _size(self) -> int:
@@ -216,30 +314,20 @@ class AuditLog:
 
     def append(self, actor: str, action: str, target: str, detail: dict | None = None) -> None:
         with self._lock:
-            entry = {
-                "ts": now_ms(),
-                "actor": actor,
-                "action": action,
-                "target": target,
-                "detail": detail or {},
-                "prev": self._tail_hash,
-            }
-            body = json.dumps({k: v for k, v in entry.items() if k != "h"}, sort_keys=True).encode()
-            entry["h"] = hashlib.sha256(body).hexdigest()
-            payload = json.dumps(entry, separators=(",", ":")).encode() + b"\n"
-            if self.envelope is not None and self.envelope.enabled:
-                ns = self.key.split("/")[1] if "/" in self.key else ""
-                enc = self.envelope.encrypt(ns, payload)
-                # frame the CIPHERTEXT length - read() walks [len][ciphertext]
-                payload = len(enc).to_bytes(4, "big") + enc
-            self.store.append(self.key, payload)
-            self._tail_hash = entry["h"]
+            self.store.append(self.key, self._seal(actor, action, target, detail))
             self._checkpoint()
             self._maybe_rotate()
 
     def read(self) -> list[dict]:
+        return self._read_tagged()[0]
+
+    def _read_tagged(self) -> tuple[list[dict], int | None]:
+        """read() -> (entries, index of the first entry read from a plaintext
+        object while the namespace is encrypted, or None)."""
         out: list[dict] = []
         seen: set[str] = set()
+        plain_at: int | None = None
+        encrypted = self.envelope is not None and self.envelope.enabled
         keys = [self._seg_key(n) for n in range(self._segments)] + [self.key]
         for k in keys:
             try:
@@ -248,7 +336,9 @@ class AuditLog:
                 blob = None
             if not blob:
                 continue
-            data = self._decode(blob) if k != self.key else self._decode(blob)
+            if encrypted and blob[:1] == b"{" and plain_at is None:
+                plain_at = len(out)
+            data = self._decode(blob)
             for line in data.decode(errors="replace").splitlines():
                 line = line.strip()
                 if not line:
@@ -265,7 +355,7 @@ class AuditLog:
                 if isinstance(h, str):
                     seen.add(h)
                 out.append(e)
-        return out
+        return out, plain_at
 
     def verify(self) -> bool:
         """Tamper-evidence over the RETAINED window.
@@ -275,15 +365,15 @@ class AuditLog:
         rather than at zero. Anchoring at zero made verify() permanently False
         the moment the ring engaged, which reads as "tampered" when the truth
         is "we pruned on purpose". `_pruned` records that history was dropped
-        so a reader can tell the two apart.
+        so a reader can tell the two apart. Keyed entries verify by HMAC
+        (see the module docstring).
         """
-        prev = self._chain_start
-        for e in self.read():
-            body = json.dumps({k: v for k, v in e.items() if k != "h"}, sort_keys=True).encode()
-            if e.get("prev") != prev or e.get("h") != hashlib.sha256(body).hexdigest():
-                return False
-            prev = e["h"]
-        return True
+        self._undecryptable_frames = 0
+        entries, plain_at = self._read_tagged()
+        if getattr(self, "_undecryptable_frames", 0):
+            return False
+        return _verified_prefix(entries, self._chain_start, self._chain_key,
+                                plain_at) == len(entries)
 
 
 class BufferedAuditLog(AuditLog):
@@ -304,24 +394,7 @@ class BufferedAuditLog(AuditLog):
 
     def append(self, actor: str, action: str, target: str, detail: dict | None = None) -> None:
         with self._lock:
-            entry = {
-                "ts": now_ms(),
-                "actor": actor,
-                "action": action,
-                "target": target,
-                "detail": detail or {},
-                "prev": self._tail_hash,
-            }
-            body = json.dumps({k: v for k, v in entry.items() if k != "h"}, sort_keys=True).encode()
-            entry["h"] = hashlib.sha256(body).hexdigest()
-            payload = json.dumps(entry, separators=(",", ":")).encode() + b"\n"
-            if self.envelope is not None and self.envelope.enabled:
-                ns = self.key.split("/")[1] if "/" in self.key else ""
-                enc = self.envelope.encrypt(ns, payload)
-                # frame the CIPHERTEXT length - read() walks [len][ciphertext]
-                payload = len(enc).to_bytes(4, "big") + enc
-            self._buffer.append(payload)
-            self._tail_hash = entry["h"]
+            self._buffer.append(self._seal(actor, action, target, detail))
             self._since += 1
             if self._since >= self.flush_every:
                 self.flush()
@@ -348,13 +421,48 @@ class BufferedAuditLog(AuditLog):
                 # availability over tail-durability in embedded mode (documented
                 # trade-off); entries are dropped, chain stays verifiable
 
-    def read(self) -> list[dict]:
+    def _read_tagged(self) -> tuple[list[dict], int | None]:
         # flush first so buffered entries are included in the parsed result
         # (the previous formulation computed `store.get(...) or b"" + pending`,
         # which bound the pending bytes to the wrong branch and never used them)
         self.flush()
-        return super().read()
+        return super()._read_tagged()
 
     def verify(self) -> bool:
         self.flush()
         return super().verify()
+
+
+class VerifiedLedger(NamedTuple):
+    entries: list[dict]     # up to the last valid link of the chain
+    ok: bool                # the whole ledger verified
+    total: int              # entries read
+    unverified: list[dict]  # the entries past the break
+
+
+def read_verified(store, key: str, envelope=None) -> VerifiedLedger:
+    """The ledger at `key`, split at the first break of its hash chain.
+
+    Read-only, unlike AuditLog(): opening one heals the `.state` sidecar,
+    which a reader that must not change what it reads (a migration before its
+    commit) cannot afford. The window and its anchor come from the sidecar
+    (segments, chain_start) exactly as AuditLog reads them, and an encrypted
+    ledger is decoded with the namespace's envelope the same way. The chain
+    breaks at the first entry whose `prev` is not its predecessor's digest
+    or whose own digest does not match its body (HMAC for a keyed entry), at
+    an unkeyed entry after a keyed one, and at a plaintext object in an
+    encrypted namespace."""
+    log = AuditLog.__new__(AuditLog)
+    log.store, log.key, log.envelope = store, key, envelope
+    log._segments, log._pruned, log._chain_start = 0, 0, "0" * 64
+    try:
+        raw = store.get(key + ".state")
+        if raw:
+            st = json.loads(raw.decode())
+            log._segments = int(st.get("segs", 0) or 0)
+            log._chain_start = str(st.get("chain_start") or "0" * 64)
+    except Exception:  # noqa: BLE001 - no usable sidecar: the live object alone, anchored at zero
+        pass
+    entries, plain_at = log._read_tagged()
+    n = _verified_prefix(entries, log._chain_start, log._chain_key, plain_at)
+    return VerifiedLedger(entries[:n], n == len(entries), len(entries), entries[n:])

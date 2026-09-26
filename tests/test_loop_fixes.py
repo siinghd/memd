@@ -2,7 +2,10 @@
 import concurrent.futures
 import threading
 
+import pytest
+
 from memd.engine.memory import Memory
+from memd.pipeline.embedder import fastembed_available
 
 
 def test_forget_deletes_beyond_packing_budget(tmp_path):
@@ -25,10 +28,18 @@ def test_forget_deletes_beyond_packing_budget(tmp_path):
         m.close()
 
 
-def test_forget_never_deletes_zero_evidence_records(tmp_path):
+@pytest.mark.parametrize("embedder", [
+    "hash",
+    pytest.param("fastembed", marks=pytest.mark.skipif(
+        not fastembed_available(), reason="fastembed extra not installed")),
+])
+def test_forget_never_deletes_zero_evidence_records(tmp_path, embedder):
     """The catastrophic case: records sharing NO terms with the forget query
-    must never be swept by weak vector-only similarity."""
-    m = Memory(str(tmp_path / "d"))
+    must never be swept by weak vector-only similarity. Run under every
+    embedder: bge-small scores these unrelated strings ~0.58, far above the
+    hash embedder's ~0, so a threshold that is safe for one deletes 120
+    records under the other."""
+    m = Memory(str(tmp_path / "d"), config={"embedder": embedder})
     try:
         for i in range(60):
             m.add(f"purge target zebra {i}", user_id="u1", session_id=f"s{i//20}")

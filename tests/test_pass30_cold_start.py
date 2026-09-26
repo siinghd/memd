@@ -103,9 +103,15 @@ class TestIndexSnapshot:
 
     def test_cold_start_uses_the_snapshot_and_restores_every_record(self, tmp_path):
         root = str(tmp_path / "d")
+        # the snapshot must be taken with the vector lane complete: with the
+        # default 60s flush budget a loaded host left 545 of 4000 embeddings
+        # pending, the worker kept adding vectors after compact() took the
+        # snapshot, and `before` counted more vectors than the snapshot held
         m = Memory(root, encrypt=False,
-                   config={"rate_max_writes": 10 ** 9, "vector_selfheal": False})
+                   config={"rate_max_writes": 10 ** 9, "vector_selfheal": False,
+                           "embed_flush_drain_s": 900})
         _seed(m, 4000)
+        assert m.stats()["embed_pending"] == 0, "flush() returned before the embeddings drained"
         m.compact(force=True)
         before = m.ns.index.stats()
         m.close()

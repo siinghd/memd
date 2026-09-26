@@ -1,0 +1,104 @@
+name: sdk-ts
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "sdk-ts/**"
+      - "src/**"
+      - "pyproject.toml"
+      - ".github/workflows/sdk-ts.yml"
+  pull_request:
+    paths:
+      - "sdk-ts/**"
+      - "src/**"
+      - "pyproject.toml"
+      - ".github/workflows/sdk-ts.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: sdk-ts-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: sdk-ts
+
+jobs:
+  build:
+    name: typecheck, unit tests, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: sdk-ts/package-lock.json
+      - run: npm ci
+      # the core compiles with no Node types: a Node-only API is a type error
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      # tarball holds only dist/README/LICENSE/package.json; bundles are edge-safe
+      - run: npm run check:dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdk-ts-dist
+          path: sdk-ts/dist/
+          retention-days: 7
+
+  runtimes:
+    name: load the built package (${{ matrix.runtime }})
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: ["node18", "node20", "node24", "bun"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdk-ts-dist
+          path: sdk-ts/dist/
+      - if: startsWith(matrix.runtime, 'node')
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.runtime == 'node18' && '18' || matrix.runtime == 'node20' && '20' || '24' }}
+      - if: matrix.runtime == 'bun'
+        uses: oven-sh/setup-bun@v2
+      # zero runtime dependencies: nothing to install, the package resolves itself
+      - if: startsWith(matrix.runtime, 'node')
+        run: npm run smoke
+      - if: matrix.runtime == 'bun'
+        run: bun test/smoke/smoke.mjs && bun test/smoke/smoke.cjs
+
+  integration:
+    name: integration (real memd server)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install memd
+        working-directory: .
+        run: pip install -e .
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: sdk-ts/package-lock.json
+      - run: npm ci
+      # a skipped suite would pass green having proved nothing: require it
+      - name: Integration tests
+        env:
+          MEMD_PYTHON: python
+          MEMD_REQUIRE_INTEGRATION: "1"
+        run: npm run test:integration

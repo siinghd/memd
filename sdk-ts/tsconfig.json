@@ -1,0 +1,21 @@
+{
+  // Core build: the SDK itself. No Node types on purpose - the core must
+  // run on Cloudflare Workers, Deno, Bun and browsers, so any Node-only API
+  // (Buffer, process, node:*) is a compile error here.
+  "compilerOptions": {
+    "target": "ES2020",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": [],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "exactOptionalPropertyTypes": false,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["src"]
+}

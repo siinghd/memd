@@ -74,8 +74,13 @@ def test_reads_are_not_serialized_on_the_writer_lock(tmp_path):
 
 
 def test_bm25_hydrates_only_what_it_returns(tmp_path):
-    """Ranking happens on content; full records are built only for survivors.
-    Guards against reintroducing an O(window) hydration."""
+    """Full records are built only for the rows the lane returns.
+    Guards against reintroducing an O(window) hydration.
+
+    Mechanism changed in retrieval v2: this used to rank a ~320-row window on
+    content and hydrate survivors through get_many. The lane now ranks IN SQL
+    (FTS5 bm25, ORDER BY rank LIMIT k), so the LIMIT itself bounds hydration;
+    count every record build on either path."""
     from memd.core.schema import Scope
     from memd.index.sqlite_index import IndexFilter
 
@@ -86,13 +91,19 @@ def test_bm25_hydrates_only_what_it_returns(tmp_path):
         real = idx.get_many
         asked = []
         idx.get_many = lambda ids: (asked.append(len(ids)), real(ids))[1]
-        hits = idx.search_bm25("standup session discussed follow ups",
-                               IndexFilter(scope=Scope(user="u")), limit=40)
-        idx.get_many = real
+        real_row = idx._row_to_record
+        built = []
+        idx._row_to_record = lambda row: (built.append(1), real_row(row))[1]
+        try:
+            hits = idx.search_bm25("standup session discussed follow ups",
+                                   IndexFilter(scope=Scope(user="u")), limit=40)
+        finally:
+            idx.get_many = real
+            del idx._row_to_record
         assert hits, "expected results"
-        assert asked, "expected a hydration call"
-        assert max(asked) <= 200, (
-            f"hydrated {max(asked)} rows to return {len(hits)} - the bounded "
+        hydrated = len(built) + sum(asked)
+        assert hydrated <= 40, (
+            f"hydrated {hydrated} rows to return {len(hits)} - a candidate "
             "window is being materialized in full again")
     finally:
         m.close()

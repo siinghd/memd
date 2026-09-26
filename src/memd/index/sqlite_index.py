@@ -6,6 +6,9 @@ Backing: SQLite (WAL mode) providing
     namespaces < ~50K vectors - the vast majority - get perfect recall here;
     IVF-PQ slots behind VectorSearchStrategy later without API change)
   - btree columns for time / entity / scope / validity filtering
+  - optionally, a tantivy accelerator for the bm25 lane (memd[fast]; see
+    memd.index.tantivy_lexical): a derived view of this index, attached by
+    the namespace store; FTS5 stays the synchronous source of truth
 
 Durability contract: the durable append (segments) is the source of truth;
 this index is committed synchronously before write-ack to give immediate
@@ -89,6 +92,8 @@ class NamespaceIndex:
     def __init__(self, path: str):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         self.path = path
+        # a new file holds only what is written from now on (see scrub())
+        self.created = not os.path.exists(path)
         try:
             os.chmod(path, 0o600)  # records may be sensitive; local file only
         except OSError:
@@ -128,11 +133,24 @@ class NamespaceIndex:
         self._closed = False
         self._stats_cache: dict | None = None
         self._stats_at = 0.0
+        # optional lexical accelerator (TantivyLexical); every mutation below
+        # tells it which rows changed BEFORE the change becomes visible
+        self.lexical = None
+        # Hard-deleted text must not survive in this file (D7): zero every
+        # freed cell and page, and keep the freelist vacuumable (auto_vacuum
+        # only takes effect before the first table exists - see scrub()).
+        self._con.execute("PRAGMA secure_delete=ON")
+        self._con.execute("PRAGMA auto_vacuum=INCREMENTAL")
         self._con.execute("PRAGMA journal_mode=WAL")
         self._con.execute("PRAGMA synchronous=NORMAL")
         self._con.execute("PRAGMA temp_store=MEMORY")
         self._con.execute("PRAGMA busy_timeout=5000")
         self._migrate()
+        # rowids are never reused (see _note_rowid_hwm): the highest rowid
+        # ever handed out, and whether MAX(rowid) may have fallen below it
+        row = self._con.execute("SELECT v FROM meta WHERE k='rowid_hwm'").fetchone()
+        self._rowid_hwm = int(row[0]) if row else 0
+        self._rowid_gap = self._rowid_hwm > 0
 
     def _migrate(self) -> None:
         c = self._con
@@ -255,7 +273,17 @@ class NamespaceIndex:
             c.execute("INSERT INTO meta(k,v) VALUES('schema_version',?)", (str(SCHEMA_VERSION),))
         c.commit()
 
+    def attach_lexical(self, lexical) -> None:
+        self.lexical = lexical
+
     def close(self) -> None:
+        lex, self.lexical = self.lexical, None
+        if lex is not None:
+            # its final batch reads this index, so it goes first
+            try:
+                lex.close()
+            except Exception:
+                pass
         with self._lock:
             self.flush()
             self._closed = True
@@ -289,13 +317,20 @@ class NamespaceIndex:
                 return
             c = self._con
             try:
+                if self.lexical is not None:
+                    # an upsert that overwrites an existing id (a native
+                    # import keeps ids) changes a row the accelerator may
+                    # already hold: its content, scope or flags must be
+                    # re-indexed, not just rows above the watermark
+                    self._lex_touch(self._existing_ids(c, [rec.id for rec, _, _ in items]))
+                rowid = self._next_rowid_locked(c)
                 for rec, vec, model in items:
                     p = rec.provenance
                     c.execute(
-                        """INSERT INTO records(id,kind,content,scope_org,scope_agent,scope_user,scope_session,
+                        """INSERT INTO records(rowid,id,kind,content,scope_org,scope_agent,scope_user,scope_session,
                              source,actor_id,prov_session,lineage,extractor,t_event,t_ingested,valid_from,
                              invalidated_at,superseded_by,entity_keys,embedding_version,meta,quarantined,deleted)
-                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                            ON CONFLICT(id) DO UPDATE SET
                              kind=excluded.kind, content=excluded.content,
                              scope_org=excluded.scope_org, scope_agent=excluded.scope_agent,
@@ -308,7 +343,7 @@ class NamespaceIndex:
                              embedding_version=excluded.embedding_version, meta=excluded.meta,
                              quarantined=excluded.quarantined, deleted=excluded.deleted""",
                         (
-                            rec.id, rec.kind, rec.content,
+                            rowid, rec.id, rec.kind, rec.content,
                             rec.scope.org, rec.scope.agent, rec.scope.user, rec.scope.session,
                             int(p.source), p.actor_id, p.session_id,
                             json.dumps(p.lineage),
@@ -319,6 +354,8 @@ class NamespaceIndex:
                             json.dumps(rec.meta), int(quarantined.get(rec.id, False)), int(rec.deleted),
                         ),
                     )
+                    if rowid is not None:
+                        rowid += 1  # (an overwrite leaves a gap: harmless)
                     c.execute("DELETE FROM entities WHERE record_id=?", (rec.id,))
                     c.executemany(
                         "INSERT OR IGNORE INTO entities(entity_key, record_id) VALUES(?,?)",
@@ -340,6 +377,10 @@ class NamespaceIndex:
                             "INSERT OR REPLACE INTO vectors(id,dim,model,vec) VALUES(?,?,?,?)",
                             (rec.id, int(vec.shape[0]), model, _vec_blob(vec)),
                         )
+                # new rows land above the lexical watermark, where the FTS5
+                # tail serves them until the accelerator indexes them
+                if self.lexical is not None:
+                    self.lexical.note_new(len(items))
                 # no per-batch commit: lazy via _maybe_commit (replay-safe)
             except Exception:
                 self.flush()  # don't leave a broken transaction open
@@ -409,6 +450,7 @@ class NamespaceIndex:
             con = sqlite3.connect(self.path, check_same_thread=False)
             con.row_factory = sqlite3.Row
             con.execute("PRAGMA busy_timeout=5000")
+            con.execute("PRAGMA secure_delete=ON")
             self._local.con = con
             with self._reader_lock:
                 self._reader_cons.append(con)
@@ -460,8 +502,52 @@ class NamespaceIndex:
         self._invalidate_stats()
         self._maybe_commit()
 
+    def _lex_touch(self, ids) -> None:
+        if self.lexical is not None:
+            self.lexical.touch(list(ids))
+
+    @staticmethod
+    def _existing_ids(c: sqlite3.Connection, ids: list[str]) -> list[str]:
+        out: list[str] = []
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            out += [r[0] for r in c.execute(
+                f"SELECT id FROM records WHERE id IN ({','.join('?' * len(chunk))})",  # nosec B608
+                chunk).fetchall()]
+        return out
+
+    def _note_rowid_hwm(self, c: sqlite3.Connection) -> None:
+        """Rowids are never reused. Called BEFORE a physical delete, inside
+        its transaction: remember the highest rowid ever handed out.
+
+        SQLite gives a new row MAX(rowid)+1, so deleting the newest rows
+        hands their rowids out again. The lexical accelerator indexes by
+        rowid order (everything above its watermark is new), and a reused
+        rowid lands below the watermark, where nothing rescans: the record
+        was missing from the bm25 lane for good. The mark is written in the
+        same transaction as the delete, so no crash can separate the two,
+        and upsert_batch places new rows above it (AUTOINCREMENT semantics
+        without rebuilding the table)."""
+        top = c.execute("SELECT MAX(rowid) FROM records").fetchone()[0]
+        if top is not None and int(top) > self._rowid_hwm:
+            self._rowid_hwm = int(top)
+            c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('rowid_hwm',?)", (str(self._rowid_hwm),))
+        self._rowid_gap = self._rowid_hwm > 0
+
+    def _next_rowid_locked(self, c: sqlite3.Connection) -> int | None:
+        """The rowid for the next inserted row, or None to let SQLite pick
+        (its MAX(rowid)+1 is then already above every rowid ever used)."""
+        if not self._rowid_gap:
+            return None
+        top = c.execute("SELECT MAX(rowid) FROM records").fetchone()[0] or 0
+        if int(top) >= self._rowid_hwm:
+            self._rowid_gap = False
+            return None
+        return self._rowid_hwm + 1
+
     def mark_superseded(self, old_id: str, new_id: str, at_ms: int) -> None:
         with self._lock:
+            self._lex_touch([old_id])
             self._con.execute(
                 "UPDATE records SET invalidated_at=?, superseded_by=? WHERE id=?",
                 (at_ms, new_id, old_id),
@@ -471,6 +557,7 @@ class NamespaceIndex:
 
     def mark_quarantined(self, record_id: str, flag: bool) -> None:
         with self._lock:
+            self._lex_touch([record_id])
             if flag:
                 self._con.execute(
                     "UPDATE records SET quarantined=1 WHERE id=?", (record_id,))
@@ -490,6 +577,7 @@ class NamespaceIndex:
 
     def tombstone(self, record_id: str, at_ms: int) -> bool:
         with self._lock:
+            self._lex_touch([record_id])
             cur = self._con.execute(
                 "UPDATE records SET deleted=1, invalidated_at=COALESCE(invalidated_at,?) WHERE id=?",
                 (at_ms, record_id),
@@ -498,9 +586,43 @@ class NamespaceIndex:
             self._invalidate_stats()
             return cur.rowcount > 0
 
+    def scrub(self) -> bool:
+        """Remove what deleted rows left behind in the FILE (D7).
+
+        Deleting a row is not erasing its text: FTS5 keeps a deleted row's
+        terms in its older segments until they merge, pages freed before
+        secure_delete was on keep their bytes, and the WAL keeps earlier page
+        images. Run when a hard-delete purge happened: merge the FTS index
+        into one segment, vacuum every free page out of the file (one full
+        VACUUM for a file created before auto_vacuum was set), truncate the
+        WAL, and rebuild the tantivy copy from the rows that remain. False
+        when a reader kept the WAL from being truncated: scrub again later."""
+        with self._lock:
+            if self._closed:
+                return False
+            self.flush()
+            c = self._con
+            c.execute("INSERT INTO fts(fts) VALUES('optimize')")
+            c.commit()
+            if int(c.execute("PRAGMA auto_vacuum").fetchone()[0]) != 2:
+                c.execute("PRAGMA auto_vacuum=INCREMENTAL")
+                c.execute("VACUUM")
+            else:
+                c.execute("PRAGMA incremental_vacuum").fetchall()
+            busy = c.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+            self._invalidate_stats()
+        if self.lexical is not None:
+            self.lexical.reset()
+        METRICS.inc("memd_index_scrubs_total",
+                    help="index caches scrubbed of hard-deleted content",
+                    ns=getattr(self, "_ns_hint", ""), complete=str(not busy).lower())
+        return not busy
+
     def hard_delete(self, record_id: str) -> bool:
         """Physical removal inside the index (compaction deadline path)."""
         with self._lock:
+            self._lex_touch([record_id])
+            self._note_rowid_hwm(self._con)
             cur = self._con.execute("DELETE FROM records WHERE id=?", (record_id,))
             self._hard_delete_rows(self._con, record_id)
             self._con.commit()
@@ -535,7 +657,12 @@ class NamespaceIndex:
             if self._closed:
                 return
             c = self._con
+            self._lex_touch([op.get("id") or op.get("old") for op in ops
+                             if (op.get("id") or op.get("old"))
+                             and op.get("op") in ("tombstone", "supersede", "quarantine", "hard_delete")])
             try:
+                if any(op.get("op") == "hard_delete" for op in ops):
+                    self._note_rowid_hwm(c)
                 for op in ops:
                     kind = op.get("op")
                     rid = op.get("id") or op.get("old")
@@ -705,137 +832,167 @@ class NamespaceIndex:
         return out
 
     def search_bm25(self, query: str, f: IndexFilter, limit: int = 50) -> list[Hit]:
-        """AND-first FTS with OR fallback (minimum-should-match semantics).
+        """One OR query over the content terms, ranked by FTS5 bm25.
 
-        At 50K docs the old all-terms-OR expression matched huge fractions
-        of the corpus on natural-language queries (~155ms/query: bm25 + row
-        join per match). AND over content words returns a small,
-        highest-precision candidate set in milliseconds; when it comes back
-        empty or thin - genuinely disjoint vocabularies, single common terms -
-        we fall back to the OR union so recall-first behavior is preserved.
-        Two bounded FTS queries worst case; O(matches) either way."""
+        This replaced an AND-first tier plus a bounded, UNORDERED OR window
+        re-ranked in Python by distinct query-term coverage. On natural
+        language questions the AND tier almost never fired, so the coverage
+        re-rank decided the lane: it had no IDF and no TF, so a record that
+        happened to share several common query words outranked the one record
+        holding the rare, decisive term (LongMemEval_S ndcg@5 0.739 for the
+        lane vs 0.891 for plain bm25 ordering; 0.241 vs 0.884 on _M). It was
+        also the dominant CPU cost of search (~130-145ms p50 at 10K-150K
+        records): hundreds of rows fetched and string-scanned per query to
+        keep ~40.
+
+        bm25 ordering is not free either: FTS5 scores every row on the posting
+        lists of the query terms, so cost grows with posting-list length for
+        high-document-frequency terms (stopwords are dropped to keep that
+        bounded). With the tantivy accelerator attached (memd[fast]), the
+        lane is answered by its block-max WAND top-k plus an FTS5 tail, and
+        falls back here whenever it cannot answer exactly."""
+        METRICS.inc("memd_bm25_queries_total", help="bm25 lane queries (one ranked FTS5 OR query each)")
+        lex = self.lexical
+        if lex is not None and not self._closed:
+            hits = lex.search(query, f, limit)
+            if hits is not None:
+                return hits
         q_all = _fts_escape(query)
-        if not q_all:
+        if not q_all or self._closed:
             return []
-        words = q_all.split()
-        args: list = []
-        filt = self._filter_where(f, args)
+        return self._fts5_bm25(" OR ".join(f'"{w}"' for w in q_all.split()), f, limit)
 
-        def _run(match_expr: str) -> list[Hit]:
-            sql = (
-                # CROSS JOIN pins the join order: fts drives, records is
-                # probed by rowid. Without it the planner drove from `records`
-                # (via ix_rec_valid, because the scope/validity predicates sit
-                # there) and probed the fts index once PER ROW - 10K probes,
-                # turning a 17ms lane into 22 SECONDS at 10K records. The plain
-                # fts5 table happened to cost out the other way; external
-                # content changed the estimate, not the right answer.
-                f"SELECT r.*, bm25(fts) AS rank FROM fts CROSS JOIN records r ON r.rowid = fts.rowid "  # nosec B608
-                f"WHERE fts MATCH ? AND {filt} ORDER BY rank LIMIT ?"
-            )
-            qargs = [match_expr] + args + [limit]
-            with self._read() as _c:
-                rows = _c.execute(sql, qargs).fetchall()
-            hits = []
-            for r in rows:
-                if r["id"] in f.exclude_ids:
-                    continue
-                rec = self._row_to_record(r)
-                rec.namespace = self._ns_hint
-                hits.append(Hit(record=rec, score=-float(r["rank"]), lane="bm25"))
-            return hits
+    def _fts5_bm25(self, match_expr: str, f: IndexFilter, limit: int, *,
+                   rowid_min: int | None = None, ids: list[str] | None = None,
+                   ids_only: bool = False) -> list:
+        """The FTS5 bm25 query itself. `rowid_min` / `ids` restrict it to the
+        lexical accelerator's tail: rows above its watermark, or rows changed
+        since its last commit. `ids_only` returns [(id, score, t_event,
+        content key)] (SQL-filtered, not hydrated) for a caller that hydrates
+        what it keeps.
 
-        and_hits: list[Hit] = []
-        if len(words) > 1:
-            and_hits = _run(" AND ".join(f'"{w}"' for w in words))
-            if len(and_hits) >= min(10, limit):
-                METRICS.inc("memd_bm25_and_hits_total",
-                            help="bm25 served by the high-precision AND tier")
-                return and_hits
-        # OR tier, BOUNDED: ranking the full posting list made any query with
-        # a high-document-frequency term O(everything) - ~150ms at 50K docs
-        # when a single stemmed word appeared in all records. Instead take a
-        # bounded window (FTS5 serves it in milliseconds), hydrate, and re-rank
-        # by term coverage in Python - coverage reproduces bm25's multi-match
-        # preference at bounded cost.
-        #
-        # The window is FILTERED IN SQL, not after. Selecting ids with no
-        # predicate and filtering in Python counted PRE-filter rows, so any
-        # older bulk of matching-but-ineligible rows (other scope, tombstoned,
-        # superseded, quarantined, not-yet-valid) consumed the whole window and
-        # starved the eligible records out of the lane entirely - 5 live
-        # in-scope records behind 400 ineligible ones returned ZERO hits, and a
-        # routine bulk delete (which leaves fts rows in place) made the
-        # survivors invisible. Same LIMIT-before-predicate family as pass 1 and
-        # pass 15; the fix is to make the LIMIT count only eligible rows.
-        window = max(limit * 8, 320)
-        or_args: list = []
-        or_filt = self._filter_where(f, or_args)
+        Equal scores are ordered by fusion's key (score, -t_event, content
+        hash, id), as the tantivy lane orders them, so the backend never
+        changes the order of tied rows. FTS5 alone returned them oldest-first
+        (rowid order) while tantivy returned them newest-first."""
         if self._closed:
             return []
-        # Fetch id + content ONLY. Ranking needs the text; it does not need the
-        # record. Hydrating all `window` rows first meant ~320 full row builds
-        # with three json.loads each per query, to keep `limit` (~40) of them -
-        # 61% of total search latency at 8K records, and pure Python, so it
-        # pinned the GIL and stopped reads scaling past two threads. Rank on
-        # content, then hydrate only the survivors: O(window) cheap string
-        # scans + O(limit) hydrations instead of O(window) hydrations.
-        with self._read() as _c:
-            rows = _c.execute(
-                "SELECT r.id, r.content FROM fts CROSS JOIN records r ON r.rowid = fts.rowid "  # nosec B608
-                f"WHERE fts MATCH ? AND {or_filt} LIMIT ?",
-                [" OR ".join(f'"{w}"' for w in words)] + or_args + [window]).fetchall()
-        if len(rows) >= window:
-            # recall is capped by the window from here on: say so, rather than
-            # letting a silent truncation read as "we found everything"
-            METRICS.inc("memd_bm25_window_saturated_total",
-                        help="bm25 OR scans that filled the bounded window (recall capped)")
-        wset = set(words)
-
-        def _coverage_text(text: str) -> int:
-            toks = set()
-            for t in text.lower().split():
-                t = "".join(ch for ch in t if ch.isalnum() or ch in "_-")
-                if len(t) >= 3 and t not in _FTS_STOPWORDS:
-                    toks.add(t)
-            n = 0
-            for w in wset:
-                if w in toks or any(t.startswith(w) or w.startswith(t) for t in toks):
-                    n += 1
-            return n
-
-        ranked = sorted(
-            ((r[0], _coverage_text(r[1])) for r in rows if r[0] not in f.exclude_ids),
-            key=lambda t: (-t[1], t[0]),
+        args: list = []
+        # Filtering stays IN SQL so the LIMIT counts only eligible rows: a
+        # bulk of matching-but-ineligible rows (other scope, tombstoned,
+        # superseded, quarantined, not-yet-valid) must never starve eligible
+        # records out of the lane.
+        filt = self._filter_where(f, args)
+        extra = ""
+        extra_args: list = []
+        if rowid_min is not None:
+            extra = " AND fts.rowid > ?"
+            extra_args = [int(rowid_min)]
+        if ids is not None:
+            if not ids:
+                return []
+            with self._read() as _c:
+                rowids = []
+                for i in range(0, len(ids), 500):
+                    chunk = ids[i:i + 500]
+                    rowids += [r[0] for r in _c.execute(
+                        f"SELECT rowid FROM records WHERE id IN ({','.join('?' * len(chunk))})",  # nosec B608
+                        chunk).fetchall()]
+            if not rowids:
+                return []
+            extra += f" AND fts.rowid IN ({','.join('?' * len(rowids))})"
+            extra_args += rowids
+        sql = (
+            # CROSS JOIN pins the join order: fts drives, records is
+            # probed by rowid. Without it the planner drove from `records`
+            # (via ix_rec_valid, because the scope/validity predicates sit
+            # there) and probed the fts index once PER ROW - 10K probes,
+            # turning a 17ms lane into 22 SECONDS at 10K records. The plain
+            # fts5 table happened to cost out the other way; external
+            # content changed the estimate, not the right answer.
+            f"SELECT {'r.id, r.t_event, r.content' if ids_only else 'r.*'}, bm25(fts) AS rank "  # nosec B608
+            f"FROM fts CROSS JOIN records r ON r.rowid = fts.rowid "
+            f"WHERE fts MATCH ?{extra} AND {filt}"
         )
-        # The AND tier proved these documents match EVERY term and they are
-        # already SQL-filtered. Discarding them because there were fewer than
-        # ten (exactly the high-precision case) and then failing to re-find
-        # them in a saturated window returned a page of one-term matches while
-        # the only document matching the whole query was absent. They rank
-        # first by construction: full term coverage.
-        and_ids = [h.record.id for h in and_hits]
-        by_id = {h.record.id: h.record for h in and_hits}
-        order = and_ids + [rid for rid, _ in ranked if rid not in by_id]
-        if not order:
-            return []
-        # hydrate a bounded head: enough to survive the belt-and-braces filter
-        head = order[: max(limit * 2, limit + 16)]
-        need = [rid for rid in head if rid not in by_id]
-        for rec in self.get_many(need) if need else []:
-            by_id[rec.id] = rec
-        hits = []
-        for rid in head:
-            rec = by_id.get(rid)
-            if rec is None or not self._passes_filter(rec, f):
+        qargs = [match_expr] + extra_args + args
+        # exclude_ids is applied in Python; over-fetch so it never shrinks the page
+        n = limit + len(f.exclude_ids)
+        with self._read() as _c:
+            rows = _c.execute(sql + " ORDER BY rank, r.t_event DESC LIMIT ?", qargs + [n + 1]).fetchall()
+            if n and len(rows) > n and _tie(rows[n]) == _tie(rows[n - 1]):
+                # the cut falls inside a group of equal (score, t_event): only
+                # the content hash orders it, so the whole group is needed
+                b = _tie(rows[n - 1])
+                group = _c.execute(sql + " AND r.t_event = ?", qargs + [b[1]]).fetchall()
+                rows = [r for r in rows if _tie(r) != b] + [r for r in group if _tie(r) == b]
+            else:
+                rows = rows[:n]
+        rows = _lane_order(rows)
+        if ids_only:
+            from memd.query.fusion import content_sha
+
+            return [(r["id"], -float(r["rank"]), int(r["t_event"]), int(content_sha(r["content"] or ""), 16))
+                    for r in rows if r["id"] not in f.exclude_ids][:limit]
+        hits: list[Hit] = []
+        for r in rows:
+            if r["id"] in f.exclude_ids:
                 continue
-            hits.append(Hit(record=rec, score=-float(len(hits)), lane="bm25"))
+            rec = self._row_to_record(r)
+            rec.namespace = self._ns_hint
+            # belt-and-braces: the Python twin of the SQL predicate set
+            if not self._passes_filter(rec, f):
+                continue
+            hits.append(Hit(record=rec, score=-float(r["rank"]), lane="bm25"))
             if len(hits) >= limit:
                 break
-        METRICS.inc("memd_bm25_or_bounded_total",
-                    help="bm25 served by the bounded OR scan")
         return hits
 
+    def session_neighbours(self, ids: list[str], f: IndexFilter,
+                           radius: int = 1) -> tuple[dict[str, list[MemoryRecord]], dict[str, int]]:
+        """For each record id: up to `radius` raw turns before and after it
+        in the SAME session, ordered by (t_event, rowid) - the rowid is the
+        ingestion order, which is what orders turns that share a session date.
+
+        Every neighbour satisfies `f` (SQL, then _passes_filter): a session id
+        is a caller-chosen string that two users can share, so adjacency alone
+        must never pull another scope's row into a packed context.
+
+        Returns ({id: [previous..., next...]}, {record id: rowid}) - the
+        positions cover the anchors and their neighbours."""
+        out: dict[str, list[MemoryRecord]] = {}
+        positions: dict[str, int] = {}
+        if not ids or radius <= 0 or self._closed:
+            return out, positions
+        fargs: list = []
+        filt = self._filter_where(f, fargs)
+        with self._read() as _c:
+            for rid in ids:
+                a = _c.execute("SELECT rowid AS _rowid, scope_session, t_event FROM records WHERE id=?",
+                               (rid,)).fetchone()
+                if a is None:
+                    continue
+                positions[rid] = int(a["_rowid"])
+                if a["scope_session"] is None:
+                    continue
+                got: list[MemoryRecord] = []
+                for cmp, order in (("<", "DESC"), (">", "ASC")):
+                    rows = _c.execute(
+                        f"SELECT rowid AS _rowid, * FROM records WHERE scope_session = ? "  # nosec B608
+                        f"AND kind = 'raw_event' AND (t_event {cmp} ? OR (t_event = ? AND rowid {cmp} ?)) "
+                        f"AND {filt} ORDER BY t_event {order}, rowid {order} LIMIT ?",
+                        [a["scope_session"], a["t_event"], a["t_event"], a["_rowid"], *fargs, radius],
+                    ).fetchall()
+                    if order == "DESC":
+                        rows = list(reversed(rows))
+                    for r in rows:
+                        rec = self._row_to_record(r)
+                        rec.namespace = self._ns_hint
+                        if rec.id in f.exclude_ids or not self._passes_filter(rec, f):
+                            continue
+                        positions[rec.id] = int(r["_rowid"])
+                        got.append(rec)
+                out[rid] = got
+        return out, positions
 
     def _fold_overflow_locked(self) -> None:
         """Fold the overflow block into the main matrix (O(main)); called
@@ -975,8 +1132,9 @@ class NamespaceIndex:
     def _passes_filter(self, rec: MemoryRecord, f: IndexFilter) -> bool:
         """Python-side twin of _filter_where. Every predicate the SQL path
         enforces must be enforced here too: the lanes that hydrate rows before
-        (or instead of) SQL filtering - the bounded bm25 window, the time
-        lane's recency fetch - reach records through THIS function alone.
+        (or instead of) SQL filtering - the time lane's recency fetch - reach
+        records through THIS function alone, and bm25 re-checks its SQL-
+        filtered rows here as belt-and-braces.
 
         Scope is delegated to Scope.contains rather than re-implemented. The
         open-coded copy that used to live here diverged from it: it applied a
@@ -1002,8 +1160,8 @@ class NamespaceIndex:
         if rec.id in f.exclude_ids:
             return False
         # quarantine: single authority for every Python-side filter path
-        # (the bounded bm25 window hydrates rows BEFORE any SQL could exclude
-        # them - without this check an unreviewed record was retrievable)
+        # (a lane that hydrates rows BEFORE any SQL could exclude them - the
+        # old bounded bm25 window did - made an unreviewed record retrievable)
         if not f.include_quarantined and rec.meta.get("quarantined"):
             return False
         if not f.include_invalid:
@@ -1305,6 +1463,10 @@ class NamespaceIndex:
 
     def wipe(self) -> None:
         with self._lock:
+            if self.lexical is not None:
+                self.lexical.reset()  # every row is replaced: the watermark is void
+            self._note_rowid_hwm(self._con)
+            # (executescript COMMITs first, so the mark is durable before the delete)
             self._con.executescript(
                 "DELETE FROM vectors; DELETE FROM entities; "
                 "DELETE FROM entity_segments; DELETE FROM links; DELETE FROM records;"
@@ -1329,15 +1491,16 @@ class NamespaceIndex:
 
 # Stopwords excluded from FTS terms: OR-ing them made every natural-language
 # query match a huge fraction of the corpus (at 50K docs the bm25 lane alone
-# cost ~155ms/query - 74% of end-to-end latency). Mirrors the embedder's
-# list plus standard IR stopwords.
+# cost ~155ms/query - 74% of end-to-end latency). Standard IR stopwords
+# ONLY: words fitted to the synthetic test generator ("later follow ups
+# agreed discussed session number notes") used to live here too, and they
+# silently dropped real query words on real data.
 _FTS_STOPWORDS = frozenset(
     "a an and are as at be but by for from has have i in is it its of on or "
     "that the this to we was were will with you your do does did not no yes "
     "so if then than there their they he she his her them about into over "
     "under again further once here when where why how all any both each few "
-    "more most other some such only own same too very can just should now "
-    "later follow ups agreed discussed session number notes".split()
+    "more most other some such only own same too very can just should now".split()
 )
 
 
@@ -1352,3 +1515,23 @@ def _fts_escape(query: str) -> str:
             seen.add(tok)
             words.append(tok)
     return " ".join(words)
+
+
+def _tie(row: sqlite3.Row) -> tuple[float, int]:
+    return float(row["rank"]), int(row["t_event"])
+
+
+def _lane_order(rows: list) -> list:
+    """FTS5 rows in the bm25 lane's order: (-score, -t_event, content hash,
+    id), fusion's tie-break. The hash is computed only inside groups of equal
+    (score, t_event), where it can decide something."""
+    from collections import Counter
+
+    from memd.query.fusion import content_sha
+
+    groups = Counter(_tie(r) for r in rows)
+
+    def key(r: sqlite3.Row) -> tuple:
+        rank, t = _tie(r)
+        return (rank, -t, content_sha(r["content"] or "") if groups[(rank, t)] > 1 else "", r["id"])
+    return sorted(rows, key=key)

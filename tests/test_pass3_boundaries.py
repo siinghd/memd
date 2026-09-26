@@ -63,6 +63,12 @@ class TestLaneInstrumentation:
         h = {"Authorization": f"Bearer {key}"}
         assert client.post("/v1/ns/acme/events", headers=h,
                            json={"events": [{"content": "alpha beta gamma"}]}).status_code == 202
+        # a local model loads lazily in the embed worker and search serves
+        # without the vector lane until it is up (by design): wait for it
+        client.app.state.engine.flush()
+        # the hash embedder's lane is not fused by default (patch 3); this
+        # test is about per-lane instrumentation, so run every lane
+        client.app.state.engine.fuse_vector = True
         assert client.post("/v1/ns/acme/search", headers=h,
                            json={"query": "alpha"}).status_code == 200
         snap = METRICS.snapshot()
