@@ -613,7 +613,10 @@ class Memory:
                        or os.environ.get("MEMD_LOCAL_DIR")
                        or os.path.join(".memd-local", bucket, s3_prefix or "_"))
         os.makedirs(path, exist_ok=True)
-        envelope = LocalKeyEnvelope(os.path.join(path, "keys")) if encrypt else NullKeyEnvelope()
+        keys_dir = os.path.join(path, "keys")
+        # (with encryption off, the keys directory still tells an open that a
+        # namespace was written with it on: see NamespaceStore._verify_key)
+        envelope = LocalKeyEnvelope(keys_dir) if encrypt else NullKeyEnvelope(keys_dir)
         # resolved before any namespace opens: the accelerators attach at open
         self.lexical_backend = resolve_lexical_backend(cfg)
         self.vector_index = resolve_vector_index(cfg)

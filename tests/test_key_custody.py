@@ -97,7 +97,7 @@ def _foreign_keys(root: str, tmp_path) -> str:
 
 def _restore_keys(root: str, saved: str) -> None:
     kd = os.path.join(root, "keys")
-    shutil.rmtree(kd)
+    shutil.rmtree(kd, ignore_errors=True)   # (a refused open creates no keys directory)
     shutil.copytree(saved, kd)
 
 
@@ -432,6 +432,264 @@ def test_a_stamp_is_written_once_the_key_is_proven(tmp_path):
     m = _open(root)
     m.close()
     assert _manifest(root).get("key_check"), "an open that proved the key stamps it"
+
+
+# ------------------------------------------ unstamped stores (every 0.2.0 one)
+
+
+def _write_mixed(root: str) -> int:
+    """Data everywhere: a compacted segment (5), a rotated one (3), two
+    records in the WAL and an acked soft delete in the ops log -> 9 served."""
+    m = _open(root)
+    try:
+        ids = [m.remember(f"alpha fact {i}") for i in range(5)]
+        m.flush()
+        m.compact(force=True)
+        for i in range(3):
+            m.remember(f"beta fact {i}")
+        m.flush()
+        m.ns.rotate("probe")
+        for i in range(2):
+            m.remember(f"gamma fact {i}")
+        m.delete(ids[0])
+        m.flush()
+        n = _count(m)
+    finally:
+        m.close()
+    assert len(_segments(root)) == 2 and os.path.getsize(_path(root, "wal"))
+    assert os.path.getsize(_path(root, "ops"))
+    return n
+
+
+def _keyfiles(root: str) -> dict[str, str]:
+    kd = os.path.join(root, "keys")
+    if not os.path.isdir(kd):
+        return {}
+    return {fn: hashlib.sha256(open(os.path.join(kd, fn), "rb").read()).hexdigest()
+            for fn in sorted(os.listdir(kd))}
+
+
+@pytest.mark.parametrize("layout", ["mixed", "wal", "ops", "segments"])
+def test_an_unstamped_encrypted_namespace_opened_with_encryption_off_is_refused(tmp_path, layout):
+    """The stamp only exists on stores this release wrote. On an unstamped
+    one (every store 0.2.0 wrote) one open + close with encryption off, no
+    write, cut the WAL off as a torn tail and emptied the ops log: with the
+    key back, two acked records were gone and an acked delete undone."""
+    root = str(tmp_path / "d")
+    n = _write_mixed(root) if layout == "mixed" else _write(root, layout)
+    _unstamp(root)
+    before, keys = _files(root), _keyfiles(root)
+    for _attempt in range(2):
+        with pytest.raises(KeyCustodyError, match="encrypt"):
+            _open(root, encrypt=False)
+        assert _files(root) == before, "a refused open must not truncate, rewrite or delete anything"
+    assert _keyfiles(root) == keys
+    m = _open(root)
+    try:
+        assert _count(m) == n, "every acked record, every acked delete"
+        m.compact(force=True)
+        assert _count(m) == n
+    finally:
+        m.close()
+
+
+@pytest.mark.parametrize("enc", [True, False], ids=["encrypted", "plaintext"])
+def test_a_complete_frame_that_does_not_parse_is_never_cut_under_any_envelope(tmp_path, enc):
+    """Only a frame cut short by its own length prefix is a torn tail. A
+    COMPLETE frame that does not parse is refused - encrypted or not - and
+    the refusal says what it is: under a key proven to be this data's
+    (another frame decrypts) it is damage, not a wrong key."""
+    root = str(tmp_path / "d")
+    m = _open(root, encrypt=enc)
+    try:
+        for i in range(4):
+            m.remember(f"precious fact number {i}")
+    finally:
+        m.close()
+    wal = _path(root, "wal")
+    good = os.path.getsize(wal)
+    with open(wal, "ab") as f:   # a torn tail: still repaired
+        f.write((500).to_bytes(4, "big") + os.urandom(40))
+    m = _open(root, encrypt=enc)
+    try:
+        assert _count(m) == 4
+    finally:
+        m.close()
+    assert os.path.getsize(wal) == good
+    for junk in (os.urandom(64), b"\x07garbage"):   # complete frames, long and short
+        with open(wal, "ab") as f:
+            f.write(_frame_encode(junk))
+        size = os.path.getsize(wal)
+        shutil.rmtree(os.path.join(root, "store", "_cache"))
+        with pytest.raises(KeyCustodyError) as ei:
+            _open(root, encrypt=enc)
+        assert os.path.getsize(wal) == size, "a complete frame must never be cut off"
+        msg = str(ei.value)
+        assert "damaged" in msg
+        if enc:
+            assert "not the one" not in msg, "the key is proven: do not blame it"
+        with open(wal, "r+b") as f:   # (the operator's repair: cut the frame by hand)
+            f.truncate(good)
+
+
+def test_an_unstamped_namespace_whose_first_probed_segment_is_damaged_opens_with_the_right_key(tmp_path):
+    """The unstamped probe used to try ONE candidate - the smallest segment
+    - and blame the key when it did not decrypt. It is "wrong key" only if
+    NOTHING decrypts; the right key proves itself on another segment, and
+    the damaged one is damage: skipped by reads, kept by compaction."""
+    root = str(tmp_path / "d")
+    m = _open(root)
+    try:
+        for i in range(5):
+            m.remember(f"alpha fact {i}")
+        m.compact(force=True)
+        for i in range(3):
+            m.remember(f"beta fact {i}")
+        small = m.ns.rotate("probe")
+    finally:
+        m.close()
+    _unstamp(root)
+    with open(_path(root, small), "rb") as f:
+        size = len(f.read())
+    with open(_path(root, small), "wb") as f:
+        f.write(os.urandom(size))
+    saved = _foreign_keys(root, tmp_path)
+    before = _files(root)
+    with pytest.raises(KeyCustodyError, match="key"):   # nothing decrypts: a wrong key
+        _open(root)
+    assert _files(root) == before
+    _restore_keys(root, saved)
+    m = _open(root)
+    try:
+        assert _count(m) == 5
+        m.compact(force=True)
+        assert _count(m) == 5
+    finally:
+        m.close()
+    assert _files(root)[small] == before[small], "never deleted"
+    assert _manifest(root).get("key_check"), "the right key proved itself: stamped"
+
+
+def test_an_unstamped_damaged_first_wal_frame_is_damage_not_a_wrong_key(tmp_path):
+    root = str(tmp_path / "d")
+    _write(root, "wal")
+    _unstamp(root)
+    _flip(_path(root, "wal"), 0)
+    shutil.rmtree(os.path.join(root, "store", "_cache"))
+    before = _files(root)
+    with pytest.raises(KeyCustodyError) as ei:
+        _open(root)
+    assert _files(root) == before
+    assert "damaged" in str(ei.value) and "not the one" not in str(ei.value)
+    assert "SECURITY.md" in str(ei.value), "the refusal points at the recovery procedure"
+
+
+@pytest.mark.parametrize("enc", [True, False], ids=["encrypted", "plaintext"])
+def test_a_hard_delete_held_in_a_quarantined_segment_stays_pending_and_is_never_served_again(
+        tmp_path, enc):
+    """A hard delete of a record only a damaged (quarantined) segment holds
+    was counted as purged, and retired: once the segment was repaired the
+    purged record came back in export. While a segment is quarantined, the
+    deletes a compaction retires ride on in its output's header (as a rotate
+    carries them past segments it cannot see) and a hard delete stays
+    pending; the fold that can read the segment again purges it."""
+    root = str(tmp_path / "d")
+    cfg = dict(CFG, hard_delete_deadline_ms=0)
+    m = Memory(root, namespace=NS, config=cfg, encrypt=enc)
+    try:
+        for i in range(5):
+            m.remember(f"alpha fact {i}")
+        m.compact(force=True)
+        b = [m.remember(f"beta secret {i} zqx") for i in range(3)]
+        victim = m.ns.rotate("probe")
+    finally:
+        m.close()
+    with open(_path(root, victim), "rb") as f:
+        orig = f.read()
+    with open(_path(root, victim), "wb") as f:
+        f.write(os.urandom(len(orig)))
+    m = Memory(root, namespace=NS, config=cfg, encrypt=enc)
+    try:
+        assert m.delete(b[0], hard=True)
+        assert m.delete(b[1])
+        m.compact(force=True)
+        m.compact(force=True)
+        assert m.ns.pending_hard_deletes == 1, "its bytes may still sit in the quarantined segment"
+    finally:
+        m.close()
+    assert victim in _segments(root)
+    with open(_path(root, victim), "wb") as f:   # repaired (restored from a backup)
+        f.write(orig)
+    for cache in ("warm", "cold"):
+        if cache == "cold":
+            shutil.rmtree(os.path.join(root, "store", "_cache"))
+        m = Memory(root, namespace=NS, config=cfg, encrypt=enc)
+        try:
+            ids = {json.loads(ln)["id"] for ln in m.export_jsonl().splitlines() if ln.strip()}
+            assert b[0] not in ids, f"a hard-deleted record served again ({cache})"
+            assert b[1] not in ids, f"a deleted record served again ({cache})"
+            assert b[2] in ids, "the repaired segment's other records are back"
+            assert not m.get(b[0]) and not m.get(b[1])
+            assert all(it.id not in (b[0], b[1]) for it in m.search("beta secret zqx").items)
+        finally:
+            m.close()
+    m = Memory(root, namespace=NS, config=cfg, encrypt=enc)
+    try:
+        m.compact(force=True)
+        assert m.ns.pending_hard_deletes == 0, "readable again: purged"
+    finally:
+        m.close()
+    assert victim not in _segments(root)
+    if not enc:
+        for fn in os.listdir(_ns_dir(root)):
+            with open(_path(root, fn), "rb") as f:
+                assert b"beta secret 0" not in f.read(), f"purged text left in {fn}"
+
+
+def test_a_wrong_key_never_stamps_a_namespace_it_could_not_read(tmp_path):
+    """A manifest whose checkpoint is missing from its segment list (an
+    older crash state) looked empty to the unstamped probe: a wrong key
+    opened it empty and stamped ITS fingerprint, and the right key was then
+    refused. The checkpoint is probed too, and a stamp is written only once
+    the key decrypted something (or there is nothing encrypted at all)."""
+    root = str(tmp_path / "d")
+    n = _write(root, "segments")
+    man = _manifest(root)
+    man.pop("key_check", None)
+    assert man["checkpoint"] and len(man["segments"]) == 1
+    man["segments"] = []
+    with open(_path(root, "manifest.json"), "w") as f:
+        json.dump(man, f)
+    saved = _foreign_keys(root, tmp_path)
+    before = _files(root)
+    with pytest.raises(KeyCustodyError, match="key"):
+        _open(root)
+    assert _files(root) == before
+    assert not _manifest(root).get("key_check")
+    _restore_keys(root, saved)
+    m = _open(root)
+    try:
+        assert _count(m) == n
+    finally:
+        m.close()
+
+
+def test_a_refused_open_creates_no_key_material(tmp_path):
+    root = str(tmp_path / "d")
+    _write(root, "segments")
+    kd = os.path.join(root, "keys")
+    saved = str(tmp_path / "keys.saved")
+    shutil.move(kd, saved)
+    with pytest.raises(KeyCustodyError):
+        _open(root)
+    assert not os.path.exists(os.path.join(kd, "root.key")), "no root key minted by a refused open"
+    assert _keyfiles(root) == {}
+    _restore_keys(root, saved)
+    m = _open(root)
+    try:
+        assert _count(m) == 6
+    finally:
+        m.close()
 
 
 # ----------------------------------------------------------------------- S3
