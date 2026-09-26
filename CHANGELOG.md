@@ -107,7 +107,19 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   1.000 / 0.999 / 0.993 on dense synthetic vectors, lane p50 14-19 ms
   (exact scan: 37 ms at 50K, 54 ms at 200K), no write-ack cost; ~0.94 on
   the hash embedder's sparse vectors. `ann_expansion_search` sets the
-  HNSW search-depth floor.
+  HNSW search-depth floor. While the sidecar loads, rebuilds or failed to
+  attach, a namespace over `flat_max_vectors` (200000) never loads the
+  exact scan's float32 matrix: sweeps and selective filters are answered
+  exactly from SQLite, other queries skip the vector lane
+  (`memd_vector_lane_skipped_total{reason="ann_rebuilding"}`) and are not
+  cached. Sidecar load (at open) and final save (at close, evictions
+  included) run on background threads; usearch holds the GIL for them, so
+  the process pauses ~100 ms per save or load at 200K vectors (a memory
+  copy: files up to 256 MB are read and written outside the GIL).
+
+### Fixed
+- `test_mcp_budget_clamped` skips when the optional `mcp` extra is not
+  installed (it failed with `ModuleNotFoundError`), like `test_mcp.py`.
 
 ## [0.2.0] - 2026-09-26
 

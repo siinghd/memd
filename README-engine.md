@@ -391,6 +391,7 @@ fully functional, honestly degraded, clearly labeled in `stats()`.
 | `lexical_backend` / `MEMD_LEXICAL_BACKEND` | `auto` \| `fts5` \| `tantivy` | `auto`: tantivy when installed (`pip install "memd[fast]"`) |
 | `vector_index` / `MEMD_VECTOR_INDEX` | `auto` \| `flat` \| `usearch` | `auto`: the usearch sidecar (`pip install "memd[ann]"`) for a namespace holding ≥ `ann_min_vectors` vectors, else the exact scan; an explicit `usearch` that cannot be honoured raises |
 | `ann_min_vectors`, `ann_overfetch`, `ann_exact_max`, `ann_dtype`, `ann_expansion_search` | auto threshold, candidate over-fetch, exact-answer cutoff, stored precision, HNSW search-depth floor | 20000, 4, 2000, `f16` (or `i8`), 0 (usearch's default; a search for k candidates explores at least k) |
+| `flat_max_vectors` | while the sidecar is loading or rebuilding, a namespace with more vectors than this never loads the exact scan's float32 matrix | 200000 |
 
 - **Reranker.** The top-30 of the bm25 lane (plus the vector lane with a real
   embedder) is reordered by a relevance judge; the rest follows in fused
@@ -440,13 +441,29 @@ fully functional, honestly degraded, clearly labeled in `stats()`.
   them in `fallback_exact_total`). Its file is used only when it matches the
   SQLite file's vector watermark exactly; missing, corrupt, foreign, stale or
   pre-purge files are rebuilt in the background (temp file + fsync +
-  rename; a kill never leaves a torn file in use) while the exact scan
-  serves. A hard-delete purge deletes its files and rebuilds it from SQLite
-  (usearch removal only marks entries), and it is published with the index
-  snapshot so a cold node installs it instead of rebuilding. recall@10 is
-  0.99+ on dense embeddings up to 1M vectors, ~0.94 on the hash embedder's
-  sparse vectors (see BENCHMARKS.md); a crash costs a rebuild (~5 min at 1M
-  on 4 threads), during which the exact scan serves.
+  rename; a kill never leaves a torn file in use). A hard-delete purge
+  deletes its files and rebuilds it from SQLite (usearch removal only marks
+  entries), and it is published with the index snapshot so a cold node
+  installs it instead of rebuilding. recall@10 is 0.99+ on dense embeddings
+  up to 1M vectors, ~0.94 on the hash embedder's sparse vectors (see
+  BENCHMARKS.md); a crash costs a rebuild (~5 min at 1M on 4 threads).
+- **While the sidecar is not serving** (loading at open, rebuilding, or
+  failed to attach), the exact scan serves up to `flat_max_vectors`. Above
+  that its float32 matrix (1.5 GB at 1M × 384) is never loaded: sweeps and
+  filters admitting at most `ann_exact_max` rows are answered exactly,
+  streamed from SQLite, and other queries skip the vector lane (bm25 and the
+  other lanes serve them; `memd_vector_lane_skipped_total{reason="ann_rebuilding"}`,
+  `stats()["vector_index"]["skipped_total"]`; such results are not cached).
+- **Sidecar save and load are off the request path.** Opening a namespace
+  does not wait for its sidecar to load (a background thread does it), and
+  closing hands the final save to a background thread (engine close waits
+  for it; a destroy cancels it). usearch holds the GIL for the whole of a
+  save or load, so the process pauses for it wherever it runs: measured at
+  200K × 384 f16, ~100 ms per save and ~105 ms per load (files up to 256 MB
+  are read and written by Python outside the GIL, so the pause is a memory
+  copy; larger ones are saved and loaded by usearch directly and pause
+  longer). `stats()["vector_index"]["last_gil_hold_ms"]` and
+  `memd_vector_index_gil_hold_ms` report it.
 
 ## Ops
 
