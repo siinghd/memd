@@ -13,6 +13,12 @@ or an open with encryption off, could permanently delete data. Upgrade from
 0.2.0 in place; no migration.
 
 ### Fixed - data integrity / security
+- **A crash inside a namespace key shred no longer bricks the name.** The key
+  file was overwritten in place and then unlinked; a crash in between left
+  random bytes as `ns-<ns>.key`, and every later open of that namespace name
+  failed as a wrong root key. The file is now renamed out of its name before
+  it is overwritten, and interrupted shreds are finished when the keys
+  directory is next loaded.
 - **A wrong encryption key destroyed the data it could not read**
   (0.2.0 and earlier). A valid key that is not the one the data was
   written with - another deployment's `keys/` directory restored over this
