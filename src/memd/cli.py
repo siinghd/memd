@@ -17,14 +17,17 @@ def _cmd_serve(args) -> int:
         return 0
     import uvicorn
 
-    from memd.server.cluster import ClusterConfig
-
     host = args.host or os.environ.get("MEMD_HOST", "127.0.0.1")
     port = args.port or int(os.environ.get("MEMD_PORT", "8700"))
     # --node-id (or MEMD_NODE_ID): one node of a fleet on one s3:// data
-    # root, routing each namespace to the node holding its lease (ADR-12)
-    cluster = ClusterConfig.from_env(node_id=args.node_id, advertise=args.advertise,
-                                     host=host, port=port)
+    # root, routing each namespace to the node holding its lease (ADR-12).
+    # A single server never imports the cluster module.
+    cluster = None
+    if args.node_id or os.environ.get("MEMD_NODE_ID"):
+        from memd.server.cluster import ClusterConfig
+
+        cluster = ClusterConfig.from_env(node_id=args.node_id, advertise=args.advertise,
+                                         host=host, port=port)
     app = create_app_from_env(hosted=True if args.hosted else None, cluster=cluster)
     # graceful: SIGTERM stops accepting, drains in-flight requests, then the
     # lifespan hook deregisters the node and releases its leases

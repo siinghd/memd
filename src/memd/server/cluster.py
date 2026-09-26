@@ -60,6 +60,7 @@ NODE_NS_PREFIX = "memd-node."
 ROUTE_HEADER = "x-memd-route"
 NOT_OWNER_HEADER = "x-memd-not-owner"
 _NODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_NS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")   # memd.storage.engine._validate_ns
 # hop-by-hop headers (RFC 9110 7.6.1) plus the ones the client recomputes
 _HOP = {b"connection", b"keep-alive", b"proxy-authenticate", b"proxy-authorization", b"te",
         b"trailer", b"transfer-encoding", b"upgrade", b"host", b"content-length", ROUTE_HEADER.encode()}
@@ -492,7 +493,9 @@ class ClusterMiddleware:
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
         ns = namespace_of_path(scope["path"])
-        if ns is None:
+        if ns is None or not _NS_RE.fullmatch(ns):
+            # not a namespace route, or not a valid namespace name: the app
+            # answers it (400/404) at once - no store lookup, no retry loop
             return await self.app(scope, receive, send)
         if ns.startswith(NODE_NS_PREFIX):
             # a node's own facade namespace: never served to a tenant
