@@ -26,6 +26,8 @@ from memd.server.auth import Principal, hash_secret
 
 _log = logging.getLogger("memd.hosted")
 _OPS = {"ns": "_billing"}
+# Stripe's events are a few KiB; nothing legitimate comes near this
+WEBHOOK_MAX_BYTES = 1 << 20
 
 
 class CheckoutIn(BaseModel):
@@ -160,6 +162,8 @@ class Hosted:
                                "pip install 'memd[billing]'")
         self.plans = plans or Plans.from_env()
         self.store = AdminStore.for_data_root(data_dir)
+        # one process per data root: reservations on disk are a dead process's
+        self.store.clear_reservations()
         self.keystore = HostedKeyStore(self.store, admin_key=admin_key)
         self.metering = Metering(self.store, self.plans, engine)
         self.billing = Billing(self.store, self.plans, self.cfg, client=stripe_client)
@@ -188,13 +192,13 @@ class Hosted:
 
         @app.exception_handler(BillingError)
         async def billing_error(_request: Request, exc: BillingError):
-            return _error(exc.status, exc.detail, exc.code)
+            return _error(exc.status, exc.detail, exc.code, extra=exc.extra)
 
         def billing_org(p: Principal = Depends(auth)) -> dict:
             if p.org_id is None:
                 raise ApiError(400, "billing routes act on the calling key's org; this key has none",
                                code="no_org")
-            if "billing" not in p.scopes and not p.scope_override:
+            if "billing" not in p.scopes:  # exact: `override` does not imply it
                 raise ApiError(403, "key lacks the 'billing' scope")
             org = hosted.store.get_org(p.org_id)
             if org is None:
@@ -216,9 +220,16 @@ class Hosted:
         @app.post("/v1/billing/webhook")
         async def webhook(request: Request):
             # unauthenticated by design: the Stripe-Signature HMAC over the
-            # RAW body is the authentication (parsed JSON would not verify)
-            raw = await request.body()
-            event = hosted.billing.verify_webhook(raw, request.headers.get("stripe-signature"))
+            # RAW body is the authentication (parsed JSON would not verify).
+            # Capped by bytes actually READ: a chunked body has no
+            # Content-Length for the global 8 MiB guard to see.
+            buf = bytearray()
+            async for chunk in request.stream():
+                buf += chunk
+                if len(buf) > WEBHOOK_MAX_BYTES:
+                    METRICS.inc("memd_billing_webhook_rejected_total", reason="too_large", **_OPS)
+                    return _error(413, "webhook body too large")
+            event = hosted.billing.verify_webhook(bytes(buf), request.headers.get("stripe-signature"))
             try:
                 result = await run_in_threadpool(hosted.billing.handle_event, event)
             except BillingError:

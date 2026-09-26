@@ -150,17 +150,21 @@ def test_free_reranked_and_extraction_caps(hosted):
     c = hosted.client(org, "acme")
     hosted.engine.rerank = RerankStage(_Scorer())
     hosted.engine.extractor = _KeyedExtractor()
-    for i in range(3):
+    for i in range(2):  # 2 of the 4 memories the free plan stores here
         assert _mem(c, "acme", f"kumquat note {i}").status_code == 201
-    assert _search(c, "acme", "kumquat one").status_code == 200
-    assert _search(c, "acme", "kumquat two").status_code == 200
-    r = _search(c, "acme", "kumquat three")  # reranked cap (2) hits before searches (3)
-    assert r.status_code == 402 and r.json()["meter"] == "reranked_searches"
-    # extraction on our key: 3 raw records considered -> at the cap of 3
+    p = period_of(time.time())
+    # the reranked cap (2) is reached before the searches cap (3): the third
+    # search is served unreranked, not refused, and only `searches` grows
+    for q in ("kumquat one", "kumquat two", "kumquat three"):
+        assert _search(c, "acme", q).status_code == 200
+    assert hosted.store.rollup(org, "reranked_searches", p) == 2
+    assert hosted.store.rollup(org, "searches", p) == 3
+    r = _search(c, "acme", "kumquat four")
+    assert r.status_code == 402 and r.json()["meter"] == "searches"
+    # extraction on our key: the session's raw records, up to the cap of 3
     c.post("/v1/ns/acme/events", json={"events": [{"content": "x", "session_id": "s1"}]})
     r = c.post("/v1/ns/acme/sessions/s1/close")
     assert r.status_code == 200
-    p = period_of(time.time())
     assert hosted.store.rollup(org, "extractions_our_key", p) == r.json()["raw_considered"] >= 1
 
 
@@ -250,10 +254,15 @@ def test_scopes_split_data_and_billing_keys(hosted):
     org = hosted.org("acme")
     data_only = hosted.client(org, "acme", scopes="memory")
     billing_only = hosted.client(org, "acme", scopes="billing")
+    override_only = hosted.client(org, "acme", scopes="override")
     assert data_only.get("/v1/billing/usage").status_code == 403
     assert billing_only.get("/v1/billing/usage").status_code == 200
     assert billing_only.get("/v1/ns/acme/stats").status_code == 403
     assert data_only.get("/v1/ns/acme/stats").status_code == 200
+    # scopes are exact: `override` adds the cross-user capability to a
+    # memory key and grants nothing on its own
+    assert override_only.get("/v1/ns/acme/stats").status_code == 403
+    assert override_only.get("/v1/billing/usage").status_code == 403
 
 
 def test_keys_are_hashed_at_rest_and_revocable(hosted, tmp_path):

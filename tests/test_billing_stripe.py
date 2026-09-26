@@ -77,12 +77,19 @@ def _post_webhook(client, payload: str, sig: str | None):
 
 @pytest.fixture()
 def billed(tmp_path):
-    app, h = _app(tmp_path, _env())
+    fake = FakeStripe()  # serves the subscription reads webhooks verify against
+    app, h = _app(tmp_path, _env(fake.url, MEMD_STRIPE_MAX_NETWORK_RETRIES="0"))
+    h.fake = fake
     org = h.store.create_org("acme")
     h.store.update_org(org, stripe_customer_id="cus_acme")
     yield app, h, org, TestClient(app)
     app.state.engine.close()
     h.store.close()
+    fake.close()
+
+
+def _invoice(iid: str, sub: str = "sub_acme", customer: str = "cus_acme") -> dict:
+    return {"id": iid, "object": "invoice", "customer": customer, "subscription": sub}
 
 
 def _sub(status="active", prices=("price_dev_monthly", "price_dev_extractions", "price_dev_reranked"),
@@ -98,7 +105,8 @@ def _sub(status="active", prices=("price_dev_monthly", "price_dev_extractions", 
 
 def test_webhook_signature_valid_tampered_and_wrong_secret(billed):
     app, h, org, c = billed
-    ev = event("invoice.payment_succeeded", {"id": "in_1", "object": "invoice", "customer": "cus_acme"})
+    h.store.update_org(org, stripe_subscription_id="sub_acme", plan="dev", status="past_due")
+    ev = event("invoice.payment_succeeded", _invoice("in_1"))
     payload = json.dumps(ev)
     r = _post_webhook(c, payload, sign(payload))
     assert r.status_code == 200 and r.json()["received"] is True and r.json()["handled"] is True
@@ -116,7 +124,7 @@ def test_webhook_signature_valid_tampered_and_wrong_secret(billed):
 
 def test_webhook_replay_old_timestamp_is_rejected(billed):
     app, h, org, c = billed
-    ev = event("invoice.payment_failed", {"id": "in_old", "object": "invoice", "customer": "cus_acme"})
+    ev = event("invoice.payment_failed", _invoice("in_old"))
     payload = json.dumps(ev)
     old = int(time.time()) - 3600  # a delivery captured an hour ago, correctly signed
     r = _post_webhook(c, payload, sign(payload, t=old))
@@ -127,8 +135,8 @@ def test_webhook_replay_old_timestamp_is_rejected(billed):
 
 def test_webhook_replay_within_tolerance_is_a_no_op(billed):
     app, h, org, c = billed
-    h.store.update_org(org, plan="dev")
-    ev = event("invoice.payment_failed", {"id": "in_f", "object": "invoice", "customer": "cus_acme"})
+    h.store.update_org(org, plan="dev", stripe_subscription_id="sub_acme")
+    ev = event("invoice.payment_failed", _invoice("in_f"))
     payload = json.dumps(ev)
     sig = sign(payload)
     first = _post_webhook(c, payload, sig).json()
@@ -155,18 +163,29 @@ def test_same_event_twice_has_one_effect(billed):
         assert con.execute("SELECT COUNT(*) FROM processed_events WHERE id = 'evt_sub_once'").fetchone()[0] == 1
 
 
-def test_unknown_customer_asks_for_retry_and_is_not_claimed(billed):
+def test_unknown_customer_is_acked_and_a_failed_verification_retried(billed):
     app, h, org, c = billed
-    ev = event("customer.subscription.created", _sub(customer="cus_later"), eid="evt_early")
+    # not a memd customer at all: acknowledged (Stripe would retry a 500
+    # for three days for nothing), counted, nothing changes
+    ev = event("customer.subscription.created", _sub(customer="cus_stranger"), eid="evt_stranger")
     payload = json.dumps(ev)
     r = _post_webhook(c, payload, sign(payload))
-    assert r.status_code == 500 and r.json()["code"] == "retry"
-    assert h.store.processed_event("evt_early") is None  # Stripe's retry will be processed
+    assert r.status_code == 200 and r.json()["reason"] == "unknown_customer"
+    # names a memd org without a customer: the binding is verified with
+    # Stripe first - an outage there asks Stripe to retry, unclaimed
     other = h.store.create_org("later")
-    h.store.update_org(other, stripe_customer_id="cus_later")
+    sub = dict(_sub(customer="cus_later"), metadata={"memd_org_id": other})
+    ev = event("customer.subscription.created", sub, eid="evt_early")
+    payload = json.dumps(ev)
+    h.fake.down = True
+    r = _post_webhook(c, payload, sign(payload))
+    assert r.status_code == 500
+    assert h.store.processed_event("evt_early") is None
+    h.fake.down = False
+    h.fake.customers["cus_later"] = {"id": "cus_later", "object": "customer", "metadata": {"memd_org_id": other}}
     r = _post_webhook(c, payload, sign(payload))
     assert r.status_code == 200 and r.json()["handled"] is True
-    assert h.store.get_org(other)["plan"] == "dev"
+    assert h.store.get_org(other)["plan"] == "dev" and h.store.get_org(other)["stripe_customer_id"] == "cus_later"
 
 
 def test_out_of_order_subscription_events_cannot_roll_back(billed):
@@ -192,21 +211,20 @@ def test_payment_failed_starts_grace_then_read_only_then_recovery(billed):
     data.headers["Authorization"] = f"Bearer {key}"
     t0 = int(time.time())
     for etype, obj in (("customer.subscription.created", _sub()),
-                       ("invoice.payment_failed", {"id": "in_1", "object": "invoice", "customer": "cus_acme"})):
+                       ("invoice.payment_failed", _invoice("in_1"))):
         p = json.dumps(event(etype, obj, created=t0))
         assert _post_webhook(c, p, sign(p)).status_code == 200
     o = h.store.get_org(org)
     assert o["status"] == "past_due" and o["grace_until"] == t0 + 7 * 86400
     # a second failure (Stripe's retry of the invoice) does not extend grace
-    p = json.dumps(event("invoice.payment_failed", {"id": "in_1", "object": "invoice", "customer": "cus_acme"},
-                         created=t0 + 86400))
+    p = json.dumps(event("invoice.payment_failed", _invoice("in_1"), created=t0 + 86400))
     _post_webhook(c, p, sign(p))
     assert h.store.get_org(org)["grace_until"] == t0 + 7 * 86400
     assert data.post("/v1/ns/acme/memories", json={"content": "in grace"}).status_code == 201
     h.metering.clock = lambda: t0 + 7 * 86400 + 1
     assert data.post("/v1/ns/acme/memories", json={"content": "blocked"}).status_code == 402
     assert data.post("/v1/ns/acme/search", json={"query": "grace"}).status_code == 200
-    p = json.dumps(event("invoice.payment_succeeded", {"id": "in_1", "object": "invoice", "customer": "cus_acme"}))
+    p = json.dumps(event("invoice.payment_succeeded", _invoice("in_1")))
     assert _post_webhook(c, p, sign(p)).status_code == 200
     assert h.store.get_org(org)["grace_until"] is None
     assert data.post("/v1/ns/acme/memories", json={"content": "paid again"}).status_code == 201
@@ -214,23 +232,29 @@ def test_payment_failed_starts_grace_then_read_only_then_recovery(billed):
 
 def test_checkout_session_cannot_repoint_another_customer(billed):
     app, h, org, c = billed
+    h.fake.subscriptions["sub_acme"] = _sub(customer="cus_attacker")
     ev = event("checkout.session.completed", {
-        "id": "cs_x", "object": "checkout.session", "customer": "cus_attacker", "client_reference_id": org,
-        "payment_status": "paid", "subscription": _sub(customer="cus_attacker"), "metadata": {"plan": "dev"}})
+        "id": "cs_x", "object": "checkout.session", "mode": "subscription", "customer": "cus_attacker",
+        "client_reference_id": org, "payment_status": "paid", "subscription": "sub_acme",
+        "metadata": {"plan": "dev"}})
     p = json.dumps(ev)
     r = _post_webhook(c, p, sign(p))
-    assert r.status_code == 200 and r.json()["reason"] == "customer_mismatch"
+    assert r.status_code == 200 and r.json()["reason"] == "customer_unverified"
+    assert h.store.log_entries(org, "customer_mismatch")
     o = h.store.get_org(org)
     assert o["stripe_customer_id"] == "cus_acme" and o["plan"] == "free"
 
 
 def test_unpaid_checkout_does_not_upgrade(billed):
     app, h, org, c = billed
+    # the payment did not go through: Stripe's copy of the subscription is
+    # `incomplete`, whatever the session payload claims
+    h.fake.subscriptions["sub_acme"] = _sub(status="incomplete")
     ev = event("checkout.session.completed", {
-        "id": "cs_u", "object": "checkout.session", "customer": "cus_acme", "client_reference_id": org,
-        "payment_status": "unpaid", "subscription": _sub()})
+        "id": "cs_u", "object": "checkout.session", "mode": "subscription", "customer": "cus_acme",
+        "client_reference_id": org, "payment_status": "unpaid", "subscription": _sub()})
     p = json.dumps(ev)
-    assert _post_webhook(c, p, sign(p)).json()["reason"] == "payment_incomplete"
+    assert _post_webhook(c, p, sign(p)).json()["status"] == "incomplete"
     o = h.store.get_org(org)
     assert o["plan"] == "free" and o["status"] == "incomplete"
 
@@ -431,13 +455,18 @@ def test_end_to_end_checkout_webhook_entitlement_usage_push(tmp_path, stripe_moc
     # Point the dev monthly price at the fixture's price, so the webhook's
     # "plan = the price Stripe bills" lookup resolves through the real API.
     probe = stripe.StripeClient("sk_test_123", base_addresses={"api": stripe_mock})
-    fixture_price = probe.v1.subscriptions.retrieve("sub_e2e").to_dict()["items"]["data"][0]["price"]["id"]
+    fixture_sub = probe.v1.subscriptions.retrieve("sub_e2e").to_dict()
+    fixture_price = fixture_sub["items"]["data"][0]["price"]["id"]
     fixture_meter = probe.v1.billing.meters.list().data[0].id
     env = _env(stripe_mock, MEMD_STRIPE_PRICE_DEV_MONTHLY=fixture_price,
                MEMD_STRIPE_METER_ID_RERANKED_SEARCHES=fixture_meter)
     app, h = _app(tmp_path, env)
     try:
         org = h.store.create_org("acme")
+        # ...and since stripe-mock's subscription fixture belongs to a fixed
+        # customer, that is the customer this org's checkout reuses (the
+        # webhook verifies the subscription's customer against the org's)
+        h.store.update_org(org, stripe_customer_id=fixture_sub["customer"])
         key, _ = h.keystore.create("acme", org_id=org, scopes="memory,billing")
         c = TestClient(app)
         c.headers["Authorization"] = f"Bearer {key}"
@@ -458,9 +487,10 @@ def test_end_to_end_checkout_webhook_entitlement_usage_push(tmp_path, stripe_moc
         customer = h.store.get_org(org)["stripe_customer_id"]
         assert customer and customer.startswith("cus_")
 
-        # 2. the signed webhook Stripe sends when the customer paid
+        # 2. the signed webhook Stripe sends when the customer paid (the
+        #    subscription is re-read from Stripe: stripe-mock's fixture)
         ev = event("checkout.session.completed", {
-            "id": r.json()["id"], "object": "checkout.session", "customer": customer,
+            "id": r.json()["id"], "object": "checkout.session", "mode": "subscription", "customer": customer,
             "client_reference_id": org, "subscription": "sub_e2e", "payment_status": "paid",
             "metadata": {"memd_org_id": org, "plan": "dev"}})
         p = json.dumps(ev)

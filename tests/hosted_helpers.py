@@ -47,11 +47,17 @@ def free_port() -> int:
 
 
 class FakeStripe:
-    """POST /v1/billing/meter_events, GET /v1/billing/meters and
-    GET /v1/billing/meters/{id}/event_summaries, idempotent like Stripe -
-    including Stripe's LIMIT: a key is remembered for `key_ttl_s` (Stripe:
-    ~24 h) on the fake's own `clock`, after which the same key is a new
-    event."""
+    """The Stripe endpoints memd uses, over real HTTP for the real SDK:
+
+    - POST /v1/billing/meter_events, GET /v1/billing/meters and
+      GET /v1/billing/meters/{id}/event_summaries, idempotent like Stripe -
+      including Stripe's LIMIT: a key is remembered for `key_ttl_s`
+      (Stripe: ~24 h) on the fake's own `clock`, after which the same key
+      is a new event;
+    - GET /v1/subscriptions/{id} and GET /v1/customers/{id} from the
+      `subscriptions` / `customers` dicts the test fills in;
+    - POST /v1/customers, /v1/checkout/sessions, /v1/billing_portal/sessions
+      (recorded in `created`)."""
 
     def __init__(self, event_names: dict[str, str] | None = None):
         self.lock = threading.Lock()
@@ -68,6 +74,9 @@ class FakeStripe:
         self.on_meter_event = None           # hook(params) -> "kill_before" | None; runs pre-response
         self.after_accept = None             # hook(params) after the event is stored, pre-response
         self.meters = {f"mtr_{i}": name for i, name in enumerate(sorted((event_names or {}).values()))}
+        self.subscriptions: dict[str, dict] = {}
+        self.customers: dict[str, dict] = {}
+        self.created: list[tuple[str, dict]] = []  # (kind, form) of every create call
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -87,7 +96,23 @@ class FakeStripe:
                 form = {k: v[0] for k, v in parse_qs(self.rfile.read(n).decode()).items()}
                 if fake.down:
                     return self._send(503, {"error": {"message": "outage", "type": "api_error"}})
-                if urlparse(self.path).path != "/v1/billing/meter_events":
+                path = urlparse(self.path).path
+                if path in ("/v1/customers", "/v1/checkout/sessions", "/v1/billing_portal/sessions"):
+                    kind = path.rsplit("/", 2)[-2] if path.endswith("sessions") else "customer"
+                    with fake.lock:
+                        fake.created.append((kind, form))
+                        n_created = len(fake.created)
+                    if kind == "customer":
+                        cid = f"cus_fake{n_created}"
+                        meta = {k[len("metadata["):-1]: v for k, v in form.items() if k.startswith("metadata[")}
+                        fake.customers[cid] = {"id": cid, "object": "customer", "metadata": meta}
+                        return self._send(200, fake.customers[cid])
+                    obj = "checkout.session" if kind == "checkout" else "billing_portal.session"
+                    return self._send(200, {"id": f"{'cs' if kind == 'checkout' else 'bps'}_fake{n_created}",
+                                            "object": obj, "url": f"https://stripe.test/{kind}/{n_created}",
+                                            "customer": form.get("customer"),
+                                            "expires_at": int(form.get("expires_at") or 0) or None})
+                if path != "/v1/billing/meter_events":
                     return self._send(404, {"error": {"message": "unknown path"}})
                 key = self.headers.get("Idempotency-Key")
                 params = {"event_name": form.get("event_name"), "identifier": form.get("identifier"),
@@ -126,6 +151,12 @@ class FakeStripe:
                 u = urlparse(self.path)
                 q = {k: v[0] for k, v in parse_qs(u.query).items()}
                 parts = u.path.strip("/").split("/")
+                if len(parts) == 3 and parts[:2] in (["v1", "subscriptions"], ["v1", "customers"]):
+                    table = fake.subscriptions if parts[1] == "subscriptions" else fake.customers
+                    if parts[2] not in table:
+                        return self._send(404, {"error": {"message": "No such object", "type": "invalid_request_error",
+                                                          "code": "resource_missing"}})
+                    return self._send(200, table[parts[2]])
                 if u.path == "/v1/billing/meters":
                     return self._send(200, {"object": "list", "has_more": False, "url": u.path, "data": [
                         {"object": "billing.meter", "id": mid, "event_name": name, "status": "active"}

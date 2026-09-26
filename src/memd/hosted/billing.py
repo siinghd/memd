@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping
@@ -27,11 +28,64 @@ _log = logging.getLogger("memd.billing")
 # /metrics then shows these series to operator keys only
 _OPS = {"ns": "_billing"}
 
+# subscription status -> entitlement. Only these grant the paid plan:
+PAID_SUB_STATUSES = frozenset({"active", "trialing"})
+# the plan is kept, the grace clock runs (then read-only)
+GRACE_SUB_STATUSES = frozenset({"past_due"})
+# no longer a subscription at all
 DEAD_STATUSES = frozenset({"canceled", "incomplete_expired"})
-GRACE_STATUSES = frozenset({"past_due", "unpaid"})
+# still the org's subscription (so a second one is a duplicate), but not
+# entitling anything unless in PAID/GRACE: incomplete, unpaid, paused
+LIVE_SUB_STATUSES = frozenset({"active", "trialing", "past_due", "unpaid", "incomplete", "paused"})
+GRACE_STATUSES = GRACE_SUB_STATUSES  # org.status values the grace/read-only rules watch
 # "no_payment_required": a 100%-off coupon or a trial
 PAID_SESSION_STATUSES = frozenset({"paid", "no_payment_required"})
 INTERVALS = {"month": "MONTHLY", "year": "YEARLY"}
+# a Checkout Session memd creates expires after this (Stripe: 30 min - 24 h);
+# while one is open, a second checkout is refused
+CHECKOUT_TTL_S = 3600
+_SECRET_ENV = ("MEMD_STRIPE_SECRET_KEY", "MEMD_STRIPE_WEBHOOK_SECRET")
+
+_KEYLIKE = [
+    (re.compile(r"\b((?:sk|rk|pk)_(?:live|test))_[A-Za-z0-9_]+"), r"\1_[REDACTED]"),
+    (re.compile(r"\bwhsec_[A-Za-z0-9_]+"), "whsec_[REDACTED]"),
+    (re.compile(r"\bmemd_[A-Za-z0-9_.-]+_[0-9a-f]{8}_[0-9a-f]{16,}"), "memd_[REDACTED]"),
+    (re.compile(r"(?i)\b(bearer|basic)\s+[^\s'\",;]+"), r"\1 [REDACTED]"),
+]
+
+
+def redact(text: object) -> str:
+    """Stripe error text can echo the API key ("Authorization was 'Bearer
+    sk_test_...'"): nothing key-like is ever logged or stored."""
+    out = str(text)
+    for rx, sub in _KEYLIKE:
+        out = rx.sub(sub, out)
+    return out
+
+
+class _RedactingFilter(logging.Filter):
+    """The Stripe SDK logs response bodies at INFO/DEBUG, and an auth error's
+    body echoes the key ("Authorization was 'Bearer sk_...'")."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        clean = redact(msg)
+        if clean != msg:
+            record.msg, record.args = clean, ()
+        if record.exc_info and not record.exc_text:
+            # formatters reuse a cached exc_text: cache the redacted one
+            record.exc_text = redact(logging.Formatter().formatException(record.exc_info))
+        return True
+
+
+def install_log_redaction() -> None:
+    for name in ("stripe", "memd.billing", "memd.hosted"):
+        lg = logging.getLogger(name)
+        if not any(isinstance(f, _RedactingFilter) for f in lg.filters):
+            lg.addFilter(_RedactingFilter())
 
 
 class LiveKeyRefused(RuntimeError):
@@ -39,16 +93,17 @@ class LiveKeyRefused(RuntimeError):
 
 
 class BillingError(Exception):
-    def __init__(self, status: int, code: str, detail: str):
+    def __init__(self, status: int, code: str, detail: str, **extra: Any):
         super().__init__(detail)
-        self.status, self.code, self.detail = status, code, detail
+        self.status, self.code, self.detail, self.extra = status, code, detail, extra
 
 
 def guard_live_key(key: str | None, env: Mapping[str, str] | None = None) -> None:
     """Refuse live keys (secret or restricted) unless explicitly allowed:
-    a live key on a dev box bills real cards."""
+    a live key on a dev box bills real cards. Whitespace around the key
+    (a pasted newline) does not hide it."""
     env = os.environ if env is None else env
-    if key and key.startswith(("sk_live_", "rk_live_")) and env.get("MEMD_ALLOW_LIVE_BILLING") != "1":
+    if key and key.strip().startswith(("sk_live_", "rk_live_")) and env.get("MEMD_ALLOW_LIVE_BILLING") != "1":
         raise LiveKeyRefused(
             "refusing to start hosted billing with a LIVE Stripe key; use an sk_test_ key, "
             "or set MEMD_ALLOW_LIVE_BILLING=1 on the production deployment")
@@ -56,8 +111,8 @@ def guard_live_key(key: str | None, env: Mapping[str, str] | None = None) -> Non
 
 @dataclass
 class BillingConfig:
-    secret_key: str = ""
-    webhook_secret: str = ""
+    secret_key: str = field(default="", repr=False)
+    webhook_secret: str = field(default="", repr=False)
     api_base: str = ""
     webhook_tolerance_s: int = 300
     max_push_age_s: int = MAX_AUTO_PUSH_AGE_S
@@ -69,16 +124,25 @@ class BillingConfig:
     success_url: str = ""
     cancel_url: str = ""
     return_url: str = ""
-    env: dict[str, str] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict, repr=False)  # prices and meters; no secrets
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "BillingConfig":
         env = dict(os.environ if env is None else env)
+        guard_live_key(env.get("MEMD_STRIPE_SECRET_KEY", ""), env)
+        for name in _SECRET_ENV:
+            v = env.get(name, "")
+            if any(c.isspace() for c in v):
+                raise ValueError(f"{name} contains whitespace (a pasted newline?); refusing to start")
+        tolerance = int(env.get("MEMD_STRIPE_WEBHOOK_TOLERANCE_S", "300"))
+        if tolerance <= 0:
+            # stripe.Webhook treats 0 as "no timestamp check": replays forever
+            raise ValueError("MEMD_STRIPE_WEBHOOK_TOLERANCE_S must be > 0")
         cfg = cls(
             secret_key=env.get("MEMD_STRIPE_SECRET_KEY", ""),
             webhook_secret=env.get("MEMD_STRIPE_WEBHOOK_SECRET", ""),
             api_base=env.get("MEMD_STRIPE_API_BASE", ""),
-            webhook_tolerance_s=int(env.get("MEMD_STRIPE_WEBHOOK_TOLERANCE_S", "300")),
+            webhook_tolerance_s=tolerance,
             # capped below Stripe's ~24 h idempotency-key memory
             max_push_age_s=min(int(env.get("MEMD_BILLING_MAX_PUSH_AGE_S", str(MAX_AUTO_PUSH_AGE_S))),
                                MAX_AUTO_PUSH_AGE_S),
@@ -87,7 +151,7 @@ class BillingConfig:
             grace_days=float(env.get("MEMD_BILLING_GRACE_DAYS", "7")),
             drift_tolerance=float(env.get("MEMD_BILLING_DRIFT_TOLERANCE", "0.01")),
             public_url=env.get("MEMD_PUBLIC_URL", "http://localhost:8700").rstrip("/"),
-            env={k: v for k, v in env.items() if k.startswith("MEMD_STRIPE_")},
+            env={k: v for k, v in env.items() if k.startswith("MEMD_STRIPE_") and k not in _SECRET_ENV},
         )
         cfg.success_url = env.get("MEMD_BILLING_SUCCESS_URL") or (
             f"{cfg.public_url}/billing/success?session_id={{CHECKOUT_SESSION_ID}}")
@@ -130,6 +194,28 @@ class BillingConfig:
         return best
 
 
+def _object_id(v: Any) -> str | None:
+    if isinstance(v, str):
+        return v or None
+    if isinstance(v, Mapping):
+        return v.get("id")
+    return None
+
+
+def _customer_id(obj: Mapping[str, Any] | None) -> str | None:
+    return _object_id((obj or {}).get("customer"))
+
+
+def _invoice_subscription(inv: Mapping[str, Any]) -> str | None:
+    """The subscription an invoice bills: `subscription` (older API
+    versions) or parent.subscription_details.subscription (newer)."""
+    sid = _object_id(inv.get("subscription"))
+    if sid:
+        return sid
+    details = ((inv.get("parent") or {}).get("subscription_details") or {})
+    return _object_id(details.get("subscription"))
+
+
 def _price_ids(sub: Mapping[str, Any] | None) -> list[str]:
     items = ((sub or {}).get("items") or {}).get("data") or []
     out = []
@@ -163,6 +249,7 @@ class _Rollback(Exception):
 
 class Billing:
     def __init__(self, store: AdminStore, plans: Plans, cfg: BillingConfig, client: Any = None):
+        install_log_redaction()
         self.store = store
         self.plans = plans
         self.cfg = cfg
@@ -194,10 +281,6 @@ class Billing:
             raise BillingError(400, "invalid_plan", f"unknown or unpaid plan {plan_name!r}")
         if interval not in INTERVALS:
             raise BillingError(400, "invalid_interval", f"unknown billing interval {interval!r}")
-        if (self.plans.get(org["plan"]).paid and org.get("stripe_subscription_id")
-                and org.get("status") not in DEAD_STATUSES):
-            raise BillingError(409, "already_subscribed",
-                               "the org already has a subscription; change plans in the billing portal")
         plan = self.plans.get(plan_name)
         flat = self.cfg.flat_price(plan_name, interval)
         if interval == "year" and not flat:
@@ -211,7 +294,10 @@ class Billing:
         items += [{"price": self.cfg.metered_price(plan_name, m)} for m in sorted(plan.metered)]
         if not items:
             raise BillingError(503, "billing_not_configured", f"no Stripe prices for {plan_name!r}")
+        now = int(time.time())
+        self._claim_checkout_slot(org["id"], now)
         meta = {"memd_org_id": org["id"], "plan": plan_name, "interval": interval}
+        expires = now + CHECKOUT_TTL_S
         try:
             customer = self._ensure_customer(org)
             session = self.svc.checkout.sessions.create(params={
@@ -222,23 +308,46 @@ class Billing:
                 "success_url": self.cfg.success_url,
                 "cancel_url": self.cfg.cancel_url,
                 "allow_promotion_codes": True,
+                "expires_at": expires,
                 "metadata": meta,
                 "subscription_data": {"metadata": meta},
             })
-        except BillingError:
-            raise
         except Exception as ex:
-            _log.warning("memd billing: checkout failed for %s: %s", org["id"], ex)
+            self.store.update_org(org["id"], checkout_session_id=None, checkout_url=None, checkout_expires_at=None)
+            if isinstance(ex, BillingError):
+                raise
+            _log.warning("memd billing: checkout failed for %s: %s", org["id"], redact(ex))
             METRICS.inc("memd_billing_stripe_errors_total", op="checkout", **_OPS)
             raise BillingError(502, "billing_error", "could not start checkout") from None
+        self.store.update_org(org["id"], checkout_session_id=session.id, checkout_url=session.url,
+                              checkout_expires_at=expires)
         self.store.append_log(org["id"], "checkout_started", {"plan": plan_name, "interval": interval,
                                                               "session": session.id})
         return {"url": session.url, "id": session.id}
 
+    def _claim_checkout_slot(self, org_id: str, now: int) -> None:
+        """One subscription per org: refuse while one is live, and let only
+        ONE Checkout Session be open at a time - claimed atomically, so two
+        racing requests cannot both reach Stripe."""
+        with self.store.txn() as con:
+            o = dict(con.execute("SELECT * FROM org WHERE id = ?", (org_id,)).fetchone())
+            if o.get("stripe_subscription_id") and o.get("status") in LIVE_SUB_STATUSES:
+                raise BillingError(409, "already_subscribed",
+                                   "the org already has a subscription; change plans in the billing portal")
+            if o.get("checkout_expires_at") and int(o["checkout_expires_at"]) > now:
+                raise BillingError(409, "checkout_pending",
+                                   "a checkout for this org is already open; finish it or let it expire",
+                                   url=o.get("checkout_url"), expires_at=o.get("checkout_expires_at"))
+            # the slot is held (for the Stripe round trip) before any call
+            con.execute("UPDATE org SET checkout_session_id = NULL, checkout_url = NULL, checkout_expires_at = ?"
+                        " WHERE id = ?", (now + 120, org_id))
+
     def _ensure_customer(self, org: dict) -> str:
         if org.get("stripe_customer_id"):
             return org["stripe_customer_id"]
-        # the idempotency key makes two racing checkouts create ONE customer
+        # the metadata marks the customer as created by OUR checkout for THIS
+        # org (webhooks bind a customer to an org only on that evidence); the
+        # idempotency key makes two racing checkouts create ONE customer
         cust = self.svc.customers.create(
             params={"name": org.get("name") or org["id"], "metadata": {"memd_org_id": org["id"]}},
             options={"idempotency_key": f"memd-customer-{org['id']}"})
@@ -257,7 +366,7 @@ class Billing:
             s = self.svc.billing_portal.sessions.create(params={
                 "customer": org["stripe_customer_id"], "return_url": self.cfg.return_url})
         except Exception as ex:
-            _log.warning("memd billing: portal failed for %s: %s", org["id"], ex)
+            _log.warning("memd billing: portal failed for %s: %s", org["id"], redact(ex))
             METRICS.inc("memd_billing_stripe_errors_total", op="portal", **_OPS)
             raise BillingError(502, "billing_error", "could not open the billing portal") from None
         return {"url": s.url}
@@ -280,15 +389,17 @@ class Billing:
                                                    tolerance=self.cfg.webhook_tolerance_s)
         except (stripe.SignatureVerificationError, ValueError) as ex:
             METRICS.inc("memd_billing_webhook_rejected_total", **_OPS)
-            _log.warning("memd billing: webhook rejected: %s", ex)
+            _log.warning("memd billing: webhook rejected: %s", redact(ex))
             raise BillingError(400, "invalid_signature", "signature verification failed") from None
         return event.to_dict()
 
     def handle_event(self, event: Mapping[str, Any]) -> dict:
-        """Apply one Stripe event. The processed_events claim and the event's
-        effects commit in ONE transaction: a re-delivery is a no-op, and an
-        event whose effects failed (or asked to be retried) stays unclaimed so
-        Stripe's retry is processed for real."""
+        """Apply one Stripe event. Stripe reads it needs (the subscription a
+        session completed, a customer's metadata) happen first, outside the
+        admin write transaction; a failed read raises (500: Stripe retries).
+        The processed_events claim and the event's effects then commit in
+        ONE transaction: a re-delivery is a no-op, and an event whose effects
+        failed (or asked to be retried) stays unclaimed."""
         eid = str(event.get("id") or "")
         etype = str(event.get("type") or "")
         if not eid:
@@ -301,36 +412,69 @@ class Billing:
         if self.store.processed_event(eid) is not None:
             METRICS.inc("memd_billing_webhook_total", type=etype, result="duplicate", **_OPS)
             return {"handled": False, "type": etype, "duplicate": True}
-        sub = None
-        if etype == "checkout.session.completed":
-            # the Stripe call happens OUTSIDE the admin write transaction
-            sub = self._subscription_of(obj)
+        pre = self._prefetch(etype, obj)
         try:
             with self.store.txn() as con:
                 if not AdminStore.claim_event(con, eid, etype, created or None):
                     result = {"handled": False, "type": etype, "duplicate": True}
                 else:
-                    result = self._apply(con, etype, obj, created, sub)
+                    result = self._apply(con, etype, obj, created, pre)
                     if result.get("retry"):
                         raise _Rollback(result)
                     AdminStore.finish_event(con, eid, result.get("org_id"),
                                             "handled" if result.get("handled") else result.get("reason", ""))
         except _Rollback as rb:
             result = rb.result
+        if result.get("reason") == "unknown_customer":
+            METRICS.inc("memd_billing_webhook_unmapped_total", type=etype, **_OPS)
         METRICS.inc("memd_billing_webhook_total", type=etype,
                     result="duplicate" if result.get("duplicate") else
                     ("retry" if result.get("retry") else ("handled" if result.get("handled") else "ignored")),
                     **_OPS)
         return result
 
-    def _subscription_of(self, session: Mapping[str, Any]) -> dict | None:
-        sub = session.get("subscription")
-        if isinstance(sub, Mapping):
-            return dict(sub)  # expanded in the payload
-        if not sub or not self.cfg.configured:
+    def _session_org(self, obj: Mapping[str, Any], con=None) -> dict | None:
+        ref = obj.get("client_reference_id") or (obj.get("metadata") or {}).get("memd_org_id")
+        if ref:
+            if con is not None:
+                row = con.execute("SELECT * FROM org WHERE id = ?", (str(ref),)).fetchone()
+                return dict(row) if row is not None else None
+            return self.store.get_org(str(ref))
+        cust = _customer_id(obj)
+        if not cust:
             return None
-        # raises on a Stripe outage: the webhook answers 500 and Stripe retries
-        return self.svc.subscriptions.retrieve(str(sub)).to_dict()
+        if con is not None:
+            row = con.execute("SELECT * FROM org WHERE stripe_customer_id = ?", (cust,)).fetchone()
+            return dict(row) if row is not None else None
+        return self.store.org_by_customer(cust)
+
+    def _customer_org_id(self, customer: str) -> str | None:
+        """The memd org OUR checkout created this Stripe customer for (the
+        metadata _ensure_customer writes), or None."""
+        c = self.svc.customers.retrieve(customer).to_dict()
+        if c.get("deleted"):
+            return None
+        return (c.get("metadata") or {}).get("memd_org_id")
+
+    def _prefetch(self, etype: str, obj: Mapping[str, Any]) -> dict:
+        pre: dict[str, Any] = {}
+        customer = _customer_id(obj)
+        if etype == "checkout.session.completed":
+            sid = _object_id(obj.get("subscription"))
+            if obj.get("mode") == "subscription" and sid:
+                # ALWAYS Stripe's current copy, never the payload's: a late
+                # delivery must not apply a state the subscription has left
+                pre["sub"] = self.svc.subscriptions.retrieve(sid).to_dict()
+            org = self._session_org(obj)
+            if org is not None and not org.get("stripe_customer_id") and customer:
+                pre["customer_org"] = self._customer_org_id(customer)
+        elif etype.startswith("customer.subscription.") and customer:
+            if self.store.org_by_customer(customer) is None:
+                oid = (obj.get("metadata") or {}).get("memd_org_id")
+                org = self.store.get_org(str(oid)) if oid else None
+                if org is not None and not org.get("stripe_customer_id"):
+                    pre["customer_org"] = self._customer_org_id(customer)
+        return pre
 
     @staticmethod
     def _org(con, org_id: str | None = None, customer: str | None = None) -> dict | None:
@@ -341,102 +485,149 @@ class Billing:
             row = con.execute("SELECT * FROM org WHERE id = ?", (org_id,)).fetchone()
         return dict(row) if row is not None else None
 
-    def _apply(self, con, etype: str, obj: dict, created: int, sub: dict | None) -> dict:
+    def _may_bind(self, con, org: dict, customer: str | None, pre: dict, etype: str, ref: Any) -> bool:
+        """An org is bound to a Stripe customer only if it has none yet AND
+        the customer was created by our checkout for this org."""
+        if org.get("stripe_customer_id"):
+            if customer == org["stripe_customer_id"]:
+                return True
+            # e.g. a payment link with a forged client_reference_id
+            AdminStore.log(con, org["id"], "customer_mismatch", {"event": etype, "object": ref})
+            return False
+        if customer and pre.get("customer_org") == org["id"]:
+            return True
+        AdminStore.log(con, org["id"], "customer_unverified", {"event": etype, "object": ref})
+        METRICS.inc("memd_billing_customer_unverified_total", **_OPS)
+        return False
+
+    def _apply(self, con, etype: str, obj: dict, created: int, pre: dict) -> dict:
         now = created or int(time.time())
         grace_s = int(self.cfg.grace_days * 86400)
-        customer = obj.get("customer") if isinstance(obj.get("customer"), str) else (
-            (obj.get("customer") or {}).get("id"))
+        customer = _customer_id(obj)
         meta = obj.get("metadata") or {}
+        unmapped = {"handled": False, "type": etype, "reason": "unknown_customer"}
 
-        if etype == "checkout.session.completed":
-            ref = obj.get("client_reference_id") or meta.get("memd_org_id")
-            org = self._org(con, org_id=ref) if ref else self._org(con, customer=customer)
+        if etype in ("checkout.session.completed", "checkout.session.expired"):
+            org = self._session_org(obj, con)
             if org is None:
-                return {"handled": False, "type": etype, "reason": "unknown_org"}
-            if org.get("stripe_customer_id") and customer and org["stripe_customer_id"] != customer:
-                # a session naming this org but paid by another customer
-                # (e.g. a payment link with a forged client_reference_id)
-                # must not re-point the org's billing account
-                AdminStore.log(con, org["id"], "customer_mismatch", {"session": obj.get("id")})
+                return unmapped
+            ours = org.get("checkout_session_id") == obj.get("id")
+            if etype == "checkout.session.expired":
+                if ours:
+                    self.store.update_org(org["id"], con, checkout_session_id=None, checkout_url=None,
+                                          checkout_expires_at=None)
+                return {"handled": ours, "type": etype, "org_id": org["id"],
+                        **({} if ours else {"reason": "not_the_open_checkout"})}
+            if not self._may_bind(con, org, customer, pre, etype, obj.get("id")):
+                return {"handled": False, "type": etype, "org_id": org["id"], "reason": "customer_unverified"}
+            if ours:
+                self.store.update_org(org["id"], con, checkout_session_id=None, checkout_url=None,
+                                      checkout_expires_at=None)
+            sub = pre.get("sub")
+            if obj.get("mode") != "subscription" or not sub:
+                # a payment-mode session (or one without a subscription) never
+                # grants a plan nor clears past_due / grace
+                return {"handled": False, "type": etype, "org_id": org["id"], "reason": "not_a_subscription"}
+            if _customer_id(sub) != customer:
+                AdminStore.log(con, org["id"], "subscription_customer_mismatch", {"subscription": sub.get("id")})
                 return {"handled": False, "type": etype, "org_id": org["id"], "reason": "customer_mismatch"}
-            sub_id = obj.get("subscription") if isinstance(obj.get("subscription"), str) else (sub or {}).get("id")
-            if str(obj.get("payment_status") or "") not in PAID_SESSION_STATUSES:
-                self.store.update_org(org["id"], con, status="incomplete",
-                                      stripe_customer_id=customer or org.get("stripe_customer_id"),
-                                      stripe_subscription_id=sub_id or org.get("stripe_subscription_id"))
-                AdminStore.log(con, org["id"], "checkout_unpaid", {"session": obj.get("id")})
-                return {"handled": False, "type": etype, "org_id": org["id"], "reason": "payment_incomplete"}
-            # the plan is the one Stripe BILLS (the subscription's prices);
-            # the metadata we wrote into the session is the fallback
-            plan = self.cfg.plan_for_prices(_price_ids(sub), self.plans)
-            if plan is None and meta.get("plan") in self.plans.paid_names():
-                plan = meta["plan"]
-            plan = plan or org["plan"]
-            self.store.update_org(org["id"], con, plan=plan, status="active", grace_until=None,
-                                  stripe_customer_id=customer or org.get("stripe_customer_id"),
-                                  stripe_subscription_id=sub_id or org.get("stripe_subscription_id"),
-                                  current_period_end=_period_end(sub) or org.get("current_period_end"))
-            AdminStore.log(con, org["id"], "subscription_started", {"plan": plan, "session": obj.get("id")})
-            return {"handled": True, "type": etype, "org_id": org["id"], "plan": plan}
+            return self._sync_subscription(con, org, sub, created, etype, customer, grace_s, now)
 
         if etype in ("customer.subscription.created", "customer.subscription.updated",
                      "customer.subscription.deleted"):
             org = self._org(con, customer=customer)
-            if org is None and meta.get("memd_org_id"):
-                cand = self._org(con, org_id=meta["memd_org_id"])
-                if cand and (not cand.get("stripe_customer_id") or cand["stripe_customer_id"] == customer):
-                    org = cand
             if org is None:
-                # the checkout webhook may still be in flight: 500 -> Stripe retries
-                return {"handled": False, "type": etype, "reason": "unknown_org", "retry": True}
-            if created and created < int(org.get("last_event_created") or 0):
-                return {"handled": False, "type": etype, "org_id": org["id"], "reason": "stale_event"}
-            status = "canceled" if etype.endswith(".deleted") else str(obj.get("status") or "active")
-            dead = status in DEAD_STATUSES
-            if dead:
-                plan = "free"
-            else:
-                plan = self.cfg.plan_for_prices(_price_ids(obj), self.plans)
-                if plan is None and meta.get("plan") in self.plans.paid_names():
-                    plan = meta["plan"]
-                plan = plan or org["plan"]
-            if status in GRACE_STATUSES:
+                cand = self._org(con, org_id=str(meta["memd_org_id"])) if meta.get("memd_org_id") else None
+                if cand is None:
+                    return unmapped  # not a memd customer: ack, do not retry
+                if not self._may_bind(con, cand, customer, pre, etype, obj.get("id")):
+                    return {"handled": False, "type": etype, "org_id": cand["id"], "reason": "customer_unverified"}
+                org = cand
+            sub = dict(obj)
+            if etype.endswith(".deleted"):
+                sub["status"] = "canceled"
+            return self._sync_subscription(con, org, sub, created, etype, customer, grace_s, now)
+
+        if etype in ("invoice.payment_failed", "invoice.payment_succeeded", "invoice.paid"):
+            org = self._org(con, customer=customer)
+            if org is None:
+                return unmapped
+            inv_sub = _invoice_subscription(obj)
+            if not inv_sub or inv_sub != org.get("stripe_subscription_id"):
+                # a one-off invoice or another subscription's: it neither
+                # starts nor ends the current subscription's grace
+                return {"handled": False, "type": etype, "org_id": org["id"], "reason": "noncurrent_subscription"}
+            if etype == "invoice.payment_failed":
+                if not self.plans.get(org["plan"]).paid:
+                    return {"handled": False, "type": etype, "org_id": org["id"], "reason": "not_on_paid_plan"}
+                # the grace clock starts at the FIRST failure; Stripe's retries
+                # of the same invoice must not extend it
                 grace = org.get("grace_until") or now + grace_s
-            else:
-                grace = None
-            self.store.update_org(
-                org["id"], con, plan=plan, status=status, grace_until=grace,
-                stripe_customer_id=customer or org.get("stripe_customer_id"),
-                stripe_subscription_id=None if dead else (obj.get("id") or org.get("stripe_subscription_id")),
-                current_period_end=None if dead else _period_end(obj),
-                last_event_created=max(created, int(org.get("last_event_created") or 0)))
-            AdminStore.log(con, org["id"], etype.rsplit(".", 1)[1] + "_subscription",
-                           {"plan": plan, "status": status, "subscription": obj.get("id")})
-            return {"handled": True, "type": etype, "org_id": org["id"], "plan": plan, "status": status}
-
-        if etype == "invoice.payment_failed":
-            org = self._org(con, customer=customer)
-            if org is None:
-                return {"handled": False, "type": etype, "reason": "unknown_org"}
-            if not self.plans.get(org["plan"]).paid:
-                return {"handled": False, "type": etype, "org_id": org["id"], "reason": "not_on_paid_plan"}
-            # the grace clock starts at the FIRST failure; Stripe's retries
-            # of the same invoice must not extend it
-            grace = org.get("grace_until") or now + grace_s
-            self.store.update_org(org["id"], con, status="past_due", grace_until=grace)
-            AdminStore.log(con, org["id"], "payment_failed", {"invoice": obj.get("id"), "grace_until": grace})
-            return {"handled": True, "type": etype, "org_id": org["id"], "grace_until": grace}
-
-        if etype in ("invoice.payment_succeeded", "invoice.paid"):
-            org = self._org(con, customer=customer)
-            if org is None:
-                return {"handled": False, "type": etype, "reason": "unknown_org"}
-            if org["status"] in GRACE_STATUSES or org["status"] == "incomplete" or org.get("grace_until"):
+                self.store.update_org(org["id"], con, status="past_due", grace_until=grace)
+                AdminStore.log(con, org["id"], "payment_failed", {"invoice": obj.get("id"), "grace_until": grace})
+                return {"handled": True, "type": etype, "org_id": org["id"], "grace_until": grace}
+            if org["status"] in GRACE_STATUSES or org.get("grace_until"):
                 self.store.update_org(org["id"], con, status="active", grace_until=None)
             AdminStore.log(con, org["id"], "payment_succeeded", {"invoice": obj.get("id")})
             return {"handled": True, "type": etype, "org_id": org["id"]}
 
         return {"handled": False, "type": etype, "reason": "ignored"}
+
+    def _sync_subscription(self, con, org: dict, sub: Mapping[str, Any], created: int, etype: str,
+                           customer: str | None, grace_s: int, now: int) -> dict:
+        """Apply a subscription's state to its org - one subscription per org.
+
+        Only active/trialing grant the plan its prices bill; past_due keeps
+        it while the grace clock runs; incomplete, unpaid, paused and the dead
+        statuses grant nothing. A second live subscription is flagged (its
+        metered usage would be billed twice, so pushes are held) instead of
+        replacing the current one, and a non-current subscription ending
+        never downgrades the org. Re-ordered older events are ignored."""
+        sid = str(sub.get("id") or "")
+        status = str(sub.get("status") or "")
+        if created and created < int(org.get("last_event_created") or 0):
+            return {"handled": False, "type": etype, "org_id": org["id"], "reason": "stale_event"}
+        cur = org.get("stripe_subscription_id")
+        if cur != sid and (status not in LIVE_SUB_STATUSES or (cur and org.get("status") in LIVE_SUB_STATUSES)):
+            if status in LIVE_SUB_STATUSES:
+                if org.get("duplicate_subscription_id") != sid:
+                    self.store.update_org(org["id"], con, duplicate_subscription_id=sid)
+                    AdminStore.log(con, org["id"], "duplicate_subscription", {"current": cur, "duplicate": sid})
+                    METRICS.inc("memd_billing_duplicate_subscriptions_total", **_OPS)
+                    _log.warning("memd billing: org %s has a second live subscription %s (current %s): metered "
+                                 "pushes held until one is canceled", org["id"], sid, cur)
+                return {"handled": False, "type": etype, "org_id": org["id"], "reason": "duplicate_subscription"}
+            if org.get("duplicate_subscription_id") == sid:
+                self.store.update_org(org["id"], con, duplicate_subscription_id=None)
+                AdminStore.log(con, org["id"], "duplicate_resolved", {"subscription": sid})
+                return {"handled": True, "type": etype, "org_id": org["id"], "reason": "duplicate_resolved"}
+            AdminStore.log(con, org["id"], "noncurrent_subscription", {"subscription": sid, "status": status})
+            return {"handled": False, "type": etype, "org_id": org["id"], "reason": "noncurrent_subscription"}
+
+        dead = status in DEAD_STATUSES
+        if status in PAID_SUB_STATUSES or status in GRACE_SUB_STATUSES:
+            plan = self.cfg.plan_for_prices(_price_ids(sub), self.plans)
+            if plan is None and (sub.get("metadata") or {}).get("plan") in self.plans.paid_names():
+                plan = sub["metadata"]["plan"]
+            plan = plan or (org["plan"] if self.plans.get(org["plan"]).paid else "free")
+        else:
+            plan = "free"  # incomplete, unpaid, paused, canceled, incomplete_expired
+        grace = (org.get("grace_until") or now + grace_s) if status in GRACE_SUB_STATUSES else None
+        fields: dict[str, Any] = dict(
+            plan=plan, status=status, grace_until=grace,
+            stripe_customer_id=org.get("stripe_customer_id") or customer,
+            stripe_subscription_id=None if dead else sid,
+            current_period_end=None if dead else _period_end(sub),
+            last_event_created=max(created, int(org.get("last_event_created") or 0)))
+        if dead and org.get("duplicate_subscription_id"):
+            # the current one ended while a duplicate is live: its next event
+            # makes it current; until then usage is no longer held
+            AdminStore.log(con, org["id"], "duplicate_left", {"duplicate": org["duplicate_subscription_id"]})
+            fields["duplicate_subscription_id"] = None
+        self.store.update_org(org["id"], con, **fields)
+        AdminStore.log(con, org["id"], etype.rsplit(".", 1)[1] + "_subscription",
+                       {"plan": plan, "status": status, "subscription": sid})
+        return {"handled": True, "type": etype, "org_id": org["id"], "plan": plan, "status": status}
 
     # ------------------------------------------------------------ meter push
 
@@ -450,9 +641,9 @@ class Billing:
         except BillingError:
             raise
         except Exception as ex:
-            self.store.mark_push_failed(b["id"], f"{type(ex).__name__}: {ex}")
+            self.store.mark_push_failed(b["id"], redact(f"{type(ex).__name__}: {ex}"))
             METRICS.inc("memd_billing_push_failures_total", meter=b["meter"], **_OPS)
-            _log.warning("memd billing: meter push %s failed: %s", b["id"], ex)
+            _log.warning("memd billing: meter push %s failed: %s", b["id"], redact(ex))
             return False
         METRICS.inc("memd_billing_meter_events_pushed_total", meter=b["meter"], **_OPS)
         return True
@@ -578,7 +769,7 @@ class Billing:
                 in_stripe = self._stripe_total(meter, customer, start, end)
             except Exception as ex:
                 METRICS.inc("memd_billing_stripe_errors_total", op="reconcile", **_OPS)
-                _log.warning("memd billing: reconcile deferred for %s/%s: %s", g["org_id"], meter, ex)
+                _log.warning("memd billing: reconcile deferred for %s/%s: %s", g["org_id"], meter, redact(ex))
                 out["deferred"] += 1
                 continue
             settled = 0 if meter in GAUGES else self.store.settled_units(g["org_id"], meter, customer, start, end)
@@ -626,7 +817,7 @@ class Billing:
                 stripe_val = self._stripe_total(meter, customer, start, end)
             except Exception as ex:
                 METRICS.inc("memd_billing_stripe_errors_total", op="reconcile", **_OPS)
-                rows.append({"org_id": org_id, "meter": meter, "error": f"{type(ex).__name__}: {ex}"})
+                rows.append({"org_id": org_id, "meter": meter, "error": redact(f"{type(ex).__name__}: {ex}")})
                 continue
             if meter in GAUGES:
                 ledger_val = float(self.store.last_settled_gauge(org_id, meter, customer, start, end) or 0)

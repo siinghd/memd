@@ -62,6 +62,10 @@ class Forbidden(Exception):
 class _NoAdmission:
     """An org-less principal (the operator key): nothing reserved or billed."""
 
+    allow_rerank = True
+    extract_limit: int | None = None
+    max_facts: int | None = None
+
     def __enter__(self):
         return self
 
@@ -76,9 +80,19 @@ NO_ADMISSION = _NoAdmission()
 
 
 class Admission:
-    def __init__(self, metering: "Metering", p: Any, ns: str, reservation: str | None):
+    """What the operation may do, and at most what it may record:
+    `allow_rerank` (the reranked-search quota), `extract_limit` (raw records
+    the extractor may see) and `max_facts` (facts a session close may
+    write). None: unlimited. Every recorded quantity stays within what was
+    reserved."""
+
+    def __init__(self, metering: "Metering", p: Any, ns: str, reservation: str | None, *,
+                 allow_rerank: bool = True, extract_limit: int | None = None, max_facts: int | None = None):
         self.metering, self.p, self.ns, self.reservation = metering, p, ns, reservation
+        self.allow_rerank, self.extract_limit, self.max_facts = allow_rerank, extract_limit, max_facts
         self.recorded = False
+        if reservation is not None:
+            metering._live_add(reservation)
 
     def __enter__(self) -> "Admission":
         return self
@@ -92,8 +106,12 @@ class Admission:
 
     def __exit__(self, *exc) -> None:
         # the operation failed (or never recorded): give the quota back
-        if not self.recorded and self.reservation is not None:
-            self.metering.store.release(self.reservation)
+        if self.reservation is not None:
+            try:
+                if not self.recorded:
+                    self.metering.store.release(self.reservation)
+            finally:
+                self.metering._live_discard(self.reservation)
         return None
 
 
@@ -101,8 +119,12 @@ class Metering:
     # a namespace's live record count is re-read from the engine at most
     # this often; between reads it moves by the writes/deletes seen here
     ANCHOR_TTL_S = 300.0
-    # a reservation outliving this belongs to a crashed request
+    # a reservation outliving this (and no longer held by a running request
+    # of this process) belongs to a crashed request
     RESERVATION_TTL_S = 600.0
+    # facts a session close may write when the memories cap is hard: all of
+    # the remaining allowance near the cap, at most this much far from it
+    CLOSE_FACT_RESERVE = 10_000
 
     def __init__(self, store: AdminStore, plans: Plans, engine: Any,
                  clock: Callable[[], float] = time.time):
@@ -116,6 +138,21 @@ class Metering:
         self._stored_lock = threading.Lock()
         self._counts: dict[str, list[float]] = {}  # ns -> [records, anchored_at (monotonic)]
         self._owners: dict[str, str] = {}  # ns -> org (ownership never moves)
+        # reservations of requests still running here: never expired, however
+        # long the request takes (the TTL only reclaims a dead request's)
+        self._live: set[str] = set()
+
+    def _live_add(self, rid: str) -> None:
+        with self._lock:
+            self._live.add(rid)
+
+    def _live_discard(self, rid: str) -> None:
+        with self._lock:
+            self._live.discard(rid)
+
+    def _live_ids(self) -> frozenset[str]:
+        with self._lock:
+            return frozenset(self._live)
 
     # -------------------------------------------------------------- authz
 
@@ -126,7 +163,7 @@ class Metering:
         org_id = getattr(p, "org_id", None)
         if org_id is None or ns is None:
             return
-        if "memory" not in p.scopes and not p.scope_override:
+        if "memory" not in p.scopes:  # exact: `override` does not imply it
             raise Forbidden("key lacks the 'memory' scope")
         owner = self._owners.get(ns)
         if owner is None:
@@ -151,8 +188,15 @@ class Metering:
         key (the dominant COGS line); the local heuristic costs nothing."""
         return bool(getattr(getattr(self.engine, "extractor", None), "api_key", None))
 
-    def admit(self, p: Any, ns: str, *, writes: int = 0, searches: int = 0,
-              extract: bool = False) -> "Admission | _NoAdmission":
+    def admit(self, p: Any, ns: str, *, writes: int = 0, searches: int = 0, extract: bool = False,
+              session_id: str | None = None, user_id: str | None = None) -> "Admission | _NoAdmission":
+        """Check and reserve. `writes`: records to add. `searches`: a search
+        (a spent reranked quota only turns reranking off - allow_rerank -
+        never refuses it). `extract`: a session close - the extraction
+        allowance (at most the session's raw records) and the facts
+        allowance (the memories cap) are reserved up front and handed to the
+        engine as extract_limit / max_facts, so what is recorded can never
+        exceed what was reserved."""
         org_id = getattr(p, "org_id", None)
         if org_id is None:
             return NO_ADMISSION
@@ -167,34 +211,63 @@ class Metering:
                               "(searches and deletes still work); update the payment method in the "
                               "billing portal", grace_until=org["grace_until"])
         plan = self.plans.get(org["plan"])
-        checks: list[tuple[str, int]] = []
+
+        def hard(meter: str) -> float | None:
+            ent = plan.entitlement(meter)
+            return ent.limit if ent.hard and ent.limit is not None else None
+
+        # (meter, want, minimum, limit)
+        checks: list[tuple[str, float, float, float]] = []
+        extract_limit = max_facts = None
         if writes:
-            checks += [(MEMORIES_STORED, writes), (WRITES, writes)]
-        if searches:
-            checks.append((SEARCHES, searches))
-            if getattr(self.engine, "rerank", None) is not None:
-                checks.append((RERANKED_SEARCHES, searches))
-        if extract and self.our_key_extraction():
-            checks.append((EXTRACTIONS_OUR_KEY, 1))
+            checks += [(m, writes, writes, hard(m)) for m in (MEMORIES_STORED, WRITES) if hard(m) is not None]
+        if searches and hard(SEARCHES) is not None:
+            checks.append((SEARCHES, searches, searches, hard(SEARCHES)))
+        if extract:
+            if self.our_key_extraction() and hard(EXTRACTIONS_OUR_KEY) is not None:
+                size = self.engine.session_raw_count(session_id, user_id=user_id, namespace=ns) if session_id else 0
+                # at least 1 of a non-empty session, or nothing to reserve
+                checks.append((EXTRACTIONS_OUR_KEY, size, min(size, 1), hard(EXTRACTIONS_OUR_KEY)))
+            if hard(MEMORIES_STORED) is not None:
+                # a close writes facts: like any write it needs room for one
+                checks.append((MEMORIES_STORED, self.CLOSE_FACT_RESERVE, 1, hard(MEMORIES_STORED)))
         period = period_of(now)
-        hard = [(m, q, plan.entitlement(m).limit) for m, q in checks
-                if plan.entitlement(m).hard and plan.entitlement(m).limit is not None]
-        if not hard:
-            return Admission(self, p, ns, None)
-        live = any(m == MEMORIES_STORED for m, _, _ in hard)
-        if live:
-            self.stored_records(org_id, ns)  # refresh a stale anchor outside the lock
-        with self._stored_lock if live else _NULL_LOCK:
-            base = self.stored_records(org_id, ns) if live else None
-            rid, denied = self.store.try_reserve(
-                org_id, period, [(m, q, lim, base if m == MEMORIES_STORED else None) for m, q, lim in hard],
-                now=now, ttl_s=self.RESERVATION_TTL_S)
-        if denied is not None:
-            METRICS.inc("memd_quota_denials_total", meter=denied["meter"], **_OPS)
-            raise QuotaDenied("quota_exceeded", f"{plan.name} plan limit reached for {denied['meter']}",
-                              meter=denied["meter"], limit=denied["limit"], used=denied["used"],
-                              plan=plan.name)
-        return Admission(self, p, ns, rid)
+        rid: str | None = None
+        granted: dict[str, float] = {}
+        if checks:
+            live = any(m == MEMORIES_STORED for m, *_ in checks)
+            if live:
+                self.stored_records(org_id, ns)  # refresh a stale anchor outside the lock
+            with self._stored_lock if live else _NULL_LOCK:
+                base = self.stored_records(org_id, ns) if live else None
+                rid, denied, granted = self.store.reserve(
+                    org_id, period,
+                    [(m, w, mn, lim, base if m == MEMORIES_STORED else None) for m, w, mn, lim in checks],
+                    now=now, ttl_s=self.RESERVATION_TTL_S, live=self._live_ids())
+            if denied is not None:
+                METRICS.inc("memd_quota_denials_total", meter=denied["meter"], **_OPS)
+                raise QuotaDenied("quota_exceeded", f"{plan.name} plan limit reached for {denied['meter']}",
+                                  meter=denied["meter"], limit=denied["limit"], used=denied["used"],
+                                  plan=plan.name)
+            if extract:
+                if EXTRACTIONS_OUR_KEY in granted:
+                    extract_limit = int(granted[EXTRACTIONS_OUR_KEY])
+                if MEMORIES_STORED in granted:
+                    max_facts = int(granted[MEMORIES_STORED])
+        allow_rerank = True
+        if searches and getattr(self.engine, "rerank", None) is not None and hard(RERANKED_SEARCHES) is not None:
+            # a spent reranked quota never refuses the search: it is served
+            # unreranked and only `searches` is metered
+            rrid, denied, _ = self.store.reserve(
+                org_id, period, [(RERANKED_SEARCHES, searches, searches, hard(RERANKED_SEARCHES), None)],
+                now=now, ttl_s=self.RESERVATION_TTL_S, live=self._live_ids(), rid=rid)
+            if denied is not None:
+                allow_rerank = False
+                METRICS.inc("memd_quota_denials_total", meter=RERANKED_SEARCHES, **_OPS)
+            else:
+                rid = rrid
+        return Admission(self, p, ns, rid, allow_rerank=allow_rerank, extract_limit=extract_limit,
+                         max_facts=max_facts)
 
     # -------------------------------------------------------------- usage
 

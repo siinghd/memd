@@ -38,6 +38,13 @@ CREATE TABLE IF NOT EXISTS org (
   -- newest Stripe subscription event applied: re-ordered deliveries must
   -- not roll the plan back to an older state
   last_event_created INTEGER NOT NULL DEFAULT 0,
+  -- a second live subscription for the same customer: metered usage would
+  -- be billed by both, so pushes for the org are held until it is gone
+  duplicate_subscription_id TEXT,
+  -- the one Checkout Session in flight (one subscription per org)
+  checkout_session_id TEXT,
+  checkout_url TEXT,
+  checkout_expires_at INTEGER,
   created INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS namespace (
@@ -140,7 +147,8 @@ CREATE TABLE IF NOT EXISTS billing_log (
 """
 
 _ORG_COLS = ("name", "stripe_customer_id", "stripe_subscription_id", "plan", "status",
-             "current_period_end", "grace_until", "last_event_created")
+             "current_period_end", "grace_until", "last_event_created", "duplicate_subscription_id",
+             "checkout_session_id", "checkout_url", "checkout_expires_at")
 _USAGE_NS = uuid.UUID("6f1b0c5e-2a7d-4c1e-9a53-8d0f4e2b7c11")
 SCOPES = frozenset({"memory", "billing", "override"})
 # Stripe accepts meter events up to 35 days old; leave a day of margin
@@ -178,6 +186,17 @@ def period_bounds(period: str) -> tuple[int, int]:
     return int(start.timestamp()), int(end.timestamp())
 
 
+def validate_namespace(ns: str) -> str:
+    """The engine's namespace grammar ([A-Za-z0-9][A-Za-z0-9_.-]{0,127}), so
+    '*' (the operator key) and '_'-prefixed names - '_billing' labels the
+    operator-only metrics - can never be bound to a tenant key."""
+    from memd.storage.engine import _validate_ns
+
+    if not isinstance(ns, str) or ns == "*":
+        raise ValueError("hosted keys are bound to one namespace ('*' is the operator key)")
+    return _validate_ns(ns)
+
+
 def parse_scopes(scopes: str | list[str] | None) -> list[str]:
     if scopes is None:
         return ["memory"]
@@ -188,10 +207,28 @@ def parse_scopes(scopes: str | list[str] | None) -> list[str]:
     return sorted(set(items)) or ["memory"]
 
 
+def _private_file(path: str) -> None:
+    """Create `path` owner-only BEFORE SQLite opens it: SQLite gives the
+    -wal/-shm files the database file's mode, so they are born 0600 too."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    os.close(fd)
+    for p in (path, path + "-wal", path + "-shm"):
+        try:
+            os.chmod(p, 0o600)  # also tightens files an older version created
+        except OSError:
+            pass
+
+
 class AdminStore:
     def __init__(self, path: str):
         self.path = path
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        admin_dir = os.path.dirname(path) or "."
+        os.makedirs(admin_dir, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(admin_dir, 0o700)
+        except OSError:
+            pass
+        _private_file(path)
         self._lock = threading.RLock()
         self._con = sqlite3.connect(path, check_same_thread=False, isolation_level=None, timeout=10.0)
         self._con.row_factory = sqlite3.Row
@@ -203,10 +240,7 @@ class AdminStore:
         self._con.execute("PRAGMA busy_timeout=10000")
         with self._lock:
             self._con.executescript(SCHEMA)
-        try:
-            os.chmod(path, 0o600)  # key hashes, customer ids
-        except OSError:
-            pass
+        _private_file(path)  # key hashes, customer ids
 
     @classmethod
     def for_data_root(cls, data_dir: str) -> "AdminStore":
@@ -305,8 +339,7 @@ class AdminStore:
         """A new namespace-bound key for `org_id`, claiming `ns` for the org
         in the same transaction. Returns (full_key, key_id); only the hash of
         the secret is stored."""
-        if ns == "*":
-            raise ValueError("hosted keys are bound to one namespace ('*' is the operator key)")
+        validate_namespace(ns)
         sc = " ".join(parse_scopes(scopes))
         full, kid = generate_key(ns)
         h = hash_secret(full.rsplit("_", 1)[1])
@@ -324,6 +357,7 @@ class AdminStore:
                    created: int | None = None) -> None:
         """Adopt a legacy (keys.toml.json) key: same `memd_<ns>_<kid>_<secret>`
         format and the same secret hash, so the key keeps working unchanged."""
+        validate_namespace(ns)
         sc = " ".join(parse_scopes(scopes))
         with self.txn() as con:
             if con.execute("SELECT 1 FROM org WHERE id = ?", (org_id,)).fetchone() is None:
@@ -401,43 +435,69 @@ class AdminStore:
     # ------------------------------------------------------------ reservations
 
     def try_reserve(self, org_id: str, period: str, checks: list[tuple[str, float, float, float | None]],
-                    *, now: float, ttl_s: float) -> tuple[str | None, dict | None]:
+                    *, now: float, ttl_s: float, live: "set[str] | frozenset[str]" = frozenset(),
+                    rid: str | None = None) -> tuple[str | None, dict | None]:
         """Atomic check-and-reserve for hard caps. `checks` holds (meter,
         quantity, limit, live_base): the used amount is `live_base` (the
         memories gauge, counted outside SQLite) or the period rollup, plus
         every live reservation. Under BEGIN IMMEDIATE no other request can
         check or reserve in between, so concurrent requests at the boundary
-        cannot all pass. Returns (reservation id, None) or (None, denial)."""
-        rid = str(uuid.uuid4())
-        try:
-            self._reserve(rid, org_id, period, checks, now=now, ttl_s=ttl_s)
-        except _Denied as d:
-            return None, d.info
-        return rid, None
+        cannot all pass. Returns (reservation id, None) or (None, denial).
 
-    def _reserve(self, rid: str, org_id: str, period: str, checks, *, now: float, ttl_s: float) -> None:
-        with self.txn() as con:
-            con.execute("DELETE FROM usage_reservation WHERE created < ?", (now - ttl_s,))
-            for meter, qty, limit, live_base in checks:
-                rperiod = "live" if live_base is not None else period
-                if live_base is not None:
-                    used = float(live_base)
-                else:
-                    row = con.execute("SELECT quantity FROM usage_rollup WHERE org_id = ? AND meter = ?"
-                                      " AND period = ?", (org_id, meter, period)).fetchone()
-                    used = float(row["quantity"]) if row else 0.0
-                held = con.execute("SELECT COALESCE(SUM(quantity), 0) FROM usage_reservation"
-                                   " WHERE org_id = ? AND meter = ? AND period = ?",
-                                   (org_id, meter, rperiod)).fetchone()[0]
-                if used + float(held) + qty > limit:
-                    # raising rolls back the reservations made so far
-                    raise _Denied({"meter": meter, "limit": limit, "used": used + float(held)})
-                con.execute("INSERT INTO usage_reservation (id, org_id, meter, period, quantity, created)"
-                            " VALUES (?, ?, ?, ?, ?, ?)", (rid, org_id, meter, rperiod, float(qty), now))
+        Expiry reclaims only reservations older than `ttl_s` that are NOT in
+        `live` (the ids of requests still running in this process): a slow
+        request's quota is never handed out twice, while a crashed request's
+        is. `rid` adds rows to an existing reservation."""
+        rid, denial, _ = self.reserve(org_id, period, [(m, q, q, lim, base) for m, q, lim, base in checks],
+                                      now=now, ttl_s=ttl_s, live=live, rid=rid)
+        return rid, denial
+
+    def reserve(self, org_id: str, period: str, checks: list[tuple[str, float, float, float, float | None]],
+                *, now: float, ttl_s: float, live: "set[str] | frozenset[str]" = frozenset(),
+                rid: str | None = None) -> tuple[str | None, dict | None, dict[str, float]]:
+        """try_reserve() generalized: each check is (meter, want, minimum,
+        limit, live_base) and reserves as much of `want` as fits, refusing
+        (the whole reservation) when less than `minimum` does. Returns
+        (reservation id, denial, {meter: granted})."""
+        rid = rid or str(uuid.uuid4())
+        granted: dict[str, float] = {}
+        try:
+            with self.txn() as con:
+                con.execute("DELETE FROM usage_reservation WHERE created < ? AND id NOT IN"
+                            " (SELECT value FROM json_each(?))", (now - ttl_s, json.dumps(sorted(live))))
+                for meter, want, minimum, limit, live_base in checks:
+                    rperiod = "live" if live_base is not None else period
+                    if live_base is not None:
+                        used = float(live_base)
+                    else:
+                        row = con.execute("SELECT quantity FROM usage_rollup WHERE org_id = ? AND meter = ?"
+                                          " AND period = ?", (org_id, meter, period)).fetchone()
+                        used = float(row["quantity"]) if row else 0.0
+                    held = float(con.execute("SELECT COALESCE(SUM(quantity), 0) FROM usage_reservation"
+                                             " WHERE org_id = ? AND meter = ? AND period = ?",
+                                             (org_id, meter, rperiod)).fetchone()[0])
+                    grant = min(float(want), max(0.0, float(limit) - used - held))
+                    if grant < float(minimum):
+                        # raising rolls back the reservations made so far
+                        raise _Denied({"meter": meter, "limit": limit, "used": used + held})
+                    granted[meter] = grant
+                    if grant > 0:
+                        con.execute("INSERT OR REPLACE INTO usage_reservation (id, org_id, meter, period,"
+                                    " quantity, created) VALUES (?, ?, ?, ?, ?, ?)",
+                                    (rid, org_id, meter, rperiod, grant, now))
+        except _Denied as d:
+            return None, d.info, {}
+        return rid, None, granted
 
     def release(self, reservation: str) -> None:
         with self.txn() as con:
             con.execute("DELETE FROM usage_reservation WHERE id = ?", (reservation,))
+
+    def clear_reservations(self) -> int:
+        """At server start: memd is one process per data root, so every
+        reservation on disk belongs to a request that died with the last one."""
+        with self.txn() as con:
+            return con.execute("DELETE FROM usage_reservation").rowcount
 
     def reservations(self, org_id: str | None = None) -> list[dict]:
         if org_id is None:
@@ -508,6 +568,8 @@ class AdminStore:
                 "SELECT e.id, e.org_id, e.meter, e.billable, e.ts, o.stripe_customer_id AS customer"
                 " FROM usage_event e LEFT JOIN org o ON o.id = e.org_id"
                 " WHERE e.pushed_at IS NULL AND e.push_id IS NULL AND e.push_status IS NULL"
+                # held: two live subscriptions would each bill the usage
+                " AND o.duplicate_subscription_id IS NULL"
                 " ORDER BY e.ts, e.id LIMIT ?", (limit,)).fetchall()
             groups: dict[tuple, list] = {}
             for r in rows:
@@ -548,8 +610,9 @@ class AdminStore:
         return counts
 
     def pending_pushes(self, limit: int = 1000) -> list[dict]:
-        return self._all("SELECT * FROM meter_push WHERE pushed_at IS NULL AND abandoned_at IS NULL"
-                         " ORDER BY created, id LIMIT ?", (limit,))
+        return self._all("SELECT p.* FROM meter_push p JOIN org o ON o.id = p.org_id"
+                         " WHERE p.pushed_at IS NULL AND p.abandoned_at IS NULL"
+                         " AND o.duplicate_subscription_id IS NULL ORDER BY p.created, p.id LIMIT ?", (limit,))
 
     def mark_pushed(self, batch_id: str, now: float | None = None, status: str = "sent") -> None:
         now_i = int(time.time() if now is None else now)
@@ -576,7 +639,8 @@ class AdminStore:
         rows = self._all(
             "SELECT e.id, e.org_id, e.meter, e.billable, e.ts, e.period, o.stripe_customer_id AS customer"
             " FROM usage_event e LEFT JOIN org o ON o.id = e.org_id"
-            " WHERE e.push_status = 'needs_reconcile' ORDER BY e.ts, e.id")
+            " WHERE e.push_status = 'needs_reconcile' AND o.duplicate_subscription_id IS NULL"
+            " ORDER BY e.ts, e.id")
         groups: dict[tuple, dict] = {}
         for r in rows:
             key = (r["org_id"], r["meter"], r["customer"], r["period"],

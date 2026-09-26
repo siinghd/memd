@@ -130,6 +130,10 @@ def _error(status: int, detail: Any, code: str | None = None,
 class _Unmetered:
     """Hosted mode off (the default): no org checks, no quotas, no ledger."""
 
+    allow_rerank = True
+    extract_limit = None
+    max_facts = None
+
     def __enter__(self):
         return self
 
@@ -465,6 +469,7 @@ def create_app(
                 kinds=body.kinds,
                 include_quarantined=body.include_quarantined,
                 namespace=ns,
+                rerank=meter.allow_rerank,  # hosted: False once the reranked quota is spent
             )
             meter.record(searches=1, reranked=res.reranked)
         return {
@@ -546,8 +551,9 @@ def create_app(
         # pinned keys constrain extraction to their user (blocks cross-user
         # session-id injection into the fact lane); override keys may target any
         heavy(ns, "close_session", p)
-        with bill.admit(p, ns, extract=True) as meter:
-            res = engine.close_session(session_id, user_id=p.pinned_user, namespace=ns)
+        with bill.admit(p, ns, extract=True, session_id=session_id, user_id=p.pinned_user) as meter:
+            res = engine.close_session(session_id, user_id=p.pinned_user, namespace=ns,
+                                       extract_limit=meter.extract_limit, max_facts=meter.max_facts)
             meter.record(extraction=res)
         return res
 
