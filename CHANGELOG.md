@@ -45,7 +45,7 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   `BaseException` from a reranker no longer escapes search (KeyboardInterrupt
   and SystemExit still propagate).
 
-## [0.2.0] - 2026-09-24
+## [0.2.0] - 2026-09-26
 
 First release evaluated on real data: LongMemEval (ICLR 2025), not memd's synthetic
 suite. Session retrieval ndcg@5 on LongMemEval_S dev: 0.727 (0.1.0) -> 0.866 (zero-key
