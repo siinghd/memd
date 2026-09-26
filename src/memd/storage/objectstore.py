@@ -151,6 +151,26 @@ class ObjectStore(ABC):
     @abstractmethod
     def copy(self, src: str, dst: str) -> None: ...
 
+    def put_if_absent(self, key: str, data: bytes) -> bool:
+        """Create `key` only if nothing is there; False if it already exists.
+
+        Wrapped data keys are minted this way: two nodes opening the same new
+        namespace must agree on ONE key, and the loser adopts the winner's.
+        The default is check-then-put (not atomic); both real backends
+        override it with an atomic create."""
+        if self.exists(key):
+            return False
+        self.put(key, data)
+        return True
+
+    def shred(self, key: str) -> None:
+        """Delete `key` so that no copy the store keeps stays readable.
+
+        Same as delete() here; a versioned bucket overrides it to remove every
+        noncurrent version too - a delete marker over a wrapped data key is
+        not a crypto-shred."""
+        self.delete(key)
+
 
 class LogWriter(ABC):
     """Persistent-handle append log. write() makes bytes visible (flushed);
@@ -262,6 +282,30 @@ class LocalObjectStore(ObjectStore):
                 os.unlink(tmp)
             raise
 
+    def put_if_absent(self, key: str, data: bytes) -> bool:
+        """Atomic create: the fsynced temp file is hard-LINKED into place,
+        which fails if the name exists (rename would silently replace it)."""
+        _count_op("put_if_absent")
+        path = self._path(key)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=_TMP_TAG)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.link(tmp, path)
+            except FileExistsError:
+                return False
+            self._fsync_dir(os.path.dirname(path))
+            return True
+        finally:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+
     def get(self, key: str) -> bytes | None:
         _count_op("get")
         try:
@@ -274,6 +318,21 @@ class LocalObjectStore(ObjectStore):
         _count_op("delete")
         try:
             os.unlink(self._path(key))
+        except FileNotFoundError:
+            pass
+
+    def shred(self, key: str) -> None:
+        """Overwrite, fsync, then unlink - as LocalKeyEnvelope.destroy does
+        for its key files, so a lazy filesystem does not keep the bytes."""
+        _count_op("shred")
+        path = self._path(key)
+        try:
+            size = os.path.getsize(path)
+            with open(path, "r+b") as f:
+                f.write(secrets.token_bytes(size))
+                f.flush()
+                os.fsync(f.fileno())
+            os.unlink(path)
         except FileNotFoundError:
             pass
 

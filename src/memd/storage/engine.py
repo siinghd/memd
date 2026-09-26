@@ -637,7 +637,8 @@ class NamespaceStore:
         if not os.environ.get("MEMD_ALLOW_MULTI_PROCESS"):
             leaser = getattr(store, "try_acquire_owner", None)
             if callable(leaser):
-                holder = f"{socket.gethostname()}:{os.getpid()}"
+                holder = (getattr(store, "lease_holder", None)
+                          or f"{socket.gethostname()}:{os.getpid()}")
                 if not leaser(namespace, holder):
                     raise NamespaceBusyError(
                         f"namespace {namespace!r} is leased by another writer. "
@@ -681,7 +682,23 @@ class NamespaceStore:
         self._collected: list[dict] = []
         self._defer_notes = False  # collections audited later (see _collect_garbage_now)
         self._audit_sink = None  # set by StorageEngine once the store is open
-        self._open()
+        try:
+            if self.envelope.enabled and getattr(self.envelope, "prefetch_at_open", False):
+                # a remote key provider resolves the data key BEFORE the
+                # manifest is touched: a namespace whose key is held elsewhere
+                # then fails here, cleanly, instead of mid-replay (and a new
+                # namespace mints its key while it still has no data)
+                self.envelope.data_key(namespace)
+            self._open()
+        except BaseException:
+            # never keep a lease (heartbeating forever) on a namespace this
+            # process failed to open - another node could serve it
+            try:
+                self.index.close()
+            except Exception:
+                pass
+            self._release_ownership()
+            raise
         self._attach_lexical(lexical)
 
     def _attach_lexical(self, lexical: dict | None) -> None:
@@ -2620,6 +2637,9 @@ class NamespaceStore:
         except Exception:
             pass  # closed/deleted index; replay covers it
         self.index.close()
+        self._release_ownership()
+
+    def _release_ownership(self) -> None:
         if self._owner_path:
             _release_owner(self._owner_path)
             self._owner_path = None
