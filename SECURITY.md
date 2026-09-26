@@ -44,7 +44,12 @@ any probe fails the build.
   `memd_audit_segments_pruned_total` records the truncation. Compliance tiers
   needing unbounded history must ship segments off-box before they roll.
 - **`/metrics`, `/v1/metrics/json` and `/v1/status` are namespace-scoped** for
-  a scoped key and unscoped for a `*` key. `MEMD_METRICS_PUBLIC=1` allows
+  a scoped key and unscoped for a `*` key: series labelled with a namespace
+  are served only to that namespace's keys and the operator. Series without a
+  namespace label (the http counters) are visible to every key, so their
+  labels carry nothing a caller chose: the route is one of the server's
+  route templates (`/v1/ns/:ns/memories/:id`) or `other`, and an unknown HTTP
+  method is `OTHER`. `MEMD_METRICS_PUBLIC=1` allows
   unauthenticated scraping - only do that on a trusted network segment.
 - **Interactive docs are off by default** (`MEMD_ENABLE_DOCS=1` to enable):
   the OpenAPI schema enumerates every route of an otherwise authenticated API.

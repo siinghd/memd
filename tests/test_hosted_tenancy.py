@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient
 from memd.hosted.billing import BillingConfig, LiveKeyRefused, guard_live_key
 from memd.hosted.plans import Plans
 from memd.hosted.store import AdminStore, OwnershipError, period_of
+from memd.metrics import METRICS
 from memd.query.rerank import RerankStage
 from memd.server.http import create_app
 
@@ -578,3 +579,59 @@ def test_a_crashed_requests_reservation_expires(hosted):
     assert _search(c, "acme", "held by a live reservation").status_code == 402
     hosted.h.metering.clock = lambda: now + 601  # the owning request died long ago
     assert _search(c, "acme", "the stale hold no longer counts").status_code == 200
+
+
+# ------------------------------- /metrics: no tenant-controlled label values
+
+
+@pytest.mark.parametrize("hosted_mode", [True, False])
+def test_crafted_paths_leave_nothing_tenant_controlled_in_another_tenants_metrics(tmp_path, hosted_mode):
+    """A tenant can put any string in a path segment, a record or session id,
+    an unknown route or the HTTP method. None of it may become a label value
+    another tenant's key can read on /metrics or /v1/metrics/json - nor may
+    the tenant's own namespace name."""
+    import uuid
+
+    from memd.server.auth import KeyStore
+
+    mark = "zq" + uuid.uuid4().hex[:10]
+    ns_a, ns_b = f"alpha{mark}", "beta"
+    if hosted_mode:
+        h = Hosted(tmp_path)
+        a = h.client(h.org("alpha"), ns_a, scopes="memory")
+        b = h.client(h.org("beta"), ns_b, scopes="memory")
+        app, closer = h.app, h.close
+    else:
+        app = create_app(data_dir=str(tmp_path / "d"), keys_path=str(tmp_path / "keys.json"))
+        ks: KeyStore = app.state.keystore
+        a, b = TestClient(app), TestClient(app)
+        a.headers["Authorization"] = f"Bearer {ks.create(ns_a)[0]}"
+        b.headers["Authorization"] = f"Bearer {ks.create(ns_b)[0]}"
+        closer = app.state.engine.close
+    try:
+        a.post(f"/v1/ns/{ns_a}/memories", json={"content": "a fact"})
+        a.post(f"/v1/ns/{ns_a}/search", json={"query": "fact"})
+        for method, path in [
+            ("GET", f"/v1/ns/{ns_a}/{mark}"),
+            ("POST", f"/v1/ns/{ns_a}/{mark}/search"),
+            ("GET", f"/v1/ns/{ns_a}/memories/{mark}"),
+            ("POST", f"/v1/ns/{ns_a}/sessions/{mark}/close"),
+            ("POST", f"/v1/ns/{mark}/search"),
+            ("POST", f"/v1/ns/./{mark}/search"),
+            ("GET", f"/{mark}"),
+            ("GET", f"/v1/{mark}/stats"),
+            ("GET", f"/health/{mark}"),
+            ("GET", f"/v1/ns/{ns_a}/stats?{mark}=1"),
+            (mark.upper(), f"/v1/ns/{ns_a}/stats"),
+        ]:
+            a.request(method, path, json={"query": mark} if method == "POST" else None)
+        for view in (b.get("/metrics"), b.get("/v1/metrics/json")):
+            assert view.status_code == 200
+            text = view.text.lower()
+            assert mark not in text, [ln for ln in view.text.splitlines() if mark in ln.lower()][:5]
+            assert ns_a.lower() not in text
+        routes = {s["labels"].get("route") for s in METRICS.snapshot()["counters"]["memd_http_requests_total"]}
+        assert not [r for r in routes if r and mark in r]
+        assert "other" in routes
+    finally:
+        closer()

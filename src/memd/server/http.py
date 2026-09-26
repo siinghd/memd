@@ -162,20 +162,57 @@ def _rate_limited(detail: str, retry_s: float) -> ApiError:
                     headers={"Retry-After": str(max(1, math.ceil(retry_s)))})
 
 
+# every route this server serves, as a label; anything else is "other"
+_FIXED_ROUTE_LABELS = frozenset({
+    "/health", "/metrics", "/v1/metrics/json", "/v1/status",
+    "/v1/billing/checkout", "/v1/billing/portal", "/v1/billing/usage", "/v1/billing/webhook",
+    "/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json",
+})
+# the path under /v1/ns/{ns}/, with {id} for a record/session id
+_NS_ROUTE_SHAPES = {
+    (): "/v1/ns/:ns",
+    ("events",): "/v1/ns/:ns/events",
+    ("memories",): "/v1/ns/:ns/memories",
+    ("memories", None): "/v1/ns/:ns/memories/:id",
+    ("search",): "/v1/ns/:ns/search",
+    ("export",): "/v1/ns/:ns/export",
+    ("stats",): "/v1/ns/:ns/stats",
+    ("sessions", None, "close"): "/v1/ns/:ns/sessions/:id/close",
+    ("compact",): "/v1/ns/:ns/compact",
+    ("find_ids",): "/v1/ns/:ns/find_ids",
+    ("forget",): "/v1/ns/:ns/forget",
+    ("reembed",): "/v1/ns/:ns/reembed",
+}
+_METHOD_LABELS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
+
+
 def _route_label(path: str) -> str:
-    """Bucket dynamic path segments for metric labels.
+    """The route TEMPLATE a path matches, as a metric label - never a
+    request-supplied string.
 
     Namespace names and record ids are UNBOUNDED cardinality (scales with
-    tenants and rows); a raw value in a Prometheus label multiplies every
-    http series by both. At registry cap the eviction guard starts silently
-    dropping unrelated series - so labels carry only the route SHAPE:
-    /v1/ns/{ns}/memories/{id} -> /v1/ns/:ns/memories/:id."""
+    tenants and rows), and the http series carry no `ns` label, so every
+    tenant key sees them on /metrics: a raw segment in a label handed one
+    tenant's namespace names and ids - or any string a caller put in a path,
+    404s included - to every other tenant, and let anyone grow the registry
+    until its eviction guard dropped unrelated series. Only the known route
+    shapes are labels (/v1/ns/{ns}/memories/{id} -> /v1/ns/:ns/memories/:id);
+    everything else is "other"."""
+    if path in _FIXED_ROUTE_LABELS:
+        return path
     parts = path.split("/")
-    if len(parts) >= 4 and parts[1] == "v1" and parts[2] == "ns":
+    if len(parts) >= 4 and parts[0] == "" and parts[1] == "v1" and parts[2] == "ns" and parts[3]:
         rest = parts[4:]
-        tail = [":id" if i >= 1 else p for i, p in enumerate(rest)]
-        return "/".join(["/v1/ns/:ns"] + tail)
-    return path
+        for shape, label in _NS_ROUTE_SHAPES.items():
+            if len(shape) == len(rest) and all(
+                    (seg != "") if want is None else seg == want for want, seg in zip(shape, rest)):
+                return label
+    return "other"
+
+
+def _method_label(method: str) -> str:
+    """The HTTP method is a client-chosen token, too."""
+    return method if method in _METHOD_LABELS else "OTHER"
 
 
 def create_app(
@@ -257,6 +294,7 @@ def create_app(
         # bucket paths: /v1/ns/{ns}/memories/{id} -> /v1/ns/:ns/memories/:id
         # (label cardinality guard - see _route_label)
         route_label = _route_label(request.url.path)
+        method_label = _method_label(request.method)
         cl = request.headers.get("content-length")
         if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
             METRICS.inc("memd_oversized_requests_total", route=route_label)
@@ -267,21 +305,21 @@ def create_app(
         except ValueError as ex:
             # engine-boundary guards (size caps, bad enum-ish values) are
             # caller errors: 400 with the guard's message
-            METRICS.inc("memd_http_errors_total", route=route_label, method=request.method, kind="value")
+            METRICS.inc("memd_http_errors_total", route=route_label, method=method_label, kind="value")
             return _error(400, str(ex))
         except sqlite3.Error:
             # lifecycle races surface as driver errors (namespace destroyed /
             # index closed mid-request): clean 503, no internals leaked
-            METRICS.inc("memd_http_errors_total", route=route_label, method=request.method, kind="storage")
+            METRICS.inc("memd_http_errors_total", route=route_label, method=method_label, kind="storage")
             return _error(503, "namespace unavailable (destroyed or rebuilding)")
         except Exception:
-            METRICS.inc("memd_http_errors_total", route=route_label, method=request.method)
+            METRICS.inc("memd_http_errors_total", route=route_label, method=method_label)
             # sanitized 500: tracebacks go to the server log, never the client
             return _error(500, "internal error")
         finally:
             METRICS.observe("memd_http_request_ms", (time.monotonic() - t0) * 1000,
-                            help="HTTP request duration (ms)", route=route_label, method=request.method)
-        METRICS.inc("memd_http_requests_total", route=route_label, method=request.method,
+                            help="HTTP request duration (ms)", route=route_label, method=method_label)
+        METRICS.inc("memd_http_requests_total", route=route_label, method=method_label,
                     status=str(response.status_code))
         return response
 
@@ -294,7 +332,7 @@ def create_app(
             return _error(410, "namespace destroyed", "namespace_destroyed")
         if "evicted" in msg:
             return _error(503, "namespace re-opening; retry", headers={"Retry-After": "1"})
-        METRICS.inc("memd_http_errors_total", route=request.url.path)
+        METRICS.inc("memd_http_errors_total", route=_route_label(request.url.path))
         return _error(500, "internal error")
 
     @app.exception_handler(StarletteHTTPException)

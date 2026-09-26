@@ -61,6 +61,13 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
     non-positive webhook tolerance refused.
   - Hosted mode refuses to start with a live Stripe key (`sk_live_`,
     `rk_live_`) unless `MEMD_ALLOW_LIVE_BILLING=1`.
+- **`/metrics` route labels no longer carry request-supplied strings.** The
+  http series have no namespace label, so every key sees them; the route
+  label kept the path segment after `/v1/ns/{ns}/` (and whole unknown
+  paths, 404s included) verbatim, letting any caller show strings - another
+  tenant's namespace name, ids - to every tenant and grow the registry.
+  Labels are now the server's route templates or `other`; an unknown HTTP
+  method is `OTHER`.
 - `SearchResult.reranked`: whether the reranker ran for that call (a cache
   hit or a reranker fallback is `False`). The REST response is unchanged.
 - The `dev` extra now includes `stripe`, so the billing tests run in CI;
