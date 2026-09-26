@@ -175,7 +175,17 @@ case it is. Nothing was changed in any of them.
      open(p, "wb").write(b[:n] + b[n + 4 + ln:])
      ```
 
-     On S3, download the object, edit it the same way and upload it back.
+     On S3 the log is not one object: it is stored as part objects
+     (`ns/<namespace>/wal.__part-NNN`, plus `wal.__seq`), and byte N counts
+     across the parts in order. Find the part that holds byte N and delete
+     that one part object (every frame in it is lost; the backup from step 1
+     still holds them). Do not re-upload an edited single `wal` object: memd
+     does not read one.
+
+     Removing an `ops` frame loses the deletes it held: records it
+     tombstoned come back, and a hard delete in it is undone, so the purged
+     text is served again. After recovering, repeat any delete that was
+     acknowledged around the time of the damage.
   4. Open again; another damaged frame, if any, is reported the same way.
 
 A damaged segment never blocks an open: it is skipped by reads, kept by
