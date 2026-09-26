@@ -83,12 +83,14 @@ is why the lock exists.
 Concretely:
 - **`uvicorn --workers N` with N > 1 will not work.** Run one worker.
 - Two containers on one volume will not work.
-- To scale reads, scale *namespaces* across processes, not processes across one
-  namespace. `MEMD_ALLOW_MULTI_PROCESS=1` disables the lock and re-enables the
-  data loss; it exists for recovery tooling, not for serving.
+- To scale, scale *namespaces* across processes, not processes across one
+  namespace - which is exactly what [multi-node serving](#multi-node-adr-12)
+  does on an `s3://` data root. `MEMD_ALLOW_MULTI_PROCESS=1` disables the lock
+  and re-enables the data loss; it exists for recovery tooling, not for
+  serving.
 
-A multi-writer protocol (manifest CAS on ETag) is the real fix and is not
-built.
+A multi-writer protocol inside one namespace (manifest CAS on ETag) is
+deferred (ADR-12 item 5).
 
 ## Object storage as the source of truth (S3 / R2 / MinIO)
 
@@ -125,18 +127,101 @@ they are the number that decides both the cost model and how a WAN changes
 things. A warm search touches object storage zero times because retrieval is
 served by the local derived index.
 
-What stays local, and why it matters: the SQLite derived index (rebuildable by
-contract — pass 22's snapshot is what makes a cold node cheap) and the envelope
-**keys**. Data is remote, keys are not, so this is *one node with remote
-durability*, not *any node serves any namespace*. Crypto-shred still works — the
-key is local, destroy it and the ciphertext is inert — but a second node cannot
-decrypt. A KMS key provider is the missing piece and is not built.
+What stays local: the SQLite derived index (rebuildable by contract — pass
+22's snapshot is what makes a cold node cheap) and, with the default `local`
+key provider, the envelope **keys**. Then data is remote and keys are not:
+*one node with remote durability*. Crypto-shred works (destroy the local key
+and the ciphertext is inert), but a second node cannot decrypt. With a remote
+key provider (`aws-kms` or `vault-transit`, below) the wrapped keys live in
+the bucket too, and any authorised node can serve any namespace.
 
 Single-writer is still enforced, by a **lease** rather than a file lock (`flock`
 cannot see another machine): the first writer claims `ns/<ns>/.owner` with a
 conditional PUT, a second gets `NamespaceBusyError`, and a lease older than the
-TTL is reclaimable so a crashed node cannot wedge a namespace forever. It makes
-split-brain loud, not impossible.
+TTL (`MEMD_LEASE_TTL_S`, default 60 s) is reclaimable - by compare-and-swap on
+its ETag, so exactly one of several reclaimers wins - so a crashed node cannot
+wedge a namespace forever. A holder that cannot renew for 2/3 of the TTL stops
+writing (self-fencing).
+
+### Key custody: local, AWS KMS or Vault transit
+
+| `MEMD_KEY_PROVIDER` | root key held by | wrapped data keys | settings |
+|---|---|---|---|
+| `local` (default) | `<local_dir>/keys/root.key` | files beside it | - |
+| `aws-kms` | AWS KMS (the CMK never leaves it) | `keys/<ns>.dek` in the store | `MEMD_KMS_KEY_ID` (ARN, id, alias; may contain `{namespace}`), `MEMD_KMS_REGION`/`AWS_REGION`, `MEMD_KMS_ENDPOINT` (LocalStack), `MEMD_KMS_SHRED` |
+| `vault-transit` | Vault transit engine | `keys/<ns>.dek` in the store | `VAULT_ADDR`, `VAULT_TOKEN`, `MEMD_VAULT_TRANSIT_KEY` (default `memd`; may contain `{namespace}`), `MEMD_VAULT_TRANSIT_MOUNT`, `VAULT_NAMESPACE`, `MEMD_VAULT_SHRED` |
+
+The same settings work as `Memory(config={"key_provider": "aws-kms",
+"kms_key_id": ...})`. Every data key is bound to its namespace (KMS
+encryption context / transit associated data). Moving an existing store:
+
+```bash
+memd keys status  --data s3://bucket/memd            # MEMD_LOCAL_DIR = the node holding the keys
+memd keys migrate --data s3://bucket/memd --to aws-kms   # stop the server first
+memd keys rotate  --data s3://bucket/memd            # re-wrap under the current key version
+```
+
+`migrate` never re-encrypts data (the data key is unchanged, only its
+wrapping moves), is idempotent and crash-safe (rerun it), and removes the
+local key files only after every namespace verified under the new provider.
+A node still set to `local` then refuses the store instead of minting keys.
+What crypto-shred means with a shared CMK is spelled out in SECURITY.md.
+
+## Multi-node (ADR-12)
+
+Several `memd serve --http` processes on ONE `s3://` data root serve every
+namespace between them: scale by namespace, one writer per namespace at a
+time.
+
+```bash
+export MEMD_DATA=s3://bucket/memd MEMD_S3_ENDPOINT=... AWS_REGION=eu-west-1
+export MEMD_KEY_PROVIDER=aws-kms MEMD_KMS_KEY_ID=arn:aws:kms:...:key/...
+export MEMD_CLUSTER_SECRET=$(openssl rand -hex 32)   # the same on every node
+export MEMD_STATE_DIR=/srv/memd-state                # shared: API keys / hosted admin db
+memd serve --http --node-id n1 --host 10.0.0.1 --port 8700   # MEMD_LOCAL_DIR per node
+memd serve --http --node-id n2 --host 10.0.0.2 --port 8700
+```
+
+Point clients (or a plain load balancer) at ANY node:
+
+- **Routing.** The node holding a namespace's lease serves it. Another node
+  receiving the request **proxies** it there (one base URL for clients; a
+  handoff in progress is retried by the node for up to `MEMD_ROUTE_RETRY_S`,
+  default 3 s, before a `503 namespace_unavailable` with `Retry-After`). A
+  namespace nobody holds goes to the node that rendezvous hashing picks among
+  the live nodes - a hint only; the lease is authoritative.
+- **Membership** is a heartbeat object per node in the bucket
+  (`_cluster/nodes/<id>.json`, every TTL/3). No gossip, no consensus, nothing
+  else to run. `--advertise` (`MEMD_ADVERTISE_URL`) is the URL peers use.
+- **Handoff.** SIGTERM: the node deregisters, drains, flushes and releases
+  its leases - peers take over at once. A crash: its leases go stale after
+  `MEMD_LEASE_TTL_S` and the next request for each namespace is served (and
+  the lease reclaimed) by a live node. A frozen node (GC pause, VM freeze) is
+  fenced when it resumes: its writes fail instead of landing in the new
+  owner's log.
+- **Hosted billing** works through the router: a request is authenticated and
+  metered by the node that executes it, once. The admin database is SQLite in
+  `MEMD_STATE_DIR`, so a hosted fleet runs on one host (or a volume with
+  working POSIX locks); a networked admin store is the open item for
+  multi-host hosted.
+
+Measured on 3 node processes (MinIO + moto KMS, TTL 4 s): leaseholder
+SIGKILLed → next write acked after 3.7-3.8 s (bound: TTL + ε); SIGTERM →
+0.04-1.1 s; frozen past its TTL → 4.8 s, with no acked write lost in any
+case. Not built yet: read replicas (every read goes to the leaseholder) and
+multiple writers inside one namespace.
+
+| setting | default | |
+|---|---|---|
+| `--node-id` / `MEMD_NODE_ID` | - | turns cluster mode on |
+| `MEMD_CLUSTER_SECRET` | - | required, >= 16 chars, signs proxied requests |
+| `--advertise` / `MEMD_ADVERTISE_URL` | `http://HOST:PORT` | required when binding 0.0.0.0 |
+| `MEMD_LEASE_TTL_S` | 60 | failover bound; keep clock skew under TTL/3 |
+| `MEMD_ROUTE_RETRY_S` | 3 | how long an entry node absorbs a handoff |
+| `MEMD_STATE_DIR` | - | required: keys.toml.json / hosted admin db |
+| `MEMD_KEY_PROVIDER` | - | required: `aws-kms` or `vault-transit` (a `local` key file cannot be shared) |
+| `MEMD_LOCAL_DIR` | `.memd-local` | node-local cache, under `<dir>/node-<id>` |
+| `MEMD_SHUTDOWN_GRACE_S` | 30 | uvicorn graceful drain on SIGTERM |
 
 ## Hosted mode & billing
 

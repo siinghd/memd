@@ -7,6 +7,27 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
 ## [Unreleased]
 
 ### Added
+- **Key providers (ADR-12).** `MEMD_KEY_PROVIDER=local|aws-kms|vault-transit`
+  (`Memory(config={"key_provider": ...})`). `local` stays the default and
+  byte-compatible; `aws-kms` (boto3, encryption context per namespace) and
+  `vault-transit` (httpx, associated data per namespace) keep the wrapped
+  data keys as objects in the store (`keys/<ns>.dek`), so any authorised
+  node can open any namespace. A namespace with data but no wrapped key is
+  refused instead of silently re-keyed; a custody marker makes a node still
+  on `local` refuse a migrated store. Crypto-shred deletes the wrapped key
+  (every version on a versioned bucket); with a per-namespace key template
+  it can also disable or schedule deletion of the CMK / delete the transit
+  key. `memd keys status|migrate|rotate` (migrate is crash-safe and
+  idempotent, holds every namespace's writer lock, and removes local key
+  files only after verification). See SECURITY.md "Key custody".
+- **Multi-node serving (ADR-12).** `memd serve --http --node-id N` (with
+  `MEMD_CLUSTER_SECRET`, `MEMD_STATE_DIR`, an `s3://` `MEMD_DATA`): nodes
+  heartbeat a registry object in the bucket and proxy each namespace's
+  requests to the node holding its lease (rendezvous hashing over live nodes
+  for a free namespace). Graceful shutdown hands leases off immediately; a
+  crashed node's namespaces move after the lease TTL. Hosted usage is metered
+  once, on the executing node. See "Multi-node" in README-engine.md; read
+  replicas are not built yet.
 - **Hosted mode: tenancy, usage metering and Stripe billing** (off by
   default; `memd serve --http --hosted` or `MEMD_HOSTED=1`; Stripe SDK in the
   new optional extra `memd[billing]`, imported lazily - embedded and
@@ -84,6 +105,32 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   they are offline (signed webhook payloads, an in-process fake with
   Stripe's idempotency semantics, and `stripe/stripe-mock` in docker for the
   end-to-end test, skipped without docker).
+
+### Changed
+- **The S3 owner lease is a compare-and-swap** on its ETag for every write
+  after the create (refresh, stale reclaim, heartbeat): of several nodes
+  reclaiming one stale lease exactly one wins, and a holder that stalled
+  between reading and renewing fences itself instead of overwriting the new
+  owner's lease. A holder that cannot renew for 2/3 of the TTL refuses to
+  write (`LeaseLostError`, a `RuntimeError`); taking over a stale lease
+  burns the next part of the WAL/ops/audit logs so a stalled previous
+  holder's resumed append conflicts instead of landing unseen; a namespace
+  that fails to open releases its lease; `MEMD_LEASE_TTL_S` sets the TTL for
+  `s3://` roots. Endpoints without conditional writes keep the old
+  behaviour.
+- With `local` keys on an `s3://` root, a node that has no key for a
+  namespace that already has data refuses to open it (`KeyCustodyError`)
+  instead of minting a new key - which made the existing data unreadable and
+  wrote new data under a different key. `MEMD_KEYS_ALLOW_MINT_EXISTING=1`
+  overrides (e.g. a namespace written unencrypted).
+- REST: a namespace another process holds answers `503 not_owner` (with
+  `Retry-After` and `X-Memd-Not-Owner`) instead of `500`; a lease lost
+  mid-request answers `503 lease_lost`.
+- `MEMD_STATE_DIR` (optional; required in cluster mode) moves the server's
+  own state - `keys.toml.json`, the hosted admin database - out of the data
+  root. Unset, nothing moves.
+- The `dev` extra now includes `moto[server]` (KMS for the key-provider and
+  multi-node tests).
 
 ## [0.2.0] - 2026-09-26
 

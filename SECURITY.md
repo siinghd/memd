@@ -21,23 +21,70 @@ any probe fails the build.
   fails fast with `NamespaceBusyError`. `uvicorn --workers N` with N>1 and two
   containers on one volume do not work. `MEMD_ALLOW_MULTI_PROCESS=1` disables
   the check and re-enables silent data loss; it exists for recovery tooling.
-- **At-rest encryption is local-file envelope encryption.** It protects the
-  volume and makes crypto-shred possible. It is *not* protection against
-  someone with filesystem read access on the same machine. Hosted deployments
-  are expected to swap the root-key provider for a KMS; that provider does not
-  ship yet.
-- **With the S3 backend, data is remote but KEYS ARE LOCAL.** That is a
-  deliberate, load-bearing asymmetry: crypto-shred still works (the key never
-  left the node, so destroying it makes the remote ciphertext inert), but a
-  second node cannot decrypt the bucket. Back up the local key directory
-  separately and treat it as the crown jewels - losing it is equivalent to
-  shredding every namespace. This is "one node with remote durability", not
-  "any node serves any namespace".
+- **At-rest encryption with the default `local` key provider is local-file
+  envelope encryption.** It protects the volume and makes crypto-shred
+  possible. It is *not* protection against someone with filesystem read
+  access on the same machine (the root key file sits beside the data). See
+  "Key custody" below for the KMS / Vault providers.
+- **With the S3 backend and `local` keys, data is remote but KEYS ARE LOCAL.**
+  Crypto-shred works (destroying the local key makes the remote ciphertext
+  inert), but a second node cannot decrypt the bucket - it refuses to open a
+  namespace it has no key for (it used to mint a new one). Back up the local
+  key directory separately and treat it as the crown jewels - losing it is
+  equivalent to shredding every namespace. Cluster mode refuses `local` keys.
 - **Single-writer on S3 is a LEASE, not a distributed lock.** The first writer
   claims `ns/<ns>/.owner` with a conditional PUT and a second gets
-  `NamespaceBusyError`; a lease older than the TTL is reclaimable so a crashed
-  node cannot wedge a namespace. It makes split-brain loud, not impossible.
-  Do not run two writers and rely on it.
+  `NamespaceBusyError`; a lease older than the TTL is reclaimable (by
+  compare-and-swap: one winner) so a crashed node cannot wedge a namespace. A
+  holder that cannot renew for 2/3 of the TTL stops writing, and a node
+  taking over a stale lease fences the previous holder's append logs. What
+  remains open: a process pause longer than TTL/3 landing exactly between a
+  fence check and an unconditional put/delete (rotation, compaction), and
+  clock skew between nodes of more than TTL/3. Do not run two writers on one
+  namespace and rely on it; the cluster router (ADR-12) never does.
+
+## Key custody (ADR-12)
+
+- **Where the root key lives.** `MEMD_KEY_PROVIDER=local` (default): a file,
+  `<local_dir>/keys/root.key` (0600), on the node. `aws-kms`: in AWS KMS; memd
+  holds only wrapped data keys (`keys/<ns>.dek` in the bucket) and asks KMS to
+  unwrap them. `vault-transit`: in Vault's transit engine, likewise. With a
+  remote provider neither the bucket alone (ciphertext + wrapped keys) nor
+  the provider alone (no data) is enough; an attacker needs both bucket read
+  and `kms:Decrypt` (or the transit `decrypt` policy). Grant the latter only
+  to memd nodes, with the encryption context condition
+  `kms:EncryptionContext:memd:namespace` if you want per-tenant policies.
+- **Binding.** Each wrapped data key is bound to its namespace (KMS encryption
+  context / transit `associated_data`): a wrapped key copied under another
+  namespace's name does not unwrap. A Vault that silently ignores
+  `associated_data` is refused rather than used unbound.
+- **Plaintext data keys are in node memory** while a namespace is open (they
+  must be, to encrypt), LRU-bounded to 1024 namespaces per process.
+- **Crypto-shred with a SHARED CMK / transit key** (the normal deployment)
+  deletes the namespace's wrapped key object - including every noncurrent
+  version on a versioned bucket (a versioned bucket whose versions API memd
+  may not use makes the destroy fail loudly). It cannot delete the CMK, which
+  every other namespace needs. So a copy of the wrapped key made BEFORE the
+  shred - a bucket backup, cross-region replication, a snapshot - together
+  with `kms:Decrypt` on the CMK still recovers the data key. Keep backups of
+  the `keys/` prefix under the same retention you promise for erasure, or
+  exclude it from them. For tenants who need the stronger guarantee, give them
+  their OWN key (`MEMD_KMS_KEY_ID=alias/memd-{namespace}` /
+  `MEMD_VAULT_TRANSIT_KEY=memd-{namespace}`) and set
+  `MEMD_KMS_SHRED=schedule-deletion` (or `disable`) / `MEMD_VAULT_SHRED=delete-key`:
+  the shred then also destroys that key, and old copies of the wrapped key
+  are dead. These key-level actions are refused at startup for a shared key.
+  The destroy is recorded in the node's audit ledger with what the provider
+  did.
+- **Migration** (`memd keys migrate`) removes the local key files only after
+  every namespace verified under the new provider; `--keep-local` keeps them,
+  and then crypto-shred does NOT cover those copies until they are removed.
+- **Cluster traffic.** Nodes proxy requests to each other over plain HTTP
+  unless you front them with TLS; `MEMD_CLUSTER_SECRET` authenticates the
+  routing header (HMAC over node, time, client, method and path, 60 s
+  window) but does not encrypt anything. Run the node-to-node network as a
+  private segment. A request without a valid signature is simply routed like
+  any client request.
 - **Audit retention is bounded** (16 sealed segments, 64MB each by default).
   Past that the oldest is dropped and the hash chain is re-anchored, so
   `verify()` proves tamper-evidence over the *retained window*.
