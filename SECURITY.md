@@ -81,19 +81,30 @@ any probe fails the build.
     from starting unless `MEMD_ALLOW_LIVE_BILLING=1` is set - set it only on
     the production deployment, never in a dev or CI environment.
   - *API keys are hashed at rest.* Hosted keys live in the admin store
-    (`<data root>/admin/admin.sqlite3`, mode 0600) as SHA-256 hashes of a
+    (`<data root>/admin/admin.sqlite3`; the directory is 0700 and the
+    database with its `-wal`/`-shm` files 0600) as SHA-256 hashes of a
     192-bit random secret; the key is shown once at creation. A fast hash is
     appropriate for secrets of that entropy (there is nothing to brute-force);
     it would not be for passwords. Revocation takes effect within 5 s in
     every process (the lookup cache's TTL).
   - *Tenant isolation is enforced twice:* a key is bound to one namespace,
     and that namespace must belong to the key's org (a namespace can never
-    change org). Billing routes act on the key's own org only - the request
-    body cannot name another one - and need the `billing` scope; a
-    `billing`-only key cannot read memories.
-  - *A checkout for an org cannot re-point its billing account:* a completed
-    Checkout Session whose customer differs from the org's existing Stripe
-    customer is logged and ignored.
+    change org; `_`-prefixed names are reserved and never bound to a
+    tenant). Billing routes act on the key's own org only - the request body
+    cannot name another one. Scopes are exact: `billing` for the billing
+    routes, `memory` for the data routes; `override` grants neither.
+  - *Stripe state is verified, not taken from payloads.* A completed
+    Checkout Session applies only with `mode=subscription`, and the
+    subscription is re-read from Stripe; only `active`/`trialing` grant a
+    plan. An org is bound to a Stripe customer only when it has none and the
+    customer carries the `memd_org_id` metadata memd's checkout wrote - a
+    forged `client_reference_id` (e.g. on a payment link) is logged and
+    ignored. One subscription per org; a duplicate holds metered pushes.
+  - *No secret in logs or the admin store.* Stripe error text (which can
+    echo the API key) is redacted before it is logged or stored - `sk_`/
+    `rk_`/`pk_` keys, `whsec_` secrets, bearer tokens and memd keys - and a
+    filter redacts the Stripe SDK's own log records. `repr()` of the billing
+    configuration carries no secret.
   - *The admin store is not tenant data.* It holds org names, Stripe customer
     ids, key hashes and usage counts (no content). It is not encrypted by the
     namespace envelope keys and is not included in exports; back it up with

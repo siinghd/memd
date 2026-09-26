@@ -44,6 +44,21 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
     quantity under a fresh key, or alerting when that cannot be decided.
   - Docker: `--build-arg MEMD_BILLING=1` builds the hosted variant with the
     Stripe SDK; the default image stays without it.
+  - Hardened before release (security review): scopes are exact (`override`
+    implies neither `memory` nor `billing`); extraction and session-close
+    fact writes reserve their real quantity (extract up to the allowance,
+    `raw_skipped` / `facts_capped`); a spent reranked quota serves the
+    search unreranked instead of 402; reservations of running requests never
+    expire; `checkout.session.completed` requires `mode=subscription`,
+    re-reads the subscription from Stripe and respects the event cursor;
+    only `active`/`trialing` grant a plan; one subscription per org (409
+    while one is live or a checkout is open; a duplicate is flagged and its
+    usage held; canceling a non-current subscription never downgrades);
+    customers are bound only when memd's checkout created them; unknown
+    customers are acked; Stripe error text is redacted everywhere; admin
+    files 0600 / directory 0700; reserved namespace names; webhook bodies
+    capped at 1 MiB as read; secrets out of `repr`; whitespace in keys and a
+    non-positive webhook tolerance refused.
   - Hosted mode refuses to start with a live Stripe key (`sk_live_`,
     `rk_live_`) unless `MEMD_ALLOW_LIVE_BILLING=1`.
 - `SearchResult.reranked`: whether the reranker ran for that call (a cache

@@ -155,8 +155,12 @@ memd serve --http --hosted
 **Tenancy: org -> namespaces -> API keys.** An org is the billing unit. It owns
 namespaces (a namespace is claimed by the first org that mints a key into it
 and can never be claimed by another), and every key belongs to one org and is
-bound to one of its namespaces. Scopes: `memory` (the data routes), `billing`
-(the `/v1/billing/*` routes), `override` (the existing cross-user capability).
+bound to one of its namespaces. Scopes are exact and combine only
+explicitly: `memory` grants the data routes, `billing` the `/v1/billing/*`
+routes, and `override` only adds the existing cross-user capability to a
+`memory` key - it grants no route by itself (`--scopes memory,override`).
+Namespace names follow the engine's grammar; `_`-prefixed names are
+reserved.
 Keys keep the `memd_<ns>_<kid>_<secret>` format; only a SHA-256 hash of the
 secret is stored. The state lives in an admin SQLite database at
 `<data root>/admin/admin.sqlite3` - beside the tenant store, never inside a
@@ -185,10 +189,20 @@ recorded as billable overage. Hard caps hold under concurrency: the check and
 a *reservation* of the requested quantity happen in one `BEGIN IMMEDIATE`
 transaction against the rollup plus every in-flight reservation; the usage
 commit releases the reservation in the same transaction, a failed operation
-releases it, and a crashed request's reservation stops counting after 10
-minutes. 50 concurrent requests at a cap of 20 admit exactly 20. Quota periods are calendar months (UTC). A
-search is checked against `reranked_searches` too when a reranker is
-configured. After `invoice.payment_failed` the org has a 7-day grace period
+releases it; a reservation never expires while its request is still running
+(however long it takes), and one left by a crashed process stops counting
+after 10 minutes. 50 concurrent requests at a cap of 20 admit exactly 20.
+Nothing is ever recorded beyond what was reserved. Quota periods are calendar
+months (UTC). **A spent `reranked_searches` quota never refuses a search**:
+the search is served unreranked (`memd_rerank_fallback_total{reason="quota"}`)
+and only `searches` is metered; searches are limited by the `searches` cap
+alone. A session close is a write: at the memories cap it answers 402; below
+it, the facts it may write are reserved up front and anything beyond is not
+written (`facts_capped` in the response). With extraction on our key under a
+hard cap, the session's raw records are extracted up to the remaining
+allowance and the rest stay raw-only - searchable, never extracted
+(`raw_skipped`); with no allowance left the close answers 402. After
+`invoice.payment_failed` the org has a 7-day grace period
 (`MEMD_BILLING_GRACE_DAYS`); after it the org is **read-only**: writes and
 session extraction answer `402 {"code": "payment_required"}`, searches, reads
 and exports keep working. **Deletes (`DELETE /memories/{id}`, `forget`,
@@ -236,7 +250,7 @@ more than `MEMD_BILLING_DRIFT_TOLERANCE` (1%). Billing metrics carry
 
 | route | does |
 |---|---|
-| `POST /v1/billing/checkout` `{"plan": "dev"\|"scale", "interval": "month"\|"year"}` | a Stripe Checkout Session (subscription: the flat price plus the plan's metered prices); returns `{url, id}` |
+| `POST /v1/billing/checkout` `{"plan": "dev"\|"scale", "interval": "month"\|"year"}` | a Stripe Checkout Session (subscription: the flat price plus the plan's metered prices, open for 1 h); returns `{url, id}`. One subscription per org: `409 already_subscribed` while one is live, `409 checkout_pending` (with the open session's `url`) while a checkout is open |
 | `POST /v1/billing/portal` | a Billing Portal session; returns `{url}` |
 | `GET /v1/billing/usage` | current-period usage per meter: used, limit, hard, metered, billable; plan, status, grace, read-only |
 | `POST /v1/billing/webhook` | Stripe's webhook endpoint (no bearer: the `Stripe-Signature` is the authentication) |
@@ -244,19 +258,39 @@ more than `MEMD_BILLING_DRIFT_TOLERANCE` (1%). Billing metrics carry
 The webhook is verified with `stripe.Webhook.construct_event` (HMAC-SHA256 over
 the raw body, timestamp tolerance 300 s) and is idempotent by Stripe event id:
 the `processed_events` row commits in the same transaction as the event's
-effect. Handled: `checkout.session.completed`,
-`customer.subscription.created/updated/deleted` (the plan comes from the prices
-Stripe bills; a re-ordered older event cannot roll a plan back),
-`invoice.payment_failed` (starts the grace period once) and
-`invoice.payment_succeeded`. An event for a customer memd does not know yet
-answers 500, so Stripe retries it.
+effect; bodies over 1 MiB (counted as read, chunked or not) are refused.
+Handled:
+- `checkout.session.completed`: only `mode=subscription` sessions with a
+  subscription; the subscription is **re-read from Stripe** and *its* status
+  applies (a payment-mode session never grants a plan nor clears past_due).
+- `customer.subscription.created/updated/deleted`: `active`/`trialing` grant
+  the plan the subscription's prices bill; `past_due` keeps it and starts the
+  grace clock; `incomplete`, `incomplete_expired`, `unpaid`, `paused` and
+  `canceled` grant nothing (free plan). A per-org cursor on the event's
+  `created` ignores re-ordered older events, so a late
+  `checkout.session.completed` cannot resurrect a deleted subscription.
+- One subscription per org: an event for a subscription that is not the
+  org's current one never changes the plan (canceling it does not downgrade
+  the org); a *second live* subscription is flagged
+  (`memd_billing_duplicate_subscriptions_total`, a `duplicate_subscription`
+  log row) and the org's metered usage is **held** - not pushed, since both
+  subscriptions would bill it - until one of them is canceled.
+- `invoice.payment_failed` (starts the grace period once) and
+  `invoice.payment_succeeded` count only for the org's current
+  subscription; `checkout.session.expired` closes the open checkout.
+- An org is bound to a Stripe customer only when it has none yet and the
+  customer was created by memd's checkout for that org (its
+  `metadata.memd_org_id`); anything else is logged and ignored.
+- Events for customers memd does not know are acknowledged (200) and counted
+  (`memd_billing_webhook_unmapped_total`); a Stripe read that fails answers
+  500 so Stripe retries.
 
 **Configuration** (environment):
 
 | variable | meaning |
 |---|---|
 | `MEMD_HOSTED` | `1` enables hosted mode (same as `serve --hosted`) |
-| `MEMD_STRIPE_SECRET_KEY` | Stripe secret key. `sk_live_`/`rk_live_` keys are **refused** unless `MEMD_ALLOW_LIVE_BILLING=1` |
+| `MEMD_STRIPE_SECRET_KEY` | Stripe secret key. `sk_live_`/`rk_live_` keys are **refused** unless `MEMD_ALLOW_LIVE_BILLING=1` (exactly `1`); a key or webhook secret containing whitespace is refused |
 | `MEMD_STRIPE_WEBHOOK_SECRET` | the webhook endpoint's signing secret (`whsec_...`) |
 | `MEMD_STRIPE_PRICE_DEV_MONTHLY`, `..._DEV_YEARLY` | flat subscription prices (`MEMD_STRIPE_PRICE_<PLAN>_MONTHLY/_YEARLY`) |
 | `MEMD_STRIPE_PRICE_<PLAN>_<METER>` | metered prices, e.g. `MEMD_STRIPE_PRICE_DEV_EXTRACTIONS_OUR_KEY`, `MEMD_STRIPE_PRICE_SCALE_STORED_GB`; every metered meter of a plan needs one |
@@ -264,7 +298,7 @@ answers 500, so Stripe retries it.
 | `MEMD_STRIPE_METER_ID_<METER>` | the meter id for reconciliation (default: looked up by event name) |
 | `MEMD_PUBLIC_URL`, `MEMD_BILLING_SUCCESS_URL`, `MEMD_BILLING_CANCEL_URL`, `MEMD_BILLING_RETURN_URL` | Checkout/Portal redirect targets |
 | `MEMD_PLANS_PATH` | JSON plan overrides |
-| `MEMD_BILLING_GRACE_DAYS`, `MEMD_BILLING_PUSH_INTERVAL_S`, `MEMD_BILLING_DRIFT_TOLERANCE`, `MEMD_STRIPE_WEBHOOK_TOLERANCE_S` | 7, 3600, 0.01, 300 |
+| `MEMD_BILLING_GRACE_DAYS`, `MEMD_BILLING_PUSH_INTERVAL_S`, `MEMD_BILLING_DRIFT_TOLERANCE`, `MEMD_STRIPE_WEBHOOK_TOLERANCE_S` | 7, 3600, 0.01, 300 (must be > 0: 0 would disable the replay check) |
 | `MEMD_STRIPE_API_BASE` | point the Stripe client elsewhere (stripe-mock in tests) |
 | `MEMD_BILLING_MAX_PUSH_AGE_S`, `MEMD_BILLING_SETTLE_S`, `MEMD_STRIPE_MAX_NETWORK_RETRIES` | 72000 (the maximum), 3600, 2 |
 | `MEMD_BILLING_JOBS` | `0` disables the in-process push/snapshot/reconcile loop |
