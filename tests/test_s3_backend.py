@@ -198,7 +198,9 @@ class TestSingleWriter:
             m.close()
 
     def test_the_lease_is_released_on_close(self, tmp_path, prefix, _bucket):
-        """Asserts the lease OBJECT is gone and a DIFFERENT holder can take it.
+        """Asserts the lease is RELEASED (ADR-12: a released tombstone,
+        compare-and-swapped onto the lease so a stale holder cannot delete a
+        successor's lease) and a DIFFERENT holder can take it.
 
         The first version of this test only reopened in the same process,
         which can never fail: the holder string is host:pid, and
@@ -210,9 +212,11 @@ class TestSingleWriter:
         m.close()
 
         owner_key = f"{prefix}/ns/default/.owner"
-        remaining = [o["Key"] for o in
-                     _bucket.list_objects_v2(Bucket=BUCKET, Prefix=owner_key).get("Contents", [])]
-        assert not remaining, f"close() left the lease behind: {remaining}"
+        try:
+            body = _bucket.get_object(Bucket=BUCKET, Key=owner_key)["Body"].read()
+        except Exception:
+            body = None
+        assert body in (None, b"\n0"), f"close() left a live lease behind: {body!r}"
 
         # a genuinely different holder must be able to claim it
         from memd.storage.s3store import S3ObjectStore

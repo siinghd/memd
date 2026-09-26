@@ -602,16 +602,20 @@ class ObjectStoreKeyEnvelope(KeyEnvelope):
         return dk
 
     def read_record(self, namespace: str) -> dict | None:
-        raw = self.store.get(wrapped_key_object(namespace))
-        if not raw:
-            return None
+        return self._read_record_versioned(namespace)[0]
+
+    def _read_record_versioned(self, namespace: str) -> tuple[dict | None, str | None]:
+        got = self.store.get_versioned(wrapped_key_object(namespace))
+        if not got or not got[0]:
+            return None, None
+        raw, ver = got
         rec = json.loads(raw.decode())
         if rec.get("namespace") != namespace:
             # a record copied in from another namespace (its wrapping is
             # bound to the OTHER name and would not unwrap anyway)
             raise KeyCustodyError(f"wrapped key object for {namespace!r} names "
                                   f"{rec.get('namespace')!r}; refusing it")
-        return rec
+        return rec, ver
 
     def _unwrap_record(self, namespace: str, rec: dict) -> bytes:
         if rec.get("provider") != self.provider.name:
@@ -717,7 +721,7 @@ class ObjectStoreKeyEnvelope(KeyEnvelope):
         """Re-wrap this namespace's DEK under the provider's current root key
         version (`memd keys rotate`). The DEK is unchanged; overwriting the
         one record is atomic, and old and new record unwrap to the same key."""
-        rec = self.read_record(namespace)
+        rec, ver = self._read_record_versioned(namespace)
         if rec is None:
             return None
         if rec.get("provider") != self.provider.name:
@@ -727,8 +731,12 @@ class ObjectStoreKeyEnvelope(KeyEnvelope):
         new = self.provider.rewrap(namespace, old)
         if self.provider.unwrap(namespace, new) != self.provider.unwrap(namespace, old):
             raise KeyCustodyError(f"rewrap of {namespace!r} did not round-trip; record left unchanged")
-        self.store.put(wrapped_key_object(namespace),
-                       json.dumps(new.to_record(namespace), sort_keys=True).encode())
+        # conditional on the version just unwrapped: a concurrent shred or
+        # rotation wins, and this rewrap must not resurrect or clobber it
+        # (fence=False: this is an admin tool, not the namespace's writer)
+        self.store.put_if_match(wrapped_key_object(namespace),
+                                json.dumps(new.to_record(namespace), sort_keys=True).encode(),
+                                ver, fence=False)
         return {"namespace": namespace, "from": [old.key_id, old.key_version],
                 "to": [new.key_id, new.key_version]}
 
@@ -826,12 +834,30 @@ def read_custody(store: Any) -> dict | None:
 
 
 def write_custody(store: Any, provider: KeyProvider) -> None:
+    """Record `provider` as the store's key custodian - conditionally, on
+    the version read here, so two processes switching custody at once cannot
+    both believe they won (the loser re-reads and refuses a different one)."""
+    from memd.storage.objectstore import PreconditionFailed
+
     body = json.dumps({"provider": provider.name, **provider.describe(),
                        "since_ms": int(time.time() * 1000)}, sort_keys=True).encode()
-    if not store.put_if_absent(CUSTODY_KEY, body):
-        cur = read_custody(store) or {}
-        if cur.get("provider") != provider.name:
-            store.put(CUSTODY_KEY, body)
+    for _ in range(3):
+        got = store.get_versioned(CUSTODY_KEY)
+        if got is not None:
+            try:
+                cur = json.loads(got[0].decode())
+            except ValueError:
+                cur = {}
+            if cur.get("provider") == provider.name:
+                return
+        try:
+            store.put_if_match(CUSTODY_KEY, body, got[1] if got else None)
+            return
+        except PreconditionFailed:
+            continue
+    cur = read_custody(store) or {}
+    if cur.get("provider") != provider.name:
+        raise KeyCustodyError(f"key custody changed concurrently to {cur.get('provider')!r}")
 
 
 def envelope_from_config(cfg: dict | None, local_dir: str, store: Any, *,

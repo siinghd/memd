@@ -321,3 +321,101 @@ def test_a_second_node_with_local_keys_refuses_instead_of_rekeying(tmp_path):
     m = Memory(f"s3://{BUCKET}/{store.prefix}", config=dict(cfg, local_dir=str(tmp_path / "a")))
     assert any("node A" in i.content for i in m.search("who holds the key").items)
     m.close()
+
+
+# ------------------------------------------- conditional writes (ADR-12)
+
+
+def test_local_compare_and_swap(tmp_path):
+    from memd.storage.objectstore import LocalObjectStore, PreconditionFailed
+
+    s = LocalObjectStore(str(tmp_path / "o"))
+    v1 = s.put_if_match("ns/a/manifest.json", b"gen1", None)
+    with pytest.raises(PreconditionFailed):
+        s.put_if_match("ns/a/manifest.json", b"again", None)      # exists already
+    v2 = s.put_if_match("ns/a/manifest.json", b"gen2", v1)
+    s.put("ns/a/manifest.json", b"someone else")                  # an outside write
+    with pytest.raises(PreconditionFailed):
+        s.put_if_match("ns/a/manifest.json", b"gen3", v2)
+    assert s.get("ns/a/manifest.json") == b"someone else"
+    assert s.get_versioned("ns/a/manifest.json")[1] != v2
+
+
+def test_a_manifest_changed_under_a_namespace_fences_it_and_the_engine_reopens(tmp_path):
+    """Local backend: the CAS is emulated under the process lock. A manifest
+    that changed since this process wrote it is never overwritten; the
+    namespace stops writing and the engine reopens it from the store."""
+    import json as _json
+
+    from memd.core.schema import Kind, MemoryRecord
+    from memd.storage.engine import StorageEngine
+    from memd.storage.objectstore import LeaseLostError
+
+    e = StorageEngine(str(tmp_path / "d"))
+    ns = e.namespace("n1")
+    ns.append([MemoryRecord.create(namespace="n1", kind=Kind.FACT, content="one")])
+    raw = e.store.get("ns/n1/manifest.json")
+    m = _json.loads(raw)
+    m["gen"] += 100                                   # "another writer" committed
+    e.store.put("ns/n1/manifest.json", _json.dumps(m).encode())
+    with pytest.raises(LeaseLostError):
+        ns.rotate("test")
+    assert _json.loads(e.store.get("ns/n1/manifest.json"))["gen"] == m["gen"], "overwritten"
+    again = e.namespace("n1")
+    assert again is not ns
+    assert {r.content for r in again._visible_records()} == {"one"}
+    e.close()
+
+
+@pytest.mark.s3
+def test_s3_bounded_log_delete_spares_a_successors_parts_and_never_reuses_numbers():
+    a = _s3(lease_holder="A@1")
+    a.append("ns/x/wal", b"a0")
+    a.append("ns/x/wal", b"a1")
+    assert a.get("ns/x/wal") == b"a0a1"
+    bound = a.log_bound("ns/x/wal")                  # taken before "the commit"
+    b = _s3(prefix=a.prefix, lease_holder="B@2")     # meanwhile: a successor
+    b.append("ns/x/wal", b"")                        # its takeover fence (empty part)
+    b.append("ns/x/wal", b"b0")
+    a.delete_log("ns/x/wal", bound)                  # the paused writer resumes
+    assert b.get("ns/x/wal") == b"b0", "the stale delete reached the successor's part"
+    b.delete_log("ns/x/wal", b.log_bound("ns/x/wal"))
+    empties = [k for k, sz in b._iter_keys(b._full("ns/x/wal") + ".__part-") if sz == 0]
+    assert empties, "the takeover fence part must outlive the delete"
+    c = _s3(prefix=a.prefix, lease_holder="C@3")     # a cold process continues numbering
+    c.append("ns/x/wal", b"c0")
+    nums = sorted(int(k.rsplit("-", 1)[1]) for k, _ in c._iter_keys(c._full("ns/x/wal") + ".__part-"))
+    assert nums[-1] >= bound + 2, f"part numbers went backwards: {nums}"
+    assert c.get("ns/x/wal") == b"c0"
+
+
+@pytest.mark.s3
+def test_s3_release_is_a_tombstone_that_never_clobbers_a_successor():
+    a = _s3(lease_ttl_s=2.0)
+    b = _s3(prefix=a.prefix, lease_ttl_s=2.0)
+    assert a.try_acquire_owner("ns1", "A:1")
+    a.release_owner("ns1")
+    assert a.read_owner("ns1") is None                           # released
+    assert b.try_acquire_owner("ns1", "B:2")                     # a tombstone is free
+    assert not b.took_over("ns1"), "a clean release is not a takeover"
+    # a stale holder's release lands on a lease that is no longer its own
+    c = _s3(prefix=a.prefix, lease_ttl_s=2.0)
+    c._leases["ns1"], c._lease_etag["ns1"] = "C:3", '"stale-etag"'
+    c.release_owner("ns1")
+    assert c.read_owner("ns1")["holder"] == "B:2", "a stale release removed a live lease"
+    b.release_owner("ns1")
+
+
+@pytest.mark.s3
+def test_s3_put_if_match_fences_the_namespace_on_conflict():
+    from memd.storage.objectstore import LeaseLostError, PreconditionFailed
+
+    a = _s3(lease_ttl_s=30.0)
+    assert a.try_acquire_owner("ns1", "A:1")
+    v = a.put_if_match("ns/ns1/manifest.json", b"gen1", None)
+    a._raw_put(a._full("ns/ns1/manifest.json"), b"a successor's commit")
+    with pytest.raises(PreconditionFailed):
+        a.put_if_match("ns/ns1/manifest.json", b"gen2", v)
+    assert a.get("ns/ns1/manifest.json") == b"a successor's commit"
+    with pytest.raises(LeaseLostError):
+        a.put("ns/ns1/other", b"x")                  # fenced: no further writes

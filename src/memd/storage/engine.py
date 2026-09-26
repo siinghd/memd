@@ -41,7 +41,8 @@ from memd.core.schema import (MemoryRecord, now_ms, records_from_jsonl, records_
 from memd.metrics import METRICS
 from memd.index.sqlite_index import NamespaceIndex
 from memd.storage.crypto import KeyEnvelope, NullKeyEnvelope
-from memd.storage.objectstore import LocalObjectStore, ObjectStore, tmp_is_foreign
+from memd.storage.objectstore import (LeaseLostError, LocalObjectStore, ObjectStore,
+                                      PreconditionFailed, tmp_is_foreign)
 
 _log = logging.getLogger(__name__)
 
@@ -634,6 +635,11 @@ class NamespaceStore:
         # writers are most likely.
         self._owner_path = None
         self._owner_lease = None
+        # the manifest's version as this process last read or wrote it: every
+        # manifest write is a compare-and-swap on it (see _persist_manifest)
+        self._manifest_ver: str | None = None
+        self._took_over = False   # this open reclaimed a stale lease
+        self._lost = False        # a conditional write failed: ownership lost
         if not os.environ.get("MEMD_ALLOW_MULTI_PROCESS"):
             leaser = getattr(store, "try_acquire_owner", None)
             if callable(leaser):
@@ -648,6 +654,7 @@ class NamespaceStore:
                 self._owner_lease = namespace
                 taker = getattr(store, "took_over", None)
                 if callable(taker) and taker(namespace):
+                    self._took_over = True
                     try:
                         self._fence_previous_writer()
                     except BaseException:
@@ -968,10 +975,17 @@ class NamespaceStore:
             os.unlink(self.index.path + ".incoming")
         except OSError:
             pass
-        raw = self.store.get(self.manifest_key)
-        if raw:
-            self.manifest = Manifest.from_dict(json.loads(raw))
-        else:
+        self._read_manifest()
+        if self._took_over:
+            # Taking over from a holder that stopped heartbeating - and may
+            # only be PAUSED, mid-commit. Rewrite the manifest (a new
+            # generation, so a new version) BEFORE reading anything else: its
+            # compare-and-swap commit, whenever it resumes, then fails instead
+            # of landing on top of this session. If its commit lands first,
+            # ours fails: re-read (its commit is complete and consistent) and
+            # claim again.
+            self._claim_manifest()
+        elif self._manifest_ver is None:
             self._persist_manifest()
         # repaired before this session can append an op behind a torn record
         ops = self._read_ops(repair=True)
@@ -1024,13 +1038,13 @@ class NamespaceStore:
         if n_frames and last_seq <= base:
             # every frame is at or below the checkpoint that folded it: the
             # cleanup of a fold or migration that crashed after its commit
-            self.store.delete(self.wal_key)
+            self._drop_log(self.wal_key, self._log_bounds()[0])
             n_frames = 0
         elif good_end < len(wal):
             self.store.truncate(self.wal_key, good_end)  # torn-tail repair
         self.manifest.ops_size = self.store.size(self.ops_key)
         if not ops and self.manifest.ops_size:
-            self.store.delete(self.ops_key)  # the same cleanup, ops side
+            self._drop_log(self.ops_key, self._log_bounds()[1])  # the same cleanup, ops side
             self.manifest.ops_size = 0
         # Seed the frame counter from what is actually in the WAL. Starting it
         # at zero on every open meant the frame bound did not survive a
@@ -1053,6 +1067,67 @@ class NamespaceStore:
             _log.info("namespace %s: migration done, local index rebuilt (%d records) in "
                       "%d ms", self.namespace, len(versions),
                       int((time.monotonic() - self._migrated_t0) * 1000))
+
+    def _read_manifest(self) -> None:
+        got = self.store.get_versioned(self.manifest_key) if hasattr(
+            self.store, "get_versioned") else None
+        if got is None and not hasattr(self.store, "get_versioned"):
+            raw = self.store.get(self.manifest_key)
+            got = (raw, None) if raw else None
+        if got:
+            self.manifest = Manifest.from_dict(json.loads(got[0]))
+            self._manifest_ver = got[1]
+        else:
+            self.manifest = Manifest()
+            self._manifest_ver = None
+
+    def _claim_manifest(self) -> None:
+        for attempt in range(5):
+            try:
+                self._persist_manifest(fence=False)
+                return
+            except PreconditionFailed:
+                METRICS.inc("memd_ns_takeover_manifest_races_total",
+                            help="takeovers that found the previous holder's commit landing")
+                self._read_manifest()
+        raise NamespaceBusyError(
+            f"namespace {self.namespace!r}: the previous writer keeps committing after "
+            "losing its lease; retry shortly")
+
+    def _lose_ownership(self, ex: Exception) -> None:
+        """A conditional write found the namespace changed under us: another
+        writer owns it. Stop - never retry, never overwrite. The store fences
+        the namespace (every further mutation raises), and the engine drops
+        this store and reopens the namespace on its next use."""
+        self._lost = True
+        self._closed = True
+        self._evicted = True
+        fence = getattr(self.store, "fence", None)
+        if callable(fence) and self._owner_lease is not None:
+            fence(self.namespace)
+        self._owner_lease = None   # not ours to release any more
+        METRICS.inc("memd_ns_ownership_lost_total",
+                    help="namespaces fenced by a failed conditional write", ns=self.namespace)
+        _log.error("namespace %s: a conditional write failed - another writer owns it; "
+                   "fenced (%s)", self.namespace, ex)
+        raise LeaseLostError(
+            f"namespace {self.namespace!r} was changed by another writer: this process lost "
+            "ownership and stopped writing it; retry (it is reopened on the next request)") from ex
+
+    def _log_bounds(self) -> tuple[int | None, int | None]:
+        """High-water marks of the WAL and ops log as this process read and
+        wrote them - taken BEFORE a commit, handed to _drop_log after it."""
+        lb = getattr(self.store, "log_bound", None)
+        if not callable(lb):
+            return None, None
+        return lb(self.wal_key), lb(self.ops_key)
+
+    def _drop_log(self, key: str, bound: int | None) -> None:
+        dl = getattr(self.store, "delete_log", None)
+        if callable(dl):
+            dl(key, bound)
+        else:
+            self.store.delete(key)
 
     def _reset_index(self) -> None:
         """Empty the local index and zero its watermark: the replay that
@@ -1247,6 +1322,11 @@ class NamespaceStore:
         rebuilt from the result, so every node serves the same state."""
         t0 = time.monotonic()
         m = self.manifest
+        # a crashed earlier attempt may have left its report: this attempt
+        # rewrites it conditionally on the version seen now, under this lease
+        if hasattr(self.store, "get_versioned"):
+            got = self.store.get_versioned(self._report_key(self.namespace))
+            self._report_ver = got[1] if got else None
         _log.info("namespace %s: migrating from store format %d to %d (%d segments, "
                   "%d WAL bytes, %d ops); other namespaces keep serving", self.namespace,
                   m.format, STORE_FORMAT, len(m.segments), m.wal_size, len(ops))
@@ -1270,13 +1350,14 @@ class NamespaceStore:
         m.seq = m.wal_base_seq = fold
         m.snapshot_name, m.snapshot_seq = "", 0
         m.wal_size = m.ops_size = 0
+        bounds = self._log_bounds()
         self._persist_manifest()  # commit point
         # Only now is the old index's evidence durable in the new segment.
         # It is derived: reset it, so no format-1 watermark can make this
         # open skip the new checkpoint.
         self._reset_index()
-        self.store.delete(self.wal_key)
-        self.store.delete(self.ops_key)
+        self._drop_log(self.wal_key, bounds[0])
+        self._drop_log(self.ops_key, bounds[1])
         if stale_snapshot:
             try:
                 self.store.delete(self._snapshot_key(stale_snapshot))
@@ -1708,7 +1789,16 @@ class NamespaceStore:
         data = json.dumps(report, sort_keys=True).encode()
         if self.envelope.enabled:
             data = self.envelope.encrypt(self.namespace, data)
-        self.store.put(self._report_key(self.namespace), data)
+        key = self._report_key(self.namespace)
+        if not hasattr(self.store, "put_if_match"):
+            self.store.put(key, data)
+            return
+        # conditional like every in-place rewrite: on the version this
+        # migration started from (read at open, under the fresh lease)
+        try:
+            self.store.put_if_match(key, data, getattr(self, "_report_ver", None))
+        except PreconditionFailed as ex:
+            self._lose_ownership(ex)
 
     @classmethod
     def read_migration_report(cls, store: ObjectStore, namespace: str,
@@ -2073,9 +2163,26 @@ class NamespaceStore:
                 vec = np.frombuffer(bytes.fromhex(op["vec_hex"]), dtype=np.float32)
                 self.index.set_vector(op["id"], vec, op.get("model", ""))
 
-    def _persist_manifest(self) -> None:
+    def _persist_manifest(self, fence: bool = True) -> None:
+        """The commit point, as a compare-and-swap on the version this
+        process last read or wrote. A conflict means another writer committed
+        (a successor that took over while this process was paused): fence,
+        never overwrite (see _lose_ownership). `fence=False` only for the
+        takeover claim, which re-reads and retries instead."""
+        if self._lost:
+            raise LeaseLostError(f"namespace {self.namespace!r}: ownership was lost")
         self.manifest.version += 1
-        self.store.put(self.manifest_key, json.dumps(self.manifest.to_dict()).encode())
+        data = json.dumps(self.manifest.to_dict()).encode()
+        cas = getattr(self.store, "put_if_match", None)
+        if cas is None:
+            self.store.put(self.manifest_key, data)
+        else:
+            try:
+                self._manifest_ver = cas(self.manifest_key, data, self._manifest_ver, fence=fence)
+            except PreconditionFailed as ex:
+                if not fence:
+                    raise
+                self._lose_ownership(ex)
         self._manifest_dirty = False
         METRICS.inc("memd_manifest_writes_total", ns=self.namespace)
 
@@ -2387,10 +2494,11 @@ class NamespaceStore:
         self.manifest.checkpoint_gen = self.manifest.version + 1  # the commit's
         self.index.flush()  # rows durable before advancing watermark
         self.index.set_meta("applied_seq", str(self.manifest.seq))
+        bounds = self._log_bounds()   # what this fold read: all it may delete
         self._persist_manifest()
         # truncate logs (object-store friendly: rewrite empty)
-        self.store.delete(self.wal_key)
-        self.store.delete(self.ops_key)
+        self._drop_log(self.wal_key, bounds[0])
+        self._drop_log(self.ops_key, bounds[1])
         self.manifest.wal_size = 0
         self.manifest.ops_size = 0
         self.manifest.wal_base_seq = self.manifest.seq  # next frame = base+1
@@ -2510,12 +2618,13 @@ class NamespaceStore:
             self.index.set_meta("applied_seq", str(self.manifest.seq))
             # commit the new-segment-only view BEFORE deleting anything it
             # replaces - see docstring crash-ordering note
+            bounds = self._log_bounds()   # what this fold read: all it may delete
             self._persist_manifest()
             # seal the writer BEFORE unlinking the wal it points at - see
             # _seal_wal_writer_locked for what happens otherwise
             self._seal_wal_writer_locked()
-            self.store.delete(self.wal_key)
-            self.store.delete(self.ops_key)
+            self._drop_log(self.wal_key, bounds[0])
+            self._drop_log(self.ops_key, bounds[1])
             for on in old_names:
                 self.store.delete(f"{self.prefix}/{on}")
             if stale_snapshot:
@@ -2659,9 +2768,25 @@ class NamespaceStore:
         return st
 
     def close(self) -> None:
+        if self._lost:
+            # another writer owns it: persist nothing, collect nothing
+            try:
+                self.index.close()
+            except Exception:
+                pass
+            return
         with self._lock:
             if self._manifest_dirty:
-                self._persist_manifest()
+                try:
+                    self._persist_manifest()
+                except LeaseLostError:
+                    pass   # fenced by the write itself: nothing of ours to persist
+        if self._lost:
+            try:
+                self.index.close()
+            except Exception:
+                pass
+            return
         # a clean close collects what a crash orphaned, while this process
         # still holds the namespace; the engine audits it (take_collected)
         self._collect_garbage_now(defer_audit=True)
@@ -2898,7 +3023,7 @@ class StorageEngine:
         stale = None
         with self._lock:
             nstore = self._namespaces.get(ns)
-            if nstore is not None and ns not in self._pinned and nstore.lease_lost():
+            if nstore is not None and ns not in self._pinned and (nstore._lost or nstore.lease_lost()):
                 # fenced: another node reclaimed its lease. Its in-memory
                 # state is stale, so drop it WITHOUT persisting anything, and
                 # reopen - which re-acquires, or raises NamespaceBusyError
@@ -2913,6 +3038,7 @@ class StorageEngine:
             METRICS.inc("memd_ns_fenced_drops_total",
                         help="open namespaces dropped after losing their lease")
             stale._owner_lease = None       # not ours to release any more
+            stale._release_ownership()      # the local flock's refcount, if any
             try:
                 stale.index.close()
             except Exception:
