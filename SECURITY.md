@@ -62,6 +62,12 @@ any probe fails the build.
   context / transit `associated_data`): a wrapped key copied under another
   namespace's name does not unwrap. A Vault that silently ignores
   `associated_data` is refused rather than used unbound.
+- **Custody fails closed.** An unreadable `keys/_custody.json` refuses the
+  open on every root (never delete it to get past that - restore it); a
+  namespace that has data is never given a freshly minted key (local roots
+  included; `MEMD_KEYS_ALLOW_MINT_EXISTING=1` only for a namespace that was
+  never encrypted); and log frames that are complete but do not decrypt are
+  never truncated as a "torn tail" - the open is refused instead.
 - **Plaintext data keys are in node memory** while a namespace is open (they
   must be, to encrypt), LRU-bounded to 1024 namespaces per process.
 - **Crypto-shred with a SHARED CMK / transit key** (the normal deployment)

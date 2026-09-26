@@ -132,6 +132,22 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   fences the namespace (`LeaseLostError`, 503 `lease_lost`), never retried.
   A takeover rewrites the manifest before replay; log deletes after a commit
   are bounded to what the commit read, and part numbers never go backwards.
+- **Handoffs no longer lose acked writes** (ADR-12 re-verification): the
+  S3 store's part counters were cached per process, so a node taking a
+  namespace back (A -> B -> A, no fault needed) numbered new parts below the
+  ones written meanwhile, and a retaking node failed writes with "append
+  conflict". Every (re)acquisition now re-seeds from the bucket and the
+  manifest's recorded per-log high-water mark (`log_hw`); the takeover fence
+  takes the next slot above every part; an incomplete takeover releases with
+  an "aborted" (not clean) tombstone; buffered audit entries are flushed
+  before a lease is released.
+- **Key custody fails closed on every root**: an unreadable custody marker
+  refuses the open; a local root no longer mints a new key for a namespace
+  that has data; the torn-tail repair never truncates complete frames that
+  fail to decrypt (REST: `500 key_custody`).
+- An invalid namespace name is answered before any cluster routing; a single
+  server no longer imports the cluster module; a refused open of a
+  namespace that does not exist leaves no lease object behind.
 - REST: a namespace another process holds answers `503 not_owner` (with
   `Retry-After` and `X-Memd-Not-Owner`) instead of `500`; a lease lost
   mid-request answers `503 lease_lost`.
