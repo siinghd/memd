@@ -655,6 +655,7 @@ class Memory:
         # namespace legitimately exists again.
         self._shredded: "OrderedDict[str, None]" = OrderedDict()
         self.engine.audit_hook = self._audit_engine_event
+        self.engine.close_hook = self._namespace_closing
         self.ns = self.engine.namespace(namespace)
         # the facade holds a direct reference to this store for its lifetime:
         # pin it so LRU churn of other namespaces can't close it underneath us
@@ -1030,6 +1031,28 @@ class Memory:
                 except Exception:
                     METRICS.inc("memd_audit_flush_failures_total", ns=victim_name)
             return log
+
+    def _namespace_closing(self, ns_name: str, lost: bool) -> None:
+        """The engine is closing `ns_name` (LRU eviction, shutdown) or dropped
+        it after another writer took it over. Its ledger's buffered entries
+        are written now, while this process still holds the namespace - or
+        dropped when it no longer does (writing them would be a write without
+        the lease) - and the ledger object goes: the next tenure reloads the
+        tail another node may have extended. Cached searches go stale too."""
+        if ns_name == self.namespace_name:
+            return   # the facade's pinned namespace is never evicted
+        with self._audit_lock:
+            log = self._audits.pop(ns_name, None)
+        if log is not None and not lost:
+            try:
+                log.flush()
+            except Exception:
+                METRICS.inc("memd_audit_flush_failures_total", ns=ns_name)
+        elif log is not None:
+            METRICS.inc("memd_audit_entries_dropped_total",
+                        help="buffered audit entries of a namespace lost to another writer",
+                        ns=ns_name)
+        self._bump_epoch(ns_name)
 
     def _audit_engine_event(self, ns_name: str, action: str, target: str, detail: dict) -> None:
         """StorageEngine.audit_hook: engine-initiated events land in the

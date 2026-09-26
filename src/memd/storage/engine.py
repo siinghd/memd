@@ -40,7 +40,7 @@ from memd.core.schema import (MemoryRecord, now_ms, records_from_jsonl, records_
                               ulid_ts_ms)
 from memd.metrics import METRICS
 from memd.index.sqlite_index import NamespaceIndex
-from memd.storage.crypto import KeyEnvelope, NullKeyEnvelope
+from memd.storage.crypto import KeyCustodyError, KeyEnvelope, NullKeyEnvelope
 from memd.storage.objectstore import (LeaseLostError, LocalObjectStore, ObjectStore,
                                       PreconditionFailed, tmp_is_foreign)
 
@@ -126,6 +126,12 @@ class Manifest:
     # retires only ops whose effect its output copies carry, so replay does
     # catch an older image up across it.
     compact_seq: int = 0
+    # Per append log ("wal", "ops", "audit"): one past the highest part number
+    # any holder had used when it committed (ADR-12). A LIST cannot see parts
+    # a fold deleted, and a part number must never be reused - a writer
+    # paused mid-append or mid-delete still means that exact name - so every
+    # new tenure numbers above this (S3ObjectStore.set_log_floor).
+    log_hw: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -145,6 +151,7 @@ class Manifest:
             "checkpoint_gen": self.checkpoint_gen,
             "scrub_seq": self.scrub_seq,
             "compact_seq": self.compact_seq,
+            "log_hw": self.log_hw,
         }
 
     @classmethod
@@ -172,6 +179,8 @@ class Manifest:
             # a manifest written before the field: any checkpoint may have
             # been a compaction, so its snapshot must cover the newest one
             compact_seq=int(d.get("compact_seq", checkpoint_seq) or 0),
+            log_hw={str(k): int(v) for k, v in (d.get("log_hw") or {}).items()
+                    if isinstance(v, int) and v >= 0},
         )
 
 
@@ -639,6 +648,7 @@ class NamespaceStore:
         # manifest write is a compare-and-swap on it (see _persist_manifest)
         self._manifest_ver: str | None = None
         self._took_over = False   # this open reclaimed a stale lease
+        self._takeover_done = False  # ...and completed its fence + manifest claim
         self._lost = False        # a conditional write failed: ownership lost
         if not os.environ.get("MEMD_ALLOW_MULTI_PROCESS"):
             leaser = getattr(store, "try_acquire_owner", None)
@@ -653,13 +663,9 @@ class NamespaceStore:
                         "MEMD_ALLOW_MULTI_PROCESS=1 to override.")
                 self._owner_lease = namespace
                 taker = getattr(store, "took_over", None)
-                if callable(taker) and taker(namespace):
-                    self._took_over = True
-                    try:
-                        self._fence_previous_writer()
-                    except BaseException:
-                        self._release_ownership()
-                        raise
+                # a takeover's fence and manifest claim run in _open, after
+                # the manifest's part high-water marks are known
+                self._took_over = bool(callable(taker) and taker(namespace))
             else:
                 root = getattr(store, "root", None)
                 if root:
@@ -706,12 +712,23 @@ class NamespaceStore:
             self._open()
         except BaseException:
             # never keep a lease (heartbeating forever) on a namespace this
-            # process failed to open - another node could serve it
+            # process failed to open - another node could serve it. But say
+            # HOW it ended: a takeover that did not complete its fence and
+            # manifest claim is not a clean close (the paused holder it took
+            # over from may still resume), so the next holder must fence
+            # again; a namespace that does not exist keeps no lease object.
             try:
                 self.index.close()
             except Exception:
                 pass
-            self._release_ownership()
+            if self._took_over and not self._takeover_done:
+                self._release_ownership(clean=False)
+            else:
+                try:
+                    exists = self.store.exists(self.manifest_key)
+                except Exception:
+                    exists = True
+                self._release_ownership(discard=not exists)
             raise
         self._attach_lexical(lexical)
 
@@ -727,19 +744,36 @@ class NamespaceStore:
         it wrote earlier is replayed. The logs other than these three are
         written only under rotate/compact, whose commit point (the manifest
         PUT) is fence-checked."""
-        for key in (self.wal_key, self.ops_key, f"{self.prefix}/audit"):
-            for attempt in range(5):
+        # The lease acquisition dropped this process's cached counters, and
+        # _apply_log_floors raised them to the manifest's high-water marks,
+        # so the fence part lands on the next slot ABOVE every existing part.
+        # A conflict means a part appeared at that slot since the LIST - the
+        # paused holder's own append landing first: it is in the log (replay
+        # reads it) and the fence moves to the next slot, which is that
+        # holder's next number. Retried a bounded number of times; a holder
+        # that keeps appending past its lease is refused (NamespaceBusyError),
+        # and the aborted takeover is released as NOT clean (see __init__).
+        for key in self._log_keys().values():
+            for attempt in range(16):
                 try:
                     self.store.append(key, b"")
                     break
                 except RuntimeError as ex:
-                    if "append conflict" not in str(ex) or attempt == 4:
+                    if "append conflict" not in str(ex) or attempt == 15:
                         raise NamespaceBusyError(
                             f"namespace {self.namespace!r}: the previous writer is still "
                             "appending after losing its lease; retry shortly") from ex
-                    time.sleep(0.2 * (attempt + 1))
         METRICS.inc("memd_ns_takeover_fences_total",
                     help="namespaces taken over from a stale lease (append logs fenced)")
+
+    def _log_keys(self) -> dict[str, str]:
+        return {"wal": self.wal_key, "ops": self.ops_key, "audit": f"{self.prefix}/audit"}
+
+    def _apply_log_floors(self) -> None:
+        setf = getattr(self.store, "set_log_floor", None)
+        if callable(setf):
+            for name, key in self._log_keys().items():
+                setf(key, int(self.manifest.log_hw.get(name, 0)))
 
     def lease_lost(self) -> bool:
         """This store was opened under a lease the process no longer holds
@@ -976,7 +1010,9 @@ class NamespaceStore:
         except OSError:
             pass
         self._read_manifest()
+        self._apply_log_floors()
         if self._took_over:
+            self._fence_previous_writer()
             # Taking over from a holder that stopped heartbeating - and may
             # only be PAUSED, mid-commit. Rewrite the manifest (a new
             # generation, so a new version) BEFORE reading anything else: its
@@ -985,6 +1021,7 @@ class NamespaceStore:
             # ours fails: re-read (its commit is complete and consistent) and
             # claim again.
             self._claim_manifest()
+            self._takeover_done = True
         elif self._manifest_ver is None:
             self._persist_manifest()
         # repaired before this session can append an op behind a torn record
@@ -1037,13 +1074,17 @@ class NamespaceStore:
             self._replayed_at_open = True
         if n_frames and last_seq <= base:
             # every frame is at or below the checkpoint that folded it: the
-            # cleanup of a fold or migration that crashed after its commit
+            # cleanup of a fold or migration that crashed after its commit -
+            # unless they only LOOK folded because they do not decrypt
+            self._refuse_undecryptable(wal, 0, "WAL")
             self._drop_log(self.wal_key, self._log_bounds()[0])
             n_frames = 0
         elif good_end < len(wal):
+            self._refuse_undecryptable(wal, good_end, "WAL")
             self.store.truncate(self.wal_key, good_end)  # torn-tail repair
         self.manifest.ops_size = self.store.size(self.ops_key)
         if not ops and self.manifest.ops_size:
+            self._refuse_undecryptable(self.store.get(self.ops_key) or b"", 0, "ops")
             self._drop_log(self.ops_key, self._log_bounds()[1])  # the same cleanup, ops side
             self.manifest.ops_size = 0
         # Seed the frame counter from what is actually in the WAL. Starting it
@@ -1330,6 +1371,9 @@ class NamespaceStore:
         _log.info("namespace %s: migrating from store format %d to %d (%d segments, "
                   "%d WAL bytes, %d ops); other namespaces keep serving", self.namespace,
                   m.format, STORE_FORMAT, len(m.segments), m.wal_size, len(ops))
+        # a migration folds the logs and then deletes them: they must all be
+        # readable under this key first (see _refuse_undecryptable)
+        self._refuse_undecryptable(self.store.get(self.wal_key) or b"", 0, "WAL")
         plan = self._plan_legacy(ops, t0)
         kept, out, deferred, fold = plan["kept"], plan["out"], plan["deferred"], plan["fold"]
         report = plan["report"]
@@ -1822,6 +1866,8 @@ class NamespaceStore:
         data = self.store.get(self.ops_key) or b""
         ops, good_end = self._scan_ops(data)
         if repair and good_end < len(data):
+            if data[:1] != b"{":
+                self._refuse_undecryptable(data, good_end, "ops")
             self.store.truncate(self.ops_key, good_end)
             METRICS.inc("memd_ops_log_repairs_total",
                         help="ops logs whose damaged tail was cut off at open",
@@ -2131,6 +2177,43 @@ class NamespaceStore:
             return [data]  # legacy single blob
         return list(_frame_iter(data))
 
+    def _undecryptable(self, frame: bytes) -> bool:
+        """A length-complete frame that does not decrypt under this
+        namespace's key and is not a legacy plaintext frame either."""
+        if not self.envelope.enabled or len(frame) <= 12:
+            return False
+        try:
+            self.envelope.decrypt(self.namespace, frame)
+            return False
+        except KeyCustodyError:
+            raise
+        except Exception:
+            pass
+        if frame[:1] == b"{":
+            try:   # written before encryption was on: plaintext JSON
+                json.loads(frame.split(b"\n", 1)[0])
+                return False
+            except ValueError:
+                pass
+        return True
+
+    def _refuse_undecryptable(self, data: bytes, start: int, what: str) -> None:
+        """Before a repair CUTS data[start:] (or deletes it): every complete
+        frame there must decrypt. One that does not is not a torn tail - only
+        a frame cut short by its length is - it is data under a key this
+        process does not have (lost, replaced, another provider). Truncating
+        it would destroy it for good; refuse to open instead, nothing cut."""
+        for _end, fr in _frames_with_offsets(data[start:]):
+            if self._undecryptable(fr):
+                METRICS.inc("memd_key_custody_refusals_total",
+                            help="opens refused: complete log frames do not decrypt",
+                            ns=self.namespace, log=what)
+                raise KeyCustodyError(
+                    f"namespace {self.namespace!r}: a complete {what} frame does not decrypt "
+                    "with this process's data key - the key is not the one the data was "
+                    "written with (lost, replaced, or held by another key provider). "
+                    "Refusing to open; nothing was truncated")
+
     def _decrypt_frame(self, frame: bytes) -> bytes:
         if len(frame) > 12 and self.envelope.enabled:
             try:
@@ -2171,6 +2254,12 @@ class NamespaceStore:
         takeover claim, which re-reads and retries instead."""
         if self._lost:
             raise LeaseLostError(f"namespace {self.namespace!r}: ownership was lost")
+        lb = getattr(self.store, "log_bound", None)
+        if callable(lb):
+            for name, key in self._log_keys().items():
+                hw = lb(key)
+                if hw and hw > self.manifest.log_hw.get(name, 0):
+                    self.manifest.log_hw[name] = int(hw)
         self.manifest.version += 1
         data = json.dumps(self.manifest.to_dict()).encode()
         cas = getattr(self.store, "put_if_match", None)
@@ -2805,13 +2894,15 @@ class NamespaceStore:
         self.index.close()
         self._release_ownership()
 
-    def _release_ownership(self) -> None:
+    def _release_ownership(self, *, clean: bool = True, discard: bool = False) -> None:
         if self._owner_path:
             _release_owner(self._owner_path)
             self._owner_path = None
         if self._owner_lease is not None:
             try:
-                self.store.release_owner(self._owner_lease)
+                self.store.release_owner(self._owner_lease, clean=clean, discard=discard)
+            except TypeError:
+                self.store.release_owner(self._owner_lease)   # a store without the modes
             except Exception:
                 pass  # a lease expires on its own; never fail teardown on it
             self._owner_lease = None
@@ -2918,6 +3009,21 @@ class StorageEngine:
         # was down, or one the migration recovered - instead of leaving the
         # text on disk until the next write happens to check.
         self.open_hook = None
+        # close_hook(ns, lost): called before a namespace store is closed (LRU
+        # eviction, engine close) - while its lease is still held - or after
+        # it was dropped because another writer took it over (lost=True).
+        # The Memory facade flushes and drops its per-namespace state there:
+        # buffered audit entries must be written under the lease, and a later
+        # tenure must not start from this one's ledger tail or search cache.
+        self.close_hook = None
+
+    def _closing(self, ns: str, lost: bool = False) -> None:
+        if self.close_hook is not None:
+            try:
+                self.close_hook(ns, lost)
+            except Exception:  # noqa: BLE001 - a hook never blocks a close
+                METRICS.inc("memd_close_hook_failures_total",
+                            help="namespace-close hooks that raised", ns=ns)
 
     def pin_namespace(self, ns: str) -> None:
         """Mark a namespace as process-resident (never LRU-evicted). The
@@ -2984,6 +3090,7 @@ class StorageEngine:
         then release its claim; `held`: this thread holds its ns lock too.
         Returns what its clean close collected, for the caller to audit."""
         try:
+            self._closing(name)
             try:
                 nstore.close()  # flushes manifest + index watermark durably
             except Exception:
@@ -3037,6 +3144,7 @@ class StorageEngine:
         if stale is not None:
             METRICS.inc("memd_ns_fenced_drops_total",
                         help="open namespaces dropped after losing their lease")
+            self._closing(ns, lost=True)
             stale._owner_lease = None       # not ours to release any more
             stale._release_ownership()      # the local flock's refcount, if any
             try:

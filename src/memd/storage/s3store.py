@@ -178,6 +178,12 @@ class S3ObjectStore(ObjectStore):
         # successor wrote while this process was paused
         self._seen_hw: dict[str, int] = {}
         self._hw_lock = threading.Lock()
+        # Per append log: a part number this process must never number BELOW
+        # again - its own earlier counters (kept when a namespace's cached
+        # state is dropped) and the high-water mark the namespace's manifest
+        # records (set_log_floor). Numbering is strictly monotonic across
+        # every tenure of every node, so no part number is ever reused.
+        self._floor: dict[str, int] = {}
         # who this store claims leases as; NamespaceStore falls back to
         # host:pid. A cluster node names itself here so the router can map a
         # lease to the node serving it (see memd.server.cluster)
@@ -540,7 +546,7 @@ class S3ObjectStore(ObjectStore):
 
     def log_bound(self, key: str) -> int | None:
         with self._seq_lock:
-            nxt = self._next_part.get(key, 0)
+            nxt = max(self._next_part.get(key, 0), self._floor.get(key, 0))
         with self._hw_lock:
             hw = max(nxt, self._seen_hw.get(key, 0))
         return hw if hw else None
@@ -675,8 +681,10 @@ class S3ObjectStore(ObjectStore):
         with self._seq_lock:
             seq = self._next_part.get(key)
             if seq is None:
-                # first append to this key in this process
+                # first append to this key in this tenure: from the bucket,
+                # never below this key's floor (see _floor)
                 seq, base = self._seed_seq(key)
+                seq = max(seq, self._floor.get(key, 0))
             else:
                 base = self._size_cache.get(key)
                 if base is None:
@@ -938,6 +946,13 @@ class S3ObjectStore(ObjectStore):
         return f"{holder}\n{time.time()}".encode()
 
     def _hold(self, namespace: str, holder: str, etag: str | None, t0: float) -> None:
+        # Every (re)acquisition starts from the bucket, not from what this
+        # process remembered of an EARLIER tenure: other nodes may have
+        # appended, folded and deleted since. A stale part counter numbered
+        # new parts below existing ones (the log order is the part order) and
+        # placed the takeover fence below a paused writer's next part - acked
+        # writes were lost across an A -> B -> A handoff.
+        self._forget_ns(namespace)
         self._leases[namespace] = holder
         self._lease_etag[namespace] = etag
         self._fenced.discard(namespace)
@@ -951,6 +966,31 @@ class S3ObjectStore(ObjectStore):
         self._fenced.add(ns)
         self._leases.pop(ns, None)
         self._lease_etag.pop(ns, None)
+        self._forget_ns(ns)
+
+    def _forget_ns(self, ns: str) -> None:
+        """Drop every cached per-key state of namespace `ns` (part counters,
+        sizes, seen high-water marks), keeping only the monotonic floor."""
+        pre = f"ns/{ns}/"
+        with self._seq_lock:
+            for k in [k for k in self._next_part if k.startswith(pre)]:
+                self._floor[k] = max(self._floor.get(k, 0), self._next_part.pop(k))
+            for k in [k for k in self._size_cache if k.startswith(pre)]:
+                self._size_cache.pop(k, None)
+        with self._hw_lock:
+            for k in [k for k in self._seen_hw if k.startswith(pre)]:
+                self._floor[k] = max(self._floor.get(k, 0), self._seen_hw.pop(k))
+
+    def set_log_floor(self, key: str, floor: int) -> None:
+        """Never number a part of `key` below `floor` (the high-water mark a
+        manifest recorded - it survives the parts a fold deleted, which a
+        LIST cannot see)."""
+        if floor <= 0:
+            return
+        with self._seq_lock:
+            self._floor[key] = max(self._floor.get(key, 0), int(floor))
+            if key in self._next_part and self._next_part[key] < floor:
+                self._next_part[key] = int(floor)
 
     def _renew_one(self, ns: str, holder: str) -> bool | None:
         """One renewal. True: renewed. False: lost (fenced). None: transient
@@ -1198,7 +1238,7 @@ class S3ObjectStore(ObjectStore):
                     and time.monotonic() - self._last_beat.get(namespace, 0.0) <= self._valid_for())
         return True
 
-    def release_owner(self, namespace: str) -> None:
+    def release_owner(self, namespace: str, *, clean: bool = True, discard: bool = False) -> None:
         """Drop our lease - but only if it is still OURS.
 
         An unconditional delete would remove whichever lease is present,
@@ -1210,10 +1250,29 @@ class S3ObjectStore(ObjectStore):
         """
         holder = self._leases.pop(namespace, None)
         etag = self._lease_etag.pop(namespace, None)
+        self._forget_ns(namespace)
         if holder is None:
             return
         key = self._owner_key(namespace)
         try:
+            if discard:
+                # the namespace does not exist (a refused open of a name that
+                # was never created): leave no lease object behind
+                cur = (self._raw_get(key) or b"").decode(errors="replace")
+                if cur.split("\n", 1)[0] == holder:
+                    self._raw_delete(key)
+                return
+            if not clean:
+                # An ABORTED tenure (a takeover whose fence or manifest claim
+                # did not complete): not a clean close, so the next holder
+                # must treat it like a stale lease - fence the append logs,
+                # claim the manifest - instead of trusting a clean release
+                try:
+                    self._raw_cas_put(key, _ABORTED, if_match=etag) if etag else \
+                        self._raw_put(key, _ABORTED)
+                except _NoConditional:
+                    self._raw_put(key, _ABORTED)
+                return
             if etag:
                 # a RELEASED tombstone, compare-and-swapped onto the lease we
                 # last wrote: if anyone took it meanwhile, nothing is written
@@ -1234,8 +1293,12 @@ class S3ObjectStore(ObjectStore):
                 self._lease_thread = None
 
 
-# the body of a lease its holder released (see release_owner)
+# the body of a lease its holder released CLEANLY (see release_owner); the
+# ONLY lease body a new holder may acquire without fencing and claiming
 _RELEASED = b"\n0"
+# a tenure that ended without completing its takeover: reads as a stale
+# lease (holder "aborted", stamped at the epoch), so the next holder fences
+_ABORTED = b"aborted\n0"
 # the cluster node registry's directory (memd.server.cluster.NODE_PREFIX)
 _REGISTRY_DIR = "_cluster"
 
