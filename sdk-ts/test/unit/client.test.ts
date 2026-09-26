@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MemdClient } from "../../src/index.js";
+import { ForgetPreviewMismatchError, MemdClient } from "../../src/index.js";
 import { EMPTY_SEARCH, RECORD, SEARCH_RESULT, client, json, scriptedFetch } from "./helpers.js";
 
 afterEach(() => {
@@ -155,6 +155,12 @@ describe("reads", () => {
     expect(calls[1]!.url).toBe("http://memd.test/v1/ns/default/memories/missing");
   });
 
+  it("get passes include_deleted for admin reads", async () => {
+    const { fetch, calls } = scriptedFetch(json({ ...RECORD, deleted: true }));
+    expect((await client(fetch).get("01A", { history: true, include_deleted: true }))?.deleted).toBe(true);
+    expect(calls[0]!.url).toBe("http://memd.test/v1/ns/default/memories/01A?history=true&include_deleted=true");
+  });
+
   it("findIds returns the id list", async () => {
     const { fetch, calls } = scriptedFetch(json({ ids: ["a", "b"] }));
     expect(await client(fetch).findIds("deploy", { kinds: ["fact"], user_id: "u1" })).toEqual(["a", "b"]);
@@ -193,16 +199,58 @@ describe("lifecycle", () => {
     ]);
   });
 
-  it("forget previews without confirm and returns deleted ids with it", async () => {
-    const preview = { will_delete: [{ id: "a", content: "x" }], count: 1, confirmed: false };
-    const done = { deleted: ["a"], count: 1, confirmed: true };
+  const preview = {
+    will_delete: [{ id: "a", content: "x" }],
+    count: 1,
+    confirmed: false as const,
+    fingerprint: "3f0c2a9d8e7b6a5f4e3d2c1b0a998877",
+  };
+  const done = { deleted: ["a"], count: 1, confirmed: true };
+
+  it("forget previews without confirm", async () => {
+    const { fetch, calls } = scriptedFetch(json(preview));
+    expect(await client(fetch).forget("deploy", { user_id: "u1", kinds: ["fact"] })).toEqual(preview);
+    expect(calls[0]!.url).toBe("http://memd.test/v1/ns/default/forget");
+    expect(calls[0]!.body).toEqual({ query: "deploy", user_id: "u1", kinds: ["fact"], confirm: false });
+  });
+
+  it("confirming with the preview sends its fingerprint and the same filters", async () => {
     const { fetch, calls } = scriptedFetch(json(preview), json(done));
     const c = client(fetch);
-    expect(await c.forget("deploy", { user_id: "u1" })).toEqual(preview);
-    expect(await c.forget("deploy", { user_id: "u1", confirm: true })).toEqual(["a"]);
-    expect(calls[0]!.body).toEqual({ query: "deploy", user_id: "u1", confirm: false });
-    expect(calls[1]!.body).toEqual({ query: "deploy", user_id: "u1", confirm: true });
-    expect(calls[1]!.url).toBe("http://memd.test/v1/ns/default/forget");
+    const filters = { user_id: "u1", kinds: ["fact" as const], as_of: 1790000000000 };
+    const p = await c.forget("deploy", filters);
+    expect(await c.forget("deploy", { ...filters, confirm: p })).toEqual(["a"]);
+    expect(calls[1]!.body).toEqual({
+      query: "deploy",
+      user_id: "u1",
+      kinds: ["fact"],
+      as_of: 1790000000000,
+      confirm: true,
+      fingerprint: preview.fingerprint,
+    });
+  });
+
+  it("confirm: true sends an explicit fingerprint, or none", async () => {
+    const { fetch, calls } = scriptedFetch(json(done));
+    const c = client(fetch);
+    await c.forget("deploy", { confirm: true, fingerprint: "abc" });
+    await c.forget("deploy", { confirm: true });
+    await c.forget("deploy", { fingerprint: "ignored-without-confirm" }).catch(() => undefined);
+    expect(calls[0]!.body).toEqual({ query: "deploy", confirm: true, fingerprint: "abc" });
+    expect(calls[1]!.body).toEqual({ query: "deploy", confirm: true });
+    expect(calls[2]!.body).toEqual({ query: "deploy", confirm: false });
+  });
+
+  it("a changed match set surfaces as ForgetPreviewMismatchError", async () => {
+    const { fetch, calls } = scriptedFetch(
+      json({ detail: "the query now matches 2 record(s), not the previewed set: preview again and confirm that", code: "preview_mismatch" }, 409),
+    );
+    const err = await client(fetch, { retries: 5 })
+      .forget("deploy", { confirm: preview })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ForgetPreviewMismatchError);
+    expect((err as ForgetPreviewMismatchError).code).toBe("preview_mismatch");
+    expect(calls).toHaveLength(1); // a confirm is never retried
   });
 
   it("closeSession, compact, reembed post to their routes", async () => {
@@ -232,6 +280,12 @@ describe("lifecycle", () => {
       "DELETE http://memd.test/v1/ns/other",
       "DELETE http://memd.test/v1/ns/home",
     ]);
+  });
+
+  it("destroyNamespace returns false when the namespace does not exist (404)", async () => {
+    const { fetch, calls } = scriptedFetch(json({ detail: "namespace 'nope' not found", code: "not_found" }, 404));
+    expect(await client(fetch).destroyNamespace("nope")).toBe(false);
+    expect(calls).toHaveLength(1);
   });
 });
 

@@ -17,6 +17,7 @@ export {
   AuthenticationError,
   BadRequestError,
   ConflictError,
+  ForgetPreviewMismatchError,
   GoneError,
   MemdError,
   NetworkError,

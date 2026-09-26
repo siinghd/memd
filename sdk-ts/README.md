@@ -112,10 +112,10 @@ Every method accepts per-call options: `namespace` (overrides the client's), `si
 | `search(query, opts?)` | `POST /v1/ns/{ns}/search` | `SearchResult` |
 | `pack(messages, opts?)` | search on the last user message | messages plus one system message |
 | `observe(messages, response, opts?)` | `POST /v1/ns/{ns}/events` | `string[]` |
-| `get(id, { history? })` | `GET /v1/ns/{ns}/memories/{id}` | `MemoryRecord \| null` |
+| `get(id, { history?, include_deleted? })` | `GET /v1/ns/{ns}/memories/{id}` | `MemoryRecord \| null` |
 | `delete(id, { hard? })` | `DELETE /v1/ns/{ns}/memories/{id}` | `boolean` (`false` on 404) |
 | `findIds(query, opts?)` | `POST /v1/ns/{ns}/find_ids` | `string[]` |
-| `forget(query, opts?)` | `POST /v1/ns/{ns}/forget` | `ForgetPreview`, or `string[]` with `confirm: true` |
+| `forget(query, opts?)` | `POST /v1/ns/{ns}/forget` | `ForgetPreview`, or `string[]` with `confirm` |
 | `export(opts?)` | `POST /v1/ns/{ns}/export` | `MemoryRecord[]` |
 | `exportJsonl(opts?)` | same | raw NDJSON `string` |
 | `exportStream(opts?)` | same, streamed | `AsyncGenerator<MemoryRecord>` |
@@ -123,7 +123,7 @@ Every method accepts per-call options: `namespace` (overrides the client's), `si
 | `closeSession(sid, opts?)` | `POST /v1/ns/{ns}/sessions/{sid}/close` | `CloseSessionResult` |
 | `compact({ force? })` | `POST /v1/ns/{ns}/compact` | `CompactionReport` |
 | `reembed(opts?)` | `POST /v1/ns/{ns}/reembed` | `ReembedResult` |
-| `destroyNamespace(ns?)` | `DELETE /v1/ns/{ns}` (admin key) | `boolean` |
+| `destroyNamespace(ns?)` | `DELETE /v1/ns/{ns}` (admin key) | `boolean` (`false` if it does not exist) |
 | `status(opts?)` | `GET /v1/status` | `ServerStatus` |
 | `health(opts?)` | `GET /health` | `HealthResult` |
 
@@ -136,24 +136,40 @@ These take the same messages as the Python SDK: OpenAI-style `{ role, content }`
 - `pack` searches with the last `user` message. When anything matches, it inserts one `{ role: "system", content: packed_context }` after your leading system messages. Otherwise it returns the messages unchanged. The input array is never mutated. A user message longer than the server's 10,000-character query cap is trimmed for the search.
 - `observe` stores every message that has text, plus `response` (a string or a message object) as `assistant`, in one durable batch.
 
+### Deleting
+
+- `delete(id)` soft-deletes: the record disappears from every read at once, `history` included, and is physically purged at the next compaction (≤ 72 h). `delete(id, { hard: true })` purges it, and it also works on a record that is already soft-deleted.
+- Only an admin key can read a deleted record, with `get(id, { include_deleted: true })`. A namespace key gets `PermissionDeniedError`.
+- `forget` works in two phases. The preview says what would be deleted. Pass that preview back as `confirm`, with the same query and filters, to delete exactly that set:
+
+```ts
+const preview = await memd.forget("wifi password", { user_id: "u1", kinds: ["fact"] });
+console.log(preview.count, preview.will_delete);
+const deleted = await memd.forget("wifi password", { user_id: "u1", kinds: ["fact"], confirm: preview });
+```
+
+  The preview's `fingerprint` travels with the confirm. If the matches changed in between, the server deletes nothing and the client throws `ForgetPreviewMismatchError` (409, `preview_mismatch`): preview again. `confirm: true` deletes without this check.
+
 ## Errors
 
-Every failure is a `MemdError` with `status`, `code` and `message`. The message is the server's `detail`.
+Every failure is a `MemdError` with `status`, `code` and `message`. The message is the server's `detail`, and `code` is the server's machine-readable `code`. The class follows the status:
 
-| Status | Class | `code` |
+| Status | Class | Typical `code` |
 |---|---|---|
-| 400 | `BadRequestError` | `bad_request` |
+| 400 | `BadRequestError` | `validation_error` |
 | 401 | `AuthenticationError` | `unauthorized` |
 | 403 | `PermissionDeniedError` | `forbidden` |
-| 404 | `NotFoundError` | `not_found` (`get`/`delete` return `null`/`false` instead) |
-| 409 | `ConflictError` | `conflict` |
-| 410 | `GoneError` | `gone` |
+| 404 | `NotFoundError` | `not_found` (`get`, `delete` and `destroyNamespace` return `null`/`false` instead) |
+| 409 | `ConflictError`; `ForgetPreviewMismatchError` for a stale forget | `conflict`, `preview_mismatch` |
+| 410 | `GoneError` | `namespace_destroyed` |
 | 413 | `PayloadTooLargeError` | `payload_too_large` |
 | 422 | `ValidationError` (`.issues`: pydantic's list) | `validation_error` |
 | 429 | `RateLimitError` (`.retryAfter`, in seconds, from `Retry-After`) | `rate_limited` |
-| 5xx | `ServerError` | `server_error` |
+| 5xx | `ServerError` | `internal_error`, `unavailable` |
 | none | `NetworkError`, `RequestTimeoutError` | `network_error`, `timeout` |
 | none | `RequestAbortedError` (your signal fired) | `aborted` |
+
+A body without a `code`, such as one from an older server or a proxy, gets the server's default code for its status.
 
 ```ts
 import { PermissionDeniedError, RateLimitError, ValidationError } from "@memd/client";
@@ -182,16 +198,10 @@ new MemdClient({
 });
 ```
 
-- Retries happen on 429, 500, 502, 503 and 504, on timeouts, and on network errors. A `Retry-After` header is honored for waits up to 60 s.
+- Retries happen on 429, 500, 502, 503 and 504, on timeouts, and on network errors. memd sends `Retry-After` with its 429s, and the client waits that long, up to 60 s. Otherwise it uses its backoff.
 - Only idempotent calls retry: `get`, `search`, `pack`, `findIds`, `forget` without `confirm`, the exports, `stats`, `status`, `health` and record `delete`. A retried `delete` whose first attempt landed returns `false`.
 - Writes never retry: `add`, `addEvents`, `remember`, `observe`, confirmed `forget`, `closeSession`, `compact`, `reembed` and `destroyNamespace`. The API has no idempotency key, so a retried write could store twice. Handle `RateLimitError` on writes yourself. memd rejects a request with 429 before running it, so retrying after a 429 is safe.
 - Pass `signal` to cancel. The client throws `RequestAbortedError` and never retries after an abort.
-
-## Known server behavior
-
-- `forget(query, { confirm: true })` ignores `as_of` and `kinds`: the server applies them only to the preview. Preview and confirm with query and scope alone if you need the two to match.
-- `delete(id, { hard: true })` on a record that is already soft-deleted returns `false` (404). Soft-deleted records are physically purged at the next compaction (≤ 72 h).
-- memd's 429 responses don't send `Retry-After` today, so `retryAfter` is `undefined` and the client falls back to its backoff.
 
 ## Development
 

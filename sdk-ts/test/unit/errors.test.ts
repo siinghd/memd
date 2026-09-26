@@ -3,6 +3,7 @@ import {
   AuthenticationError,
   BadRequestError,
   ConflictError,
+  ForgetPreviewMismatchError,
   GoneError,
   MemdError,
   NotFoundError,
@@ -15,23 +16,25 @@ import {
 import { errorFromResponse, parseRetryAfter } from "../../src/errors.js";
 import { client, json, scriptedFetch } from "./helpers.js";
 
+// [status, class, the server's `code`, detail] as memd sends them
 const cases = [
-  [400, BadRequestError, "bad_request", "serialized meta exceeds 65536 byte cap"],
+  [400, BadRequestError, "validation_error", "serialized meta exceeds 65536 byte cap"],
   [401, AuthenticationError, "unauthorized", "invalid key"],
   [403, PermissionDeniedError, "forbidden", "key not valid for namespace 'b'"],
   [404, NotFoundError, "not_found", "not found"],
   [409, ConflictError, "conflict", "conflict"],
-  [410, GoneError, "gone", "namespace destroyed"],
+  [409, ForgetPreviewMismatchError, "preview_mismatch", "the query now matches 2 record(s), not the previewed set: preview again and confirm that"],
+  [410, GoneError, "namespace_destroyed", "namespace destroyed"],
   [413, PayloadTooLargeError, "payload_too_large", "request body too large"],
   [429, RateLimitError, "rate_limited", "rate limit exceeded"],
-  [500, ServerError, "server_error", "internal error"],
-  [503, ServerError, "server_error", "namespace unavailable (destroyed or rebuilding)"],
+  [500, ServerError, "internal_error", "internal error"],
+  [503, ServerError, "unavailable", "namespace unavailable (destroyed or rebuilding)"],
 ] as const;
 
 describe("status mapping", () => {
   for (const [status, Cls, code, detail] of cases) {
-    it(`${status} -> ${Cls.name}`, async () => {
-      const { fetch } = scriptedFetch(json({ detail }, status));
+    it(`${status} ${code} -> ${Cls.name}`, async () => {
+      const { fetch } = scriptedFetch(json({ detail, code }, status));
       const err = await client(fetch, { retries: 0 })
         .stats()
         .catch((e: unknown) => e);
@@ -47,10 +50,34 @@ describe("status mapping", () => {
     });
   }
 
+  it("a preview mismatch is still a ConflictError", () => {
+    const body = JSON.stringify({ detail: "changed", code: "preview_mismatch" });
+    const e = errorFromResponse(409, body, new Headers());
+    expect(e).toBeInstanceOf(ForgetPreviewMismatchError);
+    expect(e).toBeInstanceOf(ConflictError);
+  });
+
+  it("a body without `code` gets the server's default code for the status", () => {
+    const fallback = (status: number) => errorFromResponse(status, JSON.stringify({ detail: "x" }), new Headers()).code;
+    expect(fallback(400)).toBe("validation_error");
+    expect(fallback(404)).toBe("not_found");
+    expect(fallback(409)).toBe("conflict");
+    expect(fallback(429)).toBe("rate_limited");
+    expect(fallback(500)).toBe("internal_error");
+    expect(fallback(503)).toBe("unavailable");
+    expect(fallback(502)).toBe("error");
+  });
+
+  it("an unknown server code passes through", () => {
+    const e = errorFromResponse(403, JSON.stringify({ detail: "x", code: "quota_exhausted" }), new Headers());
+    expect(e).toBeInstanceOf(PermissionDeniedError);
+    expect(e.code).toBe("quota_exhausted");
+  });
+
   it("an unmapped 4xx is a plain MemdError", () => {
     const e = errorFromResponse(418, JSON.stringify({ detail: "teapot" }), new Headers());
     expect(e.constructor).toBe(MemdError);
-    expect(e.code).toBe("http_error");
+    expect(e.code).toBe("error");
     expect(e.status).toBe(418);
   });
 
@@ -58,6 +85,7 @@ describe("status mapping", () => {
     const e = errorFromResponse(502, "<html>Bad Gateway</html>", new Headers());
     expect(e).toBeInstanceOf(ServerError);
     expect(e.message).toBe("<html>Bad Gateway</html>");
+    expect(e.code).toBe("error");
   });
 
   it("a JSON body without detail falls back to the status", () => {
@@ -91,7 +119,7 @@ describe("422 validation", () => {
   ];
 
   it("exposes every issue and summarizes them in the message", async () => {
-    const { fetch } = scriptedFetch(json({ detail }, 422));
+    const { fetch } = scriptedFetch(json({ detail, code: "validation_error" }, 422));
     const err = await client(fetch)
       .search("")
       .catch((e: unknown) => e);
@@ -137,7 +165,20 @@ describe("Retry-After", () => {
     expect(err.retryAfter).toBe(120);
   });
 
-  it("retryAfter is undefined when the server sends no header (memd's 429s today)", async () => {
+  it("RateLimitError from memd's real 429 (whole-second Retry-After, code)", async () => {
+    const { fetch } = scriptedFetch(
+      json({ detail: "find_ids rate limit exceeded; retry later", code: "rate_limited" }, 429, { "Retry-After": "6" }),
+    );
+    const err = (await client(fetch, { retries: 0 })
+      .findIds("q")
+      .catch((e: unknown) => e)) as RateLimitError;
+    expect(err).toBeInstanceOf(RateLimitError);
+    expect(err.code).toBe("rate_limited");
+    expect(err.retryAfter).toBe(6);
+    expect(err.message).toBe("find_ids rate limit exceeded; retry later");
+  });
+
+  it("retryAfter is undefined when the response has no Retry-After", async () => {
     const { fetch } = scriptedFetch(json({ detail: "rate limit exceeded" }, 429));
     const err = (await client(fetch, { retries: 0 })
       .stats()
@@ -153,7 +194,7 @@ describe("malformed success bodies", () => {
       .stats()
       .catch((e: unknown) => e)) as MemdError;
     expect(err).toBeInstanceOf(MemdError);
-    expect(err.code).toBe("http_error");
+    expect(err.code).toBe("invalid_response");
     expect(err.cause).toBeInstanceOf(SyntaxError);
     expect(calls).toHaveLength(1); // not retried
   });

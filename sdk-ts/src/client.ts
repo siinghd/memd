@@ -79,12 +79,23 @@ export interface RequestOptions {
 export type AddOptions = Omit<EventIn, "content"> & RequestOptions;
 export type RememberOptions = Omit<MemoryIn, "content"> & RequestOptions;
 export type SearchOptions = Omit<SearchIn, "query"> & RequestOptions;
-export type FindOptions = Omit<FindIn, "query" | "confirm"> & RequestOptions;
-export type ForgetOptions = FindOptions & { confirm?: boolean };
+export type FindOptions = Omit<FindIn, "query" | "confirm" | "fingerprint"> & RequestOptions;
+export type ForgetOptions = FindOptions & {
+  /**
+   * `true` deletes; the preview itself (what an unconfirmed `forget`
+   * returned) deletes and sends its `fingerprint`, so the server deletes
+   * nothing if the matches changed since.
+   */
+  confirm?: boolean | ForgetPreview;
+  /** A preview's fingerprint, when confirming with `confirm: true`. */
+  fingerprint?: string;
+};
 export type ObserveOptions = ScopeFields & RequestOptions;
 export interface GetOptions extends RequestOptions {
-  /** Include the supersedence chain (and soft-deleted records). */
+  /** Include the supersedence chain (superseded versions; deleted ones only with `include_deleted`). */
   history?: boolean;
+  /** Serve a deleted record, or deleted versions in its history. Override-capable (admin) keys only: 403 otherwise. */
+  include_deleted?: boolean;
 }
 export interface DeleteOptions extends RequestOptions {
   /** Hard delete: purged from storage within the deadline, not just tombstoned. */
@@ -264,14 +275,14 @@ export class MemdClient {
     return injectContext(messages, res.packed_context);
   }
 
-  /** One record by id, or `null` when it does not exist (or is deleted, unless `history`). */
+  /** One record by id, or `null` when it does not exist (or is deleted, unless `include_deleted`). */
   async get(recordId: string, options: GetOptions = {}): Promise<MemoryRecord | null> {
     try {
       return await this.json<MemoryRecord>(
         {
           method: "GET",
           path: this.nsPath(options, `/memories/${encodeURIComponent(recordId)}`),
-          query: { history: options.history },
+          query: { history: options.history, include_deleted: options.include_deleted },
           idempotent: true,
         },
         options,
@@ -398,18 +409,30 @@ export class MemdClient {
 
   /**
    * Query-driven deletion, two-phase like the MCP tool. Without `confirm`
-   * returns a preview of what WOULD be deleted; with `confirm: true` deletes
-   * and returns the deleted ids (not retried).
+   * returns a preview of what WOULD be deleted (retried like any read). To
+   * delete, pass that preview back as `confirm` with the same query and
+   * filters: its `fingerprint` goes along, and if the matches changed since,
+   * the server deletes nothing and this throws `ForgetPreviewMismatchError`.
+   * `confirm: true` deletes without that check. Returns the deleted ids;
+   * never retried.
    *
-   * Note: the server applies `as_of` and `kinds` to the preview only; the
-   * confirmed sweep matches on query and scope.
+   * ```ts
+   * const preview = await memd.forget("wifi password", { user_id: "u1" });
+   * const deleted = await memd.forget("wifi password", { user_id: "u1", confirm: preview });
+   * ```
    */
-  async forget(query: string, options: FindOptions & { confirm: true }): Promise<string[]>;
+  async forget(
+    query: string,
+    options: FindOptions & { confirm: true | ForgetPreview; fingerprint?: string },
+  ): Promise<string[]>;
   async forget(query: string, options?: FindOptions & { confirm?: false }): Promise<ForgetPreview>;
   async forget(query: string, options?: ForgetOptions): Promise<string[] | ForgetPreview>;
   async forget(query: string, options: ForgetOptions = {}): Promise<string[] | ForgetPreview> {
-    const confirm = options.confirm === true;
-    const body = { ...pick(options, FIND_KEYS), query, confirm };
+    const preview = typeof options.confirm === "object" && options.confirm !== null ? options.confirm : undefined;
+    const confirm = options.confirm === true || preview !== undefined;
+    const fingerprint = options.fingerprint ?? preview?.fingerprint;
+    const body: Record<string, unknown> = { ...pick(options, FIND_KEYS), query, confirm };
+    if (confirm && fingerprint) body["fingerprint"] = fingerprint;
     const out = await this.json<ForgetPreview | ForgetResult>(
       // the preview only reads; the confirmed sweep deletes
       { method: "POST", path: this.nsPath(options, "/forget"), body, idempotent: !confirm },
@@ -576,7 +599,7 @@ export class MemdClient {
           ok: false,
           error: new MemdError({
             status: res.status,
-            code: "http_error",
+            code: "invalid_response",
             message: "response body is not JSON",
             detail: text.slice(0, 500),
             cause: err,

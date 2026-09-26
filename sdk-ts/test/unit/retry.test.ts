@@ -190,8 +190,9 @@ describe("backoff", () => {
 
   it("honors Retry-After instead of the backoff", async () => {
     vi.useFakeTimers();
+    // memd's own 429: whole-second Retry-After, code in the body
     const { fetch, calls } = scriptedFetch(
-      json({ detail: "rate limit exceeded" }, 429, { "retry-after": "3" }),
+      json({ detail: "rate limit exceeded", code: "rate_limited" }, 429, { "Retry-After": "3" }),
       json(EMPTY_SEARCH),
     );
     const done = client(fetch, { retryBaseDelayMs: 1 }).search("q");

@@ -44,6 +44,9 @@ describe("types", () => {
 
   it("forget's result follows confirm", () => typeOnly(() => {
     expectTypeOf(c.forget("q", { confirm: true })).resolves.toEqualTypeOf<string[]>();
+    const preview = {} as ForgetPreview;
+    expectTypeOf(c.forget("q", { confirm: preview })).resolves.toEqualTypeOf<string[]>();
+    expectTypeOf<ForgetPreview["fingerprint"]>().toEqualTypeOf<string>();
     expectTypeOf(c.forget("q")).resolves.toEqualTypeOf<ForgetPreview>();
     expectTypeOf(c.forget("q", { confirm: false })).resolves.toEqualTypeOf<ForgetPreview>();
     const flag = Math.random() > 0.5;

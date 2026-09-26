@@ -85,6 +85,12 @@ export interface FindIn extends ScopeFields {
   kinds?: Kind[] | null;
   /** `forget` only: without it the server returns a preview. */
   confirm?: boolean;
+  /**
+   * `forget` confirm only: the preview's `fingerprint`. The server refuses
+   * (409 `preview_mismatch`) and deletes nothing if the confirm would delete
+   * a different set.
+   */
+  fingerprint?: string | null;
 }
 
 // --------------------------------------------------------------- responses
@@ -194,6 +200,8 @@ export interface ForgetPreview {
   will_delete: Array<{ id: string; content: string }>;
   count: number;
   confirmed: false;
+  /** Identifies the full matched set; pass the preview back as `confirm` to send it. */
+  fingerprint: string;
 }
 
 /** `POST /v1/ns/{ns}/forget` with `confirm: true`. */
