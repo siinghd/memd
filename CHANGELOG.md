@@ -6,6 +6,16 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
 
 ## [Unreleased]
 
+### Added
+- **TypeScript SDK `@memd/client`** ([sdk-ts/](sdk-ts/README.md)): a typed
+  client for the REST API with zero runtime dependencies, shipped as ESM and
+  CJS. It runs on Node >= 18, Bun, Deno and Cloudflare Workers, and its
+  methods mirror the Python `HostedMemory`, including `pack`/`observe`.
+  Errors are typed per status and carry the server's `code`. A forget
+  confirm made from its preview sends the preview's `fingerprint`.
+  Idempotent calls are retried with backoff, honoring `Retry-After`;
+  writes are not, because the API has no idempotency key.
+
 ### Fixed
 - **tantivy lane: a write after hard-deleting the newest rows was never
   indexed.** SQLite reused their rowids below the accelerator's watermark.
