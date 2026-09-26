@@ -58,7 +58,11 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
     customers are acked; Stripe error text is redacted everywhere; admin
     files 0600 / directory 0700; reserved namespace names; webhook bodies
     capped at 1 MiB as read; secrets out of `repr`; whitespace in keys and a
-    non-positive webhook tolerance refused.
+    non-positive webhook tolerance refused. Then: a session close holds room
+    for one memory while extracting and reserves exactly its facts after;
+    every duplicate subscription is tracked (pushes held while any is live)
+    and a live one is promoted when the current one ends; `/v1/status`,
+    `/metrics` and `/v1/metrics/json` need the `memory` scope.
   - Hosted mode refuses to start with a live Stripe key (`sk_live_`,
     `rk_live_`) unless `MEMD_ALLOW_LIVE_BILLING=1`.
 - **`/metrics` route labels no longer carry request-supplied strings.** The
@@ -67,7 +71,11 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   paths, 404s included) verbatim, letting any caller show strings - another
   tenant's namespace name, ids - to every tenant and grow the registry.
   Labels are now the server's route templates or `other`; an unknown HTTP
-  method is `OTHER`.
+  method is `OTHER`. `memd_rate_limited_total` is labelled with the key's
+  authorized namespace, not the path's (a denied request used to mint a
+  series per namespace name it tried).
+- **Namespace names are matched in full**: `re.match` with `$` let a trailing
+  newline through, so `"alpha\n"` became a namespace (and a directory).
 - `SearchResult.reranked`: whether the reranker ran for that call (a cache
   hit or a reranker fallback is `False`). The REST response is unchanged.
 - The `dev` extra now includes `stripe`, so the billing tests run in CI;

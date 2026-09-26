@@ -156,11 +156,18 @@ memd serve --http --hosted
 namespaces (a namespace is claimed by the first org that mints a key into it
 and can never be claimed by another), and every key belongs to one org and is
 bound to one of its namespaces. Scopes are exact and combine only
-explicitly: `memory` grants the data routes, `billing` the `/v1/billing/*`
-routes, and `override` only adds the existing cross-user capability to a
-`memory` key - it grants no route by itself (`--scopes memory,override`).
-Namespace names follow the engine's grammar; `_`-prefixed names are
-reserved.
+explicitly (`--scopes memory,override`):
+
+| scope | grants |
+|---|---|
+| `memory` | the data routes `/v1/ns/{ns}/...` and the namespace's operational views `/v1/status`, `/metrics`, `/v1/metrics/json` |
+| `billing` | `/v1/billing/checkout`, `/portal`, `/usage` - nothing else |
+| `override` | only the cross-user capability of a `memory` key (reads across users, `include_deleted`, namespace crypto-shred); no route by itself |
+| operator key (`MEMD_ADMIN_KEY`) | every namespace, every metric series; no org, never metered |
+
+Namespace names follow the engine's grammar, matched in full
+(`[A-Za-z0-9][A-Za-z0-9_.-]{0,127}`, no trailing newline); `_`-prefixed
+names are reserved.
 Keys keep the `memd_<ns>_<kid>_<secret>` format; only a SHA-256 hash of the
 secret is stored. The state lives in an admin SQLite database at
 `<data root>/admin/admin.sqlite3` - beside the tenant store, never inside a
@@ -196,9 +203,11 @@ Nothing is ever recorded beyond what was reserved. Quota periods are calendar
 months (UTC). **A spent `reranked_searches` quota never refuses a search**:
 the search is served unreranked (`memd_rerank_fallback_total{reason="quota"}`)
 and only `searches` is metered; searches are limited by the `searches` cap
-alone. A session close is a write: at the memories cap it answers 402; below
-it, the facts it may write are reserved up front and anything beyond is not
-written (`facts_capped` in the response). With extraction on our key under a
+alone. A session close is a write: at the memories cap it answers 402. While
+its extractor runs it holds room for one memory only - writes alongside it
+are not starved - and once the facts are extracted it reserves exactly
+min(facts extracted, remaining headroom); anything beyond is not written
+(`facts_capped` in the response). With extraction on our key under a
 hard cap, the session's raw records are extracted up to the remaining
 allowance and the rest stay raw-only - searchable, never extracted
 (`raw_skipped`); with no allowance left the close answers 402. After
@@ -271,10 +280,13 @@ Handled:
   `checkout.session.completed` cannot resurrect a deleted subscription.
 - One subscription per org: an event for a subscription that is not the
   org's current one never changes the plan (canceling it does not downgrade
-  the org); a *second live* subscription is flagged
+  the org); every *other live* subscription is listed as a duplicate
   (`memd_billing_duplicate_subscriptions_total`, a `duplicate_subscription`
-  log row) and the org's metered usage is **held** - not pushed, since both
-  subscriptions would bill it - until one of them is canceled.
+  log row) and the org's metered usage is **held** - not pushed, since each
+  would bill it - while ANY duplicate is listed. When the current
+  subscription ends, the duplicates are re-read from Stripe and the first
+  one still live is promoted to current (its invoices count from then on);
+  dead ones leave the list.
 - `invoice.payment_failed` (starts the grace period once) and
   `invoice.payment_succeeded` count only for the org's current
   subscription; `checkout.session.expired` closes the open checkout.

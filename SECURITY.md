@@ -49,7 +49,9 @@ any probe fails the build.
   namespace label (the http counters) are visible to every key, so their
   labels carry nothing a caller chose: the route is one of the server's
   route templates (`/v1/ns/:ns/memories/:id`) or `other`, and an unknown HTTP
-  method is `OTHER`. `MEMD_METRICS_PUBLIC=1` allows
+  method is `OTHER`. A namespace label is always the key's authorized
+  namespace, never one taken from the request path (a denied request's
+  rate-limit rejection counts under the key's own namespace). `MEMD_METRICS_PUBLIC=1` allows
   unauthenticated scraping - only do that on a trusted network segment.
 - **Interactive docs are off by default** (`MEMD_ENABLE_DOCS=1` to enable):
   the OpenAPI schema enumerates every route of an otherwise authenticated API.
@@ -95,9 +97,11 @@ any probe fails the build.
   - *Tenant isolation is enforced twice:* a key is bound to one namespace,
     and that namespace must belong to the key's org (a namespace can never
     change org; `_`-prefixed names are reserved and never bound to a
-    tenant). Billing routes act on the key's own org only - the request body
-    cannot name another one. Scopes are exact: `billing` for the billing
-    routes, `memory` for the data routes; `override` grants neither.
+    tenant; names are matched in full, so a trailing newline is refused).
+    Billing routes act on the key's own org only - the request body cannot
+    name another one. Scopes are exact: `billing` for the billing routes
+    only; `memory` for the data routes and the namespace's `/v1/status`,
+    `/metrics` and `/v1/metrics/json`; `override` grants no route by itself.
   - *Stripe state is verified, not taken from payloads.* A completed
     Checkout Session applies only with `mode=subscription`, and the
     subscription is re-read from Stripe; only `active`/`trialing` grant a
