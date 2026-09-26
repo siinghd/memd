@@ -1076,7 +1076,11 @@ class UsearchSidecar:
         the same rows then answered some queries differently (a true top-10
         row unreachable in one of them). After this pass both find them
         (200/200 identical top-10s, recall 1.0 at 60K clustered). Costs about
-        a quarter of the build time. Returns the nodes re-inserted."""
+        a quarter of the build time. A search answered by a node holding the
+        very same vector (a duplicate record: the same text embedded twice)
+        counts as found - k=1 returns one of the tied twins, and re-inserting
+        every duplicate doubled the build at 30% duplicates. Returns the
+        nodes re-inserted."""
         n = len(ix)
         if not n:
             return 0
@@ -1089,8 +1093,17 @@ class UsearchSidecar:
                 self._check_open()
                 ks = keys[s:s + BUILD_CHUNK]
                 got = np.asarray(ix.search(_stored(ix, ks), 1, threads=self.build_threads).keys)
-                got = got.reshape(len(ks), -1)[:, 0]
-                bad.extend(ks[got != ks].tolist())
+                got = got.reshape(len(ks), -1)[:, 0].astype(np.uint64)
+                miss = got != ks
+                if miss.any():
+                    mk, mg = ks[miss], got[miss]
+                    twin = np.asarray(ix.contains(mg), dtype=bool).reshape(-1)
+                    if twin.any():
+                        # compared as stored (the index's own scalar type)
+                        twin[twin] = np.all(np.asarray(ix.get(mk[twin])).reshape(int(twin.sum()), -1)
+                                            == np.asarray(ix.get(mg[twin])).reshape(int(twin.sum()), -1),
+                                            axis=1)
+                    bad.extend(mk[~twin].tolist())
             if bad:
                 b = np.asarray(bad, dtype=np.uint64)
                 v = self._cast(_stored(ix, b))

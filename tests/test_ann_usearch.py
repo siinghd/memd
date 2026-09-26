@@ -1196,6 +1196,37 @@ def test_independent_rebuilds_give_identical_top10(tmp_path):
         e.close()
 
 
+@pytest.mark.parametrize("dtype", ["f16", "i8"])
+def test_the_repair_pass_counts_an_identical_twin_as_found(tmp_path, dtype):
+    """Records holding the very same vector (the same text embedded twice):
+    a self-search for one returns one of the tied twins, which is as good as
+    the node itself. Counting those as poorly linked re-inserted every
+    duplicate - 30% duplicates cost 2x the build time."""
+    e = _engine(tmp_path / "s", dtype=dtype)
+    try:
+        ann = e.namespace("n").index.ann
+        x = _vectors(1000, seed=41)
+        x[700:] = x[:300]
+        ix = ann._new_index(DIM)
+        ix.add(np.arange(1, 1001, dtype=np.uint64), ann._cast(x), threads=1)
+        assert ann._repair(ix) <= 10
+        assert len(ix) == 1000
+        # a self-search answered by a node with ANOTHER vector still counts
+        real = ix.search
+
+        def search(q, k, **kw):
+            m = real(q, k, **kw)
+            keys = np.asarray(m.keys).reshape(len(q), -1)
+            if len(q) == 1000:
+                keys[10:15, 0] = 400  # nodes 11-15 "unreachable"
+            return type("M", (), {"keys": keys})()
+        ix.search = search
+        assert ann._repair(ix) >= 5
+        assert len(ix) == 1000
+    finally:
+        e.close()
+
+
 @pytest.mark.parametrize("flag", ["include_quarantined", "include_invalid"])
 def test_every_vector_path_applies_the_same_eligibility(tmp_path, flag):
     """The exact scan's matrix never holds deleted, quarantined, invalidated
