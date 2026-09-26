@@ -223,3 +223,73 @@ def test_f_rate_limited_series_never_take_the_namespace_from_the_path(tmp_path):
         assert mark not in str(METRICS.snapshot())
     finally:
         app.state.engine.close()
+
+
+# ------------- C4: one unreadable duplicate never blocks the cancellation
+
+
+def test_c4_a_duplicate_stripe_no_longer_has_is_dropped_and_the_cancellation_applies(tmp_path):
+    w, org = _dup_world(tmp_path)
+    try:
+        now = int(time.time())
+        w.post(event("customer.subscription.created", w.sub("sub_b", "cus_d", prices=DEV_PRICES), created=now))
+        del w.fake.subscriptions["sub_b"]  # Stripe answers 404 resource_missing
+        r = w.post(event("customer.subscription.deleted", w.sub("sub_a", "cus_d", status="canceled"), created=now + 1))
+        assert r.status_code == 200, r.text
+        o = w.store.get_org(org)
+        assert o["plan"] == "free" and o["stripe_subscription_id"] is None
+        assert w.store.duplicates(org) == [] and o["duplicate_subscription_id"] is None
+    finally:
+        w.close()
+
+
+def test_c4_an_unreadable_duplicate_stays_listed_but_the_cancellation_applies(tmp_path):
+    w, org = _dup_world(tmp_path)
+    try:
+        now = int(time.time())
+        w.post(event("customer.subscription.created", w.sub("sub_b", "cus_d", prices=DEV_PRICES), created=now))
+        w.fake.down = True  # a Stripe outage while re-reading the duplicate
+        r = w.post(event("customer.subscription.deleted", w.sub("sub_a", "cus_d", status="canceled"), created=now + 1))
+        w.fake.down = False
+        assert r.status_code == 200, r.text
+        o = w.store.get_org(org)
+        assert o["plan"] == "free" and o["stripe_subscription_id"] is None  # the cancellation took effect
+        assert w.store.duplicates(org) == ["sub_b"]  # unknown: still listed, pushes still held
+        w.store.record_usage(org, "acme", {"reranked_searches": 20_000}, w.h.plans.get("dev"), ts=now)
+        assert w.h.billing.push_usage()["sent"] == 0
+        # its own next event settles it: it becomes the org's subscription
+        r = w.post(event("customer.subscription.updated", w.sub("sub_b", "cus_d", prices=DEV_PRICES), created=now + 2))
+        o = w.store.get_org(org)
+        assert o["stripe_subscription_id"] == "sub_b" and o["plan"] == "dev" and w.store.duplicates(org) == []
+    finally:
+        w.close()
+
+
+# --------- tombstones: a late event cannot re-list an ended subscription
+
+
+def test_out_of_order_duplicate_events_never_relist_an_ended_subscription(tmp_path):
+    w, org = _dup_world(tmp_path)
+    try:
+        now = int(time.time())
+        live = dict(w.sub("sub_c", "cus_d", prices=DEV_PRICES))
+        ended = dict(live, status="canceled")
+        # deleted delivered before created
+        w.post(event("customer.subscription.deleted", ended, created=now + 2))
+        r = w.post(event("customer.subscription.created", live, created=now + 1))
+        assert r.status_code == 200 and w.store.duplicates(org) == []
+        # a live event stamped even later cannot resurrect it either (canceled is final)
+        w.post(event("customer.subscription.updated", live, created=now + 9))
+        assert w.store.duplicates(org) == []
+        # an older update of a listed duplicate cannot undo a newer one
+        d = dict(w.sub("sub_d", "cus_d", prices=DEV_PRICES))
+        w.post(event("customer.subscription.created", d, created=now + 3))
+        assert w.store.duplicates(org) == ["sub_d"]
+        w.post(event("customer.subscription.updated", dict(d, status="incomplete_expired"), created=now + 5))
+        assert w.store.duplicates(org) == []
+        w.post(event("customer.subscription.updated", d, created=now + 4))
+        assert w.store.duplicates(org) == []
+        assert w.store.get_org(org)["duplicate_subscription_id"] is None
+        assert w.snap(org)["plan"] == "dev" and w.snap(org)["stripe_subscription_id"] == "sub_a"
+    finally:
+        w.close()

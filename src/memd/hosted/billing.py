@@ -482,9 +482,28 @@ class Billing:
                     # the current subscription ends while duplicates are
                     # listed: Stripe's CURRENT copy of each decides which,
                     # if any, survives to become the org's subscription
-                    pre["survivors"] = {d: self.svc.subscriptions.retrieve(d).to_dict()
-                                        for d in self.store.duplicates(org["id"])}
+                    pre["survivors"] = {}
+                    for d in self.store.duplicates(org["id"]):
+                        found = self._read_duplicate(d)
+                        if found is not None:
+                            pre["survivors"][d] = found
         return pre
+
+    def _read_duplicate(self, sid: str) -> "dict | str | None":
+        """Stripe's copy of one listed duplicate, read independently of the
+        others: "missing" when Stripe no longer has it (404: treat as ended),
+        None when it could not be read (it stays listed - and held - until
+        its own next event). One bad duplicate never fails the webhook."""
+        try:
+            return self.svc.subscriptions.retrieve(sid).to_dict()
+        except BillingError:
+            raise
+        except Exception as ex:
+            if getattr(ex, "http_status", None) == 404 or getattr(ex, "code", None) == "resource_missing":
+                return "missing"
+            METRICS.inc("memd_billing_stripe_errors_total", op="read_duplicate", **_OPS)
+            _log.warning("memd billing: could not re-read duplicate subscription %s: %s", sid, redact(ex))
+            return None
 
     @staticmethod
     def _org(con, org_id: str | None = None, customer: str | None = None) -> dict | None:
@@ -601,6 +620,16 @@ class Billing:
         status = str(sub.get("status") or "")
         if created and created < int(org.get("last_event_created") or 0):
             return {"handled": False, "type": etype, "org_id": org["id"], "reason": "stale_event"}
+        # the subscription's own history: an ended subscription stays ended
+        # (canceled / incomplete_expired are final in Stripe), and an older
+        # event of it cannot undo a newer one - for duplicates too
+        st = AdminStore.subscription_state(con, sid)
+        if st is not None:
+            if st["ended_at"] is not None and status not in DEAD_STATUSES:
+                return {"handled": False, "type": etype, "org_id": org["id"], "reason": "subscription_ended"}
+            if created and created < int(st["last_event_created"] or 0):
+                return {"handled": False, "type": etype, "org_id": org["id"], "reason": "stale_event"}
+        AdminStore.note_subscription(con, org["id"], sid, created, ended=status in DEAD_STATUSES)
         cur = org.get("stripe_subscription_id")
         if cur != sid and (status not in LIVE_SUB_STATUSES or (cur and org.get("status") in LIVE_SUB_STATUSES)):
             if status in LIVE_SUB_STATUSES:
@@ -619,7 +648,7 @@ class Billing:
 
         dead = status in DEAD_STATUSES
         if dead and sid == cur and AdminStore.duplicates_in(con, org["id"]):
-            promoted = self._promote_survivor(con, org, customer, survivors or {})
+            promoted = self._promote_survivor(con, org, customer, survivors or {}, created)
             if promoted is not None:
                 sub, sid, status, dead = promoted, str(promoted["id"]), str(promoted["status"]), False
         if not dead:
@@ -645,19 +674,23 @@ class Billing:
 
     @staticmethod
     def _promote_survivor(con, org: dict, customer: str | None,
-                          survivors: Mapping[str, Mapping[str, Any]]) -> dict | None:
+                          survivors: Mapping[str, Any], created: int = 0) -> dict | None:
         """The org's current subscription ended: the first listed duplicate
         that Stripe (re-read just before) reports live becomes current.
-        Duplicates Stripe reports dead leave the list; one that could not be
-        re-read stays listed (and held) until its own next event."""
+        Duplicates Stripe reports dead - or no longer has (404) - leave the
+        list with a tombstone; one that could not be re-read stays listed
+        (and held) until its own next event."""
         owner = org.get("stripe_customer_id") or customer
         chosen = None
         for d in AdminStore.duplicates_in(con, org["id"]):
             s = survivors.get(d)
             if s is None:
                 continue
-            if _customer_id(s) != owner or str(s.get("status") or "") not in LIVE_SUB_STATUSES:
+            if (s == "missing" or _customer_id(s) != owner
+                    or str(s.get("status") or "") not in LIVE_SUB_STATUSES):
                 AdminStore.set_duplicate(con, org["id"], d, False)
+                if s == "missing" or str(s.get("status") or "") in DEAD_STATUSES:
+                    AdminStore.note_subscription(con, org["id"], d, created, ended=True)
                 continue
             if chosen is None:
                 chosen = dict(s)

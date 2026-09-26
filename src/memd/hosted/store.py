@@ -145,6 +145,15 @@ CREATE TABLE IF NOT EXISTS org_duplicate_subscription (
   created INTEGER NOT NULL,
   PRIMARY KEY (org_id, subscription_id)
 );
+-- per Stripe subscription: the newest event applied, and when it ended
+-- (canceled / incomplete_expired are final) - a late or re-ordered event for
+-- it can then neither re-list it as a duplicate nor bring it back
+CREATE TABLE IF NOT EXISTS subscription_state (
+  subscription_id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL,
+  last_event_created INTEGER NOT NULL DEFAULT 0,
+  ended_at INTEGER
+);
 CREATE TABLE IF NOT EXISTS billing_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts INTEGER NOT NULL,
@@ -785,6 +794,21 @@ class AdminStore:
         con.execute("UPDATE org SET duplicate_subscription_id = ? WHERE id = ?",
                     (first[0] if first else None, org_id))
         return cur.rowcount > 0
+
+    @staticmethod
+    def subscription_state(con: sqlite3.Connection, sid: str) -> dict | None:
+        row = con.execute("SELECT * FROM subscription_state WHERE subscription_id = ?", (sid,)).fetchone()
+        return dict(row) if row is not None else None
+
+    @staticmethod
+    def note_subscription(con: sqlite3.Connection, org_id: str, sid: str, created: int, ended: bool) -> None:
+        """Advance a subscription's event cursor; `ended` records its
+        tombstone (the event time it ended)."""
+        con.execute("INSERT INTO subscription_state (subscription_id, org_id, last_event_created, ended_at)"
+                    " VALUES (?, ?, ?, ?) ON CONFLICT(subscription_id) DO UPDATE SET"
+                    " last_event_created = MAX(last_event_created, excluded.last_event_created),"
+                    " ended_at = COALESCE(ended_at, excluded.ended_at)",
+                    (sid, org_id, int(created or 0), int(created or time.time()) if ended else None))
 
     @staticmethod
     def log(con: sqlite3.Connection, org_id: str | None, kind: str, detail: dict | None = None) -> None:

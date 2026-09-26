@@ -61,8 +61,10 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
     non-positive webhook tolerance refused. Then: a session close holds room
     for one memory while extracting and reserves exactly its facts after;
     every duplicate subscription is tracked (pushes held while any is live)
-    and a live one is promoted when the current one ends; `/v1/status`,
-    `/metrics` and `/v1/metrics/json` need the `memory` scope.
+    and a live one is promoted when the current one ends - each re-read on
+    its own (404: dropped; unreadable: kept listed; never a 500), with
+    per-subscription cursors and tombstones against re-ordered events;
+    `/v1/status`, `/metrics` and `/v1/metrics/json` need the `memory` scope.
   - Hosted mode refuses to start with a live Stripe key (`sk_live_`,
     `rk_live_`) unless `MEMD_ALLOW_LIVE_BILLING=1`.
 - **`/metrics` route labels no longer carry request-supplied strings.** The

@@ -284,9 +284,14 @@ Handled:
   (`memd_billing_duplicate_subscriptions_total`, a `duplicate_subscription`
   log row) and the org's metered usage is **held** - not pushed, since each
   would bill it - while ANY duplicate is listed. When the current
-  subscription ends, the duplicates are re-read from Stripe and the first
-  one still live is promoted to current (its invoices count from then on);
-  dead ones leave the list.
+  subscription ends, the duplicates are re-read from Stripe, each on its
+  own, and the first one still live is promoted to current (its invoices
+  count from then on); dead ones - and ones Stripe no longer has (404) -
+  leave the list; one that cannot be read right now stays listed (and held)
+  until its own next event. None of this ever fails the webhook: the
+  cancellation always takes effect. Each subscription also keeps its own
+  event cursor and a tombstone once it ends, so a late or re-ordered event
+  can neither re-list an ended subscription nor undo a newer one.
 - `invoice.payment_failed` (starts the grace period once) and
   `invoice.payment_succeeded` count only for the org's current
   subscription; `checkout.session.expired` closes the open checkout.
