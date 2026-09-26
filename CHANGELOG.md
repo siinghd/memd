@@ -6,6 +6,13 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-26
+
+First release evaluated on real data: LongMemEval (ICLR 2025), not memd's synthetic
+suite. Session retrieval ndcg@5 on LongMemEval_S dev: 0.727 (0.1.0) -> 0.866 (zero-key
+default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
+
+
 ### Added
 - **TypeScript SDK `@memd/client`** ([sdk-ts/](sdk-ts/README.md)): a typed
   client for the REST API with zero runtime dependencies, shipped as ESM and
@@ -54,12 +61,6 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   background, searches skip reranking (`reason="warming"`). A
   `BaseException` from a reranker no longer escapes search (KeyboardInterrupt
   and SystemExit still propagate).
-
-## [0.2.0] - 2026-09-26
-
-First release evaluated on real data: LongMemEval (ICLR 2025), not memd's synthetic
-suite. Session retrieval ndcg@5 on LongMemEval_S dev: 0.727 (0.1.0) -> 0.866 (zero-key
-default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
 
 ### Added
 - **`memd migrate --report <data_root>`** (and
