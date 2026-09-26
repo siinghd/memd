@@ -138,6 +138,22 @@ def test_selection(monkeypatch):
     assert (cfg["min_vectors"], cfg["overfetch"], cfg["exact_max"], cfg["dtype"]) == (20000, 4, 2000, "f16")
 
 
+def test_expansion_search_floor_is_applied_to_built_and_loaded_indexes(tmp_path):
+    root = tmp_path / "s"
+    e = _engine(root, expansion_search=300)
+    _fill(e.namespace("n"), 200)
+    assert e.namespace("n").index.ann._ix.expansion_search == 300
+    e.close()
+    e = _engine(root, expansion_search=300)
+    try:
+        ann = e.namespace("n").index.ann
+        assert ann.loaded_from == "file" and ann._ix.expansion_search == 300
+    finally:
+        e.close()
+    with pytest.raises(ValueError):
+        vector_index_config({"ann_expansion_search": -1}, "auto")
+
+
 def test_flat_mode_attaches_nothing_and_drops_the_sidecar(tmp_path):
     root = tmp_path / "s"
     e = _engine(root)

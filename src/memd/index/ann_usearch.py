@@ -142,8 +142,12 @@ def vector_index_config(config: dict | None, mode: str) -> dict:
         "exact_max": int(cfg.get("ann_exact_max", DEFAULT_EXACT_MAX)),
         "dtype": dtype,
         "build_threads": int(cfg.get("ann_build_threads", _default_build_threads())),
+        # search depth floor (HNSW ef); 0 = usearch's default. A search for
+        # k candidates always explores at least k.
+        "expansion_search": int(cfg.get("ann_expansion_search", 0)),
     }
-    if out["overfetch"] < 1 or out["min_vectors"] < 0 or out["exact_max"] < 0 or out["build_threads"] < 1:
+    if (out["overfetch"] < 1 or out["min_vectors"] < 0 or out["exact_max"] < 0
+            or out["build_threads"] < 1 or out["expansion_search"] < 0):
         raise ValueError(f"invalid ANN settings: {out}")
     return out
 
@@ -230,6 +234,7 @@ class UsearchSidecar:
         self.exact_max = max(0, int(cfg.get("exact_max", DEFAULT_EXACT_MAX)))
         self.dtype = str(cfg.get("dtype", "f16"))
         self.build_threads = max(1, int(cfg.get("build_threads", _default_build_threads())))
+        self.expansion_search = max(0, int(cfg.get("expansion_search", 0)))
         self._mu = threading.Lock()            # the state below; never held across I/O
         self._apply_lock = threading.Lock()    # one applier / saver / swapper at a time
         self._rw = _RWLock()                   # searches vs mutations of self._ix
@@ -337,6 +342,8 @@ class UsearchSidecar:
         if (ix is None or int(ix.ndim) != int(st.get("ndim", -1))
                 or len(ix) != int(st.get("count", -1))):
             return "corrupt"
+        if self.expansion_search:
+            ix.expansion_search = self.expansion_search
         with self._mu:
             self._ix = ix
             self._ready = True
@@ -609,7 +616,10 @@ class UsearchSidecar:
         return ix
 
     def _new_index(self, dim: int) -> Any:
-        return self._Index(ndim=int(dim), metric=METRIC, dtype=self.dtype, connectivity=CONNECTIVITY)
+        ix = self._Index(ndim=int(dim), metric=METRIC, dtype=self.dtype, connectivity=CONNECTIVITY)
+        if self.expansion_search:
+            ix.expansion_search = self.expansion_search
+        return ix
 
     def _cast(self, mat: np.ndarray) -> np.ndarray:
         """f16 input for an f16 index (stored as-is); float32 for i8, which
