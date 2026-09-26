@@ -646,6 +646,13 @@ class NamespaceStore:
                         "silently destroys acked data. Set "
                         "MEMD_ALLOW_MULTI_PROCESS=1 to override.")
                 self._owner_lease = namespace
+                taker = getattr(store, "took_over", None)
+                if callable(taker) and taker(namespace):
+                    try:
+                        self._fence_previous_writer()
+                    except BaseException:
+                        self._release_ownership()
+                        raise
             else:
                 root = getattr(store, "root", None)
                 if root:
@@ -700,6 +707,40 @@ class NamespaceStore:
             self._release_ownership()
             raise
         self._attach_lexical(lexical)
+
+    def _fence_previous_writer(self) -> None:
+        """Storage-side fence after reclaiming a stale lease (ADR-12).
+
+        The previous holder may be STALLED, not dead - a GC pause, a frozen
+        VM - with an append already past its lease check. Its next part number
+        on each append log is the one after the last part it wrote, so taking
+        that number first (an empty part, conditional create) makes its
+        resumed append fail loudly with a conflict instead of landing in our
+        log unseen: its write is never acked. Done BEFORE replay, so anything
+        it wrote earlier is replayed. The logs other than these three are
+        written only under rotate/compact, whose commit point (the manifest
+        PUT) is fence-checked."""
+        for key in (self.wal_key, self.ops_key, f"{self.prefix}/audit"):
+            for attempt in range(5):
+                try:
+                    self.store.append(key, b"")
+                    break
+                except RuntimeError as ex:
+                    if "append conflict" not in str(ex) or attempt == 4:
+                        raise NamespaceBusyError(
+                            f"namespace {self.namespace!r}: the previous writer is still "
+                            "appending after losing its lease; retry shortly") from ex
+                    time.sleep(0.2 * (attempt + 1))
+        METRICS.inc("memd_ns_takeover_fences_total",
+                    help="namespaces taken over from a stale lease (append logs fenced)")
+
+    def lease_lost(self) -> bool:
+        """This store was opened under a lease the process no longer holds
+        (fenced after another node reclaimed it)."""
+        if self._owner_lease is None:
+            return False
+        holds = getattr(self.store, "holds_lease", None)
+        return callable(holds) and not holds(self.namespace)
 
     def _attach_lexical(self, lexical: dict | None) -> None:
         """Optional tantivy accelerator for the bm25 lane (derived, local,
@@ -2854,10 +2895,28 @@ class StorageEngine:
         ns = _validate_ns(ns)
         evicted: list[tuple[str, NamespaceStore, list]] = []
         opened = False
+        stale = None
         with self._lock:
             nstore = self._namespaces.get(ns)
+            if nstore is not None and ns not in self._pinned and nstore.lease_lost():
+                # fenced: another node reclaimed its lease. Its in-memory
+                # state is stale, so drop it WITHOUT persisting anything, and
+                # reopen - which re-acquires, or raises NamespaceBusyError
+                # while the other node holds it
+                del self._namespaces[ns]
+                stale, nstore = nstore, None
+                stale._closed = True
+                stale._evicted = True
             if nstore is not None:
                 self._namespaces.move_to_end(ns)
+        if stale is not None:
+            METRICS.inc("memd_ns_fenced_drops_total",
+                        help="open namespaces dropped after losing their lease")
+            stale._owner_lease = None       # not ours to release any more
+            try:
+                stale.index.close()
+            except Exception:
+                pass
         if nstore is None:
             # Opened under this namespace's own lock, not the engine's. An
             # open replays the namespace, and the first one after an upgrade
@@ -2923,6 +2982,12 @@ class StorageEngine:
             if nstore is not None:
                 self._namespaces.move_to_end(ns)
             return nstore
+
+    def open_namespaces(self) -> list[str]:
+        """Namespaces open in this process right now (for a cluster node:
+        the ones whose writer lease it holds)."""
+        with self._lock:
+            return list(self._namespaces)
 
     def has_namespace(self, ns: str) -> bool:
         """True if `ns` is open here or has a manifest; never materializes it."""

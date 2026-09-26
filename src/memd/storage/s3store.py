@@ -71,6 +71,12 @@ _MPU_PART_BYTES = 8 * 1024 * 1024
 _MPU_THRESHOLD = 8 * 1024 * 1024
 
 
+class LeaseLostError(RuntimeError):
+    """This process no longer holds (or cannot prove it holds) the writer
+    lease of the namespace it tried to mutate. The mutation did not happen;
+    whatever the request did before it may have. Retry through the router."""
+
+
 def _validate_key(key: str) -> str:
     """Same hygiene as the local store: no traversal, no absolute keys.
 
@@ -153,6 +159,7 @@ class S3ObjectStore(ObjectStore):
         # ETag of our last write of each held lease: renewals are
         # compare-and-swap on it (None: the endpoint has no conditional PUT)
         self._lease_etag: dict[str, str | None] = {}
+        self._took_over: set[str] = set()
         # who this store claims leases as; NamespaceStore falls back to
         # host:pid. A cluster node names itself here so the router can map a
         # lease to the node serving it (see memd.server.cluster)
@@ -865,12 +872,12 @@ class S3ObjectStore(ObjectStore):
                 if ns not in self._fenced and age > self._valid_for():
                     METRICS.inc("memd_s3_owner_lease_unconfirmed_total",
                                 help="writes refused: the lease could not be renewed in time")
-                    raise RuntimeError(
+                    raise LeaseLostError(
                         f"single-writer lease on namespace {ns!r} could not be renewed for "
                         f"{age:.1f}s; refusing to write - another node may reclaim it at the "
                         "TTL. Retry once the object store is reachable again.")
         if ns in self._fenced:
-            raise RuntimeError(
+            raise LeaseLostError(
                 f"lost the single-writer lease on namespace {ns!r}; this "
                 "process has been fenced. Another writer owns it - continuing "
                 "would interleave two writers on one data root, which silently "
@@ -970,7 +977,18 @@ class S3ObjectStore(ObjectStore):
             if who != holder:
                 METRICS.inc("memd_s3_owner_lease_reclaimed_total",
                             help="stale single-writer leases reclaimed")
+                self._took_over.add(namespace)
             self._hold(namespace, holder, etag, t0)
+            return True
+        return False
+
+    def took_over(self, namespace: str) -> bool:
+        """True (once) when the last acquire of `namespace` reclaimed a lease
+        another holder had let go stale - that holder may be merely STALLED
+        and resume mid-write. NamespaceStore then burns the next part number
+        of each append log (see NamespaceStore._fence_previous_writer)."""
+        if namespace in self._took_over:
+            self._took_over.discard(namespace)
             return True
         return False
 

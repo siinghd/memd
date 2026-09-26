@@ -17,16 +17,23 @@ def _cmd_serve(args) -> int:
         return 0
     import uvicorn
 
-    app = create_app_from_env(hosted=True if args.hosted else None)
-    uvicorn.run(
-        app,
-        host=args.host or os.environ.get("MEMD_HOST", "127.0.0.1"),
-        port=args.port or int(os.environ.get("MEMD_PORT", "8700")),
-    )
+    from memd.server.cluster import ClusterConfig
+
+    host = args.host or os.environ.get("MEMD_HOST", "127.0.0.1")
+    port = args.port or int(os.environ.get("MEMD_PORT", "8700"))
+    # --node-id (or MEMD_NODE_ID): one node of a fleet on one s3:// data
+    # root, routing each namespace to the node holding its lease (ADR-12)
+    cluster = ClusterConfig.from_env(node_id=args.node_id, advertise=args.advertise,
+                                     host=host, port=port)
+    app = create_app_from_env(hosted=True if args.hosted else None, cluster=cluster)
+    # graceful: SIGTERM stops accepting, drains in-flight requests, then the
+    # lifespan hook deregisters the node and releases its leases
+    uvicorn.run(app, host=host, port=port,
+                timeout_graceful_shutdown=int(os.environ.get("MEMD_SHUTDOWN_GRACE_S", "30")))
     return 0
 
 
-def create_app_from_env(hosted: bool | None = None):
+def create_app_from_env(hosted: bool | None = None, cluster=None):
     """`hosted` None: MEMD_HOSTED decides (default off)."""
     from memd.server.http import create_app
 
@@ -34,6 +41,7 @@ def create_app_from_env(hosted: bool | None = None):
         data_dir=os.environ.get("MEMD_DATA", "./memd-data"),
         admin_key=os.environ.get("MEMD_ADMIN_KEY"),
         hosted=hosted,
+        cluster=cluster,
     )
 
 
@@ -591,6 +599,12 @@ def main(argv=None) -> int:
                        help="hosted mode: orgs, metering, quotas, Stripe billing (also MEMD_HOSTED=1)")
     serve.add_argument("--port", type=int, default=None)
     serve.add_argument("--host", default=None)
+    serve.add_argument("--node-id", default=None,
+                       help="cluster mode (also MEMD_NODE_ID): this node's id; nodes sharing an "
+                            "s3:// MEMD_DATA route each namespace to its leaseholder")
+    serve.add_argument("--advertise", default=None,
+                       help="cluster mode: the URL peers reach this node at (MEMD_ADVERTISE_URL; "
+                            "default http://HOST:PORT)")
     serve.set_defaults(fn=_cmd_serve)
 
     key = sub.add_parser("key", help="manage API keys")

@@ -1820,6 +1820,12 @@ class Memory:
             raise RuntimeError("has_namespace is embedded-only")
         return self.engine.has_namespace(namespace)
 
+    def open_namespaces(self) -> list[str]:
+        """Namespaces open in this process (embedded-only)."""
+        if self._hosted() is not None:
+            raise RuntimeError("open_namespaces is embedded-only")
+        return self.engine.open_namespaces()
+
     def destroy_namespace(self, namespace: str | None = None, actor: str = "api") -> bool:
         impl = self._hosted()
         if impl is not None:
@@ -1857,8 +1863,13 @@ class Memory:
             self.audit = self._audit_for(name)
         METRICS.inc("memd_destroys_total", ns=name)
         # destroy is an ADMINISTRATIVE act on the engine, so it lands in the
-        # facade's own ledger - never in the ledger of the namespace just shredded
-        self.audit.append(actor=actor, action="destroy_namespace", target=name)
+        # facade's own ledger - never in the ledger of the namespace just
+        # shredded. It records what the key provider did (ADR-12): the wrapped
+        # key deleted, and any KMS-side disable / scheduled deletion
+        env = self.engine.envelope
+        shred = env.destroy_report(name) if env is not None and hasattr(env, "destroy_report") else {}
+        self.audit.append(actor=actor, action="destroy_namespace", target=name,
+                          detail={"key_shred": shred} if shred else None)
         return ok
 
     def export_jsonl_iter(self, namespace: str | None = None):
