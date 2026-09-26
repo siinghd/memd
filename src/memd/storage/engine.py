@@ -824,7 +824,9 @@ class NamespaceStore:
             self.index.flush()
             # The ANN sidecar's image must be taken at exactly the vec_wm the
             # index image holds: its appliers are held off (writes go on, and
-            # queue) from before the backup until it is saved at that value.
+            # queue) from before that value is read until the sidecar is
+            # saved at it - NOT across the SQLite copy, which reads a pinned
+            # snapshot (see below).
             ann = self.index.ann
             freeze = (ann.frozen() if ann is not None
                       and ann.publishable(self.VECTOR_SNAPSHOT_MIN_VECTORS)
@@ -832,37 +834,45 @@ class NamespaceStore:
             vec_img = None  # (image bytes, meta) of the sidecar at the image's vec_wm
             fd, tmp = _tf.mkstemp(prefix="memd-snap-", suffix=".sqlite")
             os.close(fd)
+            src = None
             try:
                 with freeze:
-                    dst = _sq.connect(tmp)
-                    try:
-                        # sqlite's backup API cannot make progress while the
-                        # SOURCE connection holds an open write transaction - it
-                        # retries forever - and this index commits LAZILY, so a
-                        # transaction is usually open. Commit inside the lock,
-                        # immediately before the copy, so nothing can reopen one in
-                        # between. (Flushing outside the lock was not enough: the
-                        # embed worker reopened a transaction in the gap and the
-                        # backup wedged the whole namespace - maintenance thread
-                        # holding index._lock, every writer queued behind it.)
-                        with self.index._lock:
-                            if self.index._closed:
-                                return False
-                            if self.index._con.in_transaction:
-                                self.index._con.commit()
-                            # what the image covers, and the purge it is scrubbed to
-                            img_seq = int(self.index.get_meta("applied_seq") or 0)
-                            img_scrubbed = int(self.index.get_meta("scrubbed_seq") or 0)
-                            img_vec_wm = self.index._vec_wm
-                            self.index._con.backup(dst)
-                    finally:
-                        dst.close()
+                    # The copy used to run on the writer connection INSIDE the
+                    # index lock (and the freeze): every write and every read
+                    # that had to publish a lazy commit waited for the whole
+                    # O(index bytes) backup, and the vectors queued meanwhile
+                    # were drained afterwards as one backlog. Now the lock
+                    # covers only the commit (this index commits LAZILY, and
+                    # the image must hold every acked write), the watermarks
+                    # the image is stamped with, and pinning a read snapshot
+                    # on a connection of its own; the backup reads that
+                    # snapshot with no lock held. (The writer connection could
+                    # not be the source outside the lock: sqlite's backup API
+                    # cannot make progress while its source holds an open
+                    # write transaction, and the embed worker reopens one.)
+                    with self.index._lock:
+                        if self.index._closed:
+                            return False
+                        if self.index._con.in_transaction:
+                            self.index._con.commit()
+                        # what the image covers, and the purge it is scrubbed to
+                        img_seq = int(self.index.get_meta("applied_seq") or 0)
+                        img_scrubbed = int(self.index.get_meta("scrubbed_seq") or 0)
+                        img_vec_wm = self.index._vec_wm
+                        src = self.index.pin_image()
                     if ann is not None and not isinstance(freeze, contextlib.nullcontext):
                         try:
                             vec_img = ann.image_at(img_vec_wm)
                         except Exception as ex:  # noqa: BLE001 - published without it
                             METRICS.inc("memd_vector_index_snapshot_failures_total", ns=self.namespace,
                                         detail=type(ex).__name__)
+                dst = _sq.connect(tmp)
+                try:
+                    src.backup(dst)
+                finally:
+                    dst.close()
+                    src.close()
+                    src = None
                 with open(tmp, "rb") as f:
                     blob = gzip.compress(f.read(), compresslevel=1)
                 vec_payload = None
@@ -873,6 +883,8 @@ class NamespaceStore:
                     if self.envelope.enabled:
                         vec_payload = self.envelope.encrypt(self.namespace, vec_payload)
             finally:
+                if src is not None:
+                    src.close()
                 for suffix in ("", "-wal", "-shm"):
                     try:
                         os.unlink(tmp + suffix)

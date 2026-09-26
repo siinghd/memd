@@ -134,7 +134,7 @@ REPAIR_EXPANSION = 16        # search depth of the post-build self-check (see _r
 DEFAULT_EXPANSION_SEARCH = 128
 BUILD_CHUNK = 50_000         # rows read (and added) per build step
 JOURNAL_CATCHUP = 256        # journal entries left for the final, locked replay
-ADD_SLICE = 64               # vectors added per write-lock hold (bounds a search's wait)
+ADD_SLICE = 16               # vectors added per write-lock hold: a search waits for at most one (~11 ms at 60K x 64)
 SWEEP_LIMIT = 1024           # limits at or above this are sweeps: answered exactly
 BACKOFF_BASE_S = 2.0
 BACKOFF_MAX_S = 300.0
@@ -255,20 +255,35 @@ class _Aborted(Exception):
 
 class _RWLock:
     """Readers (searches) share; a writer (any mutation of the usearch index)
-    excludes them. Writer-preferring: writers hold it only for short slices
-    (ADD_SLICE vectors), so a steady stream of searches cannot starve them."""
+    excludes them. Phase-fair: a waiting writer holds back NEW readers, so a
+    steady stream of searches cannot starve it, and the readers already
+    waiting when a writer lets go enter before the next writer does, so a
+    steady stream of write slices (ADD_SLICE vectors each) cannot starve
+    searches. Writer-preferring alone let an applier draining a backlog -
+    the queue a snapshot publish held back, behind a bulk writer - re-take
+    the lock slice after slice while every search waited for the whole
+    drain (p99 12-16 s)."""
 
     def __init__(self) -> None:
         self._c = threading.Condition(threading.Lock())
         self._readers = 0
         self._writer = False
-        self._waiting = 0
+        self._waiting = 0      # writers waiting
+        self._rwaiting = 0     # readers waiting
+        self._rturn = 0        # of those, how many a released writer let in ahead of the next
 
     @contextlib.contextmanager
     def read(self):
         with self._c:
-            while self._writer or self._waiting:
-                self._c.wait()
+            if self._writer or (self._waiting and not self._rturn):
+                self._rwaiting += 1
+                try:
+                    while self._writer or (self._waiting and not self._rturn):
+                        self._c.wait()
+                finally:
+                    self._rwaiting -= 1
+                if self._rturn:
+                    self._rturn -= 1
             self._readers += 1
         try:
             yield
@@ -282,15 +297,18 @@ class _RWLock:
     def write(self):
         with self._c:
             self._waiting += 1
-            while self._writer or self._readers:
-                self._c.wait()
-            self._waiting -= 1
+            try:
+                while self._writer or self._readers or self._rturn:
+                    self._c.wait()
+            finally:
+                self._waiting -= 1
             self._writer = True
         try:
             yield
         finally:
             with self._c:
                 self._writer = False
+                self._rturn = self._rwaiting
                 self._c.notify_all()
 
 
@@ -350,6 +368,9 @@ class UsearchSidecar:
         self._ready = False                    # self._ix reflects SQLite (up to the queue)
         self._queue: deque = deque()           # (wm, removes, adds) not yet applied
         self._inflight: list = []              # entries being applied right now (off the queue)
+        # rowid -> (wm, vector or None, dim): the newest queued or in-flight
+        # change of each row not yet applied (see pending_vectors)
+        self._pending: dict[int, tuple[int, bytes | None, int]] = {}
         self._journal: list | None = None      # entries applied while a load or build runs
         self._applied_wm = 0
         self._saved_wm: int | None = None
@@ -859,6 +880,10 @@ class UsearchSidecar:
             if self._closed or not self._active:
                 return
             self._queue.append((int(wm), removes, adds))
+            for k in removes:
+                self._pending[int(k)] = (int(wm), None, 0)
+            for k, blob, dim in adds:
+                self._pending[int(k)] = (int(wm), blob, int(dim))
 
     def note_reset(self, wm: int) -> None:
         """The SQLite index was wiped: every vector is gone."""
@@ -866,6 +891,7 @@ class UsearchSidecar:
             if self._closed or not self._active:
                 return
             self._queue.append((int(wm), _RESET, None))
+            self._pending.clear()
 
     def count_hint(self, n: int) -> None:
         """Vectors written while not kept: the auto threshold watches this."""
@@ -897,7 +923,7 @@ class UsearchSidecar:
             yield
         self.apply_pending()
 
-    frozen = _exclusive  # held across an index snapshot: nothing is applied
+    frozen = _exclusive  # held while an index snapshot pins its image and takes ours: nothing is applied
 
     def _drain_locked(self, upto: int | None = None) -> None:
         """(apply lock held) Apply the queue in order, up to `upto`."""
@@ -913,15 +939,31 @@ class UsearchSidecar:
                 live = self._ready
                 self._applied_wm = batch[-1][0]
                 if live:
-                    self._inflight = batch  # searchable (pending_rowids) until applied
+                    self._inflight = batch  # searchable (pending_vectors) until applied
+                else:
+                    self._unpend_locked(batch)
             if live:
                 try:
                     self._apply_entries(batch, live=True)
                 finally:
                     with self._mu:
                         self._inflight = []
+                        self._unpend_locked(batch)
             # not ready and no build journal: the rows are in SQLite, and the
             # build that makes the index ready reads them there
+
+    def _unpend_locked(self, batch: list) -> None:
+        """(mu held) These entries are applied (or not needed: the index is
+        not serving): their rows leave the pending map, unless a newer
+        change of the same row is still queued."""
+        top = batch[-1][0]
+        for _wm, removes, adds in batch:
+            if removes is _RESET:
+                continue
+            for k in list(removes) + [a[0] for a in adds]:
+                cur = self._pending.get(int(k))
+                if cur is not None and cur[0] <= top:
+                    del self._pending[int(k)]
 
     def _apply_entries(self, batch: list, *, live: bool, target: Any = None) -> Any:
         """Apply queue entries to the live index (under the search lock) or
@@ -1313,18 +1355,19 @@ class UsearchSidecar:
         ix = self._ix
         return len(ix) if ix is not None else 0
 
-    def pending_rowids(self) -> list[int]:
-        """Rowids whose vectors are queued or being applied but not yet in
-        the index (the writer could not take the apply lock - a snapshot
-        publish, another writer's batch): searched exactly, so a write is
-        visible to the search that follows it (read-your-writes)."""
+    def pending_vectors(self) -> list[tuple[int, bytes, int]]:
+        """(rowid, stored vector, dim) of each row whose latest queued or
+        in-flight change adds a vector not yet searchable in the index (the
+        writer could not take the apply lock - a snapshot publish, another
+        writer's batch): searched exactly, so a write is visible to the
+        search that follows it (read-your-writes)."""
         with self._mu:
-            entries = list(self._inflight) + list(self._queue)
-        out: set[int] = set()
-        for _wm, _removes, adds in entries:
-            if adds:
-                out.update(int(k) for k, _b, _d in adds)
-        return sorted(out)
+            items = list(self._pending.items())
+        return [(k, v[1], v[2]) for k, v in items if v[1] is not None]
+
+    def pending_rowids(self) -> list[int]:
+        """The rowids of pending_vectors()."""
+        return sorted(k for k, _b, _d in self.pending_vectors())
 
     def knn(self, q: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray] | None:
         """The approximate top-k: (rowids, cosine distances), or None when the

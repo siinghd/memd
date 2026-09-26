@@ -1541,3 +1541,180 @@ def test_a_loaded_graph_that_does_not_answer_is_rebuilt(tmp_path):
         assert not os.path.exists(os.path.join(ann.path, au.LOADING_MARKER))
     finally:
         e.close()
+
+
+# ------------------------------------------------------------ searches vs publishes and backlogs
+
+def test_a_stream_of_write_slices_does_not_starve_searches():
+    """An applier draining a backlog takes the write side slice after slice;
+    writer-preference alone let it re-take the lock before any waiting
+    search got in (p99 12-16 s behind a snapshot publish and a bulk writer).
+    Readers waiting at a release now enter before the next slice - and a
+    stream of searches still cannot starve a writer."""
+    rw = au._RWLock()
+    stop = threading.Event()
+
+    def slices():
+        while not stop.is_set():
+            with rw.write():
+                time.sleep(0.005)
+
+    def reads():
+        while not stop.is_set():
+            with rw.read():
+                time.sleep(0.005)
+
+    for body, other in ((slices, rw.read), (reads, rw.write)):
+        stop.clear()
+        ths = [threading.Thread(target=body, daemon=True) for _ in range(2)]
+        for t in ths:
+            t.start()
+        time.sleep(0.05)
+        waits = []
+        for _ in range(10):
+            got = threading.Event()
+
+            def take():
+                t0 = time.monotonic()
+                with other():
+                    waits.append(time.monotonic() - t0)
+                    got.set()
+            threading.Thread(target=take, daemon=True).start()
+            assert got.wait(5), f"{other.__name__} starved by a stream of {body.__name__}"
+        stop.set()
+        for t in ths:
+            t.join(5)
+        assert max(waits) < 0.5, waits
+
+
+class _SlowCopy:
+    """A pinned image whose backup takes a while."""
+
+    def __init__(self, con, started: threading.Event):
+        self.con, self.started = con, started
+
+    def backup(self, dst, **kw):
+        self.started.set()
+        time.sleep(1.5)
+        return self.con.backup(dst, **kw)
+
+    def close(self):
+        self.con.close()
+
+
+def test_a_snapshot_publish_copies_the_index_without_holding_it(tmp_path, monkeypatch):
+    """The SQLite image used to be copied on the writer connection inside the
+    index lock and the sidecar freeze: every write, and every search that
+    had to publish a lazy commit, waited for the whole backup. It now reads
+    a snapshot pinned under the lock; the copy runs with nothing held, and
+    the image is still exactly the one the sidecar image was taken at."""
+    import gzip
+    import sqlite3
+
+    monkeypatch.setattr(storage_engine.NamespaceStore, "SNAPSHOT_MIN_RECORDS", 1)
+    monkeypatch.setattr(storage_engine.NamespaceStore, "VECTOR_SNAPSHOT_MIN_VECTORS", 1)
+    e = _engine(tmp_path / "s")
+    try:
+        ns = e.namespace("n")
+        recs, x = _fill(ns, 2000, seed=46)
+        ns.compact(force=True)  # (stamps the index with a seq a snapshot may be published at)
+        idx = ns.index
+        started, done = threading.Event(), threading.Event()
+        real_pin = idx.pin_image
+        monkeypatch.setattr(idx, "pin_image", lambda: _SlowCopy(real_pin(), started))
+        wm0 = idx._vec_wm
+        ok = []
+        t = threading.Thread(target=lambda: (ok.append(ns.write_index_snapshot()), done.set()))
+        t.start()
+        assert started.wait(30)
+        t0 = time.monotonic()
+        late = MemoryRecord.create(namespace="n", kind="raw_event", content="written during the copy",
+                                   scope=Scope(user="alice"))
+        ns.append([late])
+        v = _vectors(1, seed=46, draw=3)[0]
+        idx.set_vectors([late.id], [v], "test-model")
+        hits = idx.search_vector(v, IndexFilter(), limit=3)
+        assert time.monotonic() - t0 < 1.0 and not done.is_set(), "the write or search waited for the copy"
+        assert hits[0].record.id == late.id
+        t.join(60)
+        assert ok == [True]
+        vs = ns.manifest.vector_snapshot
+        assert vs["wm"] == wm0
+        blob = ns.store.get(ns._snapshot_key(ns.manifest.snapshot_name))
+        if ns.envelope.enabled:
+            blob = ns.envelope.decrypt(ns.namespace, blob)
+        img = tmp_path / "image.sqlite"
+        img.write_bytes(gzip.decompress(blob))
+        con = sqlite3.connect(str(img))
+        try:
+            assert int(con.execute("SELECT v FROM meta WHERE k='vec_wm'").fetchone()[0]) == wm0
+            assert con.execute("SELECT COUNT(*) FROM records WHERE id=?", (late.id,)).fetchone()[0] == 0
+            assert con.execute("SELECT COUNT(*) FROM vectors").fetchone()[0] == 2000
+        finally:
+            con.close()
+    finally:
+        e.close()
+
+
+def test_a_write_applied_between_the_pending_snapshot_and_the_index_search_is_found(tmp_path, monkeypatch):
+    """Read-your-writes across the applier's hand-off: the queued rows are
+    taken before the index is searched, so a row applied in between is in
+    one or the other - never in neither."""
+    e = _engine(tmp_path / "s")
+    try:
+        ns = e.namespace("n")
+        _fill(ns, 2000, seed=47)
+        ann = ns.index.ann
+        real_knn = ann.knn
+
+        def knn_then_apply(q, k):
+            got = real_knn(q, k)
+            ann.apply_pending()  # the applier finishes right after the index was searched
+            return got
+        monkeypatch.setattr(ann, "knn", knn_then_apply)
+        found = 0
+        for i, v in enumerate(_vectors(20, seed=47, draw=5)):
+            r = MemoryRecord.create(namespace="n", kind="raw_event", content=f"fresh {i}", scope=Scope(user="bob"))
+            ns.append([r])
+            with ann._apply_lock:  # the writer cannot apply its own vector: it stays queued
+                ns.index.set_vectors([r.id], [v], "test-model")
+            assert ann.pending_rowids()
+            hits = ns.index.search_vector(v, IndexFilter(), limit=10)
+            found += bool(hits) and hits[0].record.id == r.id
+        assert found == 20
+    finally:
+        e.close()
+
+
+def test_the_pending_pass_filters_only_rows_that_can_make_the_page(tmp_path, monkeypatch):
+    """Behind a bulk writer the queue holds thousands of rows. They are
+    scored from their queued vectors in one pass; only those that can still
+    make the page go through SQL (every one of them did, on every search)."""
+    e = _engine(tmp_path / "s")
+    try:
+        ns = e.namespace("n")
+        _fill(ns, 2000, seed=48)
+        ann, idx = ns.index.ann, ns.index
+        recs = [MemoryRecord.create(namespace="n", kind="raw_event", content=f"bulk {i}", scope=Scope(user="carol"))
+                for i in range(3000)]
+        ns.append(recs)
+        xs = _vectors(3000, seed=48, draw=9)
+        counted: list[int] = []
+        real = idx._scored_rowids
+        with ann._apply_lock:  # nothing is applied: all 3000 stay queued
+            for i in range(0, 3000, 500):
+                idx.set_vectors([r.id for r in recs[i:i + 500]], xs[i:i + 500], "test-model")
+            assert len(ann.pending_rowids()) == 3000
+            monkeypatch.setattr(idx, "_scored_rowids",
+                                lambda q, f, rowids: (counted.append(len(rowids)), real(q, f, rowids))[1])
+            for i in (7, 1500, 2999):
+                counted.clear()
+                hits = idx.search_vector(xs[i], IndexFilter(), limit=10)
+                assert hits[0].record.id == recs[i].id
+                assert sum(counted) < 1000, counted
+                q = xs[i] / np.linalg.norm(xs[i])
+                assert {h.record.id for h in hits} == {h.record.id for h in idx._exact_vector(q, IndexFilter(), 10)}
+        ann.apply_pending()
+        assert ann.drain(60) and not ann.pending_rowids()
+    finally:
+        e.close()

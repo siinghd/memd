@@ -325,6 +325,25 @@ class NamespaceIndex:
             self._con.commit()
         return old
 
+    def pin_image(self) -> sqlite3.Connection:
+        """(write lock held, just committed) A read-only connection of its
+        own, holding a read transaction on this file as committed now. A
+        backup from it copies exactly that image - WAL snapshot isolation -
+        while writes and searches go on, with no lock held; the caller
+        closes it (that ends the transaction)."""
+        from urllib.parse import quote
+
+        con = sqlite3.connect(f"file:{quote(os.path.abspath(self.path))}?mode=ro", uri=True,
+                              isolation_level=None, check_same_thread=False)
+        try:
+            con.execute("PRAGMA busy_timeout=5000")
+            con.execute("BEGIN")
+            con.execute("SELECT COUNT(*) FROM meta").fetchone()  # the snapshot is taken here
+        except BaseException:
+            con.close()
+            raise
+        return con
+
     def set_vector_limits(self, flat_max: int, exact_max: int) -> None:
         """A sidecar is configured: while it is not serving, a namespace over
         `flat_max` vectors answers only what it can exactly without the
@@ -1405,11 +1424,10 @@ class NamespaceIndex:
         scored: list[tuple[float, int]] = []
         full = False
         # read-your-writes: vectors queued but not yet in the index (the
-        # writer could not take the apply lock) are candidates too
-        pending = ann.pending_rowids()
-        if pending:
-            seen.update(pending)
-            scored += self._scored_rowids(q, f, pending)
+        # writer could not take the apply lock) are candidates too. Taken
+        # BEFORE the index is searched: a row applied in between is then in
+        # one or the other, never in neither
+        pending = ann.pending_vectors()
         for attempt in range(2):
             got = ann.knn(q, k)
             if got is None:
@@ -1435,6 +1453,8 @@ class NamespaceIndex:
         if len(scored) < need and full:
             ann.note_fallback("short")
             return self._exact_vector(q, f, limit)
+        # (the exact answers above read the pending rows from SQLite)
+        scored += self._pending_scored(pending, q, f, scored, seen, need)
         ann.note_search()
         hits = self._hits_from_scored(f, scored, limit)
         if ann.verify_due():
@@ -1442,6 +1462,39 @@ class NamespaceIndex:
             # checked against the exact scan (in the background)
             ann.verify_later(q, f, limit, [h.record.id for h in hits])
         return hits
+
+    _PENDING_CHUNK = 64
+
+    def _pending_scored(self, pending: list, q: np.ndarray, f: IndexFilter, scored: list[tuple[float, int]],
+                        seen: set[int], need: int) -> list[tuple[float, int]]:
+        """Of the sidecar's pending rows (ann.pending_vectors(): queued or
+        being applied, not yet searchable in it - the writer could not take
+        the apply lock: a snapshot publish, another writer's batch), those
+        that can make the page.
+        The queue holds each row's stored vector, so all of them are scored
+        in one numpy pass; only those at or above the need-th best score
+        found so far are filtered (and re-scored) in SQL, best-first, until
+        the page is decided. Filtering EVERY queued row in SQL on every
+        search - tens of thousands behind a bulk writer - cost seconds per
+        query."""
+        pend = [r for r in pending if r[0] not in seen and int(r[2]) == q.shape[0]]
+        if not pend:
+            return []
+        sc = _cosines(pend, q)
+        best = sorted((s for s, _ in scored), reverse=True)
+        floor = max(MIN_COSINE, best[need - 1] - _VEC_QUANTUM if len(best) >= need else MIN_COSINE)
+        order = [int(i) for i in np.argsort(-sc, kind="stable") if sc[i] >= floor]
+        out: list[tuple[float, int]] = []
+        step = self._PENDING_CHUNK
+        for s in range(0, len(order), step):
+            chunk = [int(pend[i][0]) for i in order[s:s + step]]
+            seen.update(chunk)
+            out += self._scored_rowids(q, f, chunk)
+            if len(out) >= need and s + step < len(order):
+                kth = sorted((x for x, _ in out), reverse=True)[need - 1]
+                if sc[order[s + step]] < kth - _VEC_QUANTUM:
+                    break  # every row left scores below the page (ties at the cut are kept)
+        return out
 
     def _scored_rowids(self, q: np.ndarray, f: IndexFilter, rowids: list[int]) -> list[tuple[float, int]]:
         """(exact cosine, rowid) of the candidate rows that pass the SQL
