@@ -170,6 +170,129 @@ def test_a_b_c_a_triple_handoff_numbering_never_goes_backwards(cluster):
     _check(acked, set(), {"cold": cluster.cold()})
 
 
+# ------------------------------------ a retaken namespace's warm index cache
+
+
+def _local_bytes(m) -> bytes:
+    """Every byte node `m` keeps locally (index cache, tantivy copy, keys)."""
+    out = []
+    for d, _, files in os.walk(os.path.dirname(m.engine.cache_dir)):
+        for f in files:
+            try:
+                with open(os.path.join(d, f), "rb") as fh:
+                    out.append(fh.read())
+            except OSError:
+                pass
+    return b"\0".join(out)
+
+
+def _view(m, ids) -> dict:
+    """What `m` serves per id: None, or the record's superseded_by."""
+    out = {}
+    for r in ids:
+        d = m.get(r, namespace=NS)
+        out[r] = None if d is None else ("served", d["time"]["superseded_by"])
+    return out
+
+
+@pytest.mark.s3
+@pytest.mark.parametrize("fold", ["compact", "rotate"])
+@pytest.mark.parametrize("b_writes", [False, True])
+def test_a_retaken_namespace_never_serves_what_another_node_deleted(cluster, fold, b_writes):
+    """A -> B -> A through clean releases, A's local index cache kept warm.
+    A writes and deletes (soft and hard) and releases; B deletes more (soft
+    and hard; with b_writes it also writes new records and supersedes one of
+    A's), then folds and releases. A compaction RETIRES every op it folds:
+    the deletes survive only as absence from its segment, so replaying the
+    tail past A's old watermark cannot redo them. A's warm cache served
+    every record B deleted - hard deletes included - through get and search,
+    while export (folded from durable state) did not. Now: nothing either
+    node deleted comes back, B's writes and supersede are served, A agrees
+    with a cold node, and no hard-deleted text is left in A's local files."""
+    A, B = cluster.node("A"), cluster.node("B")
+    tag = uuid.uuid4().hex[:8]
+    word = [f"zq{tag}w{i:02d}" for i in range(30)]   # one unique token per record
+    ids = [A.remember(f"note {i} {word[i]}", namespace=NS) for i in range(30)]
+    a_soft, a_hard, b_soft, b_hard = ids[0:2], ids[2:4], ids[4:6], ids[6:8]
+    for r in a_soft:
+        assert A.delete(r, namespace=NS)
+    for r in a_hard:
+        assert A.delete(r, hard=True, namespace=NS)
+    A.search(" ".join(word[:10]), namespace=NS, budget_tokens=4000)   # warm A's caches
+    evict(A)
+    for r in b_soft:
+        assert B.delete(r, namespace=NS)
+    for r in b_hard:
+        assert B.delete(r, hard=True, namespace=NS)
+    new = []
+    if b_writes:
+        new = [B.remember(f"from b {i} zq{tag}b{i}", namespace=NS) for i in range(3)]
+        ns_b = B.engine.namespace(NS)
+        B._apply_supersedence(ns_b, [(ids[8], new[0])])
+    if fold == "compact":
+        B.compact(force=True, namespace=NS)
+    else:
+        B.engine.namespace(NS).rotate("test")
+    b_view = _view(B, ids + new)
+    evict(B)
+
+    deleted = a_soft + a_hard + b_soft + b_hard
+    a_view = _view(A, ids + new)
+    back = [r for r in deleted if a_view[r] is not None]
+    assert not back, f"A serves {len(back)} deleted record(s) again: {back}"
+    assert a_view == b_view, "A's view of the namespace differs from B's"
+    for r in new:
+        assert a_view[r] == ("served", None), f"A lost B's write {r}"
+    if b_writes:
+        assert a_view[ids[8]] == ("served", new[0]), "A lost B's supersede"
+    hits = A.search(" ".join(word[:10]), namespace=NS, budget_tokens=4000)
+    got = {h.id for h in hits.items}
+    assert not got & set(deleted), f"search serves deleted records: {sorted(got & set(deleted))}"
+    assert set(ids[8:10]) & got, "the search found nothing at all"
+    exported = {json.loads(line)["id"] for line in A.export_jsonl(namespace=NS).splitlines()
+                if line.strip()}
+    assert exported == {r for r, v in a_view.items() if v is not None}, "get and export disagree"
+    if fold == "compact":
+        # the purge B's compaction made must reach A's copies too (D7)
+        local = _local_bytes(A)
+        assert word[9].encode() in local, "the scan does not see A's index cache"
+        kept = [word[ids.index(r)] for r in a_hard + b_hard if word[ids.index(r)].encode() in local]
+        assert not kept, f"hard-deleted text left in A's local files: {kept}"
+    A.close()
+    B.close()
+    cold = cluster.node("cold")
+    try:
+        assert _view(cold, ids + new) == a_view, "A disagrees with a cold node"
+    finally:
+        cold.close()
+
+
+def test_a_reopen_no_other_tenure_came_between_keeps_its_warm_cache(tmp_path):
+    """Control for the lineage check: it discards a cache only when another
+    tenure opened the namespace since. A close + reopen in between which
+    nobody else wrote keeps the same file and replays nothing."""
+    from memd.core.schema import MemoryRecord
+    from memd.storage.engine import StorageEngine
+
+    root, cache = str(tmp_path / "store"), str(tmp_path / "cache")
+    e = StorageEngine(root, cache_dir=cache)
+    ns = e.namespace("t")
+    for i in range(5):
+        ns.append([MemoryRecord.create(namespace="t", kind="raw_event", content=f"r {i}")])
+    path = ns.index.path
+    e.close()
+    ino = os.stat(path).st_ino
+    for _ in range(2):
+        e = StorageEngine(root, cache_dir=cache)
+        ns = e.namespace("t")
+        try:
+            assert not ns._replayed_at_open, "a warm reopen replayed or rebuilt the cache"
+            assert os.stat(path).st_ino == ino, "a warm reopen replaced the cache file"
+            assert ns.index.stats()["records"] == 5
+        finally:
+            e.close()
+
+
 # ------------------------------------------- handoffs with a paused writer
 
 

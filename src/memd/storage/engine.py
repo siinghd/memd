@@ -132,6 +132,13 @@ class Manifest:
     # paused mid-append or mid-delete still means that exact name - so every
     # new tenure numbers above this (S3ObjectStore.set_log_floor).
     log_hw: dict = field(default_factory=dict)
+    # The tenure that last opened the namespace: minted by every open (a
+    # ULID, never reused - a recreated namespace starts a new one) and
+    # committed before it writes anything. A node's local index cache is
+    # stamped with the lineage it was last brought up to date in, and only
+    # a cache of the lineage an open finds may be caught up by replaying the
+    # tail past its watermark (see NamespaceStore._stale_cache).
+    lineage: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -152,6 +159,7 @@ class Manifest:
             "scrub_seq": self.scrub_seq,
             "compact_seq": self.compact_seq,
             "log_hw": self.log_hw,
+            "lineage": self.lineage,
         }
 
     @classmethod
@@ -181,6 +189,7 @@ class Manifest:
             compact_seq=int(d.get("compact_seq", checkpoint_seq) or 0),
             log_hw={str(k): int(v) for k, v in (d.get("log_hw") or {}).items()
                     if isinstance(v, int) and v >= 0},
+            lineage=str(d.get("lineage", "") or ""),
         )
 
 
@@ -985,6 +994,9 @@ class NamespaceStore:
             os.replace(tmp, path)
             self.index = NamespaceIndex(path)
             self.index._ns_hint = self.namespace
+            # the image carries its publisher's lineage stamp: this open
+            # stamps its own once it has caught the image up
+            self.index.set_meta("lineage", "")
             METRICS.inc("memd_index_snapshots_loaded_total", ns=self.namespace)
             return seq
         except Exception as ex:  # noqa: BLE001 - fall back to full replay
@@ -1022,7 +1034,12 @@ class NamespaceStore:
             # claim again.
             self._claim_manifest()
             self._takeover_done = True
-        elif self._manifest_ver is None:
+        # the tenure whose history this node's cache may be caught up on is
+        # the one that opened the namespace last; this one gets its own,
+        # committed with the manifest before it writes anything
+        prior_lineage = self.manifest.lineage
+        self.manifest.lineage = ulid_new()
+        if not self._took_over and self._manifest_ver is None:
             self._persist_manifest()
         # repaired before this session can append an op behind a torn record
         ops = self._read_ops(repair=True)
@@ -1035,6 +1052,8 @@ class NamespaceStore:
             # from a build before the stamp). Its watermark counts on the old
             # numbering and could skip the migrated checkpoint: rebuild it.
             self._reset_index()
+        elif not self.index.created and (why := self._stale_cache(prior_lineage)):
+            self._discard_index(why)
         # Index-applied watermark: the index records the highest manifest.seq it
         # has folded in. Replay covers segments + wal frames + ops with
         # seq > applied - so a fresh/restored cache rebuilds everything, while
@@ -1102,6 +1121,9 @@ class NamespaceStore:
         self.index.set_meta("applied_seq", str(self.manifest.seq))
         self.index.set_meta("store_format", str(STORE_FORMAT))
         self._persist_manifest()
+        # only now that this tenure's lineage is committed: the cache is up
+        # to date in it (a crash before this discards the cache next time)
+        self.index.set_meta("lineage", self.manifest.lineage)
         self._scrub_caches()
         self._collect_garbage()
         if self._migrated_t0 is not None:
@@ -1176,6 +1198,64 @@ class NamespaceStore:
         self.index.wipe()
         self.index.set_meta("applied_seq", "0")
         self._replayed_at_open = True
+
+    def _stale_cache(self, prior_lineage: str) -> str | None:
+        """Why this node's index cache may NOT be caught up by replaying the
+        tail past its watermark (None: it may).
+
+        The watermark is a seq, and a seq only means something in the
+        history the cache was built in. A node that took a namespace back
+        after other nodes had held it replayed past its OLD watermark - but
+        a compaction another node ran meanwhile had retired every op it
+        folded: the records its tombstones and hard deletes removed are
+        simply absent from its segment, and replaying that segment's copies
+        over the cache deletes nothing. Those deletes never reached the
+        cache, which served them - hard deletes included - through get and
+        search (export, folded from durable data, did not). Another tenure
+        can also number events at seqs the cache already counts as applied
+        (seqs consumed by appends that failed as a lease was lost).
+
+        So a cache is trusted only if it was brought up to date in the
+        lineage of the tenure that opened the namespace last - no other
+        tenure has written it since - and no fold retired ops above its
+        watermark (see _snapshot_floor). Any other cache is rebuilt: from the
+        snapshot, when one is published, plus the tail - what a node without
+        a cache pays anyway."""
+        if not prior_lineage:
+            return "the namespace has no lineage yet"   # new, or written by an older build
+        if self.index.get_meta("lineage") != prior_lineage:
+            return "another tenure wrote the namespace since"
+        try:
+            applied = int(self.index.get_meta("applied_seq") or 0)
+        except ValueError:
+            return "unreadable watermark"
+        if 0 < applied < self._snapshot_floor():
+            return "a fold retired ops above its watermark"
+        return None
+
+    def _discard_index(self, why: str) -> None:
+        """Replace this node's index cache with a new, empty one: the file,
+        its WAL and the tantivy copy deleted - not wiped - so the replay that
+        follows builds it from durable data alone. Deleting them is also the
+        physical purge (D7): a stale cache holds the text of records another
+        node hard-deleted, and purged, since; a new file holds only what is
+        written into it from now on (see NamespaceIndex.created)."""
+        path = self.index.path
+        self.index.close()
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.unlink(path + suffix)
+            except FileNotFoundError:
+                pass
+        shutil.rmtree(os.path.splitext(path)[0] + ".tantivy", ignore_errors=True)
+        self.index = NamespaceIndex(path)
+        self.index._ns_hint = self.namespace
+        self._replayed_at_open = True
+        METRICS.inc("memd_index_cache_discards_total",
+                    help="local index caches rebuilt at open: not of the namespace's lineage",
+                    ns=self.namespace)
+        _log.info("namespace %s: local index cache discarded and rebuilt (%s)",
+                  self.namespace, why)
 
     def _scrub_caches(self) -> None:
         """Bring this node's derived copies up to the newest purge (D7).
