@@ -25,6 +25,7 @@ Invariants:
 from __future__ import annotations
 
 import contextlib
+import hmac
 import itertools
 import json
 import logging
@@ -40,7 +41,7 @@ from memd.core.schema import (MemoryRecord, now_ms, records_from_jsonl, records_
                               ulid_ts_ms)
 from memd.metrics import METRICS
 from memd.index.sqlite_index import NamespaceIndex
-from memd.storage.crypto import KeyEnvelope, NullKeyEnvelope
+from memd.storage.crypto import KeyCustodyError, KeyEnvelope, NullKeyEnvelope
 from memd.storage.objectstore import LocalObjectStore, ObjectStore, tmp_is_foreign
 
 _log = logging.getLogger(__name__)
@@ -129,6 +130,10 @@ class Manifest:
     # {"name", "seq", "uid", "wm"} - usable only on top of that index image
     # (the same vec_uid and vec_wm; see memd.index.ann_usearch)
     vector_snapshot: dict = field(default_factory=dict)
+    # A public fingerprint of the namespace's data key (KeyEnvelope.key_check),
+    # "" until one was stamped: an open checks the key it was handed against
+    # it before it reads, repairs or rewrites anything (see _verify_key).
+    key_check: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -149,6 +154,7 @@ class Manifest:
             "scrub_seq": self.scrub_seq,
             "compact_seq": self.compact_seq,
             "vector_snapshot": self.vector_snapshot,
+            "key_check": self.key_check,
         }
 
     @classmethod
@@ -177,6 +183,7 @@ class Manifest:
             # been a compaction, so its snapshot must cover the newest one
             compact_seq=int(d.get("compact_seq", checkpoint_seq) or 0),
             vector_snapshot=dict(d.get("vector_snapshot") or {}),
+            key_check=str(d.get("key_check", "") or ""),
         )
 
 
@@ -205,6 +212,22 @@ def _frames_with_offsets(data: bytes):
         end = i + 4 + ln
         yield end, data[i + 4 : end]
         i = end
+
+
+def _plaintext(blob: bytes) -> bool:
+    """A frame or segment written before encryption was on: plaintext JSON
+    (JSONL), whose first line parses. A ciphertext starts with a random
+    nonce; its first line parsing as JSON is not a real possibility, so this
+    tells legacy plaintext from data under a key that is not the one in hand
+    (see NamespaceStore._decrypt_frame)."""
+    if blob[:1] != b"{":
+        return False
+    nl = blob.find(b"\n")
+    try:
+        json.loads(blob if nl == -1 else blob[:nl])
+    except ValueError:  # JSONDecodeError and UnicodeDecodeError
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -691,7 +714,22 @@ class NamespaceStore:
         self._collected: list[dict] = []
         self._defer_notes = False  # collections audited later (see _collect_garbage_now)
         self._audit_sink = None  # set by StorageEngine once the store is open
-        self._open()
+        # the key in hand is proven to be this data's (or nothing encrypted
+        # exists yet): only then is its fingerprint stamped (_persist_manifest)
+        self._key_ok = False
+        try:
+            self._open()
+        except BaseException:
+            # A refused open (KeyCustodyError, a newer store format) keeps
+            # nothing: not the index handle, not the namespace's lock or
+            # lease - it must open again, here or elsewhere, once the cause
+            # is fixed (the right keys restored).
+            try:
+                self.index.close()
+            except Exception:
+                pass
+            self._release_ownership()
+            raise
         self._attach_lexical(lexical)
 
     def _attach_lexical(self, lexical: dict | None) -> None:
@@ -1035,6 +1073,9 @@ class NamespaceStore:
             self.manifest = Manifest.from_dict(json.loads(raw))
         else:
             self._persist_manifest()
+        # before anything is read, repaired or rewritten: the key in hand
+        # must be the one the data was written with
+        self._verify_key()
         # repaired before this session can append an op behind a torn record
         ops = self._read_ops(repair=True)
         if self.manifest.format < STORE_FORMAT:
@@ -1087,13 +1128,17 @@ class NamespaceStore:
             self._replayed_at_open = True
         if n_frames and last_seq <= base:
             # every frame is at or below the checkpoint that folded it: the
-            # cleanup of a fold or migration that crashed after its commit
+            # cleanup of a fold or migration that crashed after its commit -
+            # unless they only LOOK folded because they do not decrypt
+            self._refuse_undecryptable(wal, 0, "WAL")
             self.store.delete(self.wal_key)
             n_frames = 0
         elif good_end < len(wal):
+            self._refuse_undecryptable(wal, good_end, "WAL")
             self.store.truncate(self.wal_key, good_end)  # torn-tail repair
         self.manifest.ops_size = self.store.size(self.ops_key)
         if not ops and self.manifest.ops_size:
+            self._refuse_undecryptable(self.store.get(self.ops_key) or b"", 0, "ops")
             self.store.delete(self.ops_key)  # the same cleanup, ops side
             self.manifest.ops_size = 0
         # Seed the frame counter from what is actually in the WAL. Starting it
@@ -1117,6 +1162,111 @@ class NamespaceStore:
             _log.info("namespace %s: migration done, local index rebuilt (%d records) in "
                       "%d ms", self.namespace, len(versions),
                       int((time.monotonic() - self._migrated_t0) * 1000))
+
+    def _verify_key(self) -> None:
+        """Key custody, settled before this open reads, repairs or rewrites
+        anything.
+
+        A key that is valid but not the one the data was written with - a
+        restore that copied another deployment's keys directory in, a
+        replaced root key - opened the namespace as EMPTY: every frame and
+        segment failed to decrypt, was read as damage, skipped or cut off as
+        a torn tail, and the next compaction deleted the segments for good.
+        A warm open read nothing at all, so nothing even looked wrong. The
+        manifest now carries the data key's fingerprint (key_check): a key
+        that does not match it, no key at all (minting one would orphan the
+        data), or encryption turned off for an encrypted namespace is
+        refused, nothing touched. A manifest without a stamp (written before
+        it, or no key existed yet) is probed instead (_probe_key); the stamp
+        is written once the key is proven (_persist_manifest)."""
+        env, m, ns = self.envelope, self.manifest, self.namespace
+        if not env.enabled:
+            if m.key_check:
+                raise self._custody_refusal("key", (
+                    f"namespace {ns!r} was written with encryption on (its manifest carries a "
+                    "data-key check) and this process opened it with encryption off: its frames "
+                    "would read as garbage and be cut off as a torn tail. Open it with encryption "
+                    "on and the keys it was written with. Refusing to open; nothing was changed"))
+            return
+        if not m.key_check:
+            self._probe_key()
+        elif not env.has_key(ns):
+            raise self._custody_refusal("key", (
+                f"namespace {ns!r} has encrypted data but this process has no data key for it: "
+                "the key is lost or held elsewhere (a restore without the keys directory?). "
+                "Restore the keys it was written with - minting a new key would make the "
+                "existing data unreadable. Refusing to open; nothing was changed"))
+        elif not hmac.compare_digest(self._key_check_of_key_in_hand(), m.key_check):
+            raise self._custody_refusal("key", (
+                f"namespace {ns!r}: the data key this process holds is not the one its data was "
+                "written with (the manifest's key check does not match) - a restore that mixed "
+                "up keys directories, or a replaced root key. Restore the keys it was written "
+                "with. Refusing to open; nothing was read, truncated or deleted"))
+        self._key_ok = True
+
+    def _key_check_of_key_in_hand(self) -> str:
+        try:
+            return self.envelope.key_check(self.namespace)
+        except KeyCustodyError as ex:   # e.g. a wrapped data key another root key cannot unwrap
+            raise self._custody_refusal("key", f"{ex}. Refusing to open; nothing was changed") from ex
+
+    def _probe_key(self) -> None:
+        """_verify_key for a manifest without a key check. The first
+        encrypted object found - the WAL's first frame, then the segments,
+        smallest first - is decrypted: it authenticates, and the key is
+        proven; it does not (or there is no key to try it with), and the open
+        is refused. An op the key decrypts proves it too, but an ops record
+        that does not is no evidence here: it may be one an older binary tore
+        and appended behind (the open's ops scan settles that log, see
+        _read_ops). Nothing encrypted at all - a new namespace, or one written
+        before encryption was on - leaves nothing to prove or lose."""
+        ns, env = self.namespace, self.envelope
+
+        def encrypted(blob: bytes) -> bool:
+            return len(blob) > 12 and not _plaintext(blob)
+
+        ops = self.store.get(self.ops_key) or b""
+        first = next(_frames_with_offsets(ops), None) if ops[:1] != b"{" else None
+        if (first is not None and encrypted(first[1]) and env.has_key(ns)
+                and self._parse_op(ops, 0) is not None):
+            return
+
+        def candidates():
+            wal = self.store.get(self.wal_key) or b""
+            head = next(_frames_with_offsets(wal), None) if wal[:1] != b"{" else None
+            if head is not None:
+                yield "first WAL frame", head[1]
+            for seg in sorted(self.manifest.segments, key=lambda s: int(s.get("records", 0))):
+                blob = self.store.get(f"{self.prefix}/{seg['name']}")
+                if blob:
+                    yield f"segment {seg['name']}", blob
+
+        for what, blob in candidates():
+            if not encrypted(blob):
+                continue
+            if not env.has_key(ns):
+                raise self._custody_refusal("key", (
+                    f"namespace {ns!r} has encrypted data (its {what}) but this process has no "
+                    "data key for it: the key is lost or held elsewhere (a restore without the "
+                    "keys directory?). Restore the keys it was written with - minting a new key "
+                    "would make the existing data unreadable. Refusing to open; nothing was "
+                    "changed"))
+            try:
+                env.decrypt(ns, blob)
+            except KeyCustodyError as ex:
+                raise self._custody_refusal("key", (
+                    f"namespace {ns!r}: its {what} does not decrypt with this process's data "
+                    "key - the key is not the one the data was written with (lost, replaced, "
+                    "restored from another deployment). Restore the keys it was written with. "
+                    "Refusing to open; nothing was read, truncated or deleted")) from ex
+            return
+
+    def _custody_refusal(self, what: str, msg: str) -> KeyCustodyError:
+        METRICS.inc("memd_key_custody_refusals_total",
+                    help="opens and folds refused: data does not decrypt with the data key in hand",
+                    ns=self.namespace, log=what)
+        _log.error("%s", msg)
+        return KeyCustodyError(msg)
 
     def _reset_index(self) -> None:
         """Empty the local index and zero its watermark: the replay that
@@ -1247,7 +1397,7 @@ class NamespaceStore:
                 raw = self._decrypt_frame(self.store.get(key) or b"")
                 head = json.loads(raw[:raw.find(b"\n")])["_seg"]
                 gen, fold = int(head.get("gen", 0)), int(head["fold_seq"])
-            except Exception:  # noqa: BLE001 - not provably ours or old: keep
+            except Exception:  # noqa: BLE001 - not provably ours or old (or not under this key): keep
                 continue
             if gen >= m.checkpoint_gen or fold > m.checkpoint_seq:
                 continue  # as new as the checkpoint: a writer may own it
@@ -1325,6 +1475,9 @@ class NamespaceStore:
         _log.info("namespace %s: migrating from store format %d to %d (%d segments, "
                   "%d WAL bytes, %d ops); other namespaces keep serving", self.namespace,
                   m.format, STORE_FORMAT, len(m.segments), m.wal_size, len(ops))
+        # a migration folds the logs and then deletes them: they must all be
+        # readable under this key first (see _refuse_undecryptable)
+        self._refuse_undecryptable(self.store.get(self.wal_key) or b"", 0, "WAL")
         plan = self._plan_legacy(ops, t0)
         kept, out, deferred, fold = plan["kept"], plan["out"], plan["deferred"], plan["fold"]
         report = plan["report"]
@@ -1457,6 +1610,9 @@ class NamespaceStore:
             try:
                 payload = self._decrypt_frame(fr)
                 recs = records_from_jsonl(payload)
+            except KeyCustodyError as ex:
+                # under another key: not a torn tail (the migration deletes the log)
+                raise self._frame_refusal("WAL") from ex
             except Exception:  # noqa: BLE001
                 break
             out.append((_wal_seq(payload), recs))
@@ -1803,9 +1959,18 @@ class NamespaceStore:
         durably, the way the WAL's torn tail is: an op appended behind a torn
         record was invisible to every reader and lost at the next rotate.
         Format 2: an op at or below wal_base_seq is one a checkpoint already
-        folded (left by a fold or migration that crashed after its commit)."""
+        folded (left by a fold or migration that crashed after its commit).
+
+        A record skipped as damaged, or a tail about to be cut, must be
+        damage: a COMPLETE frame there that does not decrypt is an op under
+        another key (see KeyCustodyError), and every fold deletes this log -
+        so it is refused here, whether or not this read repairs."""
         data = self.store.get(self.ops_key) or b""
-        ops, good_end = self._scan_ops(data)
+        damaged: list[tuple[int, int]] = []
+        ops, good_end = self._scan_ops(data, damaged)
+        for a, b in damaged + [(good_end, len(data))]:
+            if a < b:
+                self._refuse_undecryptable(data[a:b], 0, "ops")
         if repair and good_end < len(data):
             self.store.truncate(self.ops_key, good_end)
             METRICS.inc("memd_ops_log_repairs_total",
@@ -1827,13 +1992,16 @@ class NamespaceStore:
             return None
         try:
             op = json.loads(self._decrypt_frame(data[i + 4 : end]))
-        except ValueError:  # JSONDecodeError and UnicodeDecodeError
+        except (ValueError, KeyCustodyError):  # JSONDecodeError, UnicodeDecodeError, no auth
+            # (_read_ops decides whether a complete frame that does not
+            # decrypt is damage; resynchronizing probes arbitrary offsets)
             return None
         if not isinstance(op, dict) or not isinstance(op.get("seq"), int):
             return None
         return op, end
 
-    def _scan_ops(self, data: bytes) -> tuple[list[dict], int]:
+    def _scan_ops(self, data: bytes, damaged: list[tuple[int, int]] | None = None
+                  ) -> tuple[list[dict], int]:
         """Parse an ops log -> (ops, end of the last op that parsed).
 
         A record that does not parse - a torn append, garbage - is skipped by
@@ -1842,7 +2010,8 @@ class NamespaceStore:
         appending (and acking) ops behind it; stopping at the tear, as the
         length framing alone would, hid those acked deletes and the next
         rotate dropped them. A torn tail has nothing behind it and ends the
-        log."""
+        log. `damaged`, if given, collects the (start, end) of every record
+        skipped that way."""
         if data[:1] == b"{":  # legacy single blob
             try:
                 return [json.loads(self._decrypt_frame(data))], len(data)
@@ -1861,6 +2030,8 @@ class NamespaceStore:
                         break
                 else:
                     break  # nothing behind it parses: a torn tail
+                if damaged is not None:
+                    damaged.append((i, j))
                 METRICS.inc("memd_ops_log_salvaged_total",
                             help="ops recovered from behind a damaged ops-log record",
                             ns=self.namespace)
@@ -1873,7 +2044,8 @@ class NamespaceStore:
         return ops, good_end
 
     def _load_checkpoints(self, applied: int = 0, where: str = "segment-load",
-                          holders: dict[str, list[dict]] | None = None
+                          holders: dict[str, list[dict]] | None = None,
+                          unreadable: list[dict] | None = None
                           ) -> tuple[dict[str, tuple[MemoryRecord, int]], list[dict], int]:
         """Segment state for a fold -> (versions, carried ops, max fold_seq).
 
@@ -1882,7 +2054,15 @@ class NamespaceStore:
         them when applied is 0). carried = ops earlier rotates could not
         retire; the headers of already-reflected segments are read too when
         they hold hard deletes, because those are the purge schedule.
-        `holders`, if given, collects id -> every segment entry holding it."""
+        `holders`, if given, collects id -> every segment entry holding it.
+
+        A segment that cannot be read is skipped and counted, and
+        `unreadable`, if given, collects its entry so a compaction KEEPS it
+        (quarantined in place) instead of replacing - deleting - it. That
+        includes one that does not authenticate once the key in hand is
+        proven to be this data's (see _verify_key): damage, or an object that
+        is not ours. Before that - a preview, which proves nothing - it
+        raises KeyCustodyError instead."""
         versions: dict[str, tuple[MemoryRecord, int]] = {}
         src_fold: dict[str, int] = {}  # newest segment wins, by fold_seq
         carried: list[dict] = []
@@ -1903,9 +2083,20 @@ class NamespaceStore:
             try:
                 recs, _fold_seq, ops, before = self._segment_parse(data, header_only=reflected)
             except Exception as ex:  # noqa: BLE001 - corrupt segment: skip, count, survive
+                if isinstance(ex, KeyCustodyError) and not getattr(self, "_key_ok", False):
+                    raise self._custody_refusal("segment", (
+                        f"namespace {self.namespace!r}: segment {seg['name']} does not decrypt "
+                        "with this process's data key - the key is not the one it was written "
+                        "with. Refusing to read past it; nothing was truncated or deleted")) from ex
                 METRICS.inc("memd_storage_parse_errors_total",
                             where=where, ns=self.namespace,
                             detail=type(ex).__name__)
+                _log.warning("namespace %s: segment %s is damaged (%s: %s); skipped, and kept",
+                             self.namespace, seg["name"], type(ex).__name__,
+                             "does not authenticate under the verified data key"
+                             if isinstance(ex, KeyCustodyError) else "does not parse")
+                if unreadable is not None:
+                    unreadable.append(seg)
                 continue
             carried.extend(ops)
             for rec in recs:
@@ -1922,13 +2113,17 @@ class NamespaceStore:
 
         Seqs grow along the log, so the first frame past `applied` is found by
         bisection: a warm open decrypts O(log n) frames instead of all of them.
-        A frame past it that fails to parse ends the log (torn tail)."""
+        A frame past it that fails to parse ends the log (torn tail); one
+        that does not decrypt raises KeyCustodyError (see _decrypt_frame)."""
         frames = list(_frames_with_offsets(wal))
         probed: dict[int, int] = {}
         lo, hi = 0, len(frames)
         while lo < hi:
             mid = (lo + hi) // 2
-            probed[mid] = _frame_seq(self._decrypt_frame(frames[mid][1]))
+            try:
+                probed[mid] = _frame_seq(self._decrypt_frame(frames[mid][1]))
+            except KeyCustodyError as ex:
+                raise self._frame_refusal("WAL") from ex
             if probed[mid] <= applied:
                 lo = mid + 1
             else:
@@ -1942,6 +2137,9 @@ class NamespaceStore:
             try:
                 payload = self._decrypt_frame(fr)
                 recs = records_from_jsonl(payload)
+            except KeyCustodyError as ex:
+                # a complete frame under another key is not a torn tail
+                raise self._frame_refusal("WAL") from ex
             except Exception:
                 break
             last_seq = _frame_seq(payload)
@@ -1951,13 +2149,18 @@ class NamespaceStore:
 
     def _wal_events(self, where: str) -> list[tuple[int, list[MemoryRecord]]]:
         """Every parseable WAL frame past wal_base_seq as (seq, records); bad
-        frames are counted and skipped (fold paths, not the torn-tail repair)."""
+        frames are counted and skipped (fold paths, not the torn-tail repair).
+        A frame that does not decrypt raises KeyCustodyError instead."""
         base = self.manifest.wal_base_seq
         out: list[tuple[int, list[MemoryRecord]]] = []
         for fr in self._read_frames(self.wal_key):
             try:
                 payload = self._decrypt_frame(fr)
                 recs = records_from_jsonl(payload)
+            except KeyCustodyError as ex:
+                # every fold deletes the log it read: never past a frame
+                # under another key
+                raise self._frame_refusal("WAL") from ex
             except Exception:
                 METRICS.inc("memd_storage_parse_errors_total", where=where, ns=self.namespace)
                 continue
@@ -2094,6 +2297,13 @@ class NamespaceStore:
             return max_fold
         try:
             recs, fold_seq, ops, before = self._segment_parse(data)
+        except KeyCustodyError as ex:
+            if not self._key_ok:
+                raise self._custody_refusal("segment", (
+                    f"namespace {self.namespace!r}: its newest checkpoint {name} does not "
+                    "decrypt with this process's data key - the key is not the one it was "
+                    "written with. Refusing to open without it; nothing was changed")) from ex
+            return max_fold  # damaged under the verified key: nothing to adopt (it is kept)
         except Exception:  # noqa: BLE001 - unreadable: nothing to adopt
             return max_fold
         if fold_seq != self.manifest.checkpoint_seq:
@@ -2116,13 +2326,54 @@ class NamespaceStore:
             return [data]  # legacy single blob
         return list(_frame_iter(data))
 
+    def _undecryptable(self, frame: bytes) -> bool:
+        """A length-complete frame that does not decrypt under this
+        namespace's key and is not a legacy plaintext frame either."""
+        if not self.envelope.enabled or len(frame) <= 12 or _plaintext(frame):
+            return False
+        if not self.envelope.has_key(self.namespace):
+            return True  # encrypted, and no key here: never mint one to find out
+        try:
+            self.envelope.decrypt(self.namespace, frame)
+            return False
+        except KeyCustodyError:
+            return True
+
+    def _refuse_undecryptable(self, data: bytes, start: int, what: str) -> None:
+        """Before a repair CUTS data[start:] (or a fold deletes it): every
+        complete frame there must decrypt. One that does not is not a torn
+        tail - only a frame cut short by its length is - it is data under a
+        key this process does not have (lost, replaced, restored from another
+        deployment). Cutting it would destroy it for good; refuse instead,
+        nothing cut."""
+        for _end, fr in _frames_with_offsets(data[start:]):
+            if self._undecryptable(fr):
+                raise self._frame_refusal(what)
+
+    def _frame_refusal(self, what: str) -> KeyCustodyError:
+        return self._custody_refusal(what, (
+            f"namespace {self.namespace!r}: a complete {what} frame does not decrypt with this "
+            "process's data key - the key is not the one the data was written with (lost, "
+            "replaced, or restored from another deployment). Refusing; nothing was truncated "
+            "or deleted"))
+
     def _decrypt_frame(self, frame: bytes) -> bytes:
-        if len(frame) > 12 and self.envelope.enabled:
-            try:
-                return self.envelope.decrypt(self.namespace, frame)
-            except Exception:
-                return frame
-        return frame
+        """A frame (or segment blob) decrypted - or as it is, when it is
+        legacy plaintext written before encryption was on, or too short to be
+        a ciphertext. Anything else that does not decrypt raises
+        KeyCustodyError, never passes as data that merely fails to parse:
+        a log frame is then never cut off or folded away, and a segment is
+        refused - or, once the key is proven (_verify_key), skipped and kept
+        as damage (_load_checkpoints). This used to swallow the failure and
+        hand back the ciphertext, so a wrong key read as corruption
+        everywhere and the data was skipped, cut off and compacted away."""
+        if len(frame) <= 12 or not self.envelope.enabled or _plaintext(frame):
+            return frame
+        if not self.envelope.has_key(self.namespace):
+            # encrypted, and no key here: minting one would orphan the data
+            raise KeyCustodyError(f"namespace {self.namespace!r} has encrypted data but no data "
+                                  "key here: the key is lost or held elsewhere")
+        return self.envelope.decrypt(self.namespace, frame)
 
     def _apply_to_index(self, records: list[MemoryRecord], ops: list[dict], from_replay: bool = False) -> None:
         items = [(r, None, "") for r in records]
@@ -2149,6 +2400,10 @@ class NamespaceStore:
                 self.index.set_vector(op["id"], vec, op.get("model", ""))
 
     def _persist_manifest(self) -> None:
+        m, env = self.manifest, self.envelope
+        if (self._key_ok and not m.key_check and env.enabled
+                and env.has_key(self.namespace)):   # never mint a key to stamp it
+            m.key_check = env.key_check(self.namespace)
         self.manifest.version += 1
         self.store.put(self.manifest_key, json.dumps(self.manifest.to_dict()).encode())
         self._manifest_dirty = False
@@ -2495,7 +2750,7 @@ class NamespaceStore:
                 continue
             try:
                 recs, _ = self._segment_records(data)
-            except Exception:
+            except Exception:  # damaged (a verified key: see _load_checkpoints)
                 METRICS.inc("memd_storage_parse_errors_total", where="segment-load", ns=self.namespace)
                 continue
             for rec in recs:
@@ -2505,6 +2760,8 @@ class NamespaceStore:
         for fr in self._read_frames(self.wal_key):
             try:
                 live.update({r.id: r for r in records_from_jsonl(self._decrypt_frame(fr))})
+            except KeyCustodyError:
+                raise
             except Exception:
                 METRICS.inc("memd_storage_parse_errors_total", where="load-wal", ns=self.namespace)
                 continue
@@ -2534,7 +2791,12 @@ class NamespaceStore:
                 rep.segments_in = rep.segments_out = len(self.manifest.segments)
                 rep.duration_ms = int((time.monotonic() - t0) * 1000)
                 return rep
-            versions, carried, _ = self._load_checkpoints()
+            # a damaged segment it cannot read is KEPT, never replaced: it is
+            # not folded (nothing of it is known), so it stays referenced -
+            # quarantined in place - and no later fold or collection deletes
+            # it either. (A wrong key never gets this far: see _verify_key.)
+            damaged: list[dict] = []
+            versions, carried, _ = self._load_checkpoints(unreadable=damaged)
             ops = self._read_ops()
             frames = self._wal_events("load-wal")
             rep.bytes_before = sum(self.store.size(f"{self.prefix}/{s['name']}") for s in self.manifest.segments)
@@ -2553,11 +2815,19 @@ class NamespaceStore:
             # write folded segment; the one fold that sees every copy retires
             # every op except the not-yet-due hard deletes, which keep their
             # original seqs in its header (atomic with it - never re-appended)
-            old_names = [s["name"] for s in self.manifest.segments]
+            quarantined = [dict(s, unreadable=True) for s in damaged]
+            kept_names = {s["name"] for s in quarantined}
+            old_names = [s["name"] for s in self.manifest.segments if s["name"] not in kept_names]
+            if quarantined:
+                METRICS.inc("memd_segments_quarantined_total", len(quarantined),
+                            help="damaged segments a compaction could not read and kept",
+                            ns=self.namespace)
+                _log.warning("namespace %s: compaction kept %d damaged segment(s) it could not "
+                             "read: %s", self.namespace, len(quarantined), sorted(kept_names))
             name = f"seg-{ulid_new()}"
             if kept or pending_ops:
                 self._write_segment(name, kept, self.manifest.seq, pending_ops, deferred)
-            self.manifest.segments = (
+            self.manifest.segments = quarantined + (
                 [self._segment_entry(name, kept, self.manifest.seq, "compact", pending_ops)]
                 if kept or pending_ops
                 else []
@@ -2764,6 +3034,9 @@ class NamespaceStore:
         except Exception:
             pass  # closed/deleted index; replay covers it
         self.index.close()
+        self._release_ownership()
+
+    def _release_ownership(self) -> None:
         if self._owner_path:
             _release_owner(self._owner_path)
             self._owner_path = None
