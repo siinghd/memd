@@ -26,6 +26,18 @@ any probe fails the build.
   someone with filesystem read access on the same machine. Hosted deployments
   are expected to swap the root-key provider for a KMS; that provider does not
   ship yet.
+- **Key custody fails closed.** Restore the keys directory together with the
+  data it was written with. A key that is valid but not that data's (another
+  deployment's `keys/`, a replaced `root.key`), no key at all, or encryption
+  turned off for an encrypted namespace makes the open raise
+  `KeyCustodyError`; nothing is read, truncated or deleted, and the
+  namespace opens normally once the right keys are back. The manifest holds
+  a fingerprint of each namespace's data key (an HMAC of a fixed label under
+  the key) to check this before anything is touched; it reveals nothing
+  about the key. Data that does not authenticate is never repaired or
+  compacted away: under a key that is not proven the open is refused, and
+  under the proven key a damaged segment is skipped by reads but kept on
+  disk, a damaged log frame refused.
 - **With the S3 backend, data is remote but KEYS ARE LOCAL.** That is a
   deliberate, load-bearing asymmetry: crypto-shred still works (the key never
   left the node, so destroying it makes the remote ciphertext inert), but a

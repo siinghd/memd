@@ -6,6 +6,47 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-26
+
+Security / data-integrity patch release on 0.2.0: a restore with the wrong keys
+could permanently delete data. Upgrade from 0.2.0 in place; no migration.
+
+### Fixed - data integrity / security
+- **A wrong encryption key destroyed the data it could not read**
+  (0.2.0 and earlier). A valid key that is not the one the data was
+  written with - another deployment's `keys/` directory restored over this
+  one, a replaced `root.key` - opened a namespace whose data lived in
+  compacted segments as EMPTY: every decrypt failure was swallowed and read
+  as corruption, the segments were skipped, and the next compaction deleted
+  them. Restoring the right key then served nothing. WAL frames were cut off
+  as a "torn tail" the same way, ops too, and a restore without the keys
+  directory minted a fresh key over the existing data. Now a complete WAL or
+  ops frame, or a segment, that does not authenticate under the key in hand
+  is a key-custody failure, not damage: the open raises `KeyCustodyError`
+  (`memd.storage.crypto`; decryption no longer surfaces cryptography's bare
+  `InvalidTag`) and nothing is truncated, rewritten or deleted - put the
+  right keys back and the namespace opens with everything. Rotation,
+  compaction, migration and export refuse the same way instead of folding
+  past such data. The namespace manifest now carries a fingerprint of its
+  data key (`key_check`: HMAC-SHA256 under the key of a fixed label, 128
+  bits; it reveals nothing about the key), checked before an open reads or
+  repairs anything - so a warm open that replays nothing refuses a wrong
+  key too, and never mints a key for a namespace that has encrypted data.
+  A namespace written by an older version is probed once (its first
+  encrypted object is decrypted) and stamped; v0.2.0 ignores the field. An
+  encrypted namespace opened with encryption off is refused as well. A
+  frame cut short by its length prefix is still a torn tail and still
+  repaired, and legacy plaintext frames and segments (written before
+  encryption was on) still load. Once the key is proven, a segment that
+  still does not authenticate or parse is damage: it is still skipped by
+  reads - and compaction now keeps it, quarantined in place
+  (`"unreadable": true` in the manifest, `memd_segments_quarantined_total`),
+  instead of deleting it; a complete WAL or ops frame that does not decrypt
+  is never cut off or folded away. Refusals count in
+  `memd_key_custody_refusals_total`; a refused open releases the
+  namespace's lock or lease and its index handle, so it opens again, in
+  the same process, once the keys are fixed.
+
 ## [0.2.0] - 2026-09-26
 
 First release evaluated on real data: LongMemEval (ICLR 2025), not memd's synthetic

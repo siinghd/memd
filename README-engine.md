@@ -126,7 +126,10 @@ contract — pass 22's snapshot is what makes a cold node cheap) and the envelop
 **keys**. Data is remote, keys are not, so this is *one node with remote
 durability*, not *any node serves any namespace*. Crypto-shred still works — the
 key is local, destroy it and the ciphertext is inert — but a second node cannot
-decrypt. A KMS key provider is the missing piece and is not built.
+decrypt. A KMS key provider is the missing piece and is not built. Back the keys
+directory up with the data and restore them together: a namespace opened with a
+key its data was not written with (or without one) raises `KeyCustodyError` and
+nothing is changed — it is never read as empty, and never compacted away.
 
 Single-writer is still enforced, by a **lease** rather than a file lock (`flock`
 cannot see another machine): the first writer claims `ns/<ns>/.owner` with a
