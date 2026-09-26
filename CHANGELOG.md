@@ -123,6 +123,15 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   instead of minting a new key - which made the existing data unreadable and
   wrote new data under a different key. `MEMD_KEYS_ALLOW_MINT_EXISTING=1`
   overrides (e.g. a namespace written unencrypted).
+- **Conditional writes for every object rewritten in place** (ADR-12):
+  the manifest commit, the migration report, the audit checkpoint sidecar,
+  the key-custody marker, wrapped-key rotation, the cluster registry and the
+  lease release (a CAS'd "released" tombstone instead of read-then-delete)
+  use compare-and-swap - S3 If-Match / If-None-Match, emulated under the
+  process lock on a local root. A failed precondition on the manifest
+  fences the namespace (`LeaseLostError`, 503 `lease_lost`), never retried.
+  A takeover rewrites the manifest before replay; log deletes after a commit
+  are bounded to what the commit read, and part numbers never go backwards.
 - REST: a namespace another process holds answers `503 not_owner` (with
   `Retry-After` and `X-Memd-Not-Owner`) instead of `500`; a lease lost
   mid-request answers `503 lease_lost`.
@@ -131,6 +140,11 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   root. Unset, nothing moves.
 - The `dev` extra now includes `moto[server]` (KMS for the key-provider and
   multi-node tests).
+- `MEMD_S3_ACCESS_KEY` / `MEMD_S3_SECRET_KEY` set bucket credentials apart
+  from the `AWS_*` chain (a MinIO/R2 bucket beside AWS KMS).
+- Deploy: `docker-compose.yml` (MinIO + 3 memd nodes + optional Vault) and a
+  `fly.toml` template (not deployed); the image takes
+  `--build-arg MEMD_S3=1` for boto3 and has a `/state` volume.
 
 ## [0.2.0] - 2026-09-26
 

@@ -36,12 +36,16 @@ any probe fails the build.
   claims `ns/<ns>/.owner` with a conditional PUT and a second gets
   `NamespaceBusyError`; a lease older than the TTL is reclaimable (by
   compare-and-swap: one winner) so a crashed node cannot wedge a namespace. A
-  holder that cannot renew for 2/3 of the TTL stops writing, and a node
-  taking over a stale lease fences the previous holder's append logs. What
-  remains open: a process pause longer than TTL/3 landing exactly between a
-  fence check and an unconditional put/delete (rotation, compaction), and
-  clock skew between nodes of more than TTL/3. Do not run two writers on one
-  namespace and rely on it; the cluster router (ADR-12) never does.
+  holder that cannot renew for 2/3 of the TTL stops writing, a node taking
+  over a stale lease fences the previous holder's append logs, and every
+  object rewritten in place - the manifest commit above all - is written
+  with compare-and-swap, so a holder frozen between its check and its write
+  fails when it resumes instead of overwriting its successor. What remains
+  open (ADR-12): the audit ledger's rotation can still overwrite a
+  successor's sealed audit segment in that window (the hash chain then fails
+  verification), and clock skew between nodes must stay under TTL/3. Do not
+  run two writers on one namespace and rely on it; the cluster router
+  (ADR-12) never does.
 
 ## Key custody (ADR-12)
 

@@ -205,6 +205,16 @@ Point clients (or a plain load balancer) at ANY node:
   working POSIX locks); a networked admin store is the open item for
   multi-host hosted.
 
+To try it on one machine: `docker-compose.yml` runs MinIO, three nodes and
+(with `--profile vault`) a Vault dev server holding the data keys - see the
+comment at its top. `fly.toml` is a Fly.io template (one machine = one node,
+node id and address from the machine; fill in every `CHANGE-ME`; not
+deployed). The image needs `--build-arg MEMD_S3=1` for boto3.
+
+Every object memd rewrites in place (the manifest commit above all) is
+written with compare-and-swap, so a node frozen mid-commit and resumed after
+a takeover fails with `503 lease_lost` instead of overwriting its successor.
+
 Measured on 3 node processes (MinIO + moto KMS, TTL 4 s): leaseholder
 SIGKILLed → next write acked after 3.7-3.8 s (bound: TTL + ε); SIGTERM →
 0.04-1.1 s; frozen past its TTL → 4.8 s, with no acked write lost in any
@@ -221,6 +231,7 @@ multiple writers inside one namespace.
 | `MEMD_STATE_DIR` | - | required: keys.toml.json / hosted admin db |
 | `MEMD_KEY_PROVIDER` | - | required: `aws-kms` or `vault-transit` (a `local` key file cannot be shared) |
 | `MEMD_LOCAL_DIR` | `.memd-local` | node-local cache, under `<dir>/node-<id>` |
+| `MEMD_S3_ACCESS_KEY` / `MEMD_S3_SECRET_KEY` | boto3 chain | bucket credentials, separate from the `AWS_*` ones KMS uses |
 | `MEMD_SHUTDOWN_GRACE_S` | 30 | uvicorn graceful drain on SIGTERM |
 
 ## Hosted mode & billing
