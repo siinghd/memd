@@ -73,6 +73,7 @@ Contract - SQLite (the vectors and records tables) stays the source of truth:
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib.util
 import json
 import logging
@@ -100,8 +101,13 @@ DEFAULT_EXACT_MAX = 2_000
 CONNECTIVITY = 16
 METRIC = "cos"
 STATE_FILE = "state.json"
-STATE_VERSION = 1
-SNAPSHOT_MAGIC = b"MEMDVEC1"
+# 2: the state carries a blake2b of the file, checked before usearch reads it
+STATE_VERSION = 2
+LOADING_MARKER = "loading"   # present while usearch reads a file: a crash there must not loop
+SNAPSHOT_MAGIC = b"MEMDVEC2"
+MIN_WINDOW = 100             # fewest candidates re-ranked exactly, whatever the limit
+REPAIR_EXPANSION = 16        # search depth of the post-build self-check (see _repair)
+DEFAULT_EXPANSION_SEARCH = 128
 BUILD_CHUNK = 50_000         # rows read (and added) per build step
 JOURNAL_CATCHUP = 256        # journal entries left for the final, locked replay
 ADD_SLICE = 64               # vectors added per write-lock hold (bounds a search's wait)
@@ -200,9 +206,9 @@ def vector_index_config(config: dict | None, mode: str) -> dict:
         "exact_max": int(cfg.get("ann_exact_max", DEFAULT_EXACT_MAX)),
         "dtype": dtype,
         "build_threads": int(cfg.get("ann_build_threads", _default_build_threads())),
-        # search depth floor (HNSW ef); 0 = usearch's default. A search for
+        # search depth floor (HNSW ef; 0 = usearch's own, 64). A search for
         # k candidates always explores at least k.
-        "expansion_search": int(cfg.get("ann_expansion_search", 0)),
+        "expansion_search": int(cfg.get("ann_expansion_search", DEFAULT_EXPANSION_SEARCH)),
         # while the sidecar is not serving, a namespace with more vectors than
         # this skips the vector lane (selective filters and sweeps are still
         # answered exactly, streamed from SQLite) instead of loading the exact
@@ -275,6 +281,16 @@ def _fsync_dir(path: str) -> None:
         pass
 
 
+def _stored(ix: Any, keys: np.ndarray) -> np.ndarray:
+    """The vectors stored for `keys`, as unit float32 rows. Read in the
+    index's own scalar type: usearch 2.26's get() returns garbage (NaN) when
+    asked to convert (f16 -> f32, i8 -> f16)."""
+    v = np.asarray(ix.get(keys), dtype=np.float32).reshape(len(keys), -1)
+    n = np.linalg.norm(v, axis=1, keepdims=True)
+    n[n == 0] = 1.0
+    return v / n
+
+
 def _decode(blob: bytes, dim: int) -> np.ndarray:
     """A stored vector as float32, tolerating pre-v2 float32 blobs."""
     dtype = np.float16 if dim and len(blob) == dim * 2 else np.float32
@@ -298,7 +314,8 @@ class UsearchSidecar:
         self.exact_max = max(0, int(cfg.get("exact_max", DEFAULT_EXACT_MAX)))
         self.dtype = str(cfg.get("dtype", "f16"))
         self.build_threads = max(1, int(cfg.get("build_threads", _default_build_threads())))
-        self.expansion_search = max(0, int(cfg.get("expansion_search", 0)))
+        self.expansion_search = max(0, int(cfg.get("expansion_search", DEFAULT_EXPANSION_SEARCH)))
+        self.min_window = MIN_WINDOW
         self._mu = threading.Lock()            # the state below; never held across I/O
         self._apply_lock = threading.Lock()    # one applier / saver / swapper at a time
         self._file_lock = threading.Lock()     # the files and _file/_saved_wm (after the apply lock)
@@ -308,6 +325,7 @@ class UsearchSidecar:
         self._active = False                   # kept (usearch mode, or auto above the threshold)
         self._ready = False                    # self._ix reflects SQLite (up to the queue)
         self._queue: deque = deque()           # (wm, removes, adds) not yet applied
+        self._inflight: list = []              # entries being applied right now (off the queue)
         self._journal: list | None = None      # entries applied while a load or build runs
         self._applied_wm = 0
         self._saved_wm: int | None = None
@@ -371,6 +389,18 @@ class UsearchSidecar:
         wm, fetch, n = job
         try:
             settle(self.path)  # a predecessor's final save lands first
+            if os.path.exists(os.path.join(self.path, LOADING_MARKER)):
+                # the last process died while usearch was reading a file: do
+                # not hand it (or the snapshot) to usearch again - rebuild
+                _log.warning("memd: the usearch sidecar for %r crashed the process while loading; "
+                             "rebuilding it from SQLite", self.ns)
+                METRICS.inc("memd_vector_index_corrupt_total",
+                            help="sidecar files and snapshots rejected as corrupt (rebuilt from SQLite)",
+                            ns=self.ns, source="crash_on_load")
+                self._discard_files()
+                if self._active and n:
+                    self.request_build("crash_on_load")
+                return
             self._clean_temp()
             if not self._active or n == 0:
                 # below the auto threshold (a file kept would fall behind), or empty
@@ -446,7 +476,11 @@ class UsearchSidecar:
                 size = os.path.getsize(fpath)
                 if size != int(st.get("size", -1)):
                     return None, None, "corrupt"
-                ix = self._restore(fpath, size)
+                src = self._read_verified(fpath, size, str(st.get("blake2b") or ""))
+                if src is None:
+                    self._note_corrupt("file")
+                    return None, None, "corrupt"
+                ix = self._restore(src)
             except Exception:  # noqa: BLE001 - truncated or garbage: rebuild
                 return None, None, "corrupt"
         if (ix is None or int(ix.ndim) != int(st.get("ndim", -1))
@@ -454,18 +488,69 @@ class UsearchSidecar:
             return None, None, "corrupt"
         return ix, st, ""
 
-    def _restore(self, src, size: int) -> Any:
-        """Index.restore, the GIL held for a memory copy only when it fits
-        BUFFER_MAX_BYTES (the file is read by Python first, GIL released)."""
-        if isinstance(src, str) and size <= BUFFER_MAX_BYTES:
-            with open(src, "rb") as f:
-                src = f.read()
+    @staticmethod
+    def _digest(data) -> str:
+        return hashlib.blake2b(data, digest_size=32).hexdigest()
+
+    @staticmethod
+    def _digest_file(path: str) -> str:
+        with open(path, "rb") as f:
+            return hashlib.file_digest(f, lambda: hashlib.blake2b(digest_size=32)).hexdigest()
+
+    def _read_verified(self, path: str, size: int, want: str):
+        """The file's bytes (or, over BUFFER_MAX_BYTES, its path) when its
+        blake2b matches the state's; None when it does not. usearch trusts
+        what it reads: a file corrupted in place (same size) loaded, and then
+        crashed the process inside search, on every restart."""
+        if not want:
+            return None
+        if size <= BUFFER_MAX_BYTES:
+            with open(path, "rb") as f:
+                data = f.read()  # (GIL released while reading and hashing)
+            return data if self._digest(data) == want else None
+        return path if self._digest_file(path) == want else None
+
+    def _note_corrupt(self, source: str) -> None:
+        _log.warning("memd: the usearch sidecar %s for %r failed its checksum; rebuilding it "
+                     "from SQLite", source, self.ns)
+        METRICS.inc("memd_vector_index_corrupt_total",
+                    help="sidecar files and snapshots rejected as corrupt (rebuilt from SQLite)",
+                    ns=self.ns, source=source)
+
+    def _restore(self, src) -> Any:
+        """(file lock held) Index.restore of verified bytes (the GIL held for
+        a memory copy) or, over BUFFER_MAX_BYTES, of a verified path. The
+        loading marker brackets it and a smoke search: if usearch crashes the
+        process meanwhile, the next open rebuilds instead of looping."""
+        if not self._may_touch_files(False):
+            raise _Aborted()
+        marker = os.path.join(self.path, LOADING_MARKER)
+        with open(marker, "w") as f:
+            f.write(str(os.getpid()))
+            f.flush()
+            os.fsync(f.fileno())
+        _fsync_dir(self.path)
         t0 = time.monotonic()
         ix = self._Index.restore(src)
         self._note_gil("load", t0)
-        if ix is not None and self.expansion_search:
-            ix.expansion_search = self.expansion_search
+        if ix is not None:
+            if self.expansion_search:
+                ix.expansion_search = self.expansion_search
+            self._smoke(ix)
+        os.unlink(marker)
+        _fsync_dir(self.path)
         return ix
+
+    @staticmethod
+    def _smoke(ix: Any) -> None:
+        """A few searches for stored vectors: a structure usearch cannot walk
+        fails (or crashes, under the loading marker) here, not in a query."""
+        n = len(ix)
+        if not n:
+            return
+        keys = np.asarray(ix.keys, dtype=np.uint64)
+        pick = keys[np.linspace(0, n - 1, num=min(8, n), dtype=np.int64)]
+        ix.search(_stored(ix, pick), 1, threads=1)
 
     def _load_snapshot(self, fetch, wm: int) -> tuple[Any, dict | None]:
         """(worker) The published sidecar image, when it matches this SQLite
@@ -474,9 +559,10 @@ class UsearchSidecar:
         Restored from memory: nothing is written locally until a save."""
         if self._closed:
             raise _Aborted()
-        blob = fetch(self.index.vec_uid, wm)
-        if not blob:
+        got = fetch(self.index.vec_uid, wm)
+        if not got:
             return None, None
+        blob, expect_uid = got
         mv = memoryview(blob)
         if bytes(mv[:len(SNAPSHOT_MAGIC)]) != SNAPSHOT_MAGIC:
             raise ValueError("not a memd vector snapshot")
@@ -484,13 +570,17 @@ class UsearchSidecar:
         hlen = int.from_bytes(mv[off:off + 4], "big")
         head = json.loads(bytes(mv[off + 4:off + 4 + hlen]))
         body = mv[off + 4 + hlen:]
-        if (head.get("uid") != self.index.vec_uid or int(head.get("wm", -1)) != int(wm)
+        if (head.get("uid") != expect_uid or int(head.get("wm", -1)) != int(wm)
                 or head.get("dtype") != self.dtype or head.get("metric") != METRIC
                 or head.get("connectivity") != CONNECTIVITY
                 or int(head.get("scrub_seq", -1)) < self._scrub_known
                 or int(head.get("size", -1)) != len(body)):
             raise ValueError("vector snapshot does not match this index image")
-        ix = self._restore(body, len(body))
+        if not head.get("blake2b") or self._digest(body) != head["blake2b"]:
+            self._note_corrupt("snapshot")
+            raise ValueError("vector snapshot failed its checksum")
+        with self._file_lock:
+            ix = self._restore(body)
         if (ix is None or int(ix.ndim) != int(head.get("ndim", -1))
                 or len(ix) != int(head.get("count", -1))):
             raise ValueError("vector snapshot unreadable")
@@ -624,6 +714,7 @@ class UsearchSidecar:
             tmp = os.path.join(self.path, fn + ".tmp")
             try:
                 if buf is not None:
+                    digest = self._digest(buf)
                     with open(tmp, "wb") as f:
                         f.write(buf)
                         f.flush()
@@ -634,9 +725,10 @@ class UsearchSidecar:
                     self._note_gil("save", t1)
                     with open(tmp, "rb+") as f:
                         os.fsync(f.fileno())
+                    digest = self._digest_file(tmp)
                 os.replace(tmp, os.path.join(self.path, fn))
                 _fsync_dir(self.path)
-                self._write_state(fn, meta)
+                self._write_state(fn, dict(meta, blake2b=digest))
             except BaseException:
                 for p in (tmp, os.path.join(self.path, fn)):
                     try:
@@ -720,8 +812,14 @@ class UsearchSidecar:
                     self._journal.extend(batch)
                 live = self._ready
                 self._applied_wm = batch[-1][0]
+                if live:
+                    self._inflight = batch  # searchable (pending_rowids) until applied
             if live:
-                self._apply_entries(batch, live=True)
+                try:
+                    self._apply_entries(batch, live=True)
+                finally:
+                    with self._mu:
+                        self._inflight = []
             # not ready and no build journal: the rows are in SQLite, and the
             # build that makes the index ready reads them there
 
@@ -768,10 +866,11 @@ class UsearchSidecar:
         mat = np.stack([_decode(final[k][0], dim) for k in good])
         mat = self._cast(mat)
         karr = np.asarray(good, dtype=np.uint64)
-        threads = 1 if len(good) < 16 else min(4, self.build_threads)
         for i in range(0, len(good), ADD_SLICE):
             with (self._rw.write() if live else contextlib.nullcontext()):
-                ix.add(karr[i:i + ADD_SLICE], mat[i:i + ADD_SLICE], threads=threads)
+                # one thread: parallel insertion leaves some nodes poorly
+                # linked (see _repair), and these batches are small
+                ix.add(karr[i:i + ADD_SLICE], mat[i:i + ADD_SLICE], threads=1)
         return ix
 
     def _new_index(self, dim: int) -> Any:
@@ -955,6 +1054,8 @@ class UsearchSidecar:
                             threads=self.build_threads)
                 if len(rows) < BUILD_CHUNK:
                     break
+            if new is not None:
+                self._repair(new)
             if self._install(new, scrub=scrub, source="build"):
                 self.rebuilds += 1
                 self.last_build_ms = round((time.monotonic() - t0) * 1000, 1)
@@ -966,6 +1067,41 @@ class UsearchSidecar:
             with self._mu:
                 self._journal = None
                 self._building = False
+
+    def _repair(self, ix: Any) -> int:
+        """(worker, on the private index a build just made) Re-insert, on one
+        thread, every node that a search for its own vector does not return.
+        Parallel construction leaves a few nodes poorly linked (measured: 60
+        of 60K), and which ones differs from build to build: two builds of
+        the same rows then answered some queries differently (a true top-10
+        row unreachable in one of them). After this pass both find them
+        (200/200 identical top-10s, recall 1.0 at 60K clustered). Costs about
+        a quarter of the build time. Returns the nodes re-inserted."""
+        n = len(ix)
+        if not n:
+            return 0
+        keys = np.asarray(ix.keys, dtype=np.uint64)
+        ef = ix.expansion_search
+        bad: list = []
+        try:
+            ix.expansion_search = REPAIR_EXPANSION
+            for s in range(0, n, BUILD_CHUNK):
+                self._check_open()
+                ks = keys[s:s + BUILD_CHUNK]
+                got = np.asarray(ix.search(_stored(ix, ks), 1, threads=self.build_threads).keys)
+                got = got.reshape(len(ks), -1)[:, 0]
+                bad.extend(ks[got != ks].tolist())
+            if bad:
+                b = np.asarray(bad, dtype=np.uint64)
+                v = self._cast(_stored(ix, b))
+                ix.remove(b)
+                ix.add(b, v, threads=1)
+        finally:
+            ix.expansion_search = ef
+        if bad:
+            METRICS.inc("memd_vector_index_repaired_total", len(bad),
+                        help="poorly linked HNSW nodes re-inserted after a build", ns=self.ns)
+        return len(bad)
 
     def _install(self, new: Any, *, scrub: int, source: str,
                  saved: tuple[str, int] | None = None) -> bool:
@@ -1051,6 +1187,19 @@ class UsearchSidecar:
         ix = self._ix
         return len(ix) if ix is not None else 0
 
+    def pending_rowids(self) -> list[int]:
+        """Rowids whose vectors are queued or being applied but not yet in
+        the index (the writer could not take the apply lock - a snapshot
+        publish, another writer's batch): searched exactly, so a write is
+        visible to the search that follows it (read-your-writes)."""
+        with self._mu:
+            entries = list(self._inflight) + list(self._queue)
+        out: set[int] = set()
+        for _wm, _removes, adds in entries:
+            if adds:
+                out.update(int(k) for k, _b, _d in adds)
+        return sorted(out)
+
     def knn(self, q: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray] | None:
         """The approximate top-k: (rowids, cosine distances), or None when the
         sidecar cannot answer (the caller falls back to an exact scan)."""
@@ -1098,14 +1247,14 @@ class UsearchSidecar:
         t0 = time.monotonic()
         buf = ix.save()
         self._note_gil("save", t0)
-        return buf, dict(self._meta(ix, wm, scrub), size=len(buf))
+        return buf, dict(self._meta(ix, wm, scrub), size=len(buf), blake2b=self._digest(buf))
 
     @staticmethod
     def snapshot_payload(buf: bytearray, st: dict) -> bytearray:
         """The published object: magic, header length, header, usearch image
         (the header is put in front of `buf` in place)."""
         head = json.dumps({k: st[k] for k in ("uid", "wm", "ndim", "count", "dtype", "metric",
-                                              "connectivity", "scrub_seq", "size")}).encode()
+                                              "connectivity", "scrub_seq", "size", "blake2b")}).encode()
         buf[0:0] = SNAPSHOT_MAGIC + len(head).to_bytes(4, "big") + head
         return buf
 

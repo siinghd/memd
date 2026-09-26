@@ -684,6 +684,7 @@ class NamespaceStore:
         self._pending_hard_ids: set[str] = set()
         self._rotating = False  # re-entrancy guard for rotate-inside-append_ops
         self._replayed_at_open = False
+        self._installed_vec: tuple | None = None  # (index snapshot, its vec_uid, vec_wm) installed at open
         self._migrated_t0: float | None = None  # set by a migrating open (progress log)
         self.segments_collected = 0
         self.snapshots_collected = 0
@@ -758,19 +759,30 @@ class NamespaceStore:
                         help="namespaces opened without the usearch sidecar (the exact scan serves)",
                         ns=self.namespace, detail=type(ex).__name__)
 
-    def _fetch_vector_snapshot(self, uid: str, wm: int) -> bytes | None:
-        """The published sidecar image, decrypted - only when the manifest
-        says it was taken with an index image of exactly this vec_uid/vec_wm
-        (i.e. the one just installed) and it covers the snapshot floor, the
-        same validity rule as the index snapshot."""
+    def _fetch_vector_snapshot(self, uid: str, wm: int) -> tuple[bytes, str] | None:
+        """(published sidecar image decrypted, the vec_uid it was taken at),
+        only when it matches the local SQLite image exactly and covers the
+        snapshot floor (the index snapshot's validity rule): the image this
+        open installed - the index snapshot it was published with, at the
+        same vec_wm, nothing applied since - or, without an install, this
+        very lineage (vec_uid) at this vec_wm."""
         vs = self.manifest.vector_snapshot or {}
-        if (not vs.get("name") or vs.get("uid") != uid or int(vs.get("wm", -1)) != int(wm)
-                or int(vs.get("seq", 0)) < self._snapshot_floor()):
+        if not vs.get("name") or int(vs.get("seq", 0)) < self._snapshot_floor():
+            return None
+        inst = self._installed_vec
+        if inst is not None:
+            name, img_uid, img_wm = inst
+            ok = (vs.get("index", name) == name and vs.get("uid") == img_uid
+                  and int(vs.get("wm", -1)) == int(img_wm) == int(wm))
+        else:
+            ok = vs.get("uid") == uid and int(vs.get("wm", -1)) == int(wm)
+        if not ok:
             return None
         blob = self.store.get(self._snapshot_key(vs["name"]))
         if not blob:
             return None
-        return self.envelope.decrypt(self.namespace, blob) if self.envelope.enabled else blob
+        blob = self.envelope.decrypt(self.namespace, blob) if self.envelope.enabled else blob
+        return blob, str(vs["uid"])
 
     # ---------------------------------------------------------- index snapshot
 
@@ -905,7 +917,7 @@ class NamespaceStore:
                     vname = f"vector-{ulid_new()}.g{self.manifest.version}.snap"
                     self.store.put(self._snapshot_key(vname), vec_payload)
                     vs = {"name": vname, "seq": self.manifest.seq, "uid": vec_img[1]["uid"],
-                          "wm": int(vec_img[1]["wm"])}
+                          "wm": int(vec_img[1]["wm"]), "index": name}
                 old = self.manifest.snapshot_name
                 old_vec = (self.manifest.vector_snapshot or {}).get("name", "")
                 self.manifest.snapshot_name = name
@@ -989,6 +1001,11 @@ class NamespaceStore:
             os.replace(tmp, path)
             self.index = NamespaceIndex(path)
             self.index._ns_hint = self.namespace
+            # the image carries the publisher's vector lineage: this node's
+            # copy diverges from here, so it gets its own (a sidecar file of
+            # another lineage at the same watermark must never match it). The
+            # sidecar published WITH this image may still be installed.
+            self._installed_vec = (name, self.index.new_vector_lineage(), self.index._vec_wm)
             METRICS.inc("memd_index_snapshots_loaded_total", ns=self.namespace)
             return seq
         except Exception as ex:  # noqa: BLE001 - fall back to full replay

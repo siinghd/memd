@@ -304,6 +304,19 @@ class NamespaceIndex:
     def attach_ann(self, ann) -> None:
         self.ann = ann
 
+    def new_vector_lineage(self) -> str:
+        """Give this SQLite image a new vec_uid (after a snapshot install: the
+        image's uid is the publisher's, and a sidecar file of another lineage
+        at the same watermark must not match it). Returns the old one."""
+        import uuid
+
+        with self._lock:
+            old = self.vec_uid
+            self.vec_uid = uuid.uuid4().hex
+            self._con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('vec_uid',?)", (self.vec_uid,))
+            self._con.commit()
+        return old
+
     def set_vector_limits(self, flat_max: int, exact_max: int) -> None:
         """A sidecar is configured: while it is not serving, a namespace over
         `flat_max` vectors answers only what it can exactly without the
@@ -1205,6 +1218,12 @@ class NamespaceIndex:
             q = q / nrm
         ann = self.ann
         if ann is not None and ann.active() and not self._closed:
+            if limit >= _SWEEP_LIMIT:
+                # a destructive sweep (find_ids) must see every match: exact,
+                # streamed from SQLite - it never loads the float32 matrix
+                # beside a sidecar that already holds these vectors
+                ann.note_fallback("sweep_streamed")
+                return self._exact_vector(q, f, limit)
             hits = self._search_vector_ann(ann, q, f, limit)
             if hits is not None:
                 return hits
@@ -1256,7 +1275,7 @@ class NamespaceIndex:
         where = self._ann_where(f, args)
         with self._read() as _c:
             return int(_c.execute(
-                f"SELECT COUNT(*) FROM (SELECT 1 FROM records WHERE {where} LIMIT ?)",  # nosec B608
+                f"SELECT COUNT(*) FROM (SELECT 1 FROM records WHERE {_VEC_LIVE} AND {where} LIMIT ?)",  # nosec B608
                 args + [cap + 1]).fetchone()[0])
 
     def _search_vector_capped(self, ann, q: np.ndarray, f: IndexFilter, limit: int) -> list[Hit]:
@@ -1316,10 +1335,19 @@ class NamespaceIndex:
             ann.note_fallback("selective")
             return self._exact_vector(q, f, limit)
         need = limit + len(f.exclude_ids)
-        k = min(limit * ann.overfetch, size)
+        # at least min_window candidates, all re-ranked by exact cosine: the
+        # top of the list does not depend on how a (parallel, so
+        # nondeterministic) build happened to link the graph
+        k = min(max(limit * ann.overfetch, ann.min_window), size)
         seen: set[int] = set()
         scored: list[tuple[float, int]] = []
         full = False
+        # read-your-writes: vectors queued but not yet in the index (the
+        # writer could not take the apply lock) are candidates too
+        pending = ann.pending_rowids()
+        if pending:
+            seen.update(pending)
+            scored += self._scored_rowids(q, f, pending)
         for attempt in range(2):
             got = ann.knn(q, k)
             if got is None:
@@ -1361,7 +1389,7 @@ class NamespaceIndex:
                 chunk = rowids[i:i + 500]
                 rows = _c.execute(
                     f"SELECT records.rowid, _v._vec, _v._dim FROM records {_VEC_JOIN} "  # nosec B608
-                    f"WHERE records.rowid IN ({','.join('?' * len(chunk))}) AND {where}",
+                    f"WHERE records.rowid IN ({','.join('?' * len(chunk))}) AND {_VEC_LIVE} AND {where}",
                     list(chunk) + fargs).fetchall()
                 keep = [r for r in rows if int(r[2]) == q.shape[0]]
                 if not keep:
@@ -1395,7 +1423,7 @@ class NamespaceIndex:
                     continue
                 rec = self._row_to_record(row)
                 rec.namespace = self._ns_hint
-                if not self._passes_filter(rec, f):
+                if not _vector_live(rec) or not self._passes_filter(rec, f):
                     continue
                 hits.append(Hit(record=rec, score=score, lane="vector"))
         return _vector_order(hits)[:limit]
@@ -1414,8 +1442,8 @@ class NamespaceIndex:
         best_r = np.zeros(0, dtype=np.int64)
         with self._read() as _c:
             cur = _c.execute(
-                f"SELECT records.rowid, _v._vec, _v._dim FROM records {_VEC_JOIN} WHERE {where}",  # nosec B608
-                args)
+                f"SELECT records.rowid, _v._vec, _v._dim FROM records {_VEC_JOIN} "  # nosec B608
+                f"WHERE {_VEC_LIVE} AND {where}", args)
             while True:
                 rows = cur.fetchmany(4096)
                 if not rows:
@@ -1478,8 +1506,8 @@ class NamespaceIndex:
                 if cid in f.exclude_ids:
                     continue
                 r = recs.get(cid)
-                if r is None or not self._passes_filter(r, f):
-                    continue
+                if r is None or not _vector_live(r) or not self._passes_filter(r, f):
+                    continue  # (the matrix is not refreshed when a row stops being live)
                 hits.append(Hit(record=r, score=cscore, lane="vector"))
 
         # phase 1: speculative widening windows (cheap when the filter is
@@ -1500,8 +1528,11 @@ class NamespaceIndex:
         # phase 2: exact fallback - one SQL scan restricts scoring to rows
         # whose record satisfies every predicate, then rank within that set
         eligible = self._eligible_ids(f)
-        if eligible is not None:
-            keep = np.array([i for i, rid in enumerate(ids) if rid in eligible], dtype=np.int64)
+        if eligible is not None or limit >= 1024:
+            # (a sweep without restrictive predicates ranks every row: it
+            # used to skip both phases and return nothing)
+            keep = (np.arange(n, dtype=np.int64) if eligible is None else
+                    np.array([i for i, rid in enumerate(ids) if rid in eligible], dtype=np.int64))
             if keep.size == 0:
                 return []
             sub_scores = scores[keep]
@@ -1941,6 +1972,11 @@ def _lane_order(rows: list) -> list:
 
 # limits at or above this are sweeps (find_ids): answered by the exact scan
 _SWEEP_LIMIT = 1024
+# Vector-lane eligibility, whatever the filter's include_* flags ask: only
+# live rows have vectors in the exact scan's matrix and in the sidecar, so
+# every exact path (selective filters, sweeps, re-scoring) admits only them
+_VEC_LIVE = ("records.deleted = 0 AND records.quarantined = 0 "
+             "AND records.invalidated_at IS NULL AND records.superseded_by IS NULL")
 # a record's stored vector, joined without ambiguating the unqualified
 # column names _filter_where emits (vectors has an `id` column too)
 _VEC_JOIN = ("JOIN (SELECT id AS _vid, vec AS _vec, dim AS _dim FROM vectors) AS _v "
@@ -1948,6 +1984,12 @@ _VEC_JOIN = ("JOIN (SELECT id AS _vid, vec AS _vec, dim AS _dim FROM vectors) AS
 # scores closer than this are ties: the same stored vector scored by two
 # code paths (a BLAS scan, a per-row dot) can differ in the last bits
 _VEC_QUANTUM = 1e-6
+
+
+def _vector_live(rec: MemoryRecord) -> bool:
+    """The Python twin of _VEC_LIVE."""
+    return not (rec.deleted or rec.meta.get("quarantined") or rec.time.invalidated_at is not None
+                or rec.time.superseded_by is not None)
 
 
 def _cosines(rows: list, q: np.ndarray) -> np.ndarray:

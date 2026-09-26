@@ -557,6 +557,8 @@ CORE_COUNTERS = {
     "memd_vector_index_snapshots_loaded_total": "vector sidecars installed from a published snapshot",
     "memd_vector_index_snapshot_failures_total": "vector sidecar snapshots that could not be used (rebuilt instead)",
     "memd_vector_lane_skipped_total": "vector-lane queries skipped: the sidecar is not serving and the namespace is over flat_max_vectors (other lanes serve)",
+    "memd_vector_index_corrupt_total": "sidecar files and snapshots rejected as corrupt (rebuilt from SQLite)",
+    "memd_vector_index_repaired_total": "poorly linked HNSW nodes re-inserted after a build",
 }
 
 CORE_GAUGES = {

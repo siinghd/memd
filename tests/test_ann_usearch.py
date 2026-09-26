@@ -286,7 +286,8 @@ def test_filters_match_the_exact_scan(tmp_path):
             assert len(set(_ids(got)) & set(_ids(want))) >= 18, f
         before = _counter("memd_vector_index_fallback_total", reason="selective")
         ns.index.ann.exact_max = 100
-        assert ns.index.search_vector(q, IndexFilter(kinds=("fact",)), limit=5)
+        # a query far from the facts: the window comes back without them
+        assert ns.index.search_vector(x[2000], IndexFilter(kinds=("fact",)), limit=5)
         assert _counter("memd_vector_index_fallback_total", reason="selective") == before + 1
         assert ns.index.ann.stats()["fallback_exact_total"] >= 1
     finally:
@@ -929,9 +930,9 @@ def test_open_and_close_do_not_wait_for_the_sidecar_files(tmp_path, monkeypatch)
     e.close()
     real_restore, real_persist = UsearchSidecar._restore, UsearchSidecar._persist
 
-    def slow_restore(self, src, size):
+    def slow_restore(self, src):
         time.sleep(1.5)
-        return real_restore(self, src, size)
+        return real_restore(self, src)
 
     def slow_persist(self, cap, *, final=False):
         if final:
@@ -991,3 +992,291 @@ def test_a_destroy_cancels_a_pending_final_save(tmp_path, monkeypatch):
         assert not os.path.exists(sdir), "a cancelled final save recreated the destroyed sidecar"
     finally:
         e.close()
+
+
+# ------------------------------------------------------------ verification round (D1-D5)
+
+CORRUPT_CHILD = r"""
+import os, sys, json
+sys.path.insert(0, {src!r})
+import numpy as np
+from memd.index.sqlite_index import IndexFilter
+from memd.storage.engine import StorageEngine
+from memd.metrics import METRICS
+root = sys.argv[1]
+cfg = {{"mode": "usearch", "min_vectors": 0, "overfetch": 4, "exact_max": 0, "dtype": "f16",
+       "build_threads": 1}}
+e = StorageEngine(root, vector_index=cfg)
+ns = e.namespace("n")
+ann = ns.index.ann
+ok = ann.drain(60)
+qs = np.random.default_rng(5).standard_normal((50, {dim})).astype(np.float32)
+hits = sum(len(ns.index.search_vector(q, IndexFilter(), limit=20)) for q in qs)
+corrupt = sum(x["value"] for x in METRICS.snapshot()["counters"].get("memd_vector_index_corrupt_total", []))
+print(json.dumps({{"ok": ok, "loaded_from": ann.loaded_from, "rebuilds": ann.rebuilds, "size": ann.size(),
+                  "hits": hits, "corrupt": corrupt}}), flush=True)
+e.close()
+"""
+
+
+@pytest.mark.parametrize("where", ["q1", "mid", "q3"])
+def test_a_same_size_corruption_of_the_sidecar_file_is_detected_and_rebuilt(tmp_path, where):
+    """64 bytes overwritten in place (size unchanged): usearch loads such a
+    file and can crash in search, so the content checksum must reject it
+    before usearch ever sees it."""
+    root = tmp_path / "s"
+    e = _engine(root)
+    _fill(e.namespace("n"), 3000, seed=21)
+    e.close()
+    st = _state(root)
+    fp = os.path.join(_sidecar_dir(root), st["file"])
+    size = os.path.getsize(fp)
+    pos = {"q1": size // 4, "mid": size // 2, "q3": 3 * size // 4}[where]
+    with open(fp, "r+b") as f:
+        f.seek(pos)
+        f.write(np.random.default_rng(pos).integers(0, 256, 64, dtype=np.uint8).tobytes())
+    assert os.path.getsize(fp) == size
+    child = subprocess.run([sys.executable, "-c", CORRUPT_CHILD.format(src=SRC, dim=DIM), str(root)],
+                           capture_output=True, text=True, timeout=180)
+    assert child.returncode == 0, f"rc={child.returncode} {child.stderr[-2000:]}"
+    out = json.loads(child.stdout.strip().splitlines()[-1])
+    assert out["ok"] and out["loaded_from"] == "build" and out["rebuilds"] == 1, out
+    assert out["size"] == 3000 and out["hits"] > 0 and out["corrupt"] == 1, out
+
+
+def test_a_crash_inside_usearch_while_loading_does_not_loop(tmp_path):
+    """A process that dies inside usearch's load leaves the loading marker:
+    the next open neither loads that file nor the snapshot again, it rebuilds."""
+    root = tmp_path / "s"
+    e = _engine(root)
+    recs, x = _fill(e.namespace("n"), 1500, seed=22)
+    e.close()
+    crash = CRASH_ON_LOAD.format(src=SRC)
+    child = subprocess.run([sys.executable, "-c", crash, str(root)], capture_output=True, text=True, timeout=120)
+    assert child.returncode == 11, child.stderr[-2000:]
+    e = _engine(root)
+    try:
+        ns = e.namespace("n")
+        ann = ns.index.ann
+        assert ann.drain(60) and ann.loaded_from == "build" and ann.rebuilds == 1
+        assert _ids(ns.index.search_vector(x[3], IndexFilter(), limit=3))[0] == recs[3].id
+        assert not os.path.exists(os.path.join(ann.path, au.LOADING_MARKER))
+    finally:
+        e.close()
+
+
+CRASH_ON_LOAD = r"""
+import os, sys
+sys.path.insert(0, {src!r})
+import usearch.index
+from memd.storage.engine import StorageEngine
+def restore(*a, **k):
+    os._exit(11)   # what a segfault inside usearch does to the process
+usearch.index.Index.restore = staticmethod(restore)
+cfg = {{"mode": "usearch", "min_vectors": 0, "overfetch": 4, "exact_max": 0, "dtype": "f16",
+       "build_threads": 1}}
+e = StorageEngine(sys.argv[1], vector_index=cfg)
+e.namespace("n").index.ann.drain(60)
+os._exit(3)
+"""
+
+
+def test_a_corrupted_published_sidecar_snapshot_is_not_installed(tmp_path, monkeypatch):
+    monkeypatch.setattr(storage_engine.NamespaceStore, "SNAPSHOT_MIN_RECORDS", 1)
+    monkeypatch.setattr(storage_engine.NamespaceStore, "VECTOR_SNAPSHOT_MIN_VECTORS", 1)
+    root, cache = tmp_path / "s", tmp_path / "cache"
+    e = StorageEngine(str(root), cache_dir=str(cache), vector_index=_vcfg())
+    ns = e.namespace("n")
+    _fill(ns, 2000, seed=23)
+    ns.compact(force=True)
+    vname = ns.manifest.vector_snapshot["name"]
+    e.close()
+    vp = os.path.join(str(root), "ns", "n", vname)
+    size = os.path.getsize(vp)
+    with open(vp, "r+b") as f:  # same size, inside the usearch image
+        f.seek(size // 2)
+        f.write(b"\xa5" * 64)
+    import shutil
+
+    shutil.rmtree(cache)
+    before = _counter("memd_vector_index_corrupt_total", source="snapshot")
+    e = StorageEngine(str(root), cache_dir=str(cache), vector_index=_vcfg())
+    try:
+        ann = e.namespace("n").index.ann
+        assert ann.drain(120) and ann.loaded_from == "build" and ann.size() == 2000
+        assert _counter("memd_vector_index_corrupt_total", source="snapshot") == before + 1
+    finally:
+        e.close()
+
+
+def test_writes_are_searchable_while_the_apply_lock_is_held(tmp_path):
+    """Read-your-writes: a snapshot publish holds the apply lock (freeze), so
+    the writer cannot apply its own vectors; the queue is searched exactly."""
+    e = _engine(tmp_path / "s")
+    try:
+        ns = e.namespace("n")
+        _fill(ns, 3000, seed=24)
+        ann = ns.index.ann
+        held, release = threading.Event(), threading.Event()
+
+        def holder():
+            with ann.frozen():
+                held.set()
+                release.wait(60)
+
+        t = threading.Thread(target=holder)
+        t.start()
+        try:
+            assert held.wait(10)
+            new = _vectors(50, seed=24, draw=77)
+            served, found = ann.searches, 0
+            for i, v in enumerate(new):
+                r = MemoryRecord.create(namespace="n", kind="raw_event", content=f"fresh {i}",
+                                        scope=Scope(user="alice"))
+                ns.append([r])
+                ns.index.set_vectors([r.id], [v], "test-model")
+                hits = ns.index.search_vector(v, IndexFilter(scope=Scope(user="alice")), limit=10)
+                found += bool(hits) and hits[0].record.id == r.id
+            assert ann.searches - served == 50, "the ANN path must answer (not a fallback)"
+            assert found == 50
+        finally:
+            release.set()
+            t.join()
+    finally:
+        e.close()
+
+
+def test_a_sweep_never_loads_the_flat_matrix_while_the_sidecar_serves(tmp_path):
+    e = _engine(tmp_path / "s", flat_max=1_000_000)
+    try:
+        ns = e.namespace("n")
+        _, x = _fill(ns, 2000, seed=25)
+        idx = ns.index
+        q = x[9] / np.linalg.norm(x[9])
+        got = idx.search_vector(x[9], IndexFilter(), limit=5000)  # find_ids sweep size
+        assert got and {h.record.id for h in got} == {h.record.id for h in idx._exact_vector(q, IndexFilter(), 5000)}
+        assert not idx._vec_loaded and idx._main_mat.size == 0, "the sweep loaded the flat matrix"
+    finally:
+        e.close()
+
+
+def test_independent_rebuilds_give_identical_top10(tmp_path):
+    """Parallel HNSW construction is not deterministic; the lane's top-10 is,
+    because candidates are over-fetched and re-ranked by exact cosine with
+    fusion's tie-break."""
+    e = _engine(tmp_path / "s", build_threads=4)
+    try:
+        ns = e.namespace("n")
+        dim = 384
+        rng = np.random.default_rng(26)
+        centers = rng.standard_normal((64, dim))
+        x = centers[rng.integers(0, 64, 8000)] + 0.6 * rng.standard_normal((8000, dim))
+        recs = [MemoryRecord.create(namespace="n", kind="raw_event", content=f"doc {i}", scope=Scope(user="u"),
+                                    t_event=1_700_000_000_000 + i) for i in range(8000)]
+        ns.append(recs)
+        for i in range(0, 8000, 1000):
+            ns.index.set_vectors([r.id for r in recs[i:i + 1000]], x[i:i + 1000], "test-model")
+        ann = ns.index.ann
+        qs = centers[rng.integers(0, 64, 200)] + 0.6 * rng.standard_normal((200, dim))
+        tops = []
+        for _ in range(2):
+            assert ann.wait_built(ann.request_build("test"), 120) and ann.drain(60)
+            served = ann.searches
+            tops.append([_ids(ns.index.search_vector(q, IndexFilter(scope=Scope(user="u")), limit=10))
+                         for q in qs])
+            assert ann.searches - served == 200
+        assert sum(a != b for a, b in zip(*tops)) == 0
+    finally:
+        e.close()
+
+
+@pytest.mark.parametrize("flag", ["include_quarantined", "include_invalid"])
+def test_every_vector_path_applies_the_same_eligibility(tmp_path, flag):
+    """The exact scan's matrix never holds deleted, quarantined, invalidated
+    or superseded rows, whatever the filter asks; the sidecar's exact paths
+    (selective filter, sweep, rescoring) must agree with it."""
+    results = {}
+    for mode, over in (("flat", {"mode": "flat"}), ("usearch", {}), ("usearch_exact", {"exact_max": 100_000})):
+        e = StorageEngine(str(tmp_path / mode), vector_index=_vcfg(**over) if mode != "flat" else over)
+        try:
+            ns = e.namespace("n")
+            recs, x = _fill(ns, 1200, seed=27) if mode != "flat" else _fill_flat(ns, 1200, seed=27)
+            for i in range(10):
+                ns.index.mark_quarantined(recs[i].id, True)
+            for i in range(10, 20):
+                ns.index.tombstone(recs[i].id, 1)
+            if ns.index.ann is not None:
+                ns.index.ann.drain(30)
+            f = IndexFilter(scope=Scope(user=USERS[0]), **{flag: True})
+            found = 0
+            for i in range(20):
+                for limit in (10, 2000):
+                    found += recs[i].id in {h.record.id for h in ns.index.search_vector(x[i], f, limit=limit)}
+            results[mode] = found
+        finally:
+            e.close()
+    assert results["flat"] == 0 and results == {"flat": 0, "usearch": 0, "usearch_exact": 0}, results
+
+
+def _fill_flat(ns, n, seed):
+    x = _vectors(n, seed)
+    recs = [MemoryRecord.create(namespace=ns.namespace, kind="raw_event", content=f"doc {i} seed {seed}",
+                                scope=Scope(user=USERS[i % len(USERS)]), t_event=1_700_000_000_000 + i)
+            for i in range(n)]
+    ns.append(recs)
+    ns.index.set_vectors([r.id for r in recs], x, "test-model")
+    return recs, x
+
+
+def test_a_stale_local_file_of_the_same_uid_and_watermark_is_not_trusted_after_a_snapshot_install(
+        tmp_path, monkeypatch):
+    """A snapshot install gives the local SQLite image a new vector lineage:
+    a sidecar file left from another lineage that happens to carry the
+    publisher's uid and watermark is rebuilt, not trusted."""
+    monkeypatch.setattr(storage_engine.NamespaceStore, "SNAPSHOT_MIN_RECORDS", 1)
+    monkeypatch.setattr(storage_engine.NamespaceStore, "VECTOR_SNAPSHOT_MIN_VECTORS", 1)
+    root, cache = tmp_path / "s", tmp_path / "cache"
+    e = StorageEngine(str(root), cache_dir=str(cache), vector_index=_vcfg())
+    ns = e.namespace("n")
+    recs, x = _fill(ns, 1500, seed=28)
+    ns.compact(force=True)                     # publishes (uid U, wm W)
+    e.close()
+    sdir = _sidecar_dir(cache)
+    st = _state(cache)
+    # a divergent lineage's file under the same (uid, wm): other vectors, a
+    # valid usearch image, a matching checksum
+    from usearch.index import Index
+
+    other = Index(ndim=DIM, metric="cos", dtype="f16", connectivity=16)
+    rowids = [r[0] for r in sqlite3_rows(os.path.join(str(cache), "n.sqlite"))]
+    other.add(np.asarray(rowids, dtype=np.uint64), _vectors(len(rowids), seed=999).astype(np.float16))
+    buf = other.save()
+    with open(os.path.join(sdir, st["file"]), "wb") as f:
+        f.write(buf)
+    st.update(size=len(buf), blake2b=__import__("hashlib").blake2b(buf, digest_size=32).hexdigest())
+    json.dump(st, open(os.path.join(sdir, au.STATE_FILE), "w"))
+    os.unlink(os.path.join(str(cache), "n.sqlite"))   # the SQLite cache is lost; the snapshot is installed
+    for suf in ("-wal", "-shm"):
+        try:
+            os.unlink(os.path.join(str(cache), "n.sqlite" + suf))
+        except OSError:
+            pass
+    e = StorageEngine(str(root), cache_dir=str(cache), vector_index=_vcfg())
+    try:
+        ns = e.namespace("n")
+        ann = ns.index.ann
+        assert ns.index.vec_uid != st["uid"], "a snapshot install starts a new vector lineage"
+        assert ann.drain(60) and ann.loaded_from == "snapshot"
+        assert _ids(ns.index.search_vector(x[7], IndexFilter(), limit=3))[0] == recs[7].id
+    finally:
+        e.close()
+
+
+def sqlite3_rows(path):
+    import sqlite3
+
+    con = sqlite3.connect(path)
+    try:
+        return con.execute("SELECT r.rowid FROM records r JOIN vectors v ON v.id = r.id").fetchall()
+    finally:
+        con.close()
