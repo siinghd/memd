@@ -390,7 +390,7 @@ fully functional, honestly degraded, clearly labeled in `stats()`.
 | `fuse_vector` / `MEMD_FUSE_VECTOR` | `auto` \| `true` \| `false` | `auto`: fuse unless the embedder is the hash embedder |
 | `lexical_backend` / `MEMD_LEXICAL_BACKEND` | `auto` \| `fts5` \| `tantivy` | `auto`: tantivy when installed (`pip install "memd[fast]"`) |
 | `vector_index` / `MEMD_VECTOR_INDEX` | `auto` \| `flat` \| `usearch` | `auto`: the usearch sidecar (`pip install "memd[ann]"`) for a namespace holding ≥ `ann_min_vectors` vectors, else the exact scan; an explicit `usearch` that cannot be honoured raises |
-| `ann_min_vectors`, `ann_overfetch`, `ann_exact_max`, `ann_dtype`, `ann_expansion_search` | auto threshold, candidate over-fetch, exact-answer cutoff, stored precision, HNSW search-depth floor | 20000, 4, 2000, `f16` (or `i8`), 0 (usearch's default; a search for k candidates explores at least k) |
+| `ann_min_vectors`, `ann_overfetch`, `ann_exact_max`, `ann_dtype`, `ann_expansion_search` | auto threshold, candidate over-fetch, exact-answer cutoff, stored precision, HNSW search-depth floor | 20000, 4, 2000, `f16` (or `i8`), 128 (a search for k candidates explores at least k) |
 | `flat_max_vectors` | while the sidecar is loading or rebuilding, a namespace with more vectors than this never loads the exact scan's float32 matrix | 200000 |
 
 - **Reranker.** The top-30 of the bm25 lane (plus the vector lane with a real
@@ -447,6 +447,16 @@ fully functional, honestly degraded, clearly labeled in `stats()`.
   installs it instead of rebuilding. recall@10 is 0.99+ on dense embeddings
   up to 1M vectors, ~0.94 on the hash embedder's sparse vectors (see
   BENCHMARKS.md); a crash costs a rebuild (~5 min at 1M on 4 threads).
+  Files and published images carry a blake2b checksum, verified before
+  usearch reads them (usearch trusts what it loads: a file corrupted in
+  place crashed the process in search); a failed check, or a process that
+  died while usearch was loading, rebuilds it from SQLite. At least 100
+  candidates are re-ranked by exact cosine, writes still queued for the
+  index are searched exactly (read-your-writes), and after each build
+  poorly linked nodes are re-inserted, so independent rebuilds give the
+  same top-10. Every vector path admits only live rows, whatever
+  `include_quarantined` / `include_invalid` ask, and sweeps beside the
+  sidecar stream exactly from SQLite.
 - **While the sidecar is not serving** (loading at open, rebuilding, or
   failed to attach), the exact scan serves up to `flat_max_vectors`. Above
   that its float32 matrix (1.5 GB at 1M × 384) is never loaded: sweeps and

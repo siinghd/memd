@@ -116,10 +116,21 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   included) run on background threads; usearch holds the GIL for them, so
   the process pauses ~100 ms per save or load at 200K vectors (a memory
   copy: files up to 256 MB are read and written outside the GIL).
+  Sidecar files and published images are checksummed (blake2b) and
+  verified before usearch reads them; a corrupt file, or a process that
+  died while usearch was loading one, is rebuilt from SQLite instead of
+  crashing every restart. A snapshot install starts a new local vector
+  lineage. Writes still queued for the index are searched exactly
+  (read-your-writes); find_ids sweeps stream exactly from SQLite; every
+  vector path admits only live rows; after each build poorly linked nodes
+  are re-inserted and at least 100 candidates are re-ranked exactly, so
+  independent rebuilds answer identically.
 
 ### Fixed
 - `test_mcp_budget_clamped` skips when the optional `mcp` extra is not
   installed (it failed with `ModuleNotFoundError`), like `test_mcp.py`.
+- The flat vector scan returned nothing for a sweep-size limit (>= 1024)
+  with no restrictive filter.
 
 ## [0.2.0] - 2026-09-26
 
