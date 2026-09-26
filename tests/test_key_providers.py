@@ -82,7 +82,7 @@ class TestLocalProvider:
         p = LocalKeyProvider(os.urandom(32))
         wk = p.wrap("a", b"k" * 32)
         assert p.unwrap("a", wk) == b"k" * 32
-        with pytest.raises(Exception):
+        with pytest.raises(KeyCustodyError):
             p.unwrap("b", wk)
 
     def test_default_store_opens_exactly_as_before(self, tmp_path):

@@ -483,6 +483,17 @@ def test_complete_frames_that_do_not_decrypt_are_never_truncated(tmp_path):
         assert open(os.path.join(data, "store", "ns", "default", n), "rb").read() == before, n
 
 
+def test_a_data_key_under_another_local_root_is_a_custody_error():
+    """Not a raw cryptography InvalidTag (an opaque 500): the data key was
+    wrapped by another root key - held elsewhere, which is what
+    KeyCustodyError says (and what the HTTP layer answers as such)."""
+    from memd.storage.crypto import KeyCustodyError, LocalKeyProvider
+
+    wk = LocalKeyProvider(os.urandom(32)).wrap("a", b"k" * 32)
+    with pytest.raises(KeyCustodyError, match="different one"):
+        LocalKeyProvider(os.urandom(32)).unwrap("a", wk)
+
+
 def test_a_torn_tail_is_still_repaired(tmp_path):
     """Control: a frame cut short by its length (a torn write) is still cut."""
     from memd.engine.memory import Memory

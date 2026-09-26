@@ -149,8 +149,18 @@ class LocalKeyProvider(KeyProvider):
         return WrappedKey(self.name, self._fp, "1", ct)
 
     def unwrap(self, namespace: str, wrapped: WrappedKey) -> bytes:
+        from cryptography.exceptions import InvalidTag
+
         ct = wrapped.ciphertext
-        return AESGCM(self._root).decrypt(ct[:12], ct[12:], namespace.encode())
+        try:
+            return AESGCM(self._root).decrypt(ct[:12], ct[12:], namespace.encode())
+        except InvalidTag:
+            # not a torn or corrupt read to retry: the data key was wrapped by
+            # another root key (a replaced or mixed-up keys directory)
+            raise KeyCustodyError(
+                f"the data key of namespace {namespace!r} does not unwrap under this "
+                f"local root key ({self._fp}): it was wrapped by a different one. "
+                "Restore the root key it was written with") from None
 
 
 def _per_namespace(template: str) -> bool:
