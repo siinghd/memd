@@ -131,6 +131,31 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   installed (it failed with `ModuleNotFoundError`), like `test_mcp.py`.
 - The flat vector scan returned nothing for a sweep-size limit (>= 1024)
   with no restrictive filter.
+- The flat vector scan's matrix now follows every eligibility change made
+  after it loaded. A record unquarantined (by hand or by the rotate-time
+  quarantine expiry) or restored by a re-add was invisible to the default
+  vector lane and its sweeps until a compaction; a re-embedded record kept
+  its old vector beside the new one; and rows that stopped being live
+  stayed in it, so enough of them near a query crowded every eligible row
+  out of its windows.
+- A usearch sidecar graph loaded from a file or snapshot stays on
+  probation: the loading marker is kept until it has served 200 searches
+  or 300 s without damage (a clean close clears it), so a graph that
+  crashes the process only in a real query is rebuilt at the next open
+  instead of crashing every restart. Its bookkeeping (count, dims,
+  connectivity, kind, capacity, levels, edges) is checked at load, and its
+  first answers are re-checked against the exact scan in the background:
+  recall below 0.8 rebuilds it (`memd_vector_index_corrupt_total`
+  `source="structure"` / `"recall"`).
+- The sidecar's post-build repair pass no longer re-inserts every
+  duplicate vector (30% duplicates: 15107 re-inserts instead of 139 at
+  50K, about doubling the build).
+- Vector-lane searches no longer stall behind a snapshot publish and a
+  write backlog (p99 9-16 s, max up to 38 s, under a publish loop, a bulk
+  writer and 4 writer-searchers; now 0.4-0.5 s): the sidecar's search lock
+  is phase-fair, the SQLite image is copied from a pinned read snapshot
+  with no lock held, and the read-your-writes pass filters in SQL only the
+  queued rows that can make the page.
 
 ## [0.2.0] - 2026-09-26
 
