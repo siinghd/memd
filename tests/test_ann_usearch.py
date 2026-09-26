@@ -888,6 +888,12 @@ def test_below_the_cap_the_exact_scan_still_serves_while_the_sidecar_rebuilds(tm
         assert not idx.ann.ready() and not idx.vector_lane_degraded()
         assert len(idx.search_vector(x[1], IndexFilter(), limit=20)) == 20
         assert idx._vec_loaded and idx._main_mat.size, "below the cap the matrix is the fallback"
+        go.set()
+        deadline = time.monotonic() + 60
+        while not idx.ann.ready() and time.monotonic() - deadline < 0:
+            time.sleep(0.001)
+        # freed when the sidecar takes over - not after its (seconds-long) save
+        assert not idx._vec_loaded and idx._main_mat.size == 0
     finally:
         go.set()
         e.close()

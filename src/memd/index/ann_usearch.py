@@ -1128,12 +1128,17 @@ class UsearchSidecar:
             with self._mu:
                 batch = list(self._journal[pos:]) if self._journal is not None else []
             new = self._apply_entries(batch, live=False, target=new)
+            # the exact scan's float32 matrix (loaded while this was not
+            # serving) is dead weight from the swap on: freed around it, not
+            # after the save below (seconds, at the matrix's full size)
+            self.index.invalidate_vec_cache()
             with self._rw.write():
                 with self._mu:
                     self._ix = new
                     self._ready = True
                     self._journal = None
                     self._scrub_built = scrub
+            self.index.invalidate_vec_cache()  # (a search may have reloaded it meanwhile)
             if saved is not None:
                 with self._file_lock:
                     self._file, self._saved_wm = saved
@@ -1156,8 +1161,6 @@ class UsearchSidecar:
             except Exception as e:  # noqa: BLE001
                 _log.warning("memd: saving the usearch sidecar for %r failed (%s)", self.ns, e)
                 self._discard_files()
-        # the exact scan's float32 matrix is dead weight now
-        self.index.invalidate_vec_cache()
         return True
 
     def purged(self, scrub_seq: int) -> int:
