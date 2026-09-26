@@ -67,6 +67,38 @@ any probe fails the build.
   text unencrypted, with owner-only permissions. Both are deleted on
   crypto-shred and are rebuildable from the (encrypted) log.
 
+- **Hosted mode & billing (`--hosted`, off by default).**
+  - *The Stripe webhook is authenticated by its signature only.*
+    `POST /v1/billing/webhook` takes no bearer key; it verifies the
+    `Stripe-Signature` HMAC-SHA256 over the raw body with
+    `MEMD_STRIPE_WEBHOOK_SECRET` (constant-time, via
+    `stripe.Webhook.construct_event`) and rejects timestamps outside the
+    tolerance (300 s), so a captured delivery cannot be replayed later; a
+    replay inside the window is a no-op (idempotent by event id). Treat the
+    webhook secret like a password: anyone holding it can forge plan
+    upgrades. Rotate it in the Stripe dashboard if it leaks.
+  - *Live keys are refused.* A `sk_live_`/`rk_live_` key stops hosted mode
+    from starting unless `MEMD_ALLOW_LIVE_BILLING=1` is set - set it only on
+    the production deployment, never in a dev or CI environment.
+  - *API keys are hashed at rest.* Hosted keys live in the admin store
+    (`<data root>/admin/admin.sqlite3`, mode 0600) as SHA-256 hashes of a
+    192-bit random secret; the key is shown once at creation. A fast hash is
+    appropriate for secrets of that entropy (there is nothing to brute-force);
+    it would not be for passwords. Revocation takes effect within 5 s in
+    every process (the lookup cache's TTL).
+  - *Tenant isolation is enforced twice:* a key is bound to one namespace,
+    and that namespace must belong to the key's org (a namespace can never
+    change org). Billing routes act on the key's own org only - the request
+    body cannot name another one - and need the `billing` scope; a
+    `billing`-only key cannot read memories.
+  - *A checkout for an org cannot re-point its billing account:* a completed
+    Checkout Session whose customer differs from the org's existing Stripe
+    customer is logged and ignored.
+  - *The admin store is not tenant data.* It holds org names, Stripe customer
+    ids, key hashes and usage counts (no content). It is not encrypted by the
+    namespace envelope keys and is not included in exports; back it up with
+    the data root.
+
 ## Hardening checklist for a real deployment
 
 1. Set `MEMD_ADMIN_KEY` to a high-entropy value; never hand it to applications.
@@ -76,4 +108,9 @@ any probe fails the build.
 4. Leave `MEMD_ENABLE_DOCS` and `MEMD_METRICS_PUBLIC` unset.
 5. Set `MEMD_NS_RATE_LIMIT_PER_MIN` to a real per-tenant ceiling.
 6. Back up the data root - the object store is the source of truth; the
-   SQLite index beside it is disposable.
+   SQLite index beside it is disposable. In hosted mode also back up
+   `admin/admin.sqlite3` (orgs, keys, the usage ledger): it is not
+   rebuildable.
+7. Hosted billing: use an `sk_test_` key until go-live; restrict the
+   webhook endpoint to Stripe's events; keep `MEMD_STRIPE_WEBHOOK_SECRET`
+   and `MEMD_STRIPE_SECRET_KEY` out of images and logs.

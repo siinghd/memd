@@ -134,6 +134,127 @@ conditional PUT, a second gets `NamespaceBusyError`, and a lease older than the
 TTL is reclaimable so a crashed node cannot wedge a namespace forever. It makes
 split-brain loud, not impossible.
 
+## Hosted mode & billing
+
+**Off by default.** Embedded memd and a plain `memd serve --http` behave exactly
+as described above and never import `stripe`. Hosted mode adds tenancy, usage
+metering, plan entitlements and Stripe billing for running memd as a service:
+
+```bash
+pip install "memd[billing]"                      # the Stripe SDK, imported lazily
+export MEMD_HOSTED=1                             # or: memd serve --http --hosted
+memd org create --name acme                      # -> {"org": "org_..."}; plan "free"
+memd key create --hosted --org org_... --ns acme --scopes memory,billing
+memd serve --http --hosted
+```
+
+**Tenancy: org -> namespaces -> API keys.** An org is the billing unit. It owns
+namespaces (a namespace is claimed by the first org that mints a key into it
+and can never be claimed by another), and every key belongs to one org and is
+bound to one of its namespaces. Scopes: `memory` (the data routes), `billing`
+(the `/v1/billing/*` routes), `override` (the existing cross-user capability).
+Keys keep the `memd_<ns>_<kid>_<secret>` format; only a SHA-256 hash of the
+secret is stored. The state lives in an admin SQLite database at
+`<data root>/admin/admin.sqlite3` - beside the tenant store, never inside a
+tenant namespace, so it is neither exported with nor crypto-shredded by a
+tenant. `MEMD_ADMIN_KEY` stays the operator key: it spans namespaces, has no
+org and is never metered. Self-hosted keys (`keys.toml.json`) are not honoured
+in hosted mode; adopt them into an org with
+`memd key migrate --hosted --org org_...` (the key strings keep working).
+
+**Plans** (defaults from [06-economics.md](06-economics.md); config, not code -
+override any value with a JSON file at `MEMD_PLANS_PATH`):
+
+| meter | free (hard caps) | dev, $29/mo | scale (usage-based) |
+|---|---|---|---|
+| `memories_stored` (live gauge) | 50K | 500K (hard) | unlimited |
+| `searches` / month | 10K | 250K (hard) | metered |
+| `extractions_our_key` / month | 10K | 100K included, then metered ($8/100K) | metered |
+| `reranked_searches` / month | 1K | 10K included, then metered | metered |
+| `writes` / month | - | - | metered |
+| `stored_gb` (daily gauge) | - | - | metered |
+
+Enforcement happens before the operation: over a hard cap the request gets
+`402 {"code": "quota_exceeded", "meter": ..., "limit": ..., "used": ...}`; on a
+paid plan a soft limit never refuses - the part above the included quantity is
+recorded as billable overage. Quota periods are calendar months (UTC). A
+search is checked against `reranked_searches` too when a reranker is
+configured. After `invoice.payment_failed` the org has a 7-day grace period
+(`MEMD_BILLING_GRACE_DAYS`); after it the org is **read-only**: writes and
+session extraction answer `402 {"code": "payment_required"}`, searches, reads
+and exports keep working. **Deletes (`DELETE /memories/{id}`, `forget`,
+namespace crypto-shred) are always allowed**, whatever the plan or payment
+state, and no data is ever dropped for non-payment.
+
+**How metering works.** Each metered request writes a usage event (a UUID,
+the org, the namespace, the meter, the quantity) to an append-only ledger in
+the admin store, together with the period rollup that quota checks read, in
+one transaction, committed with `synchronous=FULL` *after* the operation
+succeeded and *before* the response is sent: every acknowledged operation is
+billed, and an operation the client never saw acknowledged (a crash in
+between) is not. Hourly (`MEMD_BILLING_PUSH_INTERVAL_S`), a background job
+claims the unpushed rows into batches (per org, meter and hour), persists
+each batch id - a UUIDv5 of its member event UUIDs - and sends it as a
+[Stripe Billing Meter Event](https://docs.stripe.com/api/billing/meter-event/create)
+with that id as both `identifier` and idempotency key; a crash anywhere
+re-sends the same key, so Stripe records each batch once. Only the billable
+part is pushed (overage on dev, everything metered on scale). The gauges
+(`memories_stored`, `stored_gb`) are snapshotted once per UTC day; `stored_gb`
+is sent in milli-GB so small tenants are not rounded up to a whole GB (price
+that meter per 1/1000 GB and give it the `last` aggregation). A daily
+reconciliation compares what the ledger pushed with Stripe's meter event
+summaries and raises `memd_billing_drift_alerts_total{meter}` (and a
+`drift_alert` row in the admin store's `billing_log`) when they differ by
+more than `MEMD_BILLING_DRIFT_TOLERANCE` (1%). Billing metrics carry
+`ns="_billing"`, so only operator keys see them on `/metrics`.
+
+**Routes** (billing-scoped key; the org is always the key's own):
+
+| route | does |
+|---|---|
+| `POST /v1/billing/checkout` `{"plan": "dev"\|"scale", "interval": "month"\|"year"}` | a Stripe Checkout Session (subscription: the flat price plus the plan's metered prices); returns `{url, id}` |
+| `POST /v1/billing/portal` | a Billing Portal session; returns `{url}` |
+| `GET /v1/billing/usage` | current-period usage per meter: used, limit, hard, metered, billable; plan, status, grace, read-only |
+| `POST /v1/billing/webhook` | Stripe's webhook endpoint (no bearer: the `Stripe-Signature` is the authentication) |
+
+The webhook is verified with `stripe.Webhook.construct_event` (HMAC-SHA256 over
+the raw body, timestamp tolerance 300 s) and is idempotent by Stripe event id:
+the `processed_events` row commits in the same transaction as the event's
+effect. Handled: `checkout.session.completed`,
+`customer.subscription.created/updated/deleted` (the plan comes from the prices
+Stripe bills; a re-ordered older event cannot roll a plan back),
+`invoice.payment_failed` (starts the grace period once) and
+`invoice.payment_succeeded`. An event for a customer memd does not know yet
+answers 500, so Stripe retries it.
+
+**Configuration** (environment):
+
+| variable | meaning |
+|---|---|
+| `MEMD_HOSTED` | `1` enables hosted mode (same as `serve --hosted`) |
+| `MEMD_STRIPE_SECRET_KEY` | Stripe secret key. `sk_live_`/`rk_live_` keys are **refused** unless `MEMD_ALLOW_LIVE_BILLING=1` |
+| `MEMD_STRIPE_WEBHOOK_SECRET` | the webhook endpoint's signing secret (`whsec_...`) |
+| `MEMD_STRIPE_PRICE_DEV_MONTHLY`, `..._DEV_YEARLY` | flat subscription prices (`MEMD_STRIPE_PRICE_<PLAN>_MONTHLY/_YEARLY`) |
+| `MEMD_STRIPE_PRICE_<PLAN>_<METER>` | metered prices, e.g. `MEMD_STRIPE_PRICE_DEV_EXTRACTIONS_OUR_KEY`, `MEMD_STRIPE_PRICE_SCALE_STORED_GB`; every metered meter of a plan needs one |
+| `MEMD_STRIPE_METER_<METER>` | the Stripe meter's `event_name` (default `memd_<meter>`) |
+| `MEMD_STRIPE_METER_ID_<METER>` | the meter id for reconciliation (default: looked up by event name) |
+| `MEMD_PUBLIC_URL`, `MEMD_BILLING_SUCCESS_URL`, `MEMD_BILLING_CANCEL_URL`, `MEMD_BILLING_RETURN_URL` | Checkout/Portal redirect targets |
+| `MEMD_PLANS_PATH` | JSON plan overrides |
+| `MEMD_BILLING_GRACE_DAYS`, `MEMD_BILLING_PUSH_INTERVAL_S`, `MEMD_BILLING_DRIFT_TOLERANCE`, `MEMD_STRIPE_WEBHOOK_TOLERANCE_S` | 7, 3600, 0.01, 300 |
+| `MEMD_STRIPE_API_BASE` | point the Stripe client elsewhere (stripe-mock in tests) |
+| `MEMD_BILLING_JOBS` | `0` disables the in-process push/snapshot/reconcile loop |
+
+Without `MEMD_STRIPE_SECRET_KEY`, hosted mode still enforces tenancy and
+quotas (orgs keep the plan set with `memd org set-plan`) and the billing
+routes answer `503 billing_not_configured`.
+
+**Privacy.** The ledger records counts - org, namespace, meter, quantity,
+time - never memory content, queries or user ids. What reaches Stripe is the
+customer id, the meter's event name, a number and a timestamp; the org's
+name goes into the Stripe customer record once, at first checkout.
+`extractions_our_key` counts only when extraction runs on the operator's LLM
+key; the local heuristic extractor is never billed.
+
 ## Doors (one engine)
 
 | Door | Command | Surface |

@@ -6,6 +6,46 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
 
 ## [Unreleased]
 
+### Added
+- **Hosted mode: tenancy, usage metering and Stripe billing** (off by
+  default; `memd serve --http --hosted` or `MEMD_HOSTED=1`; Stripe SDK in the
+  new optional extra `memd[billing]`, imported lazily - embedded and
+  self-hosted memd never import it). See "Hosted mode & billing" in
+  [README-engine.md](README-engine.md).
+  - Orgs own namespaces, API keys belong to an org and one of its
+    namespaces, with `memory` / `billing` / `override` scopes; keys are
+    stored as SHA-256 hashes in an admin SQLite store beside (never inside)
+    the tenant namespaces. `memd org create|list|set-plan`;
+    `memd key create --hosted --org ...`; `memd key migrate` adopts
+    self-hosted keys into an org. Non-hosted `memd key` is unchanged.
+  - A crash-safe usage ledger (UUID per event, committed with the quota
+    rollup in one fsynced transaction after the operation and before its
+    ack) with the meters `memories_stored` and `stored_gb` (daily gauges),
+    `searches`, `reranked_searches`, `extractions_our_key` and `writes`.
+  - Plan entitlements from config (free / dev / scale per 06-economics.md,
+    overridable with `MEMD_PLANS_PATH`): hard caps answer
+    `402 {"code": "quota_exceeded", "meter", "limit"}`; paid-plan overage is
+    allowed and metered; a 7-day grace period after a failed payment, then
+    read-only (`402 payment_required` on writes; searches, reads, exports
+    work). Deletes are always allowed.
+  - `POST /v1/billing/checkout`, `POST /v1/billing/portal`,
+    `GET /v1/billing/usage`, and a signed, idempotent
+    `POST /v1/billing/webhook` (checkout completed, subscription
+    created/updated/deleted, invoice payment failed/succeeded; re-ordered
+    events cannot roll a plan back).
+  - An hourly push of the ledger as Stripe Billing Meter Events (batched,
+    one idempotency key per batch, persisted before the first send) and a
+    daily reconciliation against Stripe's meter summaries with a drift
+    alert (`memd_billing_drift_alerts_total`).
+  - Hosted mode refuses to start with a live Stripe key (`sk_live_`,
+    `rk_live_`) unless `MEMD_ALLOW_LIVE_BILLING=1`.
+- `SearchResult.reranked`: whether the reranker ran for that call (a cache
+  hit or a reranker fallback is `False`). The REST response is unchanged.
+- The `dev` extra now includes `stripe`, so the billing tests run in CI;
+  they are offline (signed webhook payloads, an in-process fake with
+  Stripe's idempotency semantics, and `stripe/stripe-mock` in docker for the
+  end-to-end test, skipped without docker).
+
 ## [0.2.0] - 2026-09-26
 
 First release evaluated on real data: LongMemEval (ICLR 2025), not memd's synthetic
