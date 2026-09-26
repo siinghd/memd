@@ -141,6 +141,18 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   takes the next slot above every part; an incomplete takeover releases with
   an "aborted" (not clean) tombstone; buffered audit entries are flushed
   before a lease is released.
+- **A retaken namespace no longer serves what other nodes deleted**: a node
+  taking a namespace back kept its local index cache and replayed only past
+  its old watermark, but a compaction another node ran meanwhile had retired
+  the deletes it folded - soft and hard deletes (purges) came back through
+  GET and search while export was right. The manifest now records the
+  `lineage` of the tenure that opened the namespace last; a cache is caught
+  up only in its own lineage, and any other is deleted - file, WAL and
+  tantivy copy, so purged text goes with it (D7) - and rebuilt from the
+  snapshot plus the tail. A clean release racing a heartbeat renewal no
+  longer leaves the lease live (the next node waited out the TTL and took
+  over); a local data key wrapped by another root key raises
+  `KeyCustodyError`, not a raw `InvalidTag`.
 - **Key custody fails closed on every root**: an unreadable custody marker
   refuses the open; a local root no longer mints a new key for a namespace
   that has data; the torn-tail repair never truncates complete frames that
