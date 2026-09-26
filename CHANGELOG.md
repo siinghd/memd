@@ -126,6 +126,60 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   are re-inserted and at least 100 candidates are re-ranked exactly, so
   independent rebuilds answer identically.
 
+### Fixed - data integrity / security
+- **A wrong encryption key destroyed the data it could not read**
+  (predates this release). A valid key that is not the one the data was
+  written with - another deployment's `keys/` directory restored over this
+  one, a replaced `root.key` - opened a namespace whose data lived in
+  compacted segments as EMPTY: every decrypt failure was swallowed and read
+  as corruption, the segments were skipped, and the next compaction deleted
+  them. Restoring the right key then served nothing. WAL frames were cut off
+  as a "torn tail" the same way, ops too, and a restore without the keys
+  directory minted a fresh key over the existing data. Now a complete WAL or
+  ops frame, or a segment, that does not authenticate under the key in hand
+  is a key-custody failure, not damage: the open raises `KeyCustodyError`
+  (`memd.storage.crypto`; decryption no longer surfaces cryptography's bare
+  `InvalidTag`) and nothing is truncated, rewritten or deleted, and no key
+  is created (a root key too is only created with the first data key it
+  wraps) - put the right keys back and the namespace opens with everything.
+  Rotation, compaction, migration and export refuse the same way instead of
+  folding past such data. The namespace manifest now carries a fingerprint
+  of its data key (`key_check`: HMAC-SHA256 under the key of a fixed label,
+  128 bits; it reveals nothing about the key), checked before an open reads
+  or repairs anything - so a warm open that replays nothing refuses a wrong
+  key too, and never mints a key for a namespace that has encrypted data. A
+  namespace written by an older version has no fingerprint and is probed:
+  its encrypted objects (WAL frames, ops records, segments, and the
+  checkpoint the manifest names) are tried until one decrypts, and the key
+  is refused only if none does - a damaged segment does not make the right
+  key look wrong. The fingerprint is written only once the key has
+  decrypted something, or when nothing encrypted exists yet, so a wrong key
+  never stamps its own over data it could not read. v0.2.0 ignores the
+  field. An encrypted namespace opened with encryption off is refused as
+  well: by its fingerprint, or - a namespace an older version wrote - when
+  none of its data parses as plaintext (one open and close of such a store
+  with encryption off, no write, cut its WAL off and emptied its ops log:
+  acked records lost, an acked delete undone). Only a frame cut short by
+  its length prefix is a torn tail and still repaired: a complete WAL or ops
+  frame that does not read - does not decrypt, or does not parse, with
+  encryption on or off - is never cut off or folded away, and the refusal
+  says which it is: the key does not match, a ciphertext read with
+  encryption off, or a frame damaged under the right key (with its byte
+  offset; [SECURITY.md](SECURITY.md) has the recovery procedure). Legacy
+  plaintext frames and segments (written before encryption was on) still
+  load. Once the key is proven, a segment that still does not authenticate
+  or parse is damage: it is still skipped by reads - and compaction now
+  keeps it, quarantined in place (`"unreadable": true` in the manifest,
+  `memd_segments_quarantined_total`), instead of deleting it. The deletes
+  such a compaction cannot apply to it ride on in its output's header, and
+  a hard delete among them stays pending (`pending_hard_deletes`,
+  `memd_pending_purges`; not counted in `hard_deleted_purged`) until a
+  compaction that reads the segment again purges it: a repaired segment
+  never serves a deleted or hard-deleted record again. Refusals count in
+  `memd_key_custody_refusals_total`; a refused open releases the
+  namespace's lock or lease and its index handle, so it opens again, in
+  the same process, once the keys are fixed.
+
 ### Fixed
 - `test_mcp_budget_clamped` skips when the optional `mcp` extra is not
   installed (it failed with `ModuleNotFoundError`), like `test_mcp.py`.

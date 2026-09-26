@@ -26,6 +26,27 @@ any probe fails the build.
   someone with filesystem read access on the same machine. Hosted deployments
   are expected to swap the root-key provider for a KMS; that provider does not
   ship yet.
+- **Key custody fails closed.** Restore the keys directory together with the
+  data it was written with. A key that is valid but not that data's (another
+  deployment's `keys/`, a replaced `root.key`), no key at all, or encryption
+  turned off for an encrypted namespace makes the open raise
+  `KeyCustodyError`; nothing is read, truncated or deleted, no key is
+  created, and the namespace opens normally once the right keys are back.
+  The manifest holds a fingerprint of each namespace's data key (an HMAC of
+  a fixed label under the key) to check this before anything is touched; it
+  reveals nothing about the key. A manifest without one (every namespace
+  0.2.0 wrote) is probed: its encrypted objects are tried until one
+  decrypts, and the key is refused only if none does; with encryption off,
+  a namespace none of whose data parses as plaintext is refused. The
+  fingerprint is written only once the key has decrypted something, or when
+  nothing encrypted exists yet. A complete WAL or ops frame that does not
+  read - does not decrypt, or does not parse - is never cut off or folded
+  away, under any key and with encryption on or off: only a frame cut short
+  by its length prefix is a torn tail. Under the proven key a damaged
+  segment is skipped by reads but kept on disk (and the deletes a compaction
+  could not apply to it stay pending until it reads again); a damaged log
+  frame refuses the open - see "Recovering from an unreadable log frame"
+  below.
 - **With the S3 backend, data is remote but KEYS ARE LOCAL.** That is a
   deliberate, load-bearing asymmetry: crypto-shred still works (the key never
   left the node, so destroying it makes the remote ciphertext inert), but a
@@ -126,6 +147,59 @@ any probe fails the build.
     ids, key hashes and usage counts (no content). It is not encrypted by the
     namespace envelope keys and is not included in exports; back it up with
     the data root.
+
+## Recovering from an unreadable log frame
+
+An open that refuses raises `KeyCustodyError`, and its message says which
+case it is. Nothing was changed in any of them.
+
+- *"the key does not match"*, *"none of its data decrypts"*, *"no data
+  key"*: key custody. Restore the `keys/` directory the data was written
+  with (`root.key` and `ns-<namespace>.key` together) and open again with
+  encryption on. Nothing is lost.
+- *"looks encrypted ... opened it with encryption off"*: open with
+  encryption on (the default) and those keys.
+- *"a complete WAL frame (at byte N of ns/<namespace>/wal) is unreadable
+  although the data key in hand is the right one: the frame is damaged"*
+  (or an `ops` frame; with encryption off, *"(it does not parse)"*): the log
+  is damaged on disk - bit rot, a bad copy, a hand edit. memd will not cut it
+  off, because it may hold acknowledged writes, and everything logged after
+  it is behind it. To recover:
+  1. Stop memd and back up the data root (`store/` and `keys/`; on S3 the
+     `ns/<namespace>/` prefix and the local keys directory).
+  2. If a backup holds the log from before the damage, restoring it is the
+     lossless fix.
+  3. Otherwise remove exactly the frame the message names - its 4-byte
+     length prefix and the payload that prefix announces - and nothing
+     else. Frames are self-contained (each carries its own sequence
+     number), so the ones after it keep their place; only the writes or ops
+     in the damaged frame are lost, and the backup from step 1 still holds
+     its bytes:
+
+     ```python
+     p, n = "store/ns/<namespace>/wal", N   # the path and byte from the message
+     b = open(p, "rb").read()
+     ln = int.from_bytes(b[n:n + 4], "big")
+     open(p, "wb").write(b[:n] + b[n + 4 + ln:])
+     ```
+
+     On S3 the log is not one object: it is stored as part objects
+     (`ns/<namespace>/wal.__part-NNN`, plus `wal.__seq`), and byte N counts
+     across the parts in order. Find the part that holds byte N and delete
+     that one part object (every frame in it is lost; the backup from step 1
+     still holds them). Do not re-upload an edited single `wal` object: memd
+     does not read one.
+
+     Removing an `ops` frame loses the deletes it held: records it
+     tombstoned come back, and a hard delete in it is undone, so the purged
+     text is served again. After recovering, repeat any delete that was
+     acknowledged around the time of the damage.
+  4. Open again; another damaged frame, if any, is reported the same way.
+
+A damaged segment never blocks an open: it is skipped by reads, kept by
+compaction (`"unreadable": true` in the manifest,
+`memd_segments_quarantined_total`), and served again once its bytes are
+restored from a backup.
 
 ## Hardening checklist for a real deployment
 

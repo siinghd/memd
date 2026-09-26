@@ -6,13 +6,37 @@ provider for a KMS. Namespace deletion destroys the key: crypto-shred.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
 import secrets
 from collections import OrderedDict
 
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 KEY_LEN = 32
+# the label a data key's public fingerprint is taken over (KeyEnvelope.key_check)
+_KEY_CHECK_LABEL = b"memd/key-check/v1"
+
+
+class KeyCustodyError(RuntimeError):
+    """A namespace's data key is held somewhere this process is not
+    configured for (or not at all while the namespace has data). Minting a
+    fresh key instead would make the existing ciphertext unreadable, so the
+    open is refused with a message saying what to do.
+
+    Also what a ciphertext that does not authenticate under the key in hand
+    raises (never cryptography's bare InvalidTag): a valid key that is not
+    the one the data was written with - another deployment's keys directory
+    restored over this one, a replaced root key - is a custody failure, not
+    damage. Storage never skips, truncates or deletes such data."""
+
+
+def _ns_key_path(keys_dir: str, namespace: str) -> str:
+    """Where a namespace's wrapped data key lives under a keys directory."""
+    safe = namespace.replace("/", "__")
+    return os.path.join(keys_dir, f"ns-{safe}.key")
 
 
 class KeyEnvelope:
@@ -45,7 +69,24 @@ class KeyEnvelope:
 
     def decrypt(self, namespace: str, blob: bytes) -> bytes:
         key = self.data_key(namespace)
-        return AESGCM(key).decrypt(blob[:12], blob[12:], namespace.encode())
+        try:
+            return AESGCM(key).decrypt(blob[:12], blob[12:], namespace.encode())
+        except InvalidTag:
+            raise KeyCustodyError(
+                f"a ciphertext of namespace {namespace!r} does not authenticate under its data "
+                "key: the key is not the one it was written with (lost, replaced, restored from "
+                "another deployment) or the ciphertext is damaged") from None
+
+    def key_check(self, namespace: str) -> str:
+        """A public fingerprint of `namespace`'s data key: HMAC-SHA256 under
+        the key of a fixed label, 128 bits. Kept beside the data (the
+        namespace manifest), it lets an open tell whether the key in hand is
+        the one the data was written with before it reads, repairs or
+        rewrites anything. It reveals nothing about the key (a PRF output on
+        a public input - the audit chain key is derived the same way, under
+        another label). Resolves the key: callers ask has_key() first where
+        minting one would be wrong."""
+        return hmac.new(self.data_key(namespace), _KEY_CHECK_LABEL, hashlib.sha256).hexdigest()[:32]
 
 
 class LocalKeyEnvelope(KeyEnvelope):
@@ -58,23 +99,45 @@ class LocalKeyEnvelope(KeyEnvelope):
 
     def __init__(self, dir_path: str, root_key: bytes | None = None):
         self.dir = dir_path
-        os.makedirs(dir_path, exist_ok=True)
         # unwrapped per-namespace data keys, LRU-bounded. Caching is sound:
         # every encrypt/decrypt needs the raw key in process memory anyway.
         # Without this, each WAL append/replay frame paid a file read +
         # AESGCM unwrap for the SAME namespace key.
         self._cache: "OrderedDict[str, bytes]" = OrderedDict()
         self.CACHE_MAX = 1024  # namespaces; matches hosted per-node open set
-        rk_path = os.path.join(dir_path, "root.key")
-        if root_key is not None:
-            self._root = root_key
-            if not os.path.exists(rk_path):
-                self._write_secret(rk_path, root_key)
-        elif os.path.exists(rk_path):
-            self._root = self._read_secret(rk_path)
-        else:
-            self._root = secrets.token_bytes(KEY_LEN)
-            self._write_secret(rk_path, self._root)
+        self._rk_path = os.path.join(dir_path, "root.key")
+        # Loaded - or created - on first use, not here: an open that refuses
+        # (a restore without the keys directory: see KeyCustodyError) must
+        # not leave a fresh root key behind. One is minted only together
+        # with the first data key it wraps (data_key).
+        self._root_key: bytes | None = root_key
+        if root_key is not None and not os.path.exists(self._rk_path):
+            self._write_secret(self._rk_path, root_key)
+
+    @property
+    def _root(self) -> bytes:
+        """The root key on disk. Raises KeyCustodyError when there is none:
+        a wrapped data key without it cannot be unwrapped, and minting one
+        here would not change that."""
+        if self._root_key is None:
+            if not os.path.exists(self._rk_path):
+                raise KeyCustodyError(
+                    f"no root key at {self._rk_path}: the data keys under {self.dir} cannot be "
+                    "unwrapped without the root key they were wrapped with. Restore it")
+            self._root_key = self._read_secret(self._rk_path)
+        return self._root_key
+
+    def _root_or_mint(self) -> bytes:
+        """The root key, minted if this keys directory has none yet (only
+        ever to wrap a data key being minted)."""
+        if self._root_key is None and not os.path.exists(self._rk_path):
+            fresh = secrets.token_bytes(KEY_LEN)
+            try:
+                self._write_secret(self._rk_path, fresh)
+                self._root_key = fresh
+            except FileExistsError:
+                pass  # a concurrent creator won; use theirs
+        return self._root
 
     @staticmethod
     def _read_secret(path: str) -> bytes:
@@ -83,6 +146,7 @@ class LocalKeyEnvelope(KeyEnvelope):
 
     @staticmethod
     def _write_secret(path: str, data: bytes) -> None:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             os.write(fd, data)
@@ -91,8 +155,18 @@ class LocalKeyEnvelope(KeyEnvelope):
             os.close(fd)
 
     def _key_path(self, namespace: str) -> str:
-        safe = namespace.replace("/", "__")
-        return os.path.join(self.dir, f"ns-{safe}.key")
+        return _ns_key_path(self.dir, namespace)
+
+    def _unwrap(self, namespace: str, path: str) -> bytes:
+        wrapped = self._read_secret(path)
+        try:
+            return AESGCM(self._root).decrypt(wrapped[:12], wrapped[12:], namespace.encode())
+        except InvalidTag:
+            raise KeyCustodyError(
+                f"namespace {namespace!r}'s wrapped data key ({path}) does not unwrap under this "
+                f"root key ({os.path.join(self.dir, 'root.key')}): the key files come from "
+                "different deployments, or the root key was replaced. Restore the root key they "
+                "were wrapped with") from None
 
     def data_key(self, namespace: str) -> bytes:
         cached = self._cache.get(namespace)
@@ -101,20 +175,16 @@ class LocalKeyEnvelope(KeyEnvelope):
             return cached
         p = self._key_path(namespace)
         if os.path.exists(p):
-            wrapped = self._read_secret(p)
-            nonce, ct = wrapped[:12], wrapped[12:]
-            dk = AESGCM(self._root).decrypt(nonce, ct, namespace.encode())
+            dk = self._unwrap(namespace, p)
         else:
             dk = secrets.token_bytes(KEY_LEN)
             nonce = secrets.token_bytes(12)
-            wrapped = nonce + AESGCM(self._root).encrypt(nonce, dk, namespace.encode())
+            wrapped = nonce + AESGCM(self._root_or_mint()).encrypt(nonce, dk, namespace.encode())
             try:
                 self._write_secret(p, wrapped)
             except FileExistsError:
                 # concurrent creator won; use their key deterministically
-                wrapped2 = self._read_secret(p)
-                n2, c2 = wrapped2[:12], wrapped2[12:]
-                dk = AESGCM(self._root).decrypt(n2, c2, namespace.encode())
+                dk = self._unwrap(namespace, p)
         self._cache[namespace] = dk
         if len(self._cache) > self.CACHE_MAX:
             self._cache.popitem(last=False)
@@ -141,12 +211,21 @@ class LocalKeyEnvelope(KeyEnvelope):
 
 
 class NullKeyEnvelope(KeyEnvelope):
-    """No encryption at rest (testing / explicit opt-out)."""
+    """No encryption at rest (testing / explicit opt-out).
+
+    `keys_dir`, if given, is where this deployment keeps its keys when
+    encryption is on: key_on_disk() tells an open that a namespace has a
+    data key there - it was written with encryption on at some point - so
+    it looks for ciphertext before it reads anything as plaintext."""
 
     enabled = False
 
-    def __init__(self) -> None:
+    def __init__(self, keys_dir: str | None = None) -> None:
         self._keys: dict[str, bytes] = {}
+        self._keys_dir = keys_dir
+
+    def key_on_disk(self, namespace: str) -> bool:
+        return bool(self._keys_dir) and os.path.exists(_ns_key_path(self._keys_dir, namespace))
 
     def encrypt(self, namespace: str, plaintext: bytes) -> bytes:
         return plaintext
