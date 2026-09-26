@@ -726,19 +726,23 @@ class NamespaceStore:
         replayed changes reach it like live ones; loaded from its file, else
         from the published snapshot, else rebuilt in the background. It must
         never stop a namespace opening: the exact scan serves without it."""
+        from memd.index import ann_usearch
+
         path = os.path.splitext(self.index.path)[0] + ".usearch"
         if self._vector_cfg.get("mode") not in ("auto", "usearch"):
             # opened without it: rows changed now would be missing from a file
             # kept around
             if os.path.isdir(path):
+                ann_usearch.settle(path, cancel=True)
                 shutil.rmtree(path, ignore_errors=True)
             return
+        # the exact scan's matrix is capped whether or not the sidecar attaches
+        self.index.set_vector_limits(self._vector_cfg.get("flat_max", ann_usearch.DEFAULT_FLAT_MAX),
+                                     self._vector_cfg.get("exact_max", ann_usearch.DEFAULT_EXACT_MAX))
         ann = None
         try:
-            from memd.index.ann_usearch import UsearchSidecar
-
-            ann = UsearchSidecar(self.index, path, cfg=self._vector_cfg,
-                                 scrub_seq=self.manifest.scrub_seq)
+            ann = ann_usearch.UsearchSidecar(self.index, path, cfg=self._vector_cfg,
+                                             scrub_seq=self.manifest.scrub_seq)
             self.index.attach_ann(ann)
             ann.start(fetch_snapshot=self._fetch_vector_snapshot)
         except Exception as ex:  # noqa: BLE001 - the exact scan serves the lane
@@ -748,6 +752,7 @@ class NamespaceStore:
                     ann.close()
                 except Exception:
                     pass
+            ann_usearch.settle(path, cancel=True)
             shutil.rmtree(path, ignore_errors=True)
             METRICS.inc("memd_vector_index_attach_failures_total",
                         help="namespaces opened without the usearch sidecar (the exact scan serves)",
@@ -812,7 +817,7 @@ class NamespaceStore:
             freeze = (ann.frozen() if ann is not None
                       and ann.publishable(self.VECTOR_SNAPSHOT_MIN_VECTORS)
                       else contextlib.nullcontext())
-            vec_img = None  # (open file, state) of the sidecar at the image's vec_wm
+            vec_img = None  # (image bytes, meta) of the sidecar at the image's vec_wm
             fd, tmp = _tf.mkstemp(prefix="memd-snap-", suffix=".sqlite")
             os.close(fd)
             try:
@@ -852,21 +857,15 @@ class NamespaceStore:
                 if vec_img is not None:
                     from memd.index.ann_usearch import UsearchSidecar
 
-                    vf, vst = vec_img
-                    try:
-                        vec_payload = UsearchSidecar.snapshot_payload(vf, vst)
-                    finally:
-                        vf.close()
+                    vec_payload = UsearchSidecar.snapshot_payload(*vec_img)
                     if self.envelope.enabled:
-                        vec_payload = self.envelope.encrypt(self.namespace, bytes(vec_payload))
+                        vec_payload = self.envelope.encrypt(self.namespace, vec_payload)
             finally:
                 for suffix in ("", "-wal", "-shm"):
                     try:
                         os.unlink(tmp + suffix)
                     except OSError:
                         pass
-                if vec_img is not None and not vec_img[0].closed:
-                    vec_img[0].close()
             # The expensive part (backup + gzip) ran WITHOUT the namespace lock
             # on purpose. Publishing must take it: a destroy racing this would
             # otherwise put() an object under a crypto-SHREDDED namespace and,
@@ -3093,8 +3092,13 @@ class StorageEngine:
                 pass
         # the tantivy accelerator holds the same text (tokenized): shred it too
         shutil.rmtree(os.path.join(self.cache_dir, f"{safe}.tantivy"), ignore_errors=True)
-        # and the ANN sidecar holds its vectors
-        shutil.rmtree(os.path.join(self.cache_dir, f"{safe}.usearch"), ignore_errors=True)
+        # and the ANN sidecar holds its vectors: its handed-off final save is
+        # cancelled (and any write in flight waited for) before they go
+        from memd.index import ann_usearch
+
+        ann_path = os.path.join(self.cache_dir, f"{safe}.usearch")
+        ann_usearch.settle(ann_path, cancel=True)
+        shutil.rmtree(ann_path, ignore_errors=True)
         if self.envelope is not None:
             self.envelope.destroy(ns)
         return existed or n > 0
@@ -3123,6 +3127,11 @@ class StorageEngine:
             with nstore._lock:  # an operation in flight on it finishes first
                 pass
             notes += self._close_claimed(name, nstore, ent, held=False)
+        # ANN sidecars save in the background at close (evictions included):
+        # let those saves land before the process may exit
+        from memd.index import ann_usearch
+
+        ann_usearch.settle_all()
         for name, d in notes:  # outside the engine lock, as at open
             self._audit(name, d["action"], d["target"], d)
 

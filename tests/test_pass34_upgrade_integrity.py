@@ -490,6 +490,12 @@ m.flush()
 vec = m.ns.index._con.execute("SELECT vec FROM vectors WHERE id=?", (victim,)).fetchone()[0]
 m.ns.rotate("probe")                      # the victim's bytes now sit in a segment
 m.ns.compact(force=True)                  # ...and in a published index snapshot
+ann = m.ns.index.ann
+if ann is not None:                       # ...and in the ANN sidecar's local file
+    with ann._apply_lock:
+        cap = ann._capture_locked()
+    if cap:
+        ann._persist(cap)
 m.delete(victim, hard=True)               # acked hard delete; purge pending
 m.flush()
 with open(ack, "w") as f:

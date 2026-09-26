@@ -1073,15 +1073,17 @@ class Memory:
                                kinds=kinds, include_quarantined=include_quarantined,
                                namespace=namespace)
         t0 = time.monotonic()
-        ns_name = self._ns_for(namespace).namespace
+        ns_idx = self._ns_for(namespace)
+        ns_name = ns_idx.namespace
         cache_key = (
             ns_name, query,
             (user_id, session_id, agent_id, org_id),
             budget_tokens, as_of, tuple(kinds) if kinds else None,
             include_quarantined, self._qepochs.get(ns_name, 0),
             # a result served before the model loaded has no vector lane: it
-            # must not outlive the load
-            self.embedder.ready(),
+            # must not outlive the load - nor one served while the lane skips
+            # queries because the ANN sidecar is still loading or rebuilding
+            self.embedder.ready(), ns_idx.index.vector_lane_degraded(),
         )
         cached = self._qcache.get(cache_key)
         if cached is not None:
@@ -1939,6 +1941,10 @@ class Memory:
         st["vector_index"] = ann.stats() if ann is not None else {
             "kind": "flat", "mode": self.vector_index, "ready": True, "size": 0, "rebuilds": 0,
             "last_build_ms": None, "fallback_exact_total": 0}
+        # vector-lane queries skipped while the sidecar was not serving (a
+        # namespace over flat_max_vectors never loads the exact scan's matrix)
+        st["vector_index"]["skipped_total"] = ns.index.vector_lane_skipped
+        st["vector_index"]["flat_max_vectors"] = ns.index.flat_max_vectors
         st["extractor"] = self.extractor.name
         # live gauges so /metrics and stats() agree on current state
         METRICS.set_gauge("memd_records", st.get("records", 0), ns=ns.namespace)

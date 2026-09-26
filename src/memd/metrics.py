@@ -470,6 +470,7 @@ CORE_HISTOGRAMS = {
     "memd_lexical_commit_ms": ("tantivy indexer batch: read + index + commit (ms)", DEFAULT_BUCKETS),
     "memd_vector_index_build_ms": ("usearch sidecar build from SQLite (ms)", DEFAULT_BUCKETS),
     "memd_vector_index_save_ms": ("vector sidecar save (ms)", DEFAULT_BUCKETS),
+    "memd_vector_index_gil_hold_ms": ("usearch save/restore calls, which hold the GIL (ms)", DEFAULT_BUCKETS),
 }
 
 CORE_COUNTERS = {
@@ -555,6 +556,7 @@ CORE_COUNTERS = {
     "memd_vector_index_snapshots_written_total": "vector sidecar images published with an index snapshot",
     "memd_vector_index_snapshots_loaded_total": "vector sidecars installed from a published snapshot",
     "memd_vector_index_snapshot_failures_total": "vector sidecar snapshots that could not be used (rebuilt instead)",
+    "memd_vector_lane_skipped_total": "vector-lane queries skipped: the sidecar is not serving and the namespace is over flat_max_vectors (other lanes serve)",
 }
 
 CORE_GAUGES = {

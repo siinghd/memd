@@ -42,6 +42,19 @@ Contract - SQLite (the vectors and records tables) stays the source of truth:
     state is switched the same way, then the old file is deleted. A kill at
     any point leaves the old file (still named by the state) or the new one;
     temp files and unnamed files are deleted at open.
+  - off the request path: opening a namespace only counts its vectors and
+    starts a journal; loading the file (else the published snapshot, else a
+    rebuild) runs on the sidecar's worker thread, and the final save of a
+    close is handed to a background thread (settle() waits for it: a reopen
+    of the same path, a destroy - which cancels it - and engine close).
+    usearch holds the GIL for the whole of save() and restore(), so every
+    thread of the process pauses for it wherever it runs; up to
+    BUFFER_MAX_BYTES the file is read / written by Python (GIL released) and
+    usearch only copies memory (measured at 200K x 384 f16, 183 MB: a 93 ms
+    pause to save, 108 ms to load, against 175 / 170 ms through a path).
+    While the sidecar is loading or rebuilding, a namespace over
+    `flat_max_vectors` never loads the exact scan's float32 matrix (see
+    NamespaceIndex.search_vector).
   - D7: usearch `remove` only marks an entry; its bytes stay in RAM and in
     the next save. A hard-delete purge therefore deletes the files at once
     and rebuilds from SQLite (where the row is already gone); no save is made
@@ -95,7 +108,52 @@ ADD_SLICE = 64               # vectors added per write-lock hold (bounds a searc
 SWEEP_LIMIT = 1024           # limits at or above this are sweeps: answered exactly
 BACKOFF_BASE_S = 2.0
 BACKOFF_MAX_S = 300.0
+DEFAULT_FLAT_MAX = 200_000   # above this the exact scan's matrix is never loaded
+# save/load through RAM up to this size: usearch then holds the GIL for a
+# memory copy instead of the disk I/O (see "off the request path")
+BUFFER_MAX_BYTES = 256 << 20
 _RESET = object()            # queue entry: the SQLite index was wiped
+
+# Closed sidecars whose background file work (the handed-off final save, a
+# write in flight) may not be finished, by absolute path: see settle()
+_CLOSING: dict[str, "UsearchSidecar"] = {}
+_CLOSING_LOCK = threading.Lock()
+
+
+def settle(path: str, *, cancel: bool = False, timeout: float | None = None) -> bool:
+    """Wait until a closed sidecar of `path` no longer touches its files: its
+    final save written (or, with `cancel`, abandoned - a destroy) and any
+    write in flight done. A successor's load and a destroy call this first.
+    False when `timeout` ran out."""
+    key = os.path.abspath(path)
+    with _CLOSING_LOCK:
+        inst = _CLOSING.get(key)
+    if inst is None:
+        return True
+    if cancel:
+        inst._cancel.set()
+    if not inst._close_done.wait(timeout):  # its close has handed off (and started) the save
+        return False
+    th = inst._saver
+    if th is not None and th is not threading.current_thread():
+        th.join(timeout)
+        if th.is_alive():
+            return False
+    with inst._file_lock:  # a write its worker had in flight when it closed
+        pass
+    with _CLOSING_LOCK:
+        if _CLOSING.get(key) is inst:
+            del _CLOSING[key]
+    return True
+
+
+def settle_all(timeout: float | None = None) -> None:
+    """settle() every closed sidecar (engine close: final saves land before
+    the process may exit)."""
+    with _CLOSING_LOCK:
+        paths = list(_CLOSING)
+    for p in paths:
+        settle(p, timeout=timeout)
 
 
 def usearch_available() -> bool:
@@ -145,9 +203,14 @@ def vector_index_config(config: dict | None, mode: str) -> dict:
         # search depth floor (HNSW ef); 0 = usearch's default. A search for
         # k candidates always explores at least k.
         "expansion_search": int(cfg.get("ann_expansion_search", 0)),
+        # while the sidecar is not serving, a namespace with more vectors than
+        # this skips the vector lane (selective filters and sweeps are still
+        # answered exactly, streamed from SQLite) instead of loading the exact
+        # scan's float32 matrix (4 x dim bytes per vector: 1.5 GB at 1M x 384)
+        "flat_max": int(cfg.get("flat_max_vectors", DEFAULT_FLAT_MAX)),
     }
     if (out["overfetch"] < 1 or out["min_vectors"] < 0 or out["exact_max"] < 0
-            or out["build_threads"] < 1 or out["expansion_search"] < 0):
+            or out["build_threads"] < 1 or out["expansion_search"] < 0 or out["flat_max"] < 0):
         raise ValueError(f"invalid ANN settings: {out}")
     return out
 
@@ -227,6 +290,7 @@ class UsearchSidecar:
         self._Index = Index
         self.index = index
         self.path = path
+        self._key = os.path.abspath(path)
         self.ns = index._ns_hint
         self.mode = str(cfg.get("mode", "usearch"))
         self.min_vectors = int(cfg.get("min_vectors", DEFAULT_MIN_VECTORS))
@@ -237,22 +301,29 @@ class UsearchSidecar:
         self.expansion_search = max(0, int(cfg.get("expansion_search", 0)))
         self._mu = threading.Lock()            # the state below; never held across I/O
         self._apply_lock = threading.Lock()    # one applier / saver / swapper at a time
+        self._file_lock = threading.Lock()     # the files and _file/_saved_wm (after the apply lock)
         self._rw = _RWLock()                   # searches vs mutations of self._ix
         self._done_cv = threading.Condition(self._mu)
         self._ix: Any = None                   # the live usearch index (None: empty)
         self._active = False                   # kept (usearch mode, or auto above the threshold)
         self._ready = False                    # self._ix reflects SQLite (up to the queue)
         self._queue: deque = deque()           # (wm, removes, adds) not yet applied
-        self._journal: list | None = None      # entries applied while a build runs
+        self._journal: list | None = None      # entries applied while a load or build runs
         self._applied_wm = 0
         self._saved_wm: int | None = None
         self._file: str | None = None          # the current file (named by the state)
         self._scrub_known = int(scrub_seq)     # newest purge the store told us about
         self._scrub_built = int(scrub_seq)     # the purge the live index was built after
         self._closed = False
+        self._cancel = threading.Event()       # a destroy: the handed-off final save is dropped
+        self._close_done = threading.Event()   # close() returned (its saver, if any, started)
+        self._saver: threading.Thread | None = None
+        self._bg = 0                           # background threads still running
         self._approx_count = 0                 # vectors in SQLite, for the auto threshold
         self._count_checked = 0
-        self._build_thread: threading.Thread | None = None
+        self._worker: threading.Thread | None = None
+        self._open_job: tuple | None = None    # (vec_wm, fetch_snapshot, vectors) for the worker
+        self._loading = False
         self._build_want = 0
         self._build_done = 0
         self._build_reason = ""
@@ -262,6 +333,7 @@ class UsearchSidecar:
         self._retry_at = 0.0
         self.rebuilds = 0
         self.last_build_ms: float | None = None
+        self.last_gil_ms: dict[str, float] = {}  # longest GIL hold of the latest save / load
         self.fallback_exact = 0
         self.searches = 0
         self.loaded_from = ""                  # "file" | "snapshot" | "build"
@@ -270,41 +342,74 @@ class UsearchSidecar:
     # ------------------------------------------------------------ open
 
     def start(self, fetch_snapshot=None) -> None:
-        """Decide whether the sidecar is kept, then load it (from its file,
-        else from the published snapshot) or schedule a rebuild."""
+        """Decide whether the sidecar is kept and start journaling changes;
+        the load itself (its file, else the published snapshot, else a
+        rebuild) runs on the worker thread - opening a namespace never waits
+        for it. Until it is done the sidecar is not ready (see
+        NamespaceIndex.search_vector for what serves meanwhile)."""
         with self.index._read() as c:
             n = int(c.execute("SELECT COUNT(*) FROM vectors").fetchone()[0])
-        self._approx_count = self._count_checked = n
-        self._clean_temp()
-        if self.mode == "auto" and n < self.min_vectors:
-            # the exact scan serves; a file kept now would fall behind
-            self._discard_files()
-            return
-        with self._mu:
-            self._active = True
-        why = self._try_load()
-        if why is None:
-            self.loaded_from = "file"
-            return
-        if n == 0:
-            # nothing to index: empty and ready (the first add creates it)
-            self._discard_files()
+        active = not (self.mode == "auto" and n < self.min_vectors)
+        # vec_wm and the journal start together: no change falls in between
+        with self.index._lock:
             with self._mu:
-                self._ready = True
-                self._applied_wm = self.index._vec_wm
-            return
-        if fetch_snapshot is not None and why != "purge":
-            try:
-                if self._try_snapshot(fetch_snapshot):
-                    self.loaded_from = "snapshot"
-                    return
-            except Exception as e:  # noqa: BLE001 - a snapshot is a cache
-                _log.warning("memd: vector snapshot for %r unusable (%s); rebuilding", self.ns, e)
-                METRICS.inc("memd_vector_index_snapshot_failures_total",
-                            help="vector sidecar snapshots that could not be used (rebuilt instead)",
-                            ns=self.ns, detail=type(e).__name__)
-        self._discard_files()
-        self.request_build(why)
+                self._approx_count = self._count_checked = n
+                self._active = active
+                wm = int(self.index._vec_wm)
+                if active and n == 0:
+                    # nothing to index: empty and ready (the first add creates it)
+                    self._ready = True
+                    self._applied_wm = wm
+                elif active:
+                    self._journal = []
+                    self._loading = True
+                self._open_job = (wm, fetch_snapshot, n)
+                self._kick()
+
+    def _open_step(self, job: tuple) -> None:
+        """(worker) Load the sidecar at the vec_wm captured by start()."""
+        wm, fetch, n = job
+        try:
+            settle(self.path)  # a predecessor's final save lands first
+            self._clean_temp()
+            if not self._active or n == 0:
+                # below the auto threshold (a file kept would fall behind), or empty
+                self._discard_files()
+                return
+            ix, st, why = self._load_file(wm)
+            source = "file"
+            if ix is None and fetch is not None and why != "purge":
+                try:
+                    ix, st = self._load_snapshot(fetch, wm)
+                    source = "snapshot" if ix is not None else source
+                except _Aborted:
+                    raise
+                except Exception as e:  # noqa: BLE001 - a snapshot is a cache
+                    _log.warning("memd: vector snapshot for %r unusable (%s); rebuilding", self.ns, e)
+                    METRICS.inc("memd_vector_index_snapshot_failures_total",
+                                help="vector sidecar snapshots that could not be used (rebuilt instead)",
+                                ns=self.ns, detail=type(e).__name__)
+            if ix is None:
+                self._discard_files()
+                self.request_build(why)  # (before _loading clears: drain() sees the build)
+                return
+            if source == "snapshot":
+                METRICS.inc("memd_vector_index_snapshots_loaded_total",
+                            help="vector sidecars installed from a published snapshot", ns=self.ns)
+            self._install(ix, scrub=int(st["scrub_seq"]), source=source,
+                          saved=(str(st["file"]), wm) if source == "file" else None)
+        except _Aborted:
+            pass
+        except Exception as e:  # noqa: BLE001 - rebuild; the exact scan serves meanwhile
+            if not self._closed:
+                _log.warning("memd: loading the usearch sidecar for %r failed (%s: %s); rebuilding",
+                             self.ns, type(e).__name__, e)
+                self._discard_files()
+                self.request_build("corrupt")
+        finally:
+            with self._mu:
+                self._loading = False
+                self._done_cv.notify_all()
 
     def _state_path(self) -> str:
         return os.path.join(self.path, STATE_FILE)
@@ -317,47 +422,61 @@ class UsearchSidecar:
         except (OSError, ValueError):
             return None
 
-    def _try_load(self) -> str | None:
-        """Load the file the state names; None on success, else why not."""
-        st = self._read_state()
-        if st is None or not st.get("file"):
-            return "missing"
-        if (st.get("version") != STATE_VERSION or st.get("uid") != self.index.vec_uid
-                or st.get("dtype") != self.dtype or st.get("metric") != METRIC
-                or st.get("connectivity") != CONNECTIVITY):
-            return "mismatch"
-        if int(st.get("scrub_seq", -1)) < self._scrub_known:
-            return "purge"
-        if int(st.get("wm", -1)) != self.index._vec_wm:
-            return "behind"
-        fpath = os.path.join(self.path, str(st["file"]))
-        if not os.path.exists(fpath):
-            return "missing"
-        try:
-            if os.path.getsize(fpath) != int(st.get("size", -1)):
-                return "corrupt"
-            ix = self._Index.restore(fpath)
-        except Exception:  # noqa: BLE001 - truncated or garbage: rebuild
-            return "corrupt"
+    def _load_file(self, wm: int) -> tuple[Any, dict | None, str]:
+        """(worker) The index in the file the state names, if it is this
+        SQLite image's at exactly `wm`: (index, state, "") or (None, None, why not)."""
+        with self._file_lock:
+            if self._closed:
+                raise _Aborted()
+            st = self._read_state()
+            if st is None or not st.get("file"):
+                return None, None, "missing"
+            if (st.get("version") != STATE_VERSION or st.get("uid") != self.index.vec_uid
+                    or st.get("dtype") != self.dtype or st.get("metric") != METRIC
+                    or st.get("connectivity") != CONNECTIVITY):
+                return None, None, "mismatch"
+            if int(st.get("scrub_seq", -1)) < self._scrub_known:
+                return None, None, "purge"
+            if int(st.get("wm", -1)) != int(wm):
+                return None, None, "behind"
+            fpath = os.path.join(self.path, str(st["file"]))
+            if not os.path.exists(fpath):
+                return None, None, "missing"
+            try:
+                size = os.path.getsize(fpath)
+                if size != int(st.get("size", -1)):
+                    return None, None, "corrupt"
+                ix = self._restore(fpath, size)
+            except Exception:  # noqa: BLE001 - truncated or garbage: rebuild
+                return None, None, "corrupt"
         if (ix is None or int(ix.ndim) != int(st.get("ndim", -1))
                 or len(ix) != int(st.get("count", -1))):
-            return "corrupt"
-        if self.expansion_search:
-            ix.expansion_search = self.expansion_search
-        with self._mu:
-            self._ix = ix
-            self._ready = True
-            self._applied_wm = self._saved_wm = int(st["wm"])
-            self._scrub_built = int(st.get("scrub_seq", 0))
-            self._file = str(st["file"])
-        return None
+            return None, None, "corrupt"
+        return ix, st, ""
 
-    def _try_snapshot(self, fetch) -> bool:
-        """Install the published sidecar image when it matches this SQLite
-        image exactly (same vec_uid and vec_wm) and postdates every purge."""
-        blob = fetch(self.index.vec_uid, self.index._vec_wm)
+    def _restore(self, src, size: int) -> Any:
+        """Index.restore, the GIL held for a memory copy only when it fits
+        BUFFER_MAX_BYTES (the file is read by Python first, GIL released)."""
+        if isinstance(src, str) and size <= BUFFER_MAX_BYTES:
+            with open(src, "rb") as f:
+                src = f.read()
+        t0 = time.monotonic()
+        ix = self._Index.restore(src)
+        self._note_gil("load", t0)
+        if ix is not None and self.expansion_search:
+            ix.expansion_search = self.expansion_search
+        return ix
+
+    def _load_snapshot(self, fetch, wm: int) -> tuple[Any, dict | None]:
+        """(worker) The published sidecar image, when it matches this SQLite
+        image exactly (same vec_uid, vec_wm `wm`) and postdates every purge:
+        (index, header), or (None, None) when none is published for it.
+        Restored from memory: nothing is written locally until a save."""
+        if self._closed:
+            raise _Aborted()
+        blob = fetch(self.index.vec_uid, wm)
         if not blob:
-            return False
+            return None, None
         mv = memoryview(blob)
         if bytes(mv[:len(SNAPSHOT_MAGIC)]) != SNAPSHOT_MAGIC:
             raise ValueError("not a memd vector snapshot")
@@ -365,77 +484,70 @@ class UsearchSidecar:
         hlen = int.from_bytes(mv[off:off + 4], "big")
         head = json.loads(bytes(mv[off + 4:off + 4 + hlen]))
         body = mv[off + 4 + hlen:]
-        if (head.get("uid") != self.index.vec_uid or int(head.get("wm", -1)) != self.index._vec_wm
+        if (head.get("uid") != self.index.vec_uid or int(head.get("wm", -1)) != int(wm)
                 or head.get("dtype") != self.dtype or head.get("metric") != METRIC
                 or head.get("connectivity") != CONNECTIVITY
                 or int(head.get("scrub_seq", -1)) < self._scrub_known
                 or int(head.get("size", -1)) != len(body)):
             raise ValueError("vector snapshot does not match this index image")
-        fn = f"{uuid.uuid4().hex}.usearch"
-        self._write_file(fn, lambda f: f.write(body))
-        del blob, mv, body
-        self._write_state(fn, int(head["wm"]), int(head["ndim"]), int(head["count"]),
-                          int(head["scrub_seq"]))
-        why = self._try_load()
-        if why is not None:
-            self._discard_files()
-            raise ValueError(f"installed vector snapshot unreadable ({why})")
-        METRICS.inc("memd_vector_index_snapshots_loaded_total",
-                    help="vector sidecars installed from a published snapshot", ns=self.ns)
-        return True
+        ix = self._restore(body, len(body))
+        if (ix is None or int(ix.ndim) != int(head.get("ndim", -1))
+                or len(ix) != int(head.get("count", -1))):
+            raise ValueError("vector snapshot unreadable")
+        return ix, head
 
     # ------------------------------------------------------------ files
+    # Every file operation holds the file lock and is a no-op once the
+    # sidecar is closed - except the handed-off final save, which stops only
+    # for a destroy (_cancel). settle() waits on the same lock.
+
+    def _may_touch_files(self, final: bool) -> bool:
+        return not (self._cancel.is_set() if final else self._closed)
 
     def _clean_temp(self) -> None:
         """Temp files a killed write left, and files no state names."""
-        st = self._read_state() or {}
-        keep = {STATE_FILE, str(st.get("file") or "")}
-        try:
-            names = os.listdir(self.path)
-        except OSError:
-            return
-        for name in names:
-            if name not in keep:
+        with self._file_lock:
+            if not self._may_touch_files(False):
+                return
+            st = self._read_state() or {}
+            keep = {STATE_FILE, str(st.get("file") or "")}
+            try:
+                names = os.listdir(self.path)
+            except OSError:
+                return
+            for name in names:
+                if name not in keep:
+                    try:
+                        os.unlink(os.path.join(self.path, name))
+                    except OSError:
+                        pass
+
+    def _discard_files(self, final: bool = False) -> None:
+        """Delete every file of the sidecar (the state first: a crash in
+        between leaves an unnamed file, which the next open deletes)."""
+        with self._file_lock:
+            if not self._may_touch_files(final):
+                return
+            try:
+                os.unlink(self._state_path())
+            except OSError:
+                pass
+            try:
+                names = os.listdir(self.path)
+            except OSError:
+                names = []
+            for name in names:
                 try:
                     os.unlink(os.path.join(self.path, name))
                 except OSError:
                     pass
-
-    def _discard_files(self) -> None:
-        """Delete every file of the sidecar (the state first: a crash in
-        between leaves an unnamed file, which the next open deletes)."""
-        try:
-            os.unlink(self._state_path())
-        except OSError:
-            pass
-        try:
-            names = os.listdir(self.path)
-        except OSError:
-            names = []
-        for name in names:
-            try:
-                os.unlink(os.path.join(self.path, name))
-            except OSError:
-                pass
-        _fsync_dir(self.path)
-        with self._mu:
+            _fsync_dir(self.path)
             self._file = None
             self._saved_wm = None
 
-    def _write_file(self, fn: str, write) -> None:
-        tmp = os.path.join(self.path, fn + ".tmp")
-        with open(tmp, "wb") as f:
-            write(f)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, os.path.join(self.path, fn))
-        _fsync_dir(self.path)
-
-    def _write_state(self, fn: str, wm: int, ndim: int, count: int, scrub_seq: int) -> None:
-        st = {"version": STATE_VERSION, "uid": self.index.vec_uid, "wm": int(wm), "file": fn,
-              "size": os.path.getsize(os.path.join(self.path, fn)), "ndim": int(ndim),
-              "count": int(count), "dtype": self.dtype, "metric": METRIC,
-              "connectivity": CONNECTIVITY, "scrub_seq": int(scrub_seq)}
+    def _write_state(self, fn: str, meta: dict) -> None:
+        st = dict(meta, version=STATE_VERSION, file=fn,
+                  size=os.path.getsize(os.path.join(self.path, fn)))
         tmp = self._state_path() + ".tmp"
         with open(tmp, "w") as f:
             json.dump(st, f)
@@ -444,11 +556,34 @@ class UsearchSidecar:
         os.replace(tmp, self._state_path())
         _fsync_dir(self.path)
 
-    def _save_locked(self, wm: int | None = None) -> dict | None:
-        """(apply lock held) Save the live index at a COMMITTED counter value:
-        `wm` when the caller just committed and read it, else now. Returns
-        the state written, or None when nothing may be saved (not ready,
-        empty, or a purge whose rebuild has not finished - see D7)."""
+    def _meta(self, ix: Any, wm: int, scrub: int) -> dict:
+        return {"uid": self.index.vec_uid, "wm": int(wm), "ndim": int(ix.ndim), "count": len(ix),
+                "dtype": self.dtype, "metric": METRIC, "connectivity": CONNECTIVITY,
+                "scrub_seq": int(scrub)}
+
+    def _note_gil(self, op: str, t0: float) -> None:
+        """A usearch call that holds the GIL (every thread paused) ended."""
+        ms = round((time.monotonic() - t0) * 1000, 1)
+        self.last_gil_ms[op] = ms
+        METRICS.observe("memd_vector_index_gil_hold_ms", ms,
+                        help="usearch save/restore calls, which hold the GIL (ms)", ns=self.ns, op=op)
+
+    def _serialize(self, ix: Any) -> bytearray | None:
+        """ix.save() into memory when it fits BUFFER_MAX_BYTES, else None
+        (then it is saved to the file directly, disk I/O inside the GIL hold)."""
+        if int(ix.serialized_length) > BUFFER_MAX_BYTES:
+            return None
+        t0 = time.monotonic()
+        buf = ix.save()
+        self._note_gil("save", t0)
+        return buf
+
+    def _capture_locked(self, wm: int | None = None, *, serialize: bool = True) -> tuple | None:
+        """(apply lock held) What a save of the live index at a COMMITTED
+        vec_wm needs - `wm` when the caller just committed and read it, else
+        now: (bytes or None, index, meta). None when nothing may be saved (not
+        ready, or a purge whose rebuild has not finished - D7) or the file is
+        already current. An empty index: (None, None, meta) - its files go."""
         if wm is None:
             with self.index._lock:
                 if self.index._closed:
@@ -457,43 +592,67 @@ class UsearchSidecar:
                 wm = self.index._vec_wm
         self._drain_locked(upto=wm)
         with self._mu:
-            ix, ready = self._ix, self._ready
-            purged = self._scrub_built < self._scrub_known
-            scrub = self._scrub_built
-            if self._saved_wm == wm and self._file and not purged:
-                return self._read_state()
+            ix, ready, scrub = self._ix, self._ready, self._scrub_built
+            purged = scrub < self._scrub_known
         if not ready or purged:
             return None
+        with self._file_lock:
+            if self._file and self._saved_wm == wm:
+                return None
         if ix is None or len(ix) == 0:
-            self._discard_files()  # nothing to keep: an empty build is instant
-            return None
-        t0 = time.monotonic()
-        fn = f"{uuid.uuid4().hex}.usearch"
-        tmp = os.path.join(self.path, fn + ".tmp")
-        try:
-            ix.save(tmp)
-            with open(tmp, "rb+") as f:
-                os.fsync(f.fileno())
-            os.replace(tmp, os.path.join(self.path, fn))
-            _fsync_dir(self.path)
-            self._write_state(fn, wm, int(ix.ndim), len(ix), scrub)
-        except BaseException:
-            for p in (tmp, os.path.join(self.path, fn)):
+            return None, None, {"wm": int(wm), "scrub_seq": int(scrub), "empty": True}
+        return (self._serialize(ix) if serialize else None), ix, self._meta(ix, wm, scrub)
+
+    def _persist(self, cap: tuple, *, final: bool = False) -> bool:
+        """Write a capture: the bytes (no lock needed), else the index itself
+        (then nothing may mutate it: the apply lock, or a closed sidecar)."""
+        buf, ix, meta = cap
+        if meta.get("empty"):
+            self._discard_files(final)
+            return True
+        if buf is None and final:
+            buf = self._serialize(ix)
+        with self._file_lock:
+            if not self._may_touch_files(final):
+                return False
+            if int(meta["scrub_seq"]) < self._scrub_known:
+                return False  # a purge since: its vectors never reach a file (D7)
+            if self._file and self._saved_wm is not None and self._saved_wm >= int(meta["wm"]):
+                return True   # a newer save already landed
+            t0 = time.monotonic()
+            fn = f"{uuid.uuid4().hex}.usearch"
+            tmp = os.path.join(self.path, fn + ".tmp")
+            try:
+                if buf is not None:
+                    with open(tmp, "wb") as f:
+                        f.write(buf)
+                        f.flush()
+                        os.fsync(f.fileno())
+                else:
+                    t1 = time.monotonic()
+                    ix.save(tmp)
+                    self._note_gil("save", t1)
+                    with open(tmp, "rb+") as f:
+                        os.fsync(f.fileno())
+                os.replace(tmp, os.path.join(self.path, fn))
+                _fsync_dir(self.path)
+                self._write_state(fn, meta)
+            except BaseException:
+                for p in (tmp, os.path.join(self.path, fn)):
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+                raise
+            old, self._file, self._saved_wm = self._file, fn, int(meta["wm"])
+            if old and old != fn:
                 try:
-                    os.unlink(p)
+                    os.unlink(os.path.join(self.path, old))
                 except OSError:
                     pass
-            raise
-        with self._mu:
-            old, self._file, self._saved_wm = self._file, fn, wm
-        if old and old != fn:
-            try:
-                os.unlink(os.path.join(self.path, old))
-            except OSError:
-                pass
         METRICS.observe("memd_vector_index_save_ms", (time.monotonic() - t0) * 1000,
                         help="vector sidecar save (ms)", ns=self.ns)
-        return self._read_state()
+        return True
 
     # ------------------------------------------------------------ hooks
     # Called by NamespaceIndex while it holds its write lock, right after
@@ -670,10 +829,10 @@ class UsearchSidecar:
         self._discard_files()
         self.request_build("damaged")
 
-    # ------------------------------------------------------------ builds
+    # ------------------------------------------------------------ worker: open, builds
 
     def request_build(self, reason: str) -> int:
-        """Schedule a rebuild from SQLite on the sidecar's build thread.
+        """Schedule a rebuild from SQLite on the sidecar's worker thread.
         Returns a ticket for wait_built()."""
         with self._mu:
             if self._closed:
@@ -681,11 +840,15 @@ class UsearchSidecar:
             self._build_want += 1
             ticket = self._build_want
             self._build_reason = reason
-            if self._build_thread is None:
-                self._build_thread = threading.Thread(target=self._build_loop, daemon=True,
-                                                      name="memd-ann-build")
-                self._build_thread.start()
+            self._kick()
         return ticket
+
+    def _kick(self) -> None:
+        """(mu held) Start the worker thread unless it is running."""
+        if self._worker is None and not self._closed:
+            self._bg += 1
+            self._worker = threading.Thread(target=self._run, daemon=True, name="memd-ann")
+            self._worker.start()
 
     def wait_built(self, ticket: int, timeout_s: float | None = None) -> bool:
         deadline = None if timeout_s is None else time.monotonic() + max(0.0, timeout_s)
@@ -697,35 +860,61 @@ class UsearchSidecar:
                 self._done_cv.wait(timeout=left if left is not None else 1.0)
             return self._build_done >= ticket
 
-    def _build_loop(self) -> None:
-        while True:
+    def _run(self) -> None:
+        """The worker: the open job first, then builds (with backoff)."""
+        try:
+            while True:
+                with self._mu:
+                    job, self._open_job = self._open_job, None
+                    if self._closed or (job is None and self._build_done >= self._build_want):
+                        # the exit decision and _worker=None in one critical
+                        # section: a request made after it starts a new worker
+                        self._worker = None
+                        self._done_cv.notify_all()
+                        return
+                    target, reason = self._build_want, self._build_reason
+                    wait = self._retry_at - time.monotonic()
+                if job is not None:
+                    self._open_step(job)
+                    continue
+                if wait > 0 and self._stop.wait(timeout=wait):
+                    continue  # closing
+                try:
+                    self._build(reason)
+                    with self._mu:
+                        self._failures = 0
+                        self._build_done = max(self._build_done, target)
+                        self._done_cv.notify_all()
+                except _Aborted:
+                    continue
+                except Exception as e:  # noqa: BLE001 - the exact scan serves; retried with backoff
+                    if self._closed:
+                        continue  # (the index closed under it)
+                    with self._mu:
+                        self._failures += 1
+                        self._retry_at = time.monotonic() + min(
+                            BACKOFF_MAX_S, BACKOFF_BASE_S * 2 ** min(self._failures - 1, 16))
+                        self._journal = None
+                        self._building = False
+                    METRICS.inc("memd_vector_index_failures_total", ns=self.ns)
+                    _log.warning("memd: usearch sidecar build for %r failed (%s: %s); retrying",
+                                 self.ns, type(e).__name__, e)
+        finally:
             with self._mu:
-                if self._closed or self._build_done >= self._build_want:
-                    self._build_thread = None
-                    self._done_cv.notify_all()
-                    return
-                target, reason = self._build_want, self._build_reason
-                wait = self._retry_at - time.monotonic()
-            if wait > 0 and self._stop.wait(timeout=wait):
-                continue  # closing
-            try:
-                self._build(reason)
-                with self._mu:
-                    self._failures = 0
-                    self._build_done = max(self._build_done, target)
-                    self._done_cv.notify_all()
-            except _Aborted:
-                continue
-            except Exception as e:  # noqa: BLE001 - the exact scan serves; retried with backoff
-                with self._mu:
-                    self._failures += 1
-                    self._retry_at = time.monotonic() + min(
-                        BACKOFF_MAX_S, BACKOFF_BASE_S * 2 ** min(self._failures - 1, 16))
-                    self._journal = None
-                    self._building = False
-                METRICS.inc("memd_vector_index_failures_total", ns=self.ns)
-                _log.warning("memd: usearch sidecar build for %r failed (%s: %s); retrying",
-                             self.ns, type(e).__name__, e)
+                if self._worker is threading.current_thread():
+                    self._worker = None
+            self._bg_done()
+
+    def _bg_done(self) -> None:
+        """A background thread ended: a closed sidecar with none left needs
+        no settling any more."""
+        with self._mu:
+            self._bg -= 1
+            gone = self._closed and self._bg <= 0
+        if gone:
+            with _CLOSING_LOCK:
+                if _CLOSING.get(self._key) is self:
+                    del _CLOSING[self._key]
 
     def _check_open(self) -> None:
         if self._closed or self.index._closed:
@@ -766,48 +955,74 @@ class UsearchSidecar:
                             threads=self.build_threads)
                 if len(rows) < BUILD_CHUNK:
                     break
-            # catch up on what changed meanwhile without holding anything...
-            pos = 0
-            while True:
-                self._check_open()
-                with self._mu:
-                    batch = list(self._journal[pos:]) if self._journal is not None else []
-                if len(batch) <= JOURNAL_CATCHUP:
-                    break
-                new = self._apply_entries(batch, live=False, target=new)
-                pos += len(batch)
-            # ...then the rest, and the swap, with the appliers held off
-            with self._exclusive():
-                self._check_open()
-                self._drain_locked()
-                with self._mu:
-                    batch = list(self._journal[pos:]) if self._journal is not None else []
-                new = self._apply_entries(batch, live=False, target=new)
-                with self._rw.write():
-                    with self._mu:
-                        self._ix = new
-                        self._ready = True
-                        self._journal = None
-                        self._building = False
-                        self._scrub_built = scrub
+            if self._install(new, scrub=scrub, source="build"):
                 self.rebuilds += 1
                 self.last_build_ms = round((time.monotonic() - t0) * 1000, 1)
-                self.loaded_from = "build"
                 METRICS.inc("memd_vector_index_rebuilds_total", help="usearch sidecar rebuilds",
                             ns=self.ns, reason=reason)
                 METRICS.observe("memd_vector_index_build_ms", self.last_build_ms,
                                 help="usearch sidecar build from SQLite (ms)", ns=self.ns)
-                try:
-                    self._save_locked()
-                except Exception as e:  # noqa: BLE001 - it serves from RAM; the next open rebuilds
-                    _log.warning("memd: saving the usearch sidecar for %r failed (%s)", self.ns, e)
-                    self._discard_files()
         finally:
             with self._mu:
                 self._journal = None
                 self._building = False
+
+    def _install(self, new: Any, *, scrub: int, source: str,
+                 saved: tuple[str, int] | None = None) -> bool:
+        """(worker) Catch a loaded or built index up with the journal and
+        swap it in; a built or snapshot-installed one is then saved. False
+        when a purge happened meanwhile (its own rebuild follows)."""
+        # catch up on what changed meanwhile without holding anything...
+        pos = 0
+        while True:
+            self._check_open()
+            with self._mu:
+                batch = list(self._journal[pos:]) if self._journal is not None else []
+            if len(batch) <= JOURNAL_CATCHUP:
+                break
+            new = self._apply_entries(batch, live=False, target=new)
+            pos += len(batch)
+        # ...then the rest, and the swap, with the appliers held off
+        cap = None
+        with self._exclusive():
+            self._check_open()
+            if scrub < self._scrub_known:
+                return False
+            self._drain_locked()
+            with self._mu:
+                batch = list(self._journal[pos:]) if self._journal is not None else []
+            new = self._apply_entries(batch, live=False, target=new)
+            with self._rw.write():
+                with self._mu:
+                    self._ix = new
+                    self._ready = True
+                    self._journal = None
+                    self._scrub_built = scrub
+            if saved is not None:
+                with self._file_lock:
+                    self._file, self._saved_wm = saved
+            self.loaded_from = source
+            if source != "file":
+                try:
+                    cap = self._capture_locked()
+                    if cap is not None and cap[0] is None and cap[1] is not None:
+                        # too large to serialize in memory: saved from the
+                        # index itself while the appliers are still held off
+                        self._persist(cap)
+                        cap = None
+                except Exception as e:  # noqa: BLE001 - it serves from RAM; the next open rebuilds
+                    _log.warning("memd: saving the usearch sidecar for %r failed (%s)", self.ns, e)
+                    self._discard_files()
+                    cap = None
+        if cap is not None:
+            try:
+                self._persist(cap)
+            except Exception as e:  # noqa: BLE001
+                _log.warning("memd: saving the usearch sidecar for %r failed (%s)", self.ns, e)
+                self._discard_files()
         # the exact scan's float32 matrix is dead weight now
-        idx.invalidate_vec_cache()
+        self.index.invalidate_vec_cache()
+        return True
 
     def purged(self, scrub_seq: int) -> int:
         """A hard-delete purge ran (D7). `remove` only marked the purged
@@ -871,46 +1086,42 @@ class UsearchSidecar:
                     and len(self._ix) >= max(1, int(min_vectors))
                     and self._scrub_built >= self._scrub_known)
 
-    def image_at(self, wm: int) -> tuple[Any, dict] | None:
-        """(apply lock held via frozen()) The sidecar saved at exactly `wm`
-        - the counter of an index image taken under the same freeze - as
-        (open file, state), or None. The file handle stays readable after a
-        later save replaces the file."""
-        st = self._save_locked(wm)
-        if not st or int(st.get("wm", -1)) != int(wm):
-            return None
-        return open(os.path.join(self.path, st["file"]), "rb"), st
+    def image_at(self, wm: int) -> tuple[bytearray, dict] | None:
+        """(apply lock held via frozen()) The sidecar serialized at exactly
+        `wm` - the counter of an index image taken under the same freeze - as
+        (bytes, meta), or None. Nothing is written locally."""
+        self._drain_locked(upto=wm)
+        with self._mu:
+            ix, ready, scrub = self._ix, self._ready, self._scrub_built
+            if not ready or scrub < self._scrub_known or ix is None or len(ix) == 0:
+                return None
+        t0 = time.monotonic()
+        buf = ix.save()
+        self._note_gil("save", t0)
+        return buf, dict(self._meta(ix, wm, scrub), size=len(buf))
 
     @staticmethod
-    def snapshot_payload(f, st: dict) -> bytearray:
-        """The published object: magic, header length, header, usearch file."""
+    def snapshot_payload(buf: bytearray, st: dict) -> bytearray:
+        """The published object: magic, header length, header, usearch image
+        (the header is put in front of `buf` in place)."""
         head = json.dumps({k: st[k] for k in ("uid", "wm", "ndim", "count", "dtype", "metric",
                                               "connectivity", "scrub_seq", "size")}).encode()
-        pre = SNAPSHOT_MAGIC + len(head).to_bytes(4, "big") + head
-        buf = bytearray(len(pre) + int(st["size"]))
-        buf[:len(pre)] = pre
-        view = memoryview(buf)[len(pre):]
-        got = 0
-        while got < len(view):
-            n = f.readinto(view[got:])
-            if not n:
-                raise ValueError("vector sidecar file shrank while being published")
-            got += n
+        buf[0:0] = SNAPSHOT_MAGIC + len(head).to_bytes(4, "big") + head
         return buf
 
     # ------------------------------------------------------------ lifecycle
 
     def drain(self, timeout_s: float = 60.0) -> bool:
-        """Apply what is queued and wait for a build in flight; True when
-        the sidecar is (still) serving and caught up."""
+        """Apply what is queued and wait for a load or build in flight; True
+        when the sidecar is (still) serving and caught up."""
         deadline = time.monotonic() + max(0.0, timeout_s)
         while True:
             with self._apply_lock:  # an applier in flight finishes first
                 pass
             self.apply_pending()
             with self._mu:
-                ticket = self._build_want
-                busy = self._build_done < ticket and not self._closed
+                busy = not self._closed and (self._open_job is not None or self._loading
+                                             or self._build_done < self._build_want)
                 waiting = bool(self._queue)
             if not busy and not waiting:
                 return self.ready() or not self.active()
@@ -918,7 +1129,8 @@ class UsearchSidecar:
             if left <= 0:
                 return False
             if busy:
-                self.wait_built(ticket, left)
+                with self._done_cv:
+                    self._done_cv.wait(timeout=min(left, 0.5))
 
     def stats(self) -> dict:
         with self._mu:
@@ -928,27 +1140,60 @@ class UsearchSidecar:
                     "size": len(ix) if ix is not None else 0,
                     "rebuilds": self.rebuilds, "last_build_ms": self.last_build_ms,
                     "fallback_exact_total": self.fallback_exact, "searches": self.searches,
-                    "building": self._building, "dtype": self.dtype,
+                    "building": self._building, "loading": self._loading, "dtype": self.dtype,
                     "min_vectors": self.min_vectors, "loaded_from": self.loaded_from,
-                    "pending": len(self._queue), "failures": self._failures}
+                    "pending": len(self._queue), "failures": self._failures,
+                    "last_gil_hold_ms": dict(self.last_gil_ms)}
 
     def close(self) -> None:
-        """Stop a build in flight and save the index if it moved on."""
+        """Stop the worker (a build in flight aborts at its next step) and
+        hand the final save - if the index moved on since its file - to a
+        background thread: closing never waits on usearch I/O. settle() (a
+        reopen, a destroy, engine close) waits for it."""
         with self._mu:
             if self._closed:
                 return
             self._closed = True
-            th = self._build_thread
             self._done_cv.notify_all()
         self._stop.set()
-        if th is not None:
-            th.join(timeout=120)
+        with _CLOSING_LOCK:
+            _CLOSING[self._key] = self
         try:
-            with self._apply_lock:
-                self._save_locked()
-        except Exception as e:  # noqa: BLE001 - a missing file is rebuilt at open
+            self._close()
+        finally:
+            self._close_done.set()
+
+    def _close(self) -> None:
+        cap = None
+        try:
+            with self._apply_lock:  # an applier or swap in flight finishes first
+                cap = self._capture_locked(serialize=False)
+        except Exception as e:  # noqa: BLE001 - a missing or stale file is rebuilt at open
             _log.warning("memd: saving the usearch sidecar for %r failed (%s); it is rebuilt "
                          "at the next open", self.ns, e)
-            self._discard_files()
         with self._rw.write():
-            self._ix = None
+            self._ix = None  # (the saver holds its own reference)
+        with self._mu:
+            if cap is not None:
+                self._bg += 1
+                self._saver = threading.Thread(target=self._final_save, args=(cap,), daemon=True,
+                                               name="memd-ann-save")
+            idle = self._bg <= 0
+        if idle:
+            with _CLOSING_LOCK:
+                if _CLOSING.get(self._key) is self:
+                    del _CLOSING[self._key]
+        if self._saver is not None:
+            # last: usearch holds the GIL while it serializes, so the caller's
+            # own remaining work would otherwise wait for it too
+            self._saver.start()
+
+    def _final_save(self, cap: tuple) -> None:
+        try:
+            self._persist(cap, final=True)
+        except Exception as e:  # noqa: BLE001 - a missing or stale file is rebuilt at open
+            _log.warning("memd: saving the usearch sidecar for %r failed (%s); it is rebuilt "
+                         "at the next open", self.ns, e)
+            self._discard_files(final=True)
+        finally:
+            self._bg_done()

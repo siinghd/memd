@@ -147,7 +147,7 @@ def test_expansion_search_floor_is_applied_to_built_and_loaded_indexes(tmp_path)
     e = _engine(root, expansion_search=300)
     try:
         ann = e.namespace("n").index.ann
-        assert ann.loaded_from == "file" and ann._ix.expansion_search == 300
+        assert ann.drain(60) and ann.loaded_from == "file" and ann._ix.expansion_search == 300
     finally:
         e.close()
     with pytest.raises(ValueError):
@@ -369,7 +369,7 @@ def test_clean_reopen_loads_the_file(tmp_path):
     e = _engine(root)
     try:
         ann = e.namespace("n").index.ann
-        assert ann.ready() and ann.rebuilds == 0 and ann.loaded_from == "file"
+        assert ann.drain(60) and ann.ready() and ann.rebuilds == 0 and ann.loaded_from == "file"
         assert _ids(e.namespace("n").index.search_vector(q, IndexFilter(), limit=10)) == want
     finally:
         e.close()
@@ -429,7 +429,7 @@ cfg = {{"mode": "usearch", "min_vectors": 0, "overfetch": 4, "exact_max": 0, "dt
 e = StorageEngine(root, vector_index=cfg)
 ns = e.namespace("n")
 ann = ns.index.ann
-assert ann.loaded_from == "file", ann.loaded_from
+assert ann.drain(60) and ann.loaded_from == "file", ann.loaded_from
 if more:
     rng = np.random.default_rng(1)
     recs = [MemoryRecord.create(namespace="n", kind="raw_event", content=f"late {{i}}",
@@ -439,15 +439,14 @@ if more:
 else:
     ann._saved_wm = None  # the rebuild below must write a new file
 if point == "save":
-    real = usearch.index.Index.save
-    def save(self, path_or_buffer=None, progress=None):
-        data = bytes(real(self))
-        with open(path_or_buffer, "wb") as f:
-            f.write(data[:len(data) // 2])
-            f.flush()
-            os.fsync(f.fileno())
-        os._exit(9)  # killed mid-write of the new file
-    usearch.index.Index.save = save
+    real_fsync = os.fsync
+    def fsync(fd):
+        if os.readlink(f"/proc/self/fd/{{fd}}").endswith(".usearch.tmp"):
+            os.ftruncate(fd, os.fstat(fd).st_size // 2)
+            real_fsync(fd)
+            os._exit(9)  # killed mid-write of the new file
+        return real_fsync(fd)
+    os.fsync = fsync
 else:
     def write_state(self, *a, **k):
         os._exit(9)  # killed after the new file was renamed in, before the state names it
@@ -475,9 +474,10 @@ def test_killed_mid_rebuild_serves_the_old_file_or_rebuilds(tmp_path, point, mor
     try:
         ns = e.namespace("n")
         ann = ns.index.ann
+        assert ann.drain(120)
         if more:
-            assert ann.loaded_from != "file", "behind: rebuilt"
-            assert ann.drain(120) and ann.rebuilds == 1 and ann.size() == 1540
+            assert ann.loaded_from == "build", "behind: rebuilt"
+            assert ann.rebuilds == 1 and ann.size() == 1540
         else:
             assert ann.loaded_from == "file" and ann.rebuilds == 0, "the old file, complete"
             assert _state(root) == old
@@ -561,12 +561,14 @@ def test_threshold_switches_flat_and_usearch(tmp_path):
         m.close()
     m = Memory(str(root), encrypt=False, config=cfg)
     try:
+        m.flush()  # (the sidecar loads in the background)
         st = m.stats()["vector_index"]
         assert st["kind"] == "usearch" and st["loaded_from"] == "file" and st["rebuilds"] == 0
     finally:
         m.close()
     m = Memory(str(root), encrypt=False, config=dict(cfg, ann_min_vectors=1000))
     try:
+        m.flush()
         assert m.stats()["vector_index"]["kind"] == "flat"
         assert os.listdir(_sidecar_dir(root)) == [], "below the threshold the file is not kept"
         assert m.search("harbor ferry", user_id="u").items
@@ -657,6 +659,7 @@ def test_a_hard_delete_purge_leaves_no_vector_bytes_in_the_sidecar(tmp_path):
     m.close()                       # a clean close saves the sidecar file
     m = Memory(root, encrypt=False, config=cfg)
     try:
+        m.flush()
         assert m.stats()["vector_index"]["loaded_from"] == "file"
         needle = bytes(m.ns.index._con.execute("SELECT vec FROM vectors WHERE id=?", (victim,)).fetchone()[0])
         # positive control: the victim's f16 vector is in the sidecar file
@@ -704,6 +707,7 @@ def test_snapshot_is_published_and_installed_on_a_cold_node(tmp_path, monkeypatc
     try:
         ns = e.namespace("n")
         ann = ns.index.ann
+        assert ann.drain(60)
         assert ann.loaded_from == "snapshot" and ann.rebuilds == 0 and ann.ready()
         assert _counter("memd_vector_index_snapshots_loaded_total") == loaded + 1
         assert _ids(ns.index.search_vector(q, IndexFilter(), limit=10)) == want
@@ -741,8 +745,8 @@ def test_a_snapshot_that_does_not_match_is_not_installed(tmp_path, monkeypatch, 
     e = StorageEngine(str(root), cache_dir=str(cache), vector_index=_vcfg())
     try:
         ann = e.namespace("n").index.ann
-        assert ann.loaded_from != "snapshot"
-        assert ann.drain(120) and ann.rebuilds == 1 and ann.size() == 1500
+        assert ann.drain(120) and ann.loaded_from == "build"
+        assert ann.rebuilds == 1 and ann.size() == 1500
     finally:
         e.close()
 
@@ -798,5 +802,192 @@ def test_an_orphaned_vector_snapshot_is_collected(tmp_path, monkeypatch):
     try:
         e.namespace("n")
         assert _snapshot_names(root, "vector-") == [second]
+    finally:
+        e.close()
+
+
+# ------------------------------------------------------------ memory safety: the flat cap
+
+def _block_builds(monkeypatch) -> threading.Event:
+    """Hold every sidecar build until the returned event is set."""
+    go = threading.Event()
+    real = UsearchSidecar._build
+
+    def build(self, reason):
+        go.wait(60)
+        return real(self, reason)
+
+    monkeypatch.setattr(UsearchSidecar, "_build", build)
+    return go
+
+
+def _wait_loaded(ann, timeout=30.0) -> None:
+    """Until the open step (the load attempt) is over."""
+    deadline = time.monotonic() + timeout
+    while (ann._loading or ann._open_job is not None) and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+
+def test_a_big_namespace_never_loads_the_flat_matrix_while_the_sidecar_rebuilds(tmp_path, monkeypatch):
+    root = tmp_path / "s"
+    e = _engine(root, flat_max=500, exact_max=100)
+    recs, x = _fill(e.namespace("n"), 1500, seed=17)
+    facts = [MemoryRecord.create(namespace="n", kind="fact", content=f"fact {i}", scope=Scope(user="alice"))
+             for i in range(40)]
+    e.namespace("n").append(facts)
+    e.namespace("n").index.set_vectors([r.id for r in facts], x[:40], "test-model")
+    e.close()
+    os.unlink(os.path.join(_sidecar_dir(root), au.STATE_FILE))  # missing: rebuilt at open
+    go = _block_builds(monkeypatch)
+    e = _engine(root, flat_max=500, exact_max=100)
+    try:
+        ns = e.namespace("n")
+        idx, ann = ns.index, ns.index.ann
+        _wait_loaded(ann)
+        assert not ann.ready() and idx.vector_lane_degraded()
+        skipped = _counter("memd_vector_lane_skipped_total", reason="ann_rebuilding")
+        # an unselective query skips the lane (bm25 and the rest serve it)...
+        assert idx.search_vector(x[3], IndexFilter(scope=Scope(user="alice")), limit=40) == []
+        assert _counter("memd_vector_lane_skipped_total", reason="ann_rebuilding") == skipped + 1
+        assert idx.vector_lane_skipped == 1
+        # ...a selective one is answered exactly, from just its rows...
+        q = x[5]
+        f = IndexFilter(kinds=("fact",))
+        got = idx.search_vector(q, f, limit=10)
+        assert got and _ids(got) == _ids(idx._exact_vector(q / np.linalg.norm(q), f, 10))
+        assert all(h.record.kind == "fact" for h in got)
+        # ...and so is a sweep (a destructive one must see every match)
+        sweep = idx.search_vector(q, IndexFilter(), limit=5000)
+        live = idx._con.execute("SELECT COUNT(*) FROM vectors").fetchone()[0]
+        assert sweep and len(sweep) <= live
+        assert {h.record.id for h in sweep} == {h.record.id for h in idx._exact_vector(
+            q / np.linalg.norm(q), IndexFilter(), 5000)}
+        assert not idx._vec_loaded and idx._main_mat.size == 0, "the flat matrix was loaded"
+        go.set()
+        assert ann.drain(60) and ann.ready()
+        assert not idx.vector_lane_degraded()
+        assert len(idx.search_vector(x[3], IndexFilter(scope=Scope(user="alice")), limit=40)) == 40
+        assert not idx._vec_loaded
+    finally:
+        go.set()
+        e.close()
+
+
+def test_below_the_cap_the_exact_scan_still_serves_while_the_sidecar_rebuilds(tmp_path, monkeypatch):
+    root = tmp_path / "s"
+    e = _engine(root, flat_max=100_000)
+    _, x = _fill(e.namespace("n"), 800, seed=18)
+    e.close()
+    os.unlink(os.path.join(_sidecar_dir(root), au.STATE_FILE))
+    go = _block_builds(monkeypatch)
+    e = _engine(root, flat_max=100_000)
+    try:
+        idx = e.namespace("n").index
+        _wait_loaded(idx.ann)
+        assert not idx.ann.ready() and not idx.vector_lane_degraded()
+        assert len(idx.search_vector(x[1], IndexFilter(), limit=20)) == 20
+        assert idx._vec_loaded and idx._main_mat.size, "below the cap the matrix is the fallback"
+    finally:
+        go.set()
+        e.close()
+
+
+def test_memory_search_serves_other_lanes_and_is_not_cached_while_the_lane_is_skipped(tmp_path, monkeypatch):
+    root = str(tmp_path / "d")
+    cfg = {"embedder": "hash", "reranker": "none", "vector_index": "usearch", "fuse_vector": True,
+           "flat_max_vectors": 50, "ann_exact_max": 10, "lexical_backend": "fts5",
+           "rate_max_writes": 10 ** 9, "dup_max_repeats": 10 ** 9, "vector_selfheal": False}
+    m = Memory(root, encrypt=False, config=cfg)
+    m.add_events([{"content": f"harbor ferry timetable note {i}", "user_id": "u"} for i in range(120)])
+    m.flush()
+    m.close()
+    os.unlink(os.path.join(_sidecar_dir(root), au.STATE_FILE))
+    go = _block_builds(monkeypatch)
+    m = Memory(root, encrypt=False, config=cfg)
+    try:
+        _wait_loaded(m.ns.index.ann)
+        res = m.search("harbor ferry timetable", user_id="u")
+        assert res.items and not any("vector" in i.lanes for i in res.items)
+        st = m.stats()["vector_index"]
+        assert st["skipped_total"] >= 1 and st["flat_max_vectors"] == 50 and not st["ready"]
+        assert not m.ns.index._vec_loaded
+        go.set()
+        m.flush()
+        res = m.search("harbor ferry timetable", user_id="u")  # not the cached degraded result
+        assert any("vector" in i.lanes for i in res.items)
+    finally:
+        go.set()
+        m.close()
+
+
+# ------------------------------------------------------------ save / load off the request path
+
+def test_open_and_close_do_not_wait_for_the_sidecar_files(tmp_path, monkeypatch):
+    root = tmp_path / "s"
+    e = StorageEngine(str(root), vector_index=_vcfg(), max_open_namespaces=1)
+    _, x = _fill(e.namespace("n"), 1200, seed=19)
+    e.close()
+    real_restore, real_persist = UsearchSidecar._restore, UsearchSidecar._persist
+
+    def slow_restore(self, src, size):
+        time.sleep(1.5)
+        return real_restore(self, src, size)
+
+    def slow_persist(self, cap, *, final=False):
+        if final:
+            time.sleep(1.5)
+        return real_persist(self, cap, final=final)
+
+    monkeypatch.setattr(UsearchSidecar, "_restore", slow_restore)
+    monkeypatch.setattr(UsearchSidecar, "_persist", slow_persist)
+    e = StorageEngine(str(root), vector_index=_vcfg(), max_open_namespaces=1)
+    try:
+        t0 = time.monotonic()
+        ns = e.namespace("n")
+        assert time.monotonic() - t0 < 1.0, "the open waited for the sidecar load"
+        ann = ns.index.ann
+        assert not ann.ready()
+        # a write while it loads is journaled and reaches the loaded index
+        late = MemoryRecord.create(namespace="n", kind="raw_event", content="late", scope=Scope(user="bob"))
+        ns.append([late])
+        ns.index.set_vectors([late.id], [x[0]], "test-model")
+        assert ann.drain(30) and ann.loaded_from == "file" and ann.rebuilds == 0 and ann.size() == 1201
+        wm = ns.index._vec_wm
+        state = os.path.join(ann.path, au.STATE_FILE)
+        t0 = time.monotonic()
+        e.namespace("other")  # max_open_namespaces=1: "n" is evicted (closed) on this call
+        assert time.monotonic() - t0 < 1.0, "the eviction waited for the final save"
+        assert json.load(open(state)).get("wm") != wm, "precondition: the final save is in flight"
+        ns = e.namespace("n")  # the reopen's load waits for it (settle), then loads it
+        ann = ns.index.ann
+        assert ann.drain(30) and ann.loaded_from == "file" and ann.rebuilds == 0
+        assert json.load(open(state))["wm"] == wm and ann.size() == 1201
+    finally:
+        e.close()
+
+
+def test_a_destroy_cancels_a_pending_final_save(tmp_path, monkeypatch):
+    root = tmp_path / "s"
+    e = _engine(root)
+    try:
+        ns = e.namespace("n")
+        _, x = _fill(ns, 600, seed=20)
+        sdir = _sidecar_dir(root)
+        real_persist = UsearchSidecar._persist
+
+        def slow_persist(self, cap, *, final=False):
+            if final:
+                time.sleep(1.0)
+            return real_persist(self, cap, final=final)
+
+        monkeypatch.setattr(UsearchSidecar, "_persist", slow_persist)
+        more = [MemoryRecord.create(namespace="n", kind="raw_event", content="more", scope=Scope(user="a"))]
+        ns.append(more)
+        ns.index.set_vectors([more[0].id], [x[0]], "test-model")
+        assert e.destroy_namespace("n")
+        assert not os.path.exists(sdir)
+        au.settle_all()
+        time.sleep(1.5)
+        assert not os.path.exists(sdir), "a cancelled final save recreated the destroyed sidecar"
     finally:
         e.close()

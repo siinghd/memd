@@ -142,6 +142,12 @@ class NamespaceIndex:
         # change the (rowid -> vector) set it mirrors bumps vec_wm in its
         # own transaction and queues the rows' new state (see _ann_note_locked)
         self.ann = None
+        # set when a sidecar is configured (set_vector_limits): above
+        # flat_max_vectors the exact scan's float32 matrix is never loaded
+        self.flat_max_vectors: int | None = None
+        self.exact_max_vectors = 2000
+        self.vector_lane_skipped = 0
+        self._vcount = (0, -1e18)  # (vectors, monotonic time counted)
         # Hard-deleted text must not survive in this file (D7): zero every
         # freed cell and page, and keep the freelist vacuumable (auto_vacuum
         # only takes effect before the first table exists - see scrub()).
@@ -297,6 +303,13 @@ class NamespaceIndex:
 
     def attach_ann(self, ann) -> None:
         self.ann = ann
+
+    def set_vector_limits(self, flat_max: int, exact_max: int) -> None:
+        """A sidecar is configured: while it is not serving, a namespace over
+        `flat_max` vectors answers only what it can exactly without the
+        float32 matrix (filters admitting <= `exact_max` rows, sweeps)."""
+        self.flat_max_vectors = int(flat_max)
+        self.exact_max_vectors = int(exact_max)
 
     def close(self) -> None:
         lex, self.lexical = self.lexical, None
@@ -1195,7 +1208,80 @@ class NamespaceIndex:
             hits = self._search_vector_ann(ann, q, f, limit)
             if hits is not None:
                 return hits
+        if self._flat_capped(ann):
+            return self._search_vector_capped(ann, q, f, limit)
+        if ann is not None and ann.active():
+            ann.note_fallback("sweep" if limit >= _SWEEP_LIMIT
+                              else "not_ready" if not ann.ready() else "error")
         return self._search_vector_flat(q, f, limit)
+
+    _VCOUNT_TTL_S = 5.0
+
+    def _vector_count(self) -> int:
+        """Vectors stored (a covering-index COUNT, ~4 ms at 200K), cached a
+        few seconds: it only decides whether the flat matrix may be loaded."""
+        n, at = self._vcount
+        now = time.monotonic()
+        if now - at > self._VCOUNT_TTL_S:
+            with self._read() as _c:
+                n = int(_c.execute("SELECT COUNT(*) FROM vectors").fetchone()[0])
+            self._vcount = (n, now)
+        return n
+
+    def _flat_capped(self, ann) -> bool:
+        """Whether the exact scan's matrix is off limits: a sidecar is
+        configured and should be serving (not auto mode below its threshold)
+        but is not, and the namespace holds more than flat_max_vectors."""
+        if self.flat_max_vectors is None or self._closed:
+            return False
+        if ann is not None and not ann.active():
+            return False  # auto, below ann_min_vectors: the exact scan is the lane
+        if self._vector_count() <= self.flat_max_vectors:
+            return False
+        if self._vec_loaded and (self._main_ids or self._ovf_ids):
+            self.invalidate_vec_cache()  # loaded before the namespace grew past the cap
+        return True
+
+    def vector_lane_degraded(self) -> bool:
+        """True while unselective vector-lane queries are skipped (see
+        _search_vector_capped): results served meanwhile must not be cached."""
+        ann = self.ann
+        if ann is not None and ann.ready():
+            return False
+        return self._flat_capped(ann)
+
+    def _eligible_count(self, f: IndexFilter, cap: int) -> int:
+        """How many rows pass the SQL filter, counted up to cap + 1."""
+        args: list = []
+        where = self._ann_where(f, args)
+        with self._read() as _c:
+            return int(_c.execute(
+                f"SELECT COUNT(*) FROM (SELECT 1 FROM records WHERE {where} LIMIT ?)",  # nosec B608
+                args + [cap + 1]).fetchone()[0])
+
+    def _search_vector_capped(self, ann, q: np.ndarray, f: IndexFilter, limit: int) -> list[Hit]:
+        """The lane without the sidecar or the flat matrix (a big namespace
+        whose sidecar is loading, rebuilding or failed to attach): sweeps and
+        filters admitting <= exact_max rows are answered exactly, streamed
+        from SQLite in bounded memory; any other query skips the lane
+        (bm25 and the other lanes serve it) and is counted."""
+        exact_max = ann.exact_max if ann is not None else self.exact_max_vectors
+        if limit >= _SWEEP_LIMIT:
+            # a destructive sweep must see every match: exact, never skipped
+            if ann is not None:
+                ann.note_fallback("sweep_streamed")
+            return self._exact_vector(q, f, limit)
+        if self._restrictive(f) and self._eligible_count(f, exact_max) <= exact_max:
+            if ann is not None:
+                ann.note_fallback("selective")
+            return self._exact_vector(q, f, limit)
+        reason = "ann_rebuilding" if ann is not None else "ann_unavailable"
+        self.vector_lane_skipped += 1
+        METRICS.inc("memd_vector_lane_skipped_total",
+                    help="vector-lane queries skipped: the sidecar is not serving and the namespace "
+                         "is over flat_max_vectors (other lanes serve)",
+                    ns=self._ns_hint, reason=reason)
+        return []
 
     @staticmethod
     def _restrictive(f: IndexFilter) -> bool:
@@ -1221,12 +1307,9 @@ class NamespaceIndex:
         first window is so short that widening by `overfetch` is not expected
         to fill the page either, so the common case pays no COUNT), a sidecar
         no larger than that, and a window still short after widening."""
-        if limit >= _SWEEP_LIMIT:
-            # a destructive sweep must see every match: the flat scan's job
-            ann.note_fallback("sweep")
-            return None
-        if not ann.ready():
-            ann.note_fallback("not_ready")
+        if limit >= _SWEEP_LIMIT or not ann.ready():
+            # a destructive sweep must see every match: exact (search_vector
+            # counts which path answers it, and a sidecar not ready yet)
             return None
         size = ann.size()
         if size <= ann.exact_max:
@@ -1240,8 +1323,7 @@ class NamespaceIndex:
         for attempt in range(2):
             got = ann.knn(q, k)
             if got is None:
-                ann.note_fallback("error")
-                return None
+                return None  # (counted as "error" by search_vector)
             keys, dists = got
             fresh = [int(x) for x in keys if int(x) not in seen]
             seen.update(fresh)
@@ -1256,13 +1338,7 @@ class NamespaceIndex:
                 # short, and the window's eligible share says widening will
                 # not do either: few rows may pass the filter at all - then
                 # the exact answer over them is cheaper than widening, and exact
-                args: list = []
-                where = self._ann_where(f, args)
-                with self._read() as _c:
-                    n = int(_c.execute(
-                        f"SELECT COUNT(*) FROM (SELECT 1 FROM records WHERE {where} LIMIT ?)",  # nosec B608
-                        args + [ann.exact_max + 1]).fetchone()[0])
-                if n <= ann.exact_max:
+                if self._eligible_count(f, ann.exact_max) <= ann.exact_max:
                     ann.note_fallback("selective")
                     return self._exact_vector(q, f, limit)
             k = min(k * ann.overfetch, size)
@@ -1290,10 +1366,7 @@ class NamespaceIndex:
                 keep = [r for r in rows if int(r[2]) == q.shape[0]]
                 if not keep:
                     continue
-                mat = np.stack([_vec_from_blob(r[1], int(r[2])) for r in keep])
-                norms = np.linalg.norm(mat, axis=1)
-                norms[norms == 0] = 1.0
-                sc = (mat @ q) / norms
+                sc = _cosines(keep, q)
                 out += [(float(s), int(r[0])) for s, r in zip(sc, keep) if s >= MIN_COSINE]
         return out
 
@@ -1329,8 +1402,9 @@ class NamespaceIndex:
 
     def _exact_vector(self, q: np.ndarray, f: IndexFilter, limit: int) -> list[Hit]:
         """Exact cosine top-`limit` over the rows the SQL filter admits,
-        streamed from SQLite (no resident matrix): the ANN path's exact
-        answer for selective filters and short windows."""
+        streamed from SQLite (no resident matrix; memory O(limit), not O(rows)):
+        the answer for selective filters, short windows and - over
+        flat_max_vectors - sweeps."""
         if self._closed:
             return []
         args: list = []
@@ -1349,10 +1423,7 @@ class NamespaceIndex:
                 keep = [r for r in rows if int(r[2]) == q.shape[0]]
                 if not keep:
                     continue
-                mat = np.stack([_vec_from_blob(r[1], int(r[2])) for r in keep])
-                norms = np.linalg.norm(mat, axis=1)
-                norms[norms == 0] = 1.0
-                sc = (mat @ q) / norms
+                sc = _cosines(keep, q)
                 best_s = np.concatenate([best_s, sc.astype(np.float32)])
                 best_r = np.concatenate([best_r, np.asarray([r[0] for r in keep], dtype=np.int64)])
                 if best_s.shape[0] > m:
@@ -1806,6 +1877,7 @@ class NamespaceIndex:
             self._ovf_ids = []
             self._ovf_vecs = []
             self._vec_loaded = True
+            self._vcount = (0, -1e18)
         self._ann_apply()
 
     def invalidate_vec_cache(self) -> None:
@@ -1876,6 +1948,20 @@ _VEC_JOIN = ("JOIN (SELECT id AS _vid, vec AS _vec, dim AS _dim FROM vectors) AS
 # scores closer than this are ties: the same stored vector scored by two
 # code paths (a BLAS scan, a per-row dot) can differ in the last bits
 _VEC_QUANTUM = 1e-6
+
+
+def _cosines(rows: list, q: np.ndarray) -> np.ndarray:
+    """Cosine of each (rowid, vec blob, dim) row to unit `q`. float16 blobs
+    of one dimension - every row since schema v2 - decode in one call."""
+    dim = int(q.shape[0])
+    blobs = [r[1] for r in rows]
+    if all(len(b) == dim * 2 for b in blobs):
+        mat = np.frombuffer(b"".join(blobs), dtype=VEC_DTYPE).reshape(-1, dim).astype(np.float32)
+    else:
+        mat = np.stack([_vec_from_blob(b, int(r[2])) for b, r in zip(blobs, rows)])
+    norms = np.linalg.norm(mat, axis=1)
+    norms[norms == 0] = 1.0
+    return (mat @ q) / norms
 
 
 def _vector_order(hits: list[Hit]) -> list[Hit]:
