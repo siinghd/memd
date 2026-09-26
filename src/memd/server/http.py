@@ -102,25 +102,48 @@ class FindIn(BaseModel):
 
 # Error bodies: {"detail": <human text, unchanged>, "code": <machine-readable>}.
 _ERROR_CODES = {
-    400: "validation_error", 401: "unauthorized", 403: "forbidden", 404: "not_found",
+    400: "validation_error", 401: "unauthorized", 402: "payment_required", 403: "forbidden", 404: "not_found",
     405: "method_not_allowed", 409: "conflict", 410: "gone", 413: "payload_too_large",
     422: "validation_error", 429: "rate_limited", 500: "internal_error", 503: "unavailable",
 }
 
 
 class ApiError(HTTPException):
-    """An HTTPException with a specific `code` for the error body."""
+    """An HTTPException with a specific `code` (and optional extra fields,
+    e.g. a 402's meter/limit) for the error body."""
 
     def __init__(self, status_code: int, detail: str, code: str | None = None,
-                 headers: dict | None = None):
+                 headers: dict | None = None, extra: dict | None = None):
         super().__init__(status_code, detail, headers)
         self.code = code
+        self.extra = extra
 
 
 def _error(status: int, detail: Any, code: str | None = None,
-           headers: dict | None = None) -> JSONResponse:
-    return JSONResponse(status_code=status, headers=headers,
-                        content={"detail": detail, "code": code or _ERROR_CODES.get(status, "error")})
+           headers: dict | None = None, extra: dict | None = None) -> JSONResponse:
+    content = {"detail": detail, "code": code or _ERROR_CODES.get(status, "error")}
+    if extra:
+        content.update({k: v for k, v in extra.items() if k not in content})
+    return JSONResponse(status_code=status, headers=headers, content=content)
+
+
+class _Unmetered:
+    """Hosted mode off (the default): no org checks, no quotas, no ledger."""
+
+    def authorize(self, p, ns) -> None:
+        pass
+
+    def admit(self, p, ns, **kw) -> None:
+        pass
+
+    def record(self, p, ns, **kw) -> None:
+        pass
+
+    def stored_delta(self, ns, delta) -> None:
+        pass
+
+    def stored_reset(self, ns) -> None:
+        pass
 
 
 def _rate_limited(detail: str, retry_s: float) -> ApiError:
@@ -149,10 +172,29 @@ def create_app(
     data_dir: str = "./memd-data",
     keys_path: str | None = None,
     admin_key: str | None = None,
+    *,
+    hosted: bool | None = None,
+    plans: Any = None,
+    billing_config: Any = None,
+    stripe_client: Any = None,
 ) -> FastAPI:
+    """`hosted` (default: MEMD_HOSTED) turns on tenancy, metering and
+    billing (memd.hosted); off, nothing of it is imported - stripe least of
+    all - and the server behaves exactly as before."""
     os.makedirs(data_dir, exist_ok=True)
-    keys_path = keys_path or os.path.join(data_dir, "keys.toml.json")
-    keystore = KeyStore(keys_path, admin_key=admin_key)
+    from memd.hosted import hosted_enabled
+
+    hosted_ctx = None
+    is_hosted = hosted_enabled(hosted)
+    if is_hosted:
+        from memd.hosted.billing import BillingConfig
+
+        # the sk_live_ guard runs before anything is opened
+        billing_config = billing_config or BillingConfig.from_env()
+        keystore = None
+    else:
+        keys_path = keys_path or os.path.join(data_dir, "keys.toml.json")
+        keystore = KeyStore(keys_path, admin_key=admin_key)
     limiter = RateLimiter()
     failures = FailureLimiter()
     # tenancy-level ceiling: per-KEY budgets alone let a tenant multiply its
@@ -163,12 +205,24 @@ def create_app(
     # O(namespace) operations and must not be spam-able by a normal key
     heavy_limiter = RateLimiter(max_buckets=1000)
     engine = Memory(data_dir)
+    bill: Any = _Unmetered()
+    if is_hosted:
+        from memd.hosted.app import Hosted
+
+        hosted_ctx = Hosted(data_dir, engine, admin_key=admin_key, plans=plans,
+                            billing_config=billing_config, stripe_client=stripe_client)
+        keystore = hosted_ctx.keystore
+        bill = hosted_ctx.metering
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        if hosted_ctx is not None:
+            hosted_ctx.jobs.start()
         try:
             yield
         finally:
+            if hosted_ctx is not None:
+                hosted_ctx.close()
             engine.close()
 
     # Interactive docs and the OpenAPI schema were served unauthenticated,
@@ -182,6 +236,7 @@ def create_app(
                   openapi_url="/openapi.json" if _docs else None)
     app.state.engine = engine
     app.state.keystore = keystore
+    app.state.hosted = hosted_ctx
 
     from memd.metrics import METRICS
 
@@ -236,7 +291,7 @@ def create_app(
     async def http_error_handler(request: Request, exc: StarletteHTTPException):
         # every raised error, the routing 404/405 included: detail + code
         return _error(exc.status_code, exc.detail, getattr(exc, "code", None),
-                      getattr(exc, "headers", None))
+                      getattr(exc, "headers", None), getattr(exc, "extra", None))
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(request: Request, exc: RequestValidationError):
@@ -288,6 +343,7 @@ def create_app(
                         reason="namespace")
             _charge_rate(p, ns)
             raise HTTPException(403, f"key not valid for namespace {ns!r}")
+        bill.authorize(p, ns)  # hosted: the namespace belongs to the key's org
         _charge_rate(p, ns)
         return p
 
@@ -329,6 +385,7 @@ def create_app(
 
     @app.post("/v1/ns/{ns}/events", status_code=202)
     def post_events(ns: str, body: EventsIn, p: Principal = Depends(auth)):
+        bill.admit(p, ns, writes=len(body.events))
         events = []
         downgraded = 0
         for e in body.events:
@@ -356,11 +413,13 @@ def create_app(
         if downgraded:
             METRICS.inc("memd_source_downgrades_total", ns=ns, amount=downgraded)
         ids = engine.add_events(events, namespace=ns)
+        bill.record(p, ns, writes=len(ids))  # durable before the ack
         return {"ids": ids, "accepted": len(ids)}
 
     @app.post("/v1/ns/{ns}/memories", status_code=201)
     def post_memory(ns: str, body: MemoryIn, p: Principal = Depends(auth)):
         user, _ = apply_scope(p, body.user_id, body.session_id)
+        bill.admit(p, ns, writes=1)
         # Trust-tier spoofing guard (D7 #1/#2): API keys are agent
         # credentials - they cannot mint USER-tier facts by assertion.
         # Only scope_override-capable principals claim human tier.
@@ -382,11 +441,13 @@ def create_app(
             valid_from=body.valid_from,
             namespace=ns,
         )
+        bill.record(p, ns, writes=1)
         return {"id": rid}
 
     @app.post("/v1/ns/{ns}/search")
     def search(ns: str, body: SearchIn, p: Principal = Depends(auth)):
         user, _ = apply_scope(p, body.user_id, body.session_id)
+        bill.admit(p, ns, searches=1)
         res = engine.search(
             body.query,
             user_id=user,
@@ -399,6 +460,7 @@ def create_app(
             include_quarantined=body.include_quarantined,
             namespace=ns,
         )
+        bill.record(p, ns, searches=1, reranked=res.reranked)
         return {
             "packed_context": res.packed_context,
             "items": [i.__dict__ for i in res.items],
@@ -437,6 +499,8 @@ def create_app(
         if p.pinned_user and not p.scope_override and rec_scope.get("user") not in (None, p.pinned_user):
             raise HTTPException(404, "not found")
         ok = engine.delete(record_id, hard=hard, actor=f"key:{p.key_id}", namespace=ns)
+        if ok and not existing.get("deleted"):
+            bill.stored_delta(ns, -1)  # deletes are never gated, only counted down
         return {"deleted": record_id, "hard": hard,
                 "note": "physical purge guaranteed at next compaction (<=72h)" if not hard else "purged"}
 
@@ -453,6 +517,7 @@ def create_app(
             # it used to be created here, shredded and answered 200
             raise HTTPException(404, f"namespace {ns!r} not found")
         ok = engine.destroy_namespace(ns, actor=f"key:{p.key_id}")
+        bill.stored_reset(ns)
         return {"destroyed": ns, "crypto_shred": True}
 
     @app.post("/v1/ns/{ns}/export")
@@ -475,7 +540,10 @@ def create_app(
         # pinned keys constrain extraction to their user (blocks cross-user
         # session-id injection into the fact lane); override keys may target any
         heavy(ns, "close_session", p)
-        return engine.close_session(session_id, user_id=p.pinned_user, namespace=ns)
+        bill.admit(p, ns, extract=True)
+        res = engine.close_session(session_id, user_id=p.pinned_user, namespace=ns)
+        bill.record(p, ns, extraction=res)
+        return res
 
     @app.post("/v1/ns/{ns}/compact")
     def compact(ns: str, force: bool = False, p: Principal = Depends(auth)):
@@ -525,6 +593,7 @@ def create_app(
         except ForgetPreviewMismatch as ex:
             raise ApiError(409, str(ex), code="preview_mismatch") from None
         METRICS.inc("memd_forgets_total", ns=ns)
+        bill.stored_delta(ns, -len(deleted))
         return {"deleted": deleted, "count": len(deleted), "confirmed": True}
 
     @app.post("/v1/ns/{ns}/reembed")
@@ -594,6 +663,8 @@ def create_app(
         # information, so a key bound to one namespace sees only that one
         return engine.status(ns_filter=None if p.namespace == "*" else p.namespace)
 
+    if hosted_ctx is not None:
+        hosted_ctx.install(app, auth)
     return app
 
 

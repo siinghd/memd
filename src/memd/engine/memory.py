@@ -83,6 +83,9 @@ class SearchResult:
     truncated: bool
     query_class: str
     latency_ms: float
+    # the reranker actually ran for THIS call (not a cache hit, not a
+    # fallback): hosted mode meters reranked searches on it
+    reranked: bool = False
 
 
 @dataclass
@@ -1083,7 +1086,7 @@ class Memory:
             # subsequent hit - so a caller (and bench/slo_bench.py, which
             # grades the retrieval SLO from this field) read a stale number
             # that described neither the hit nor a fresh query.
-            return _dc_replace(cached, latency_ms=round(hit_ms, 3))
+            return _dc_replace(cached, latency_ms=round(hit_ms, 3), reranked=False)
         METRICS.inc("memd_search_cache_misses_total")
         # entered/exited explicitly rather than via `with`, because the tally
         # must close AFTER the latency observation below. count_io()'s reset
@@ -1223,6 +1226,7 @@ class Memory:
             truncated=packed.truncated,
             query_class=plan.qclass,
             latency_ms=round(latency, 3),
+            reranked=rerank_order is not None,
         )
         if not degraded:
             # a result served while the reranker was failing must not

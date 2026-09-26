@@ -1,5 +1,5 @@
-"""CLI: `memd serve --http|--mcp`, `memd key create`, `memd export`,
-`memd import mem0`, `memd status`, `memd migrate --report`."""
+"""CLI: `memd serve --http|--mcp [--hosted]`, `memd key create`, `memd org`,
+`memd export`, `memd import mem0`, `memd status`, `memd migrate --report`."""
 from __future__ import annotations
 
 import argparse
@@ -16,7 +16,7 @@ def _cmd_serve(args) -> int:
         return 0
     import uvicorn
 
-    app = create_app_from_env()
+    app = create_app_from_env(hosted=True if args.hosted else None)
     uvicorn.run(
         app,
         host=args.host or os.environ.get("MEMD_HOST", "127.0.0.1"),
@@ -25,16 +25,143 @@ def _cmd_serve(args) -> int:
     return 0
 
 
-def create_app_from_env():
+def create_app_from_env(hosted: bool | None = None):
+    """`hosted` None: MEMD_HOSTED decides (default off)."""
     from memd.server.http import create_app
 
     return create_app(
         data_dir=os.environ.get("MEMD_DATA", "./memd-data"),
         admin_key=os.environ.get("MEMD_ADMIN_KEY"),
+        hosted=hosted,
     )
 
 
+def _admin_store(args):
+    from memd.hosted.store import AdminStore
+
+    data_dir = args.data or os.environ.get("MEMD_DATA", "./memd-data")
+    os.makedirs(data_dir, exist_ok=True)
+    return AdminStore.for_data_root(data_dir), data_dir
+
+
+def _cmd_key_hosted(args) -> int:
+    """Hosted mode: keys live in the admin store, belong to an org and are
+    bound to one of its namespaces (claimed for the org on first use)."""
+    from memd.hosted.store import OwnershipError
+
+    store, data_dir = _admin_store(args)
+    try:
+        if args.sub == "create":
+            if not args.org:
+                print("hosted mode: --org is required (see `memd org create`)", file=sys.stderr)
+                return 2
+            scopes = (args.scopes or "memory").replace(",", " ").split()
+            if args.scope_override and "override" not in scopes:
+                scopes.append("override")
+            try:
+                full, kid = store.create_key(args.org, args.namespace, name=args.name or "",
+                                             scopes=scopes, pinned_user=args.pin_user)
+            except (KeyError, OwnershipError, ValueError) as ex:
+                print(f"refused: {ex}", file=sys.stderr)
+                return 1
+            print(json.dumps({"key": full, "key_id": kid, "namespace": args.namespace, "org": args.org,
+                              "scopes": sorted(set(scopes))}, indent=1))
+            print("# store this now - it is not retrievable later", file=sys.stderr)
+            return 0
+        if args.sub == "list":
+            for k in store.list_keys(org_id=args.org):
+                print(json.dumps(k))
+            return 0
+        if args.sub == "revoke":
+            ok = store.revoke_key(args.key_id)
+            print("revoked" if ok else "not found")
+            return 0 if ok else 1
+        if args.sub == "migrate":
+            return _migrate_legacy_keys(store, data_dir, args)
+        return 2
+    finally:
+        store.close()
+
+
+def _migrate_legacy_keys(store, data_dir: str, args) -> int:
+    """Adopt self-hosted keys (keys.toml.json) into an org: same key string,
+    same secret hash, now metered. Namespace-wide ('*') keys are skipped -
+    in hosted mode only the operator's MEMD_ADMIN_KEY spans namespaces."""
+    from memd.hosted.store import OwnershipError
+
+    if not args.org:
+        print("--org is required", file=sys.stderr)
+        return 2
+    path = os.path.join(data_dir, "keys.toml.json")
+    try:
+        with open(path) as f:
+            recs = json.load(f)
+    except FileNotFoundError:
+        print(f"no legacy key file at {path}", file=sys.stderr)
+        return 1
+    moved = skipped = 0
+    for r in recs:
+        if (r.get("revoked") or not r.get("hash") or r.get("namespace") in (None, "*")
+                or (args.namespace and r["namespace"] != args.namespace)):
+            skipped += 1
+            continue
+        scopes = ["memory"] + (["override"] if r.get("scope_override") else [])
+        try:
+            store.import_key(args.org, r["namespace"], r["key_id"], r["hash"], name=r.get("name", ""),
+                             scopes=scopes, pinned_user=r.get("pinned_user"), created=r.get("created"))
+            moved += 1
+        except (OwnershipError, KeyError) as ex:
+            print(f"skipped {r['key_id']}: {ex}", file=sys.stderr)
+            skipped += 1
+    print(json.dumps({"migrated": moved, "skipped": skipped, "org": args.org}))
+    return 0
+
+
+def _cmd_org(args) -> int:
+    """Hosted-mode orgs (the billing unit): create / list / set-plan."""
+    store, _ = _admin_store(args)
+    try:
+        if args.sub == "create":
+            from memd.hosted.plans import Plans
+
+            if args.plan not in Plans.from_env():
+                print(f"unknown plan {args.plan!r}", file=sys.stderr)
+                return 2
+            oid = store.create_org(args.name, plan=args.plan)
+            print(json.dumps({"org": oid, "name": args.name, "plan": args.plan}))
+            return 0
+        if args.sub == "list":
+            for o in store.list_orgs():
+                print(json.dumps(o))
+            return 0
+        if args.sub == "set-plan":
+            # operator override (comped / enterprise accounts); Stripe
+            # webhooks keep syncing paying orgs
+            from memd.hosted.plans import Plans
+
+            if args.plan not in Plans.from_env():
+                print(f"unknown plan {args.plan!r}", file=sys.stderr)
+                return 2
+            if store.get_org(args.org_id) is None:
+                print("not found", file=sys.stderr)
+                return 1
+            store.update_org(args.org_id, plan=args.plan)
+            print(json.dumps({"org": args.org_id, "plan": args.plan}))
+            return 0
+        return 2
+    finally:
+        store.close()
+
+
 def _cmd_key(args) -> int:
+    from memd.hosted import hosted_enabled
+
+    if hosted_enabled(True if getattr(args, "hosted", False) else None):
+        return _cmd_key_hosted(args)
+    if args.sub == "migrate":
+        print("`memd key migrate` adopts keys into a hosted org: pass --hosted (or MEMD_HOSTED=1)",
+              file=sys.stderr)
+        return 2
     from memd.server.auth import KeyStore
 
     data_dir = args.data or os.environ.get("MEMD_DATA", "./memd-data")
@@ -275,6 +402,8 @@ def main(argv=None) -> int:
     serve = sub.add_parser("serve", help="start a server")
     serve.add_argument("--http", action="store_true", help="REST API on :8700")
     serve.add_argument("--mcp", action="store_true", help="MCP over stdio")
+    serve.add_argument("--hosted", action="store_true",
+                       help="hosted mode: orgs, metering, quotas, Stripe billing (also MEMD_HOSTED=1)")
     serve.add_argument("--port", type=int, default=None)
     serve.add_argument("--host", default=None)
     serve.set_defaults(fn=_cmd_serve)
@@ -286,12 +415,33 @@ def main(argv=None) -> int:
     kc.add_argument("--name", default="")
     kc.add_argument("--pin-user", default=None)
     kc.add_argument("--scope-override", action="store_true")
+    kc.add_argument("--org", default=None, help="hosted mode: the org the key belongs to (required)")
+    kc.add_argument("--scopes", default=None,
+                    help="hosted mode: comma-separated subset of memory,billing,override (default memory)")
     kl = ksub.add_parser("list")
+    kl.add_argument("--org", default=None, help="hosted mode: only this org's keys")
     kr = ksub.add_parser("revoke")
     kr.add_argument("key_id")
-    for x in (kc, kl, kr):
+    km = ksub.add_parser("migrate", help="hosted mode: adopt keys.toml.json keys into an org")
+    km.add_argument("--org", required=True)
+    km.add_argument("--ns", "--namespace", dest="namespace", default=None, help="only this namespace's keys")
+    for x in (kc, kl, kr, km):
         x.add_argument("--data", default=None)
+        x.add_argument("--hosted", action="store_true", help="use the hosted admin store (also MEMD_HOSTED=1)")
     key.set_defaults(fn=_cmd_key)
+
+    org = sub.add_parser("org", help="hosted mode: manage orgs (the billing unit)")
+    osub = org.add_subparsers(dest="sub", required=True)
+    oc = osub.add_parser("create")
+    oc.add_argument("--name", required=True)
+    oc.add_argument("--plan", default="free")
+    ol = osub.add_parser("list")
+    op_ = osub.add_parser("set-plan")
+    op_.add_argument("org_id")
+    op_.add_argument("plan")
+    for x in (oc, ol, op_):
+        x.add_argument("--data", default=None)
+    org.set_defaults(fn=_cmd_org)
 
     exp = sub.add_parser("export", help="full JSONL export (anti-lock-in)")
     exp.add_argument("--namespace", default="default")
