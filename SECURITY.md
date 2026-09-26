@@ -44,7 +44,14 @@ any probe fails the build.
   `memd_audit_segments_pruned_total` records the truncation. Compliance tiers
   needing unbounded history must ship segments off-box before they roll.
 - **`/metrics`, `/v1/metrics/json` and `/v1/status` are namespace-scoped** for
-  a scoped key and unscoped for a `*` key. `MEMD_METRICS_PUBLIC=1` allows
+  a scoped key and unscoped for a `*` key: series labelled with a namespace
+  are served only to that namespace's keys and the operator. Series without a
+  namespace label (the http counters) are visible to every key, so their
+  labels carry nothing a caller chose: the route is one of the server's
+  route templates (`/v1/ns/:ns/memories/:id`) or `other`, and an unknown HTTP
+  method is `OTHER`. A namespace label is always the key's authorized
+  namespace, never one taken from the request path (a denied request's
+  rate-limit rejection counts under the key's own namespace). `MEMD_METRICS_PUBLIC=1` allows
   unauthenticated scraping - only do that on a trusted network segment.
 - **Interactive docs are off by default** (`MEMD_ENABLE_DOCS=1` to enable):
   the OpenAPI schema enumerates every route of an otherwise authenticated API.
@@ -67,6 +74,51 @@ any probe fails the build.
   text unencrypted, with owner-only permissions. Both are deleted on
   crypto-shred and are rebuildable from the (encrypted) log.
 
+- **Hosted mode & billing (`--hosted`, off by default).**
+  - *The Stripe webhook is authenticated by its signature only.*
+    `POST /v1/billing/webhook` takes no bearer key; it verifies the
+    `Stripe-Signature` HMAC-SHA256 over the raw body with
+    `MEMD_STRIPE_WEBHOOK_SECRET` (constant-time, via
+    `stripe.Webhook.construct_event`) and rejects timestamps outside the
+    tolerance (300 s), so a captured delivery cannot be replayed later; a
+    replay inside the window is a no-op (idempotent by event id). Treat the
+    webhook secret like a password: anyone holding it can forge plan
+    upgrades. Rotate it in the Stripe dashboard if it leaks.
+  - *Live keys are refused.* A `sk_live_`/`rk_live_` key stops hosted mode
+    from starting unless `MEMD_ALLOW_LIVE_BILLING=1` is set - set it only on
+    the production deployment, never in a dev or CI environment.
+  - *API keys are hashed at rest.* Hosted keys live in the admin store
+    (`<data root>/admin/admin.sqlite3`; the directory is 0700 and the
+    database with its `-wal`/`-shm` files 0600) as SHA-256 hashes of a
+    192-bit random secret; the key is shown once at creation. A fast hash is
+    appropriate for secrets of that entropy (there is nothing to brute-force);
+    it would not be for passwords. Revocation takes effect within 5 s in
+    every process (the lookup cache's TTL).
+  - *Tenant isolation is enforced twice:* a key is bound to one namespace,
+    and that namespace must belong to the key's org (a namespace can never
+    change org; `_`-prefixed names are reserved and never bound to a
+    tenant; names are matched in full, so a trailing newline is refused).
+    Billing routes act on the key's own org only - the request body cannot
+    name another one. Scopes are exact: `billing` for the billing routes
+    only; `memory` for the data routes and the namespace's `/v1/status`,
+    `/metrics` and `/v1/metrics/json`; `override` grants no route by itself.
+  - *Stripe state is verified, not taken from payloads.* A completed
+    Checkout Session applies only with `mode=subscription`, and the
+    subscription is re-read from Stripe; only `active`/`trialing` grant a
+    plan. An org is bound to a Stripe customer only when it has none and the
+    customer carries the `memd_org_id` metadata memd's checkout wrote - a
+    forged `client_reference_id` (e.g. on a payment link) is logged and
+    ignored. One subscription per org; a duplicate holds metered pushes.
+  - *No secret in logs or the admin store.* Stripe error text (which can
+    echo the API key) is redacted before it is logged or stored - `sk_`/
+    `rk_`/`pk_` keys, `whsec_` secrets, bearer tokens and memd keys - and a
+    filter redacts the Stripe SDK's own log records. `repr()` of the billing
+    configuration carries no secret.
+  - *The admin store is not tenant data.* It holds org names, Stripe customer
+    ids, key hashes and usage counts (no content). It is not encrypted by the
+    namespace envelope keys and is not included in exports; back it up with
+    the data root.
+
 ## Hardening checklist for a real deployment
 
 1. Set `MEMD_ADMIN_KEY` to a high-entropy value; never hand it to applications.
@@ -76,4 +128,9 @@ any probe fails the build.
 4. Leave `MEMD_ENABLE_DOCS` and `MEMD_METRICS_PUBLIC` unset.
 5. Set `MEMD_NS_RATE_LIMIT_PER_MIN` to a real per-tenant ceiling.
 6. Back up the data root - the object store is the source of truth; the
-   SQLite index beside it is disposable.
+   SQLite index beside it is disposable. In hosted mode also back up
+   `admin/admin.sqlite3` (orgs, keys, the usage ledger): it is not
+   rebuildable.
+7. Hosted billing: use an `sk_test_` key until go-live; restrict the
+   webhook endpoint to Stripe's events; keep `MEMD_STRIPE_WEBHOOK_SECRET`
+   and `MEMD_STRIPE_SECRET_KEY` out of images and logs.

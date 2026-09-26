@@ -25,6 +25,10 @@ class Principal:
     pinned_user: str | None = None
     scope_override: bool = False
     rate_limit_per_min: int = 600
+    # hosted mode only (memd.hosted): the key's org and scopes. None/empty
+    # for self-hosted keys and the operator key - nothing is metered for them
+    org_id: str | None = None
+    scopes: frozenset[str] = frozenset()
 
 
 def hash_secret(secret: str) -> str:

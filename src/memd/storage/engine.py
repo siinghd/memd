@@ -3037,6 +3037,8 @@ _NS_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
 def _validate_ns(ns: str) -> str:
-    if not ns or not _NS_RE.match(ns):
+    # fullmatch: with re.match, `$` also matches before a trailing newline,
+    # so "alpha\n" passed and became a namespace (and a directory name)
+    if not ns or not _NS_RE.fullmatch(ns):
         raise ValueError(f"invalid namespace {ns!r}: must match [A-Za-z0-9][A-Za-z0-9_.-]{{0,127}}")
     return ns

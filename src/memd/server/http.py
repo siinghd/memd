@@ -102,25 +102,61 @@ class FindIn(BaseModel):
 
 # Error bodies: {"detail": <human text, unchanged>, "code": <machine-readable>}.
 _ERROR_CODES = {
-    400: "validation_error", 401: "unauthorized", 403: "forbidden", 404: "not_found",
+    400: "validation_error", 401: "unauthorized", 402: "payment_required", 403: "forbidden", 404: "not_found",
     405: "method_not_allowed", 409: "conflict", 410: "gone", 413: "payload_too_large",
     422: "validation_error", 429: "rate_limited", 500: "internal_error", 503: "unavailable",
 }
 
 
 class ApiError(HTTPException):
-    """An HTTPException with a specific `code` for the error body."""
+    """An HTTPException with a specific `code` (and optional extra fields,
+    e.g. a 402's meter/limit) for the error body."""
 
     def __init__(self, status_code: int, detail: str, code: str | None = None,
-                 headers: dict | None = None):
+                 headers: dict | None = None, extra: dict | None = None):
         super().__init__(status_code, detail, headers)
         self.code = code
+        self.extra = extra
 
 
 def _error(status: int, detail: Any, code: str | None = None,
-           headers: dict | None = None) -> JSONResponse:
-    return JSONResponse(status_code=status, headers=headers,
-                        content={"detail": detail, "code": code or _ERROR_CODES.get(status, "error")})
+           headers: dict | None = None, extra: dict | None = None) -> JSONResponse:
+    content = {"detail": detail, "code": code or _ERROR_CODES.get(status, "error")}
+    if extra:
+        content.update({k: v for k, v in extra.items() if k not in content})
+    return JSONResponse(status_code=status, headers=headers, content=content)
+
+
+class _Unmetered:
+    """Hosted mode off (the default): no org checks, no quotas, no ledger."""
+
+    allow_rerank = True
+    extract_limit = None
+    max_facts = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        return None
+
+    def authorize(self, p, ns) -> None:
+        pass
+
+    def require_memory(self, p) -> None:
+        pass
+
+    def admit(self, p, ns, **kw) -> "_Unmetered":
+        return self
+
+    def record(self, **kw) -> None:
+        pass
+
+    def stored_delta(self, ns, delta) -> None:
+        pass
+
+    def stored_reset(self, ns) -> None:
+        pass
 
 
 def _rate_limited(detail: str, retry_s: float) -> ApiError:
@@ -129,30 +165,86 @@ def _rate_limited(detail: str, retry_s: float) -> ApiError:
                     headers={"Retry-After": str(max(1, math.ceil(retry_s)))})
 
 
+# every route this server serves, as a label; anything else is "other"
+_FIXED_ROUTE_LABELS = frozenset({
+    "/health", "/metrics", "/v1/metrics/json", "/v1/status",
+    "/v1/billing/checkout", "/v1/billing/portal", "/v1/billing/usage", "/v1/billing/webhook",
+    "/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json",
+})
+# the path under /v1/ns/{ns}/, with {id} for a record/session id
+_NS_ROUTE_SHAPES = {
+    (): "/v1/ns/:ns",
+    ("events",): "/v1/ns/:ns/events",
+    ("memories",): "/v1/ns/:ns/memories",
+    ("memories", None): "/v1/ns/:ns/memories/:id",
+    ("search",): "/v1/ns/:ns/search",
+    ("export",): "/v1/ns/:ns/export",
+    ("stats",): "/v1/ns/:ns/stats",
+    ("sessions", None, "close"): "/v1/ns/:ns/sessions/:id/close",
+    ("compact",): "/v1/ns/:ns/compact",
+    ("find_ids",): "/v1/ns/:ns/find_ids",
+    ("forget",): "/v1/ns/:ns/forget",
+    ("reembed",): "/v1/ns/:ns/reembed",
+}
+_METHOD_LABELS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
+
+
 def _route_label(path: str) -> str:
-    """Bucket dynamic path segments for metric labels.
+    """The route TEMPLATE a path matches, as a metric label - never a
+    request-supplied string.
 
     Namespace names and record ids are UNBOUNDED cardinality (scales with
-    tenants and rows); a raw value in a Prometheus label multiplies every
-    http series by both. At registry cap the eviction guard starts silently
-    dropping unrelated series - so labels carry only the route SHAPE:
-    /v1/ns/{ns}/memories/{id} -> /v1/ns/:ns/memories/:id."""
+    tenants and rows), and the http series carry no `ns` label, so every
+    tenant key sees them on /metrics: a raw segment in a label handed one
+    tenant's namespace names and ids - or any string a caller put in a path,
+    404s included - to every other tenant, and let anyone grow the registry
+    until its eviction guard dropped unrelated series. Only the known route
+    shapes are labels (/v1/ns/{ns}/memories/{id} -> /v1/ns/:ns/memories/:id);
+    everything else is "other"."""
+    if path in _FIXED_ROUTE_LABELS:
+        return path
     parts = path.split("/")
-    if len(parts) >= 4 and parts[1] == "v1" and parts[2] == "ns":
+    if len(parts) >= 4 and parts[0] == "" and parts[1] == "v1" and parts[2] == "ns" and parts[3]:
         rest = parts[4:]
-        tail = [":id" if i >= 1 else p for i, p in enumerate(rest)]
-        return "/".join(["/v1/ns/:ns"] + tail)
-    return path
+        for shape, label in _NS_ROUTE_SHAPES.items():
+            if len(shape) == len(rest) and all(
+                    (seg != "") if want is None else seg == want for want, seg in zip(shape, rest)):
+                return label
+    return "other"
+
+
+def _method_label(method: str) -> str:
+    """The HTTP method is a client-chosen token, too."""
+    return method if method in _METHOD_LABELS else "OTHER"
 
 
 def create_app(
     data_dir: str = "./memd-data",
     keys_path: str | None = None,
     admin_key: str | None = None,
+    *,
+    hosted: bool | None = None,
+    plans: Any = None,
+    billing_config: Any = None,
+    stripe_client: Any = None,
 ) -> FastAPI:
+    """`hosted` (default: MEMD_HOSTED) turns on tenancy, metering and
+    billing (memd.hosted); off, nothing of it is imported - stripe least of
+    all - and the server behaves exactly as before."""
     os.makedirs(data_dir, exist_ok=True)
-    keys_path = keys_path or os.path.join(data_dir, "keys.toml.json")
-    keystore = KeyStore(keys_path, admin_key=admin_key)
+    from memd.hosted import hosted_enabled
+
+    hosted_ctx = None
+    is_hosted = hosted_enabled(hosted)
+    if is_hosted:
+        from memd.hosted.billing import BillingConfig
+
+        # the sk_live_ guard runs before anything is opened
+        billing_config = billing_config or BillingConfig.from_env()
+        keystore = None
+    else:
+        keys_path = keys_path or os.path.join(data_dir, "keys.toml.json")
+        keystore = KeyStore(keys_path, admin_key=admin_key)
     limiter = RateLimiter()
     failures = FailureLimiter()
     # tenancy-level ceiling: per-KEY budgets alone let a tenant multiply its
@@ -163,12 +255,24 @@ def create_app(
     # O(namespace) operations and must not be spam-able by a normal key
     heavy_limiter = RateLimiter(max_buckets=1000)
     engine = Memory(data_dir)
+    bill: Any = _Unmetered()
+    if is_hosted:
+        from memd.hosted.app import Hosted
+
+        hosted_ctx = Hosted(data_dir, engine, admin_key=admin_key, plans=plans,
+                            billing_config=billing_config, stripe_client=stripe_client)
+        keystore = hosted_ctx.keystore
+        bill = hosted_ctx.metering
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        if hosted_ctx is not None:
+            hosted_ctx.jobs.start()
         try:
             yield
         finally:
+            if hosted_ctx is not None:
+                hosted_ctx.close()
             engine.close()
 
     # Interactive docs and the OpenAPI schema were served unauthenticated,
@@ -182,6 +286,7 @@ def create_app(
                   openapi_url="/openapi.json" if _docs else None)
     app.state.engine = engine
     app.state.keystore = keystore
+    app.state.hosted = hosted_ctx
 
     from memd.metrics import METRICS
 
@@ -192,6 +297,7 @@ def create_app(
         # bucket paths: /v1/ns/{ns}/memories/{id} -> /v1/ns/:ns/memories/:id
         # (label cardinality guard - see _route_label)
         route_label = _route_label(request.url.path)
+        method_label = _method_label(request.method)
         cl = request.headers.get("content-length")
         if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
             METRICS.inc("memd_oversized_requests_total", route=route_label)
@@ -202,21 +308,21 @@ def create_app(
         except ValueError as ex:
             # engine-boundary guards (size caps, bad enum-ish values) are
             # caller errors: 400 with the guard's message
-            METRICS.inc("memd_http_errors_total", route=route_label, method=request.method, kind="value")
+            METRICS.inc("memd_http_errors_total", route=route_label, method=method_label, kind="value")
             return _error(400, str(ex))
         except sqlite3.Error:
             # lifecycle races surface as driver errors (namespace destroyed /
             # index closed mid-request): clean 503, no internals leaked
-            METRICS.inc("memd_http_errors_total", route=route_label, method=request.method, kind="storage")
+            METRICS.inc("memd_http_errors_total", route=route_label, method=method_label, kind="storage")
             return _error(503, "namespace unavailable (destroyed or rebuilding)")
         except Exception:
-            METRICS.inc("memd_http_errors_total", route=route_label, method=request.method)
+            METRICS.inc("memd_http_errors_total", route=route_label, method=method_label)
             # sanitized 500: tracebacks go to the server log, never the client
             return _error(500, "internal error")
         finally:
             METRICS.observe("memd_http_request_ms", (time.monotonic() - t0) * 1000,
-                            help="HTTP request duration (ms)", route=route_label, method=request.method)
-        METRICS.inc("memd_http_requests_total", route=route_label, method=request.method,
+                            help="HTTP request duration (ms)", route=route_label, method=method_label)
+        METRICS.inc("memd_http_requests_total", route=route_label, method=method_label,
                     status=str(response.status_code))
         return response
 
@@ -229,14 +335,14 @@ def create_app(
             return _error(410, "namespace destroyed", "namespace_destroyed")
         if "evicted" in msg:
             return _error(503, "namespace re-opening; retry", headers={"Retry-After": "1"})
-        METRICS.inc("memd_http_errors_total", route=request.url.path)
+        METRICS.inc("memd_http_errors_total", route=_route_label(request.url.path))
         return _error(500, "internal error")
 
     @app.exception_handler(StarletteHTTPException)
     async def http_error_handler(request: Request, exc: StarletteHTTPException):
         # every raised error, the routing 404/405 included: detail + code
         return _error(exc.status_code, exc.detail, getattr(exc, "code", None),
-                      getattr(exc, "headers", None))
+                      getattr(exc, "headers", None), getattr(exc, "extra", None))
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(request: Request, exc: RequestValidationError):
@@ -288,6 +394,7 @@ def create_app(
                         reason="namespace")
             _charge_rate(p, ns)
             raise HTTPException(403, f"key not valid for namespace {ns!r}")
+        bill.authorize(p, ns)  # hosted: the namespace belongs to the key's org
         _charge_rate(p, ns)
         return p
 
@@ -300,13 +407,16 @@ def create_app(
         noisy-neighbour containment D6 asks for evaporates. The namespace
         bucket is the tenancy-level ceiling; the key bucket still contains a
         single runaway client inside a tenant."""
+        # labelled with the key's AUTHORIZED namespace, never the path's: this
+        # runs for requests being denied too, and a path namespace would let
+        # any key mint unbounded series (and show its strings to operators)
         if not limiter.allow(p.key_id, p.rate_limit_per_min):
-            METRICS.inc("memd_rate_limited_total", ns=ns, scope="key")
+            METRICS.inc("memd_rate_limited_total", ns=p.namespace, scope="key")
             raise _rate_limited("rate limit exceeded",
                                 limiter.retry_after(p.key_id, p.rate_limit_per_min))
         owner = p.namespace if p.namespace != "*" else (ns or "*")
         if owner != "*" and not ns_limiter.allow(f"ns:{owner}", ns_rate_limit_per_min):
-            METRICS.inc("memd_rate_limited_total", ns=owner, scope="namespace")
+            METRICS.inc("memd_rate_limited_total", ns=p.namespace, scope="namespace")
             raise _rate_limited("namespace rate limit exceeded",
                                 ns_limiter.retry_after(f"ns:{owner}", ns_rate_limit_per_min))
 
@@ -355,7 +465,9 @@ def create_app(
             })
         if downgraded:
             METRICS.inc("memd_source_downgrades_total", ns=ns, amount=downgraded)
-        ids = engine.add_events(events, namespace=ns)
+        with bill.admit(p, ns, writes=len(events)) as meter:  # hosted: check + reserve
+            ids = engine.add_events(events, namespace=ns)
+            meter.record(writes=len(ids))  # durable before the ack
         return {"ids": ids, "accepted": len(ids)}
 
     @app.post("/v1/ns/{ns}/memories", status_code=201)
@@ -368,37 +480,42 @@ def create_app(
         if source == "user" and not p.scope_override:
             source = "agent"
             METRICS.inc("memd_source_downgrades_total", ns=ns)
-        rid = engine.remember(
-            body.content,
-            kind=body.kind,
-            entity_keys=body.entity_keys,
-            session_id=body.session_id,
-            user_id=user,
-            agent_id=body.agent_id,
-            org_id=body.org_id,
-            source=source,
-            actor_id=body.actor_id or f"key:{p.key_id}",
-            t_event=body.t_event,
-            valid_from=body.valid_from,
-            namespace=ns,
-        )
+        with bill.admit(p, ns, writes=1) as meter:
+            rid = engine.remember(
+                body.content,
+                kind=body.kind,
+                entity_keys=body.entity_keys,
+                session_id=body.session_id,
+                user_id=user,
+                agent_id=body.agent_id,
+                org_id=body.org_id,
+                source=source,
+                actor_id=body.actor_id or f"key:{p.key_id}",
+                t_event=body.t_event,
+                valid_from=body.valid_from,
+                namespace=ns,
+            )
+            meter.record(writes=1)
         return {"id": rid}
 
     @app.post("/v1/ns/{ns}/search")
     def search(ns: str, body: SearchIn, p: Principal = Depends(auth)):
         user, _ = apply_scope(p, body.user_id, body.session_id)
-        res = engine.search(
-            body.query,
-            user_id=user,
-            session_id=body.session_id,
-            agent_id=body.agent_id,
-            org_id=body.org_id,
-            budget_tokens=body.budget_tokens,
-            as_of=body.as_of,
-            kinds=body.kinds,
-            include_quarantined=body.include_quarantined,
-            namespace=ns,
-        )
+        with bill.admit(p, ns, searches=1) as meter:
+            res = engine.search(
+                body.query,
+                user_id=user,
+                session_id=body.session_id,
+                agent_id=body.agent_id,
+                org_id=body.org_id,
+                budget_tokens=body.budget_tokens,
+                as_of=body.as_of,
+                kinds=body.kinds,
+                include_quarantined=body.include_quarantined,
+                namespace=ns,
+                rerank=meter.allow_rerank,  # hosted: False once the reranked quota is spent
+            )
+            meter.record(searches=1, reranked=res.reranked)
         return {
             "packed_context": res.packed_context,
             "items": [i.__dict__ for i in res.items],
@@ -437,6 +554,8 @@ def create_app(
         if p.pinned_user and not p.scope_override and rec_scope.get("user") not in (None, p.pinned_user):
             raise HTTPException(404, "not found")
         ok = engine.delete(record_id, hard=hard, actor=f"key:{p.key_id}", namespace=ns)
+        if ok and not existing.get("deleted"):
+            bill.stored_delta(ns, -1)  # deletes are never gated, only counted down
         return {"deleted": record_id, "hard": hard,
                 "note": "physical purge guaranteed at next compaction (<=72h)" if not hard else "purged"}
 
@@ -453,6 +572,7 @@ def create_app(
             # it used to be created here, shredded and answered 200
             raise HTTPException(404, f"namespace {ns!r} not found")
         ok = engine.destroy_namespace(ns, actor=f"key:{p.key_id}")
+        bill.stored_reset(ns)
         return {"destroyed": ns, "crypto_shred": True}
 
     @app.post("/v1/ns/{ns}/export")
@@ -475,7 +595,11 @@ def create_app(
         # pinned keys constrain extraction to their user (blocks cross-user
         # session-id injection into the fact lane); override keys may target any
         heavy(ns, "close_session", p)
-        return engine.close_session(session_id, user_id=p.pinned_user, namespace=ns)
+        with bill.admit(p, ns, extract=True, session_id=session_id, user_id=p.pinned_user) as meter:
+            res = engine.close_session(session_id, user_id=p.pinned_user, namespace=ns,
+                                       extract_limit=meter.extract_limit, max_facts=meter.max_facts)
+            meter.record(extraction=res)
+        return res
 
     @app.post("/v1/ns/{ns}/compact")
     def compact(ns: str, force: bool = False, p: Principal = Depends(auth)):
@@ -525,6 +649,7 @@ def create_app(
         except ForgetPreviewMismatch as ex:
             raise ApiError(409, str(ex), code="preview_mismatch") from None
         METRICS.inc("memd_forgets_total", ns=ns)
+        bill.stored_delta(ns, -len(deleted))
         return {"deleted": deleted, "count": len(deleted), "confirmed": True}
 
     @app.post("/v1/ns/{ns}/reembed")
@@ -565,6 +690,7 @@ def create_app(
                 METRICS.inc("memd_auth_failures_total", reason="metrics")
                 raise HTTPException(401, "missing or invalid bearer key")
             failures.record_success(client)
+            bill.require_memory(p)  # hosted: operational data is `memory`-scoped
             # rendering the registry is O(series); leaving the one route
             # without a budget made it the cheapest way to burn server CPU
             if not limiter.allow(f"metrics:{p.key_id}", 60):
@@ -584,6 +710,7 @@ def create_app(
 
         from memd.metrics import METRICS
 
+        bill.require_memory(p)
         snap = METRICS.snapshot(ns_filter=None if p.namespace == "*" else {p.namespace})
         snap["_epoch_ms"] = int(_t.time() * 1000)
         return snap
@@ -592,8 +719,11 @@ def create_app(
     def status(p: Principal = Depends(auth)):
         # authenticated AND scoped: the namespace inventory is tenant
         # information, so a key bound to one namespace sees only that one
+        bill.require_memory(p)
         return engine.status(ns_filter=None if p.namespace == "*" else p.namespace)
 
+    if hosted_ctx is not None:
+        hosted_ctx.install(app, auth)
     return app
 
 

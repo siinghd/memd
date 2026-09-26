@@ -34,7 +34,10 @@ local-embeddings = ["fastembed>=0.4"]
 fast = ["tantivy>=0.26"]
 # Jev reranker (TypeSafe System One); active only when TYPESAFE_API_KEY is set
 jev = ["typesafe-sdk>=0.7"]
-dev = ["pytest>=8", "pytest-timeout>=2"]
+# hosted mode only (memd serve --http --hosted): Stripe billing. Imported
+# lazily; embedded and self-hosted memd never import it.
+billing = ["stripe>=15"]
+dev = ["pytest>=8", "pytest-timeout>=2", "stripe>=15"]
 
 [project.scripts]
 memd = "memd.cli:main"

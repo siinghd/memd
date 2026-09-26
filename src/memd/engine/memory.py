@@ -22,7 +22,7 @@ from collections import OrderedDict
 from dataclasses import replace as _dc_replace
 from contextlib import ExitStack as _ExitStack
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -83,6 +83,9 @@ class SearchResult:
     truncated: bool
     query_class: str
     latency_ms: float
+    # the reranker actually ran for THIS call (not a cache hit, not a
+    # fallback): hosted mode meters reranked searches on it
+    reranked: bool = False
 
 
 @dataclass
@@ -1050,7 +1053,11 @@ class Memory:
         kinds: list[str] | None = None,
         include_quarantined: bool = False,
         namespace: str | None = None,
+        rerank: bool = True,
     ) -> SearchResult:
+        """`rerank=False` skips the reranker for this call (hosted mode: the
+        org's reranked-search quota is spent); the result is the unreranked
+        order, counted as a fallback with reason "quota" and not cached."""
         if len(query) > MAX_QUERY_CHARS:
             raise ValueError(f"query exceeds {MAX_QUERY_CHARS} char cap")
         impl = self._hosted()
@@ -1083,7 +1090,7 @@ class Memory:
             # subsequent hit - so a caller (and bench/slo_bench.py, which
             # grades the retrieval SLO from this field) read a stale number
             # that described neither the hit nor a fresh query.
-            return _dc_replace(cached, latency_ms=round(hit_ms, 3))
+            return _dc_replace(cached, latency_ms=round(hit_ms, 3), reranked=False)
         METRICS.inc("memd_search_cache_misses_total")
         # entered/exited explicitly rather than via `with`, because the tally
         # must close AFTER the latency observation below. count_io()'s reset
@@ -1152,7 +1159,7 @@ class Memory:
         METRICS.observe("memd_search_stage_ms", (time.monotonic() - _st0) * 1000,
                         help="per-stage search timing (ms): plan/fuse/pack",
                         ns=ns.namespace, stage="fuse")
-        rerank_order, degraded = self._rerank(query, lane_hits, fused, ns.namespace)
+        rerank_order, degraded = self._rerank(query, lane_hits, fused, ns.namespace, allowed=rerank)
         rerank_scores: dict[str, float] | None = None
         if rerank_order is not None:
             rerank_scores = {it.record.id: p for it, p in rerank_order}
@@ -1223,6 +1230,7 @@ class Memory:
             truncated=packed.truncated,
             query_class=plan.qclass,
             latency_ms=round(latency, 3),
+            reranked=rerank_order is not None,
         )
         if not degraded:
             # a result served while the reranker was failing must not
@@ -1231,13 +1239,20 @@ class Memory:
         return result
 
     def _rerank(self, query: str, lane_hits: dict[str, list], fused: list[FusedItem],
-                ns_name: str) -> tuple[list[tuple[FusedItem, float]] | None, bool]:
+                ns_name: str, allowed: bool = True) -> tuple[list[tuple[FusedItem, float]] | None, bool]:
         """(shortlist in reranker order with scores, degraded?). The
         shortlist is the top-k of the bm25 lane, then the vector lane when a
         real embedder is fused, deduped, bm25 first. None: no reranker, or it
         failed (then degraded=True and the fused order stands)."""
         if self.rerank is None:
             return None, False
+        if not allowed:
+            # degraded: the caller's entitlement, not the reranker - never
+            # cache it (a later caller with quota must get the reranked order)
+            METRICS.inc("memd_rerank_fallback_total",
+                        help="searches that kept the unreranked order: reranker failed, timed out or was not ready",
+                        ns=ns_name, reranker=self.rerank.name, reason="quota")
+            return None, True
         hits = list(lane_hits.get("bm25", []))
         if self.embedder.kind != "hash":
             hits += lane_hits.get("vector", [])
@@ -1332,17 +1347,31 @@ class Memory:
 
     # ------------------------------------------------------------------ lifecycle
 
+    def session_raw_count(self, session_id: str, *, user_id: str | None = None,
+                          namespace: str | None = None) -> int:
+        """How many raw records close_session() would hand the extractor."""
+        return self._ns_for(namespace).index.count_session_raw(session_id, user_id=user_id)
+
     def close_session(
         self,
         session_id: str,
         *,
         user_id: str | None = None,
         namespace: str | None = None,
+        extract_limit: int | None = None,
+        max_facts: "int | Callable[[int], int] | None" = None,
     ) -> dict:
         """Segment-close boundary: extract facts, consolidate, rotate segment.
         Consolidation resolves at session end, never deferred past it.
         When user_id is supplied, extraction sweeps only that user's rows
-        (blocks cross-user session-id injection into the fact lane)."""
+        (blocks cross-user session-id injection into the fact lane).
+
+        Quota limits (hosted mode): at most `extract_limit` raw records go to
+        the extractor (the rest stay raw-only: searchable, never extracted -
+        `raw_skipped`), and at most `max_facts` facts are written
+        (`facts_capped`); a callable `max_facts` is asked, once extraction
+        finished, how many of the n extracted facts may be written. The raw
+        lane is never touched by either."""
         impl = self._hosted()
         if impl is not None:
             return impl.close_session(session_id, user_id=user_id, namespace=namespace)
@@ -1353,8 +1382,9 @@ class Memory:
         self._audit_for(ns.namespace).flush()
         t0 = time.monotonic()
         seg_records = ns.index.records_of_session(session_id, user_id=user_id)
+        to_extract = seg_records if extract_limit is None else seg_records[:max(0, int(extract_limit))]
         try:
-            extracted = self.extractor.extract(seg_records) if seg_records else []
+            extracted = self.extractor.extract(to_extract) if to_extract else []
         except Exception as ex:
             # extraction is a REBUILDABLE derived index (raw lane is truth):
             # an extractor outage must never block the session boundary or
@@ -1363,6 +1393,18 @@ class Memory:
             self._audit_for(ns.namespace).append(actor="system", action="extraction_failed",
                               target=session_id, detail={"error": str(ex)[:200]})
             extracted = []
+        facts_capped = 0
+        if callable(max_facts):
+            max_facts = max_facts(len(extracted))
+        if max_facts is not None and len(extracted) > max(0, int(max_facts)):
+            facts_capped = len(extracted) - max(0, int(max_facts))
+            extracted = extracted[:max(0, int(max_facts))]
+        if len(to_extract) < len(seg_records) or facts_capped:
+            METRICS.inc("memd_extraction_capped_total", ns=ns.namespace,
+                        help="session closes whose extraction a quota limited")
+            self._audit_for(ns.namespace).append(actor="system", action="extraction_capped", target=session_id,
+                                                 detail={"raw_skipped": len(seg_records) - len(to_extract),
+                                                         "facts_capped": facts_capped})
         facts_written, consolidation = self._write_facts(ns, extracted, seg_records)
         seg_name = ns.rotate(f"session-close:{session_id}")
         self._taints.drop(session_id)  # taint is per-session; closed = gone
@@ -1378,8 +1420,10 @@ class Memory:
         METRICS.inc("memd_dupes_dropped_total", consolidation.dropped_dupes, ns=ns.namespace)
         return {
             "segment": seg_name,
-            "raw_considered": len(seg_records),
+            "raw_considered": len(to_extract),
+            "raw_skipped": len(seg_records) - len(to_extract),
             "facts_extracted": len(extracted),
+            "facts_capped": facts_capped,
             "facts_written": facts_written,
             "superseded": len(consolidation.superseded_pairs),
             "dupes_dropped": consolidation.dropped_dupes,

@@ -64,6 +64,10 @@ of an otherwise authenticated API). Set `MEMD_ENABLE_DOCS=1` for development.
 docker build -t memd/memd:0.2.0 .
 docker run -d -p 8700:8700 -e MEMD_ADMIN_KEY=... -v memddata:/data memd/memd:0.2.0 serve --http
 ```
+The default image does not include the Stripe SDK (~26 MB installed; only
+hosted billing uses it). For `serve --http --hosted` with billing, build the
+variant: `docker build --build-arg MEMD_BILLING=1 -t memd/memd:0.2.0-hosted .`
+(the build fails if the billing install does).
 The image runs as **uid 10001**, so a *named volume* (above) works but a
 **bind mount does not** unless you either pass `--user "$(id -u):$(id -g)"` or
 `chown 10001` the host directory. Both are verified; pick one deliberately.
@@ -133,6 +137,199 @@ cannot see another machine): the first writer claims `ns/<ns>/.owner` with a
 conditional PUT, a second gets `NamespaceBusyError`, and a lease older than the
 TTL is reclaimable so a crashed node cannot wedge a namespace forever. It makes
 split-brain loud, not impossible.
+
+## Hosted mode & billing
+
+**Off by default.** Embedded memd and a plain `memd serve --http` behave exactly
+as described above and never import `stripe`. Hosted mode adds tenancy, usage
+metering, plan entitlements and Stripe billing for running memd as a service:
+
+```bash
+pip install "memd[billing]"                      # the Stripe SDK, imported lazily
+export MEMD_HOSTED=1                             # or: memd serve --http --hosted
+memd org create --name acme                      # -> {"org": "org_..."}; plan "free"
+memd key create --hosted --org org_... --ns acme --scopes memory,billing
+memd serve --http --hosted
+```
+
+**Tenancy: org -> namespaces -> API keys.** An org is the billing unit. It owns
+namespaces (a namespace is claimed by the first org that mints a key into it
+and can never be claimed by another), and every key belongs to one org and is
+bound to one of its namespaces. Scopes are exact and combine only
+explicitly (`--scopes memory,override`):
+
+| scope | grants |
+|---|---|
+| `memory` | the data routes `/v1/ns/{ns}/...` and the namespace's operational views `/v1/status`, `/metrics`, `/v1/metrics/json` |
+| `billing` | `/v1/billing/checkout`, `/portal`, `/usage` - nothing else |
+| `override` | only the cross-user capability of a `memory` key (reads across users, `include_deleted`, namespace crypto-shred); no route by itself |
+| operator key (`MEMD_ADMIN_KEY`) | every namespace, every metric series; no org, never metered |
+
+Namespace names follow the engine's grammar, matched in full
+(`[A-Za-z0-9][A-Za-z0-9_.-]{0,127}`, no trailing newline); `_`-prefixed
+names are reserved.
+Keys keep the `memd_<ns>_<kid>_<secret>` format; only a SHA-256 hash of the
+secret is stored. The state lives in an admin SQLite database at
+`<data root>/admin/admin.sqlite3` - beside the tenant store, never inside a
+tenant namespace, so it is neither exported with nor crypto-shredded by a
+tenant. `MEMD_ADMIN_KEY` stays the operator key: it spans namespaces, has no
+org and is never metered. Self-hosted keys (`keys.toml.json`) are not honoured
+in hosted mode; adopt them into an org with
+`memd key migrate --hosted --org org_...` (the key strings keep working).
+
+**Plans** (defaults from [06-economics.md](06-economics.md); config, not code -
+override any value with a JSON file at `MEMD_PLANS_PATH`):
+
+| meter | free (hard caps) | dev, $29/mo | scale (usage-based) |
+|---|---|---|---|
+| `memories_stored` (live gauge) | 50K | 500K (hard) | unlimited |
+| `searches` / month | 10K | 250K (hard) | metered |
+| `extractions_our_key` / month | 10K | 100K included, then metered ($8/100K) | metered |
+| `reranked_searches` / month | 1K | 10K included, then metered | metered |
+| `writes` / month | - | - | metered |
+| `stored_gb` (daily gauge) | - | - | metered |
+
+Enforcement happens before the operation: over a hard cap the request gets
+`402 {"code": "quota_exceeded", "meter": ..., "limit": ..., "used": ...}`; on a
+paid plan a soft limit never refuses - the part above the included quantity is
+recorded as billable overage. Hard caps hold under concurrency: the check and
+a *reservation* of the requested quantity happen in one `BEGIN IMMEDIATE`
+transaction against the rollup plus every in-flight reservation; the usage
+commit releases the reservation in the same transaction, a failed operation
+releases it; a reservation never expires while its request is still running
+(however long it takes), and one left by a crashed process stops counting
+after 10 minutes. 50 concurrent requests at a cap of 20 admit exactly 20.
+Nothing is ever recorded beyond what was reserved. Quota periods are calendar
+months (UTC). **A spent `reranked_searches` quota never refuses a search**:
+the search is served unreranked (`memd_rerank_fallback_total{reason="quota"}`)
+and only `searches` is metered; searches are limited by the `searches` cap
+alone. A session close is a write: at the memories cap it answers 402. While
+its extractor runs it holds room for one memory only - writes alongside it
+are not starved - and once the facts are extracted it reserves exactly
+min(facts extracted, remaining headroom); anything beyond is not written
+(`facts_capped` in the response). With extraction on our key under a
+hard cap, the session's raw records are extracted up to the remaining
+allowance and the rest stay raw-only - searchable, never extracted
+(`raw_skipped`); with no allowance left the close answers 402. After
+`invoice.payment_failed` the org has a 7-day grace period
+(`MEMD_BILLING_GRACE_DAYS`); after it the org is **read-only**: writes and
+session extraction answer `402 {"code": "payment_required"}`, searches, reads
+and exports keep working. **Deletes (`DELETE /memories/{id}`, `forget`,
+namespace crypto-shred) are always allowed**, whatever the plan or payment
+state, and no data is ever dropped for non-payment.
+
+**How metering works.** Each metered request writes a usage event (a UUID,
+the org, the namespace, the meter, the quantity) to an append-only ledger in
+the admin store, together with the period rollup that quota checks read, in
+one transaction, committed with `synchronous=FULL` *after* the operation
+succeeded and *before* the response is sent: every acknowledged operation is
+billed, and an operation the client never saw acknowledged (a crash in
+between) is not. Hourly (`MEMD_BILLING_PUSH_INTERVAL_S`), a background job
+claims the unpushed rows into batches (per org, meter and hour), persists
+each batch id - a UUIDv5 of its member event UUIDs - and sends it as a
+[Stripe Billing Meter Event](https://docs.stripe.com/api/billing/meter-event/create)
+with that id as both `identifier` and idempotency key; a crash anywhere
+re-sends the same key, so Stripe records each batch once. Only the billable
+part is pushed (overage on dev, everything metered on scale).
+**Stripe only remembers an idempotency key for about 24 hours**, so usage
+older than 20 hours (`MEMD_BILLING_MAX_PUSH_AGE_S`, capped at 20 h) is never
+pushed automatically, and a batch that has been pending that long is
+abandoned rather than retried: after an outage, a re-send could otherwise
+bill a batch Stripe already has. Those events become `needs_reconcile`, and
+every job tick settles them against Stripe's meter event summary for their
+quota period (up to their last hour): what Stripe should hold (every settled
+batch in that window plus these events) minus what it reports is the
+verified missing quantity. Zero means the earlier attempts landed (nothing is
+sent); up to the events' own units is pushed once, under a fresh idempotency
+key recorded before the send. Anything else - Stripe holding more than the
+ledger, or lacking more than these events - is not guessed at: drift alert,
+nothing sent, the events stay `needs_reconcile` for a human. A window with a
+batch still pending or sent within the last hour (`MEMD_BILLING_SETTLE_S`;
+summaries lag) is retried on a later tick. The gauges
+(`memories_stored`, `stored_gb`) are snapshotted once per UTC day; `stored_gb`
+is sent in milli-GB so small tenants are not rounded up to a whole GB (price
+that meter per 1/1000 GB and give it the `last` aggregation). A daily
+drift report compares what the ledger settled for the quota period to date
+with Stripe's meter event summaries and raises `memd_billing_drift_alerts_total{meter}` (and a
+`drift_alert` row in the admin store's `billing_log`) when they differ by
+more than `MEMD_BILLING_DRIFT_TOLERANCE` (1%). Billing metrics carry
+`ns="_billing"`, so only operator keys see them on `/metrics`.
+
+**Routes** (billing-scoped key; the org is always the key's own):
+
+| route | does |
+|---|---|
+| `POST /v1/billing/checkout` `{"plan": "dev"\|"scale", "interval": "month"\|"year"}` | a Stripe Checkout Session (subscription: the flat price plus the plan's metered prices, open for 1 h); returns `{url, id}`. One subscription per org: `409 already_subscribed` while one is live, `409 checkout_pending` (with the open session's `url`) while a checkout is open |
+| `POST /v1/billing/portal` | a Billing Portal session; returns `{url}` |
+| `GET /v1/billing/usage` | current-period usage per meter: used, limit, hard, metered, billable; plan, status, grace, read-only |
+| `POST /v1/billing/webhook` | Stripe's webhook endpoint (no bearer: the `Stripe-Signature` is the authentication) |
+
+The webhook is verified with `stripe.Webhook.construct_event` (HMAC-SHA256 over
+the raw body, timestamp tolerance 300 s) and is idempotent by Stripe event id:
+the `processed_events` row commits in the same transaction as the event's
+effect; bodies over 1 MiB (counted as read, chunked or not) are refused.
+Handled:
+- `checkout.session.completed`: only `mode=subscription` sessions with a
+  subscription; the subscription is **re-read from Stripe** and *its* status
+  applies (a payment-mode session never grants a plan nor clears past_due).
+- `customer.subscription.created/updated/deleted`: `active`/`trialing` grant
+  the plan the subscription's prices bill; `past_due` keeps it and starts the
+  grace clock; `incomplete`, `incomplete_expired`, `unpaid`, `paused` and
+  `canceled` grant nothing (free plan). A per-org cursor on the event's
+  `created` ignores re-ordered older events, so a late
+  `checkout.session.completed` cannot resurrect a deleted subscription.
+- One subscription per org: an event for a subscription that is not the
+  org's current one never changes the plan (canceling it does not downgrade
+  the org); every *other live* subscription is listed as a duplicate
+  (`memd_billing_duplicate_subscriptions_total`, a `duplicate_subscription`
+  log row) and the org's metered usage is **held** - not pushed, since each
+  would bill it - while ANY duplicate is listed. When the current
+  subscription ends, the duplicates are re-read from Stripe, each on its
+  own, and the first one still live is promoted to current (its invoices
+  count from then on); dead ones - and ones Stripe no longer has (404) -
+  leave the list; one that cannot be read right now stays listed (and held)
+  until its own next event. None of this ever fails the webhook: the
+  cancellation always takes effect. Each subscription also keeps its own
+  event cursor and a tombstone once it ends, so a late or re-ordered event
+  can neither re-list an ended subscription nor undo a newer one.
+- `invoice.payment_failed` (starts the grace period once) and
+  `invoice.payment_succeeded` count only for the org's current
+  subscription; `checkout.session.expired` closes the open checkout.
+- An org is bound to a Stripe customer only when it has none yet and the
+  customer was created by memd's checkout for that org (its
+  `metadata.memd_org_id`); anything else is logged and ignored.
+- Events for customers memd does not know are acknowledged (200) and counted
+  (`memd_billing_webhook_unmapped_total`); a Stripe read that fails answers
+  500 so Stripe retries.
+
+**Configuration** (environment):
+
+| variable | meaning |
+|---|---|
+| `MEMD_HOSTED` | `1` enables hosted mode (same as `serve --hosted`) |
+| `MEMD_STRIPE_SECRET_KEY` | Stripe secret key. `sk_live_`/`rk_live_` keys are **refused** unless `MEMD_ALLOW_LIVE_BILLING=1` (exactly `1`); a key or webhook secret containing whitespace is refused |
+| `MEMD_STRIPE_WEBHOOK_SECRET` | the webhook endpoint's signing secret (`whsec_...`) |
+| `MEMD_STRIPE_PRICE_DEV_MONTHLY`, `..._DEV_YEARLY` | flat subscription prices (`MEMD_STRIPE_PRICE_<PLAN>_MONTHLY/_YEARLY`) |
+| `MEMD_STRIPE_PRICE_<PLAN>_<METER>` | metered prices, e.g. `MEMD_STRIPE_PRICE_DEV_EXTRACTIONS_OUR_KEY`, `MEMD_STRIPE_PRICE_SCALE_STORED_GB`; every metered meter of a plan needs one |
+| `MEMD_STRIPE_METER_<METER>` | the Stripe meter's `event_name` (default `memd_<meter>`) |
+| `MEMD_STRIPE_METER_ID_<METER>` | the meter id for reconciliation (default: looked up by event name) |
+| `MEMD_PUBLIC_URL`, `MEMD_BILLING_SUCCESS_URL`, `MEMD_BILLING_CANCEL_URL`, `MEMD_BILLING_RETURN_URL` | Checkout/Portal redirect targets |
+| `MEMD_PLANS_PATH` | JSON plan overrides |
+| `MEMD_BILLING_GRACE_DAYS`, `MEMD_BILLING_PUSH_INTERVAL_S`, `MEMD_BILLING_DRIFT_TOLERANCE`, `MEMD_STRIPE_WEBHOOK_TOLERANCE_S` | 7, 3600, 0.01, 300 (must be > 0: 0 would disable the replay check) |
+| `MEMD_STRIPE_API_BASE` | point the Stripe client elsewhere (stripe-mock in tests) |
+| `MEMD_BILLING_MAX_PUSH_AGE_S`, `MEMD_BILLING_SETTLE_S`, `MEMD_STRIPE_MAX_NETWORK_RETRIES` | 72000 (the maximum), 3600, 2 |
+| `MEMD_BILLING_JOBS` | `0` disables the in-process push/snapshot/reconcile loop |
+
+Without `MEMD_STRIPE_SECRET_KEY`, hosted mode still enforces tenancy and
+quotas (orgs keep the plan set with `memd org set-plan`) and the billing
+routes answer `503 billing_not_configured`.
+
+**Privacy.** The ledger records counts - org, namespace, meter, quantity,
+time - never memory content, queries or user ids. What reaches Stripe is the
+customer id, the meter's event name, a number and a timestamp; the org's
+name goes into the Stripe customer record once, at first checkout.
+`extractions_our_key` counts only when extraction runs on the operator's LLM
+key; the local heuristic extractor is never billed.
 
 ## Doors (one engine)
 

@@ -1253,6 +1253,19 @@ class NamespaceIndex:
         f = IndexFilter(entity_keys=(entity_key,), include_invalid=include_invalid, scope=scope)
         return self.query_records(f, limit=1000)
 
+    def count_session_raw(self, session_id: str, user_id: str | None = None, limit: int = 1000) -> int:
+        """len(records_of_session(...)) without materializing the rows."""
+        sql = """SELECT COUNT(*) FROM (SELECT 1 FROM records WHERE scope_session = ? AND kind = 'raw_event'
+               AND deleted = 0 AND quarantined = 0"""
+        args: list = [session_id]
+        if user_id:
+            sql += " AND (scope_user = ? OR scope_user IS NULL)"
+            args.append(user_id)
+        sql += " LIMIT ?)"
+        args.append(limit)
+        with self._lock:
+            return int(self._con.execute(sql, args).fetchone()[0])
+
     def records_of_session(
         self,
         session_id: str,
