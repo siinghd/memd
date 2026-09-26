@@ -316,7 +316,7 @@ def test_a_second_node_with_local_keys_refuses_instead_of_rekeying(tmp_path):
     m = Memory(f"s3://{BUCKET}/{store.prefix}", config=dict(cfg, local_dir=str(tmp_path / "a")))
     m.remember("only node A holds the key for this")
     m.close()
-    with pytest.raises(KeyCustodyError, match="no local key"):
+    with pytest.raises(KeyCustodyError, match="no data key here"):
         Memory(f"s3://{BUCKET}/{store.prefix}", config=dict(cfg, local_dir=str(tmp_path / "b")))
     m = Memory(f"s3://{BUCKET}/{store.prefix}", config=dict(cfg, local_dir=str(tmp_path / "a")))
     assert any("node A" in i.content for i in m.search("who holds the key").items)

@@ -1,6 +1,7 @@
 """REST server (D4 §4.1) - the substrate; SDK and MCP are thin over it."""
 from __future__ import annotations
 
+import logging
 import math
 import os
 import sqlite3
@@ -21,6 +22,8 @@ from memd.engine.memory import ForgetPreviewMismatch, Memory, forget_fingerprint
 from memd.metrics import METRICS
 from memd.server.auth import FailureLimiter, KeyStore, Principal, RateLimiter
 from memd.storage.engine import NamespaceBusyError
+
+_log = logging.getLogger("memd.http")
 
 
 class EventIn(BaseModel):
@@ -383,6 +386,7 @@ def create_app(
         except Exception:
             METRICS.inc("memd_http_errors_total", route=route_label, method=method_label)
             # sanitized 500: tracebacks go to the server log, never the client
+            _log.exception("internal error on %s %s", method_label, route_label)
             return _error(500, "internal error")
         finally:
             METRICS.observe("memd_http_request_ms", (time.monotonic() - t0) * 1000,
@@ -430,6 +434,9 @@ def create_app(
         if "evicted" in msg:
             return _error(503, "namespace re-opening; retry", headers={"Retry-After": "1"})
         METRICS.inc("memd_http_errors_total", route=_route_label(request.url.path))
+        # the client gets no internals; the operator gets the traceback
+        _log.error("internal error on %s %s", request.method, _route_label(request.url.path),
+                   exc_info=exc)
         return _error(500, "internal error")
 
     @app.exception_handler(StarletteHTTPException)

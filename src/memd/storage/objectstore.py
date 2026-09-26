@@ -51,6 +51,12 @@ class LeaseLostError(RuntimeError):
     whatever the request did before it may have. Retry through the router."""
 
 
+class AppendConflict(LeaseLostError):
+    """An append log's next part already exists: another writer - a
+    successor's takeover fence, whose part a resumed stale writer runs into
+    - wrote it. The append did not happen (it is never acked)."""
+
+
 class PreconditionFailed(LeaseLostError):
     """A conditional write found the object changed since this process last
     observed or wrote it: someone else is writing it, so this process has

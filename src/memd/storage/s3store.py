@@ -48,8 +48,9 @@ import threading
 import time
 
 from memd.metrics import METRICS
-from memd.storage.objectstore import (LeaseLostError, ObjectStore, PreconditionFailed,  # noqa: F401
-                                      _count_op, adopt_io_tally, current_io_tally)
+from memd.storage.objectstore import (AppendConflict, LeaseLostError, ObjectStore,  # noqa: F401
+                                      PreconditionFailed, _count_op, adopt_io_tally,
+                                      current_io_tally)
 
 # Append parts are SIBLINGS of the logical key, not children.
 #
@@ -702,7 +703,7 @@ class S3ObjectStore(ObjectStore):
             if code in ("PreconditionFailed", "412"):
                 METRICS.inc("memd_s3_append_conflicts_total",
                             help="append part already existed: another writer holds this log")
-                raise RuntimeError(
+                raise AppendConflict(
                     f"append conflict on {key!r}: part {seq} already exists. "
                     "Another process is writing this data root - memd is "
                     "single-writer.") from None

@@ -250,6 +250,10 @@ def test_double_handoff_with_a_paused_append_loses_no_ack(tmp_path, monkeypatch,
             A.engine.namespace(NS).rotate("test")
         gate.set()
         t.join(30)
+        # the frozen append either landed where A replays it, or failed as a
+        # LOST LEASE (503 lease_lost over REST) - never a generic error
+        assert result["b"] in acked or result["b"].split(":")[0] in (
+            "AppendConflict", "LeaseLostError", "PreconditionFailed"), result
         for i in range(3):
             acked[A.remember(f"a-post-{i}", namespace=NS)] = f"a-post-{i}"
         A.engine.namespace(NS).rotate("test")
