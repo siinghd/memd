@@ -64,6 +64,10 @@ of an otherwise authenticated API). Set `MEMD_ENABLE_DOCS=1` for development.
 docker build -t memd/memd:0.2.0 .
 docker run -d -p 8700:8700 -e MEMD_ADMIN_KEY=... -v memddata:/data memd/memd:0.2.0 serve --http
 ```
+The default image does not include the Stripe SDK (~26 MB installed; only
+hosted billing uses it). For `serve --http --hosted` with billing, build the
+variant: `docker build --build-arg MEMD_BILLING=1 -t memd/memd:0.2.0-hosted .`
+(the build fails if the billing install does).
 The image runs as **uid 10001**, so a *named volume* (above) works but a
 **bind mount does not** unless you either pass `--user "$(id -u):$(id -g)"` or
 `chown 10001` the host directory. Both are verified; pick one deliberately.
@@ -177,7 +181,12 @@ override any value with a JSON file at `MEMD_PLANS_PATH`):
 Enforcement happens before the operation: over a hard cap the request gets
 `402 {"code": "quota_exceeded", "meter": ..., "limit": ..., "used": ...}`; on a
 paid plan a soft limit never refuses - the part above the included quantity is
-recorded as billable overage. Quota periods are calendar months (UTC). A
+recorded as billable overage. Hard caps hold under concurrency: the check and
+a *reservation* of the requested quantity happen in one `BEGIN IMMEDIATE`
+transaction against the rollup plus every in-flight reservation; the usage
+commit releases the reservation in the same transaction, a failed operation
+releases it, and a crashed request's reservation stops counting after 10
+minutes. 50 concurrent requests at a cap of 20 admit exactly 20. Quota periods are calendar months (UTC). A
 search is checked against `reranked_searches` too when a reranker is
 configured. After `invoice.payment_failed` the org has a 7-day grace period
 (`MEMD_BILLING_GRACE_DAYS`); after it the org is **read-only**: writes and
@@ -198,12 +207,27 @@ each batch id - a UUIDv5 of its member event UUIDs - and sends it as a
 [Stripe Billing Meter Event](https://docs.stripe.com/api/billing/meter-event/create)
 with that id as both `identifier` and idempotency key; a crash anywhere
 re-sends the same key, so Stripe records each batch once. Only the billable
-part is pushed (overage on dev, everything metered on scale). The gauges
+part is pushed (overage on dev, everything metered on scale).
+**Stripe only remembers an idempotency key for about 24 hours**, so usage
+older than 20 hours (`MEMD_BILLING_MAX_PUSH_AGE_S`, capped at 20 h) is never
+pushed automatically, and a batch that has been pending that long is
+abandoned rather than retried: after an outage, a re-send could otherwise
+bill a batch Stripe already has. Those events become `needs_reconcile`, and
+every job tick settles them against Stripe's meter event summary for their
+quota period (up to their last hour): what Stripe should hold (every settled
+batch in that window plus these events) minus what it reports is the
+verified missing quantity. Zero means the earlier attempts landed (nothing is
+sent); up to the events' own units is pushed once, under a fresh idempotency
+key recorded before the send. Anything else - Stripe holding more than the
+ledger, or lacking more than these events - is not guessed at: drift alert,
+nothing sent, the events stay `needs_reconcile` for a human. A window with a
+batch still pending or sent within the last hour (`MEMD_BILLING_SETTLE_S`;
+summaries lag) is retried on a later tick. The gauges
 (`memories_stored`, `stored_gb`) are snapshotted once per UTC day; `stored_gb`
 is sent in milli-GB so small tenants are not rounded up to a whole GB (price
 that meter per 1/1000 GB and give it the `last` aggregation). A daily
-reconciliation compares what the ledger pushed with Stripe's meter event
-summaries and raises `memd_billing_drift_alerts_total{meter}` (and a
+drift report compares what the ledger settled for the quota period to date
+with Stripe's meter event summaries and raises `memd_billing_drift_alerts_total{meter}` (and a
 `drift_alert` row in the admin store's `billing_log`) when they differ by
 more than `MEMD_BILLING_DRIFT_TOLERANCE` (1%). Billing metrics carry
 `ns="_billing"`, so only operator keys see them on `/metrics`.
@@ -242,6 +266,7 @@ answers 500, so Stripe retries it.
 | `MEMD_PLANS_PATH` | JSON plan overrides |
 | `MEMD_BILLING_GRACE_DAYS`, `MEMD_BILLING_PUSH_INTERVAL_S`, `MEMD_BILLING_DRIFT_TOLERANCE`, `MEMD_STRIPE_WEBHOOK_TOLERANCE_S` | 7, 3600, 0.01, 300 |
 | `MEMD_STRIPE_API_BASE` | point the Stripe client elsewhere (stripe-mock in tests) |
+| `MEMD_BILLING_MAX_PUSH_AGE_S`, `MEMD_BILLING_SETTLE_S`, `MEMD_STRIPE_MAX_NETWORK_RETRIES` | 72000 (the maximum), 3600, 2 |
 | `MEMD_BILLING_JOBS` | `0` disables the in-process push/snapshot/reconcile loop |
 
 Without `MEMD_STRIPE_SECRET_KEY`, hosted mode still enforces tenancy and

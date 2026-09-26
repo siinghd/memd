@@ -24,7 +24,9 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
     `searches`, `reranked_searches`, `extractions_our_key` and `writes`.
   - Plan entitlements from config (free / dev / scale per 06-economics.md,
     overridable with `MEMD_PLANS_PATH`): hard caps answer
-    `402 {"code": "quota_exceeded", "meter", "limit"}`; paid-plan overage is
+    `402 {"code": "quota_exceeded", "meter", "limit"}` and hold under
+    concurrency (atomic check-and-reserve in the admin store; 50 concurrent
+    requests at a cap of 20 admit exactly 20); paid-plan overage is
     allowed and metered; a 7-day grace period after a failed payment, then
     read-only (`402 payment_required` on writes; searches, reads, exports
     work). Deletes are always allowed.
@@ -35,8 +37,13 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
     events cannot roll a plan back).
   - An hourly push of the ledger as Stripe Billing Meter Events (batched,
     one idempotency key per batch, persisted before the first send) and a
-    daily reconciliation against Stripe's meter summaries with a drift
-    alert (`memd_billing_drift_alerts_total`).
+    daily drift report against Stripe's meter summaries
+    (`memd_billing_drift_alerts_total`). Usage older than 20 h is never
+    auto-pushed (Stripe forgets idempotency keys after ~24 h): it is
+    settled against Stripe's summaries, pushing only the verified missing
+    quantity under a fresh key, or alerting when that cannot be decided.
+  - Docker: `--build-arg MEMD_BILLING=1` builds the hosted variant with the
+    Stripe SDK; the default image stays without it.
   - Hosted mode refuses to start with a live Stripe key (`sk_live_`,
     `rk_live_`) unless `MEMD_ALLOW_LIVE_BILLING=1`.
 - `SearchResult.reranked`: whether the reranker ran for that call (a cache

@@ -12,6 +12,17 @@ RUN pip install --no-cache-dir . \
  && python -c "import memd; print('memd', memd.__file__)" \
  && { pip install --no-cache-dir mcp || echo "optional extra 'mcp' unavailable; continuing"; }
 
+# Hosted billing (memd serve --http --hosted) needs the Stripe SDK, ~26 MB
+# installed. The default image leaves it out: self-hosted memd never uses
+# it. Build the hosted variant with:
+#   docker build --build-arg MEMD_BILLING=1 -t memd/memd:hosted .
+# Unlike mcp above, a requested billing install must NOT fail silently.
+ARG MEMD_BILLING=0
+RUN if [ "$MEMD_BILLING" = "1" ]; then \
+      pip install --no-cache-dir ".[billing]" \
+      && python -c "import stripe, memd.hosted.billing; print('stripe', stripe.VERSION)"; \
+    fi
+
 # run as unprivileged user; /data is the only writable volume
 RUN useradd -m -u 10001 memd && mkdir -p /data && chown memd:memd /data
 USER memd
