@@ -126,6 +126,12 @@ jobs:
         env:
           MEMD_TEST_S3_ENDPOINT: http://127.0.0.1:9000
         run: python -m pytest tests/test_s3_backend.py tests/test_pass32_s3_hardening.py -q
+      # ADR-12: KMS-keyed node processes on one bucket (moto server as the
+      # KMS): routing, SIGKILL/SIGTERM/SIGSTOP handoff, hosted metering
+      - name: Multi-node router on S3
+        env:
+          MEMD_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+        run: python -m pytest tests/test_cluster_unit.py tests/test_cluster_router.py -q -rs
       - name: Hosted-path shape (informational)
         continue-on-error: true
         env:

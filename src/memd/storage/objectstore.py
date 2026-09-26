@@ -45,6 +45,34 @@ def tmp_is_foreign(name: str) -> bool:
 _TALLY_LOCK = threading.Lock()
 
 
+class LeaseLostError(RuntimeError):
+    """This process no longer holds (or cannot prove it holds) the writer
+    lease of the namespace it tried to mutate. The mutation did not happen;
+    whatever the request did before it may have. Retry through the router."""
+
+
+class AppendConflict(LeaseLostError):
+    """An append log's next part already exists: another writer - a
+    successor's takeover fence, whose part a resumed stale writer runs into
+    - wrote it. The append did not happen (it is never acked)."""
+
+
+class PreconditionFailed(LeaseLostError):
+    """A conditional write found the object changed since this process last
+    observed or wrote it: someone else is writing it, so this process has
+    lost ownership. Never retried blindly - the caller fences."""
+
+
+def content_version(data: bytes) -> str:
+    """Version token of an object for stores without native ETags: its
+    content hash. Content-identical rewrites compare equal, which is safe -
+    every object written conditionally changes on every write (a manifest
+    generation, a timestamp, a chain hash)."""
+    import hashlib
+
+    return hashlib.sha256(data).hexdigest()
+
+
 def _count_op(op: str) -> None:
     """I/O round-trip counting per store operation class - request-level I/O
     budgets are only auditable if the ops themselves are visible."""
@@ -151,6 +179,74 @@ class ObjectStore(ABC):
     @abstractmethod
     def copy(self, src: str, dst: str) -> None: ...
 
+    # ------------------------------------------------ conditional writes
+    #
+    # Every object memd rewrites IN PLACE (the manifest - the commit point -,
+    # the audit ledger's checkpoint, the migration report, the key-custody
+    # marker, a wrapped key being rotated, a cluster node's registry entry)
+    # is written with compare-and-swap: "replace it only if it is still the
+    # version I last observed or wrote" (None: "only if it does not exist").
+    # A writer that was paused past its lease and resumed then fails instead
+    # of overwriting its successor's state (ADR-12). Objects under NEW
+    # unique names (segments, snapshots) need no condition: nothing reads
+    # them until a conditional manifest commit references them.
+
+    def get_versioned(self, key: str) -> tuple[bytes, str] | None:
+        """(content, version token) or None. Only for whole objects that are
+        never appended to."""
+        data = self.get(key)
+        return None if data is None else (data, content_version(data))
+
+    def put_if_match(self, key: str, data: bytes, version: str | None, *,
+                     hint: bool = False, fence: bool = True) -> str:
+        """Write `key` only if its current version is `version` (None: only
+        if it does not exist). Returns the new version; raises
+        PreconditionFailed otherwise. `hint`: a rebuildable object (put_hint
+        durability). `fence`: a leasing store also fences the namespace on
+        failure (see S3ObjectStore) - the default, because a failed
+        precondition means ownership was lost.
+
+        The default is check-then-put, correct for a store with one writer
+        process; LocalObjectStore serializes it, S3 does it server side."""
+        cur = self.get(key)
+        if (None if cur is None else content_version(cur)) != version:
+            raise PreconditionFailed(f"{key!r} changed since this process last wrote it")
+        (self.put_hint if hint else self.put)(key, data)
+        return content_version(data)
+
+    def log_bound(self, key: str) -> int | None:
+        """Opaque high-water mark of an append log as this process last saw
+        it (read or appended), or None when the store has no such notion.
+        Passed back to delete_log after a commit."""
+        return None
+
+    def delete_log(self, key: str, upto: int | None) -> None:
+        """Delete an append log a commit made obsolete - only what existed
+        at `upto` (a log_bound taken BEFORE the commit), so a paused writer
+        resuming here cannot delete what a successor appended since. Stores
+        with a single writer delete it whole."""
+        self.delete(key)
+
+    def put_if_absent(self, key: str, data: bytes) -> bool:
+        """Create `key` only if nothing is there; False if it already exists.
+
+        Wrapped data keys are minted this way: two nodes opening the same new
+        namespace must agree on ONE key, and the loser adopts the winner's.
+        The default is check-then-put (not atomic); both real backends
+        override it with an atomic create."""
+        if self.exists(key):
+            return False
+        self.put(key, data)
+        return True
+
+    def shred(self, key: str) -> None:
+        """Delete `key` so that no copy the store keeps stays readable.
+
+        Same as delete() here; a versioned bucket overrides it to remove every
+        noncurrent version too - a delete marker over a wrapped data key is
+        not a crypto-shred."""
+        self.delete(key)
+
 
 class LogWriter(ABC):
     """Persistent-handle append log. write() makes bytes visible (flushed);
@@ -194,6 +290,18 @@ class LocalLogWriter(LogWriter):
         except OSError:
             pass
         self.fd.close()
+
+
+_LOCAL_CAS_LOCKS: dict[str, threading.Lock] = {}
+_LOCAL_CAS_GUARD = threading.Lock()
+
+
+def _local_cas_lock(root: str) -> threading.Lock:
+    with _LOCAL_CAS_GUARD:
+        lk = _LOCAL_CAS_LOCKS.get(root)
+        if lk is None:
+            lk = _LOCAL_CAS_LOCKS[root] = threading.Lock()
+        return lk
 
 
 class LocalObjectStore(ObjectStore):
@@ -262,6 +370,52 @@ class LocalObjectStore(ObjectStore):
                 os.unlink(tmp)
             raise
 
+    def put_if_match(self, key: str, data: bytes, version: str | None, *,
+                     hint: bool = False, fence: bool = True) -> str:
+        """Compare-and-swap emulated under a lock: a local data root has ONE
+        writer process (the per-namespace flock), so serializing the
+        compare and the swap inside it is enough. The version is the content
+        hash (see content_version)."""
+        with _local_cas_lock(self.root):
+            try:
+                with open(self._path(key), "rb") as f:
+                    cur: str | None = content_version(f.read())
+            except FileNotFoundError:
+                cur = None
+            if cur != version:
+                _count_op("put_if_match_conflict")
+                raise PreconditionFailed(f"{key!r} changed since this process last wrote it")
+            (self.put_hint if hint else self.put)(key, data)
+            return content_version(data)
+
+    def get_versioned(self, key: str) -> tuple[bytes, str] | None:
+        data = self.get(key)
+        return None if data is None else (data, content_version(data))
+
+    def put_if_absent(self, key: str, data: bytes) -> bool:
+        """Atomic create: the fsynced temp file is hard-LINKED into place,
+        which fails if the name exists (rename would silently replace it)."""
+        _count_op("put_if_absent")
+        path = self._path(key)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=_TMP_TAG)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.link(tmp, path)
+            except FileExistsError:
+                return False
+            self._fsync_dir(os.path.dirname(path))
+            return True
+        finally:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+
     def get(self, key: str) -> bytes | None:
         _count_op("get")
         try:
@@ -274,6 +428,21 @@ class LocalObjectStore(ObjectStore):
         _count_op("delete")
         try:
             os.unlink(self._path(key))
+        except FileNotFoundError:
+            pass
+
+    def shred(self, key: str) -> None:
+        """Overwrite, fsync, then unlink - as LocalKeyEnvelope.destroy does
+        for its key files, so a lazy filesystem does not keep the bytes."""
+        _count_op("shred")
+        path = self._path(key)
+        try:
+            size = os.path.getsize(path)
+            with open(path, "r+b") as f:
+                f.write(secrets.token_bytes(size))
+                f.flush()
+                os.fsync(f.fileno())
+            os.unlink(path)
         except FileNotFoundError:
             pass
 

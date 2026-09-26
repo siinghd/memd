@@ -36,6 +36,7 @@ from memd.hosted.plans import (EXTRACTIONS_OUR_KEY, GAUGES, MEMORIES_STORED, MET
                                SEARCHES, STORED_GB, WRITES, Plans)
 from memd.hosted.store import AdminStore, period_bounds, period_of
 from memd.metrics import METRICS
+from memd.storage.engine import NamespaceBusyError
 
 _OPS = {"ns": "_billing"}  # operator-only series (see billing._OPS)
 _NULL_LOCK = contextlib.nullcontext()
@@ -375,7 +376,16 @@ class Metering:
             for row in self.store.org_namespaces(org["id"]):
                 if not self.engine.has_namespace(row["ns"]):
                     continue
-                st = self.engine.stats(namespace=row["ns"])
+                try:
+                    st = self.engine.stats(namespace=row["ns"])
+                except NamespaceBusyError:
+                    # cluster: another node holds it; its jobs record the
+                    # measure every tick (measure_open), use the latest
+                    METRICS.inc("memd_billing_measure_remote_total",
+                                help="gauge snapshots that used a peer node's last measure", **_OPS)
+                    recs += int(row.get("records") or 0)
+                    nbytes += int(row.get("bytes") or 0)
+                    continue
                 r = int(st.get("records", 0))
                 b = int(st.get("segment_bytes", 0) or 0) + int(st.get("wal_bytes", 0) or 0)
                 self.store.set_ns_measure(row["ns"], r, b, at=int(now))
@@ -387,6 +397,25 @@ class Metering:
             self.store.record_gauge(org["id"], STORED_GB, round(nbytes / 1e9, 6), plan, day, ts=now)
             out[org["id"]] = {"memories_stored": recs, "stored_bytes": nbytes}
         return out
+
+    def measure_open(self, now: float | None = None) -> int:
+        """Record the size of every org namespace open on THIS node (cluster
+        mode: only the leaseholder can read a namespace without taking it
+        over). Never opens one. Returns how many were measured."""
+        now = self.clock() if now is None else now
+        n = 0
+        for ns in self.engine.open_namespaces():
+            if self.store.ns_owner(ns) is None:
+                continue
+            try:
+                st = self.engine.stats(namespace=ns)
+            except Exception:  # noqa: BLE001 - evicted or handed off meanwhile
+                continue
+            r = int(st.get("records", 0))
+            b = int(st.get("segment_bytes", 0) or 0) + int(st.get("wal_bytes", 0) or 0)
+            self.store.set_ns_measure(ns, r, b, at=int(now))
+            n += 1
+        return n
 
     # ------------------------------------------------------------- reporting
 

@@ -115,6 +115,15 @@ class BillingJobs:
         h = self.hosted
         now = time.time() if now is None else now
         out: dict[str, Any] = {}
+        if h.router is not None:
+            # cluster: every node records the size of the namespaces IT holds
+            # (only the leaseholder can read one without taking it over), and
+            # one node - the rendezvous choice for "_billing" among the live
+            # nodes - runs the singleton steps below
+            out["measured"] = h.metering.measure_open()
+            if not h.router.is_leader("_billing"):
+                out["leader"] = False
+                return out
         day = time.strftime("%Y-%m-%d", time.gmtime(now))
         if day != self._snapshot_day:
             out["snapshot"] = h.metering.snapshot_gauges(now=now)
@@ -154,7 +163,7 @@ class BillingJobs:
 class Hosted:
     def __init__(self, data_dir: str, engine: Any, *, admin_key: str | None = None,
                  plans: Plans | None = None, billing_config: BillingConfig | None = None,
-                 stripe_client: Any = None):
+                 stripe_client: Any = None, router: Any = None):
         # from_env runs the sk_live_ guard: a refused key stops startup here
         self.cfg = billing_config or BillingConfig.from_env()
         if (self.cfg.configured or self.cfg.webhook_secret) and importlib.util.find_spec("stripe") is None:
@@ -162,8 +171,14 @@ class Hosted:
                                "pip install 'memd[billing]'")
         self.plans = plans or Plans.from_env()
         self.store = AdminStore.for_data_root(data_dir)
-        # one process per data root: reservations on disk are a dead process's
-        self.store.clear_reservations()
+        # the cluster router (memd.server.cluster.Router) when this process
+        # is one node of a fleet sharing this admin database, else None
+        self.router = router
+        if router is None:
+            # one process per data root: reservations on disk are a dead process's
+            self.store.clear_reservations()
+        # (a cluster shares the database: the other nodes' reservations are
+        # live, and a dead node's expire by their TTL)
         self.keystore = HostedKeyStore(self.store, admin_key=admin_key)
         self.metering = Metering(self.store, self.plans, engine)
         self.billing = Billing(self.store, self.plans, self.cfg, client=stripe_client)

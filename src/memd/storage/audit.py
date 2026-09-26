@@ -25,6 +25,9 @@ import threading
 from typing import Callable, NamedTuple
 
 from memd.core.schema import now_ms
+from memd.storage.objectstore import PreconditionFailed
+
+_UNKNOWN = object()   # a sidecar version not read yet
 
 CHAIN_KEYED = "hmac-sha256"
 _CHAIN_LABEL = b"memd/audit-chain/v1"
@@ -100,6 +103,7 @@ class AuditLog:
         self._chain_start = "0" * 64
         self._lock = threading.Lock()
         self._tail_hash = "0" * 64
+        self._state_ver: "str | None | object" = _UNKNOWN   # the sidecar's, as last seen
         self._load_tail()
 
     # ---------------------------------------------------------------- framing
@@ -139,7 +143,16 @@ class AuditLog:
             if (self._size() if size is None else size) < self.rotate_bytes:
                 return
             self.store.copy(self.key, self._seg_key(self._segments))
-            self.store.truncate(self.key, 0)
+            # Empty the live ledger - on a leasing store only of what the copy
+            # just sealed (log_bound: the parts this process saw), so a writer
+            # paused here and resumed after another node took the namespace
+            # over cannot wipe entries that node appended since (ADR-12)
+            bound_of = getattr(self.store, "log_bound", None)
+            bound = bound_of(self.key) if callable(bound_of) else None
+            if bound is None:
+                self.store.truncate(self.key, 0)
+            else:
+                self.store.delete_log(self.key, bound)
             self._segments += 1
             if self._segments > self.KEEP_SEGMENTS:
                 oldest = self._segments - self.KEEP_SEGMENTS - 1
@@ -254,16 +267,35 @@ class AuditLog:
         leaves a stale `bytes` and the reader self-heals via the full-read path.
         """
         try:
-            put = getattr(self.store, "put_hint", None) or self.store.put
-            put(
-                self._state_key(),
-                json.dumps({"h": self._tail_hash,
-                            "bytes": self._size() if size is None else size,
-                            "segs": self._segments,
-                            "pruned": self._pruned,
-                            "chain_start": self._chain_start},
-                           separators=(",", ":")).encode(),
-            )
+            data = json.dumps({"h": self._tail_hash,
+                               "bytes": self._size() if size is None else size,
+                               "segs": self._segments,
+                               "pruned": self._pruned,
+                               "chain_start": self._chain_start},
+                              separators=(",", ":")).encode()
+            cas = getattr(self.store, "put_if_match", None)
+            if cas is None:
+                put = getattr(self.store, "put_hint", None) or self.store.put
+                put(self._state_key(), data)
+            else:
+                # Rewritten in place, so conditional (ADR-12): never on top of
+                # a sidecar someone else wrote since we last read or wrote it.
+                # A conflict is not necessarily a lost lease (two ledger
+                # handles in one process, briefly), so it skips this write and
+                # re-reads the version next time; a writer that DID lose the
+                # namespace never gets here - its append above is fenced.
+                if self._state_ver is _UNKNOWN:
+                    got = self.store.get_versioned(self._state_key())
+                    self._state_ver = got[1] if got else None
+                try:
+                    self._state_ver = cas(self._state_key(), data, self._state_ver,
+                                          hint=True, fence=False)
+                except PreconditionFailed:
+                    self._state_ver = _UNKNOWN
+                    from memd.metrics import METRICS
+
+                    METRICS.inc("memd_audit_checkpoint_conflicts_total",
+                                help="audit checkpoints skipped: the sidecar changed under us")
         except Exception:
             # Best-effort by construction: the checkpoint is a read-side
             # optimization and the full-read path reproduces it exactly, so a
@@ -279,7 +311,11 @@ class AuditLog:
         size = self._size()
         raw = None
         try:
-            raw = self.store.get(self._state_key())
+            if hasattr(self.store, "get_versioned"):
+                got = self.store.get_versioned(self._state_key())
+                raw, self._state_ver = (got if got else (None, None))
+            else:
+                raw = self.store.get(self._state_key())
         except Exception:
             raw = None
         if raw:

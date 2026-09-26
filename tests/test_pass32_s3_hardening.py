@@ -358,8 +358,12 @@ def test_every_mutating_method_fences():
                             "src", "memd", "storage", "s3store.py")).read()
     cls = next(n for n in ast.parse(src).body
                if isinstance(n, ast.ClassDef) and n.name == "S3ObjectStore")
-    lease_internals = {"try_acquire_owner", "release_owner", "_renew_leases",
-                       "_start_lease_thread", "_delete_batch"}
+    # _renew_one is the heartbeat's body (split out so a stale writer can
+    # renew synchronously from _check_fence); it writes only the lease object
+    # (the *_locked bodies run under the namespace's lease lock)
+    lease_internals = {"try_acquire_owner", "_try_acquire_owner", "release_owner", "_renew_leases",
+                       "_renew_one", "_start_lease_thread", "_delete_batch",
+                       "_renew_one_locked", "_release_owner_locked"}
     unfenced = []
     for fn in cls.body:
         if not isinstance(fn, ast.FunctionDef) or fn.name.startswith("_raw"):

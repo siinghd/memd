@@ -23,8 +23,18 @@ RUN if [ "$MEMD_BILLING" = "1" ]; then \
       && python -c "import stripe, memd.hosted.billing; print('stripe', stripe.VERSION)"; \
     fi
 
-# run as unprivileged user; /data is the only writable volume
-RUN useradd -m -u 10001 memd && mkdir -p /data && chown memd:memd /data
+# Object storage + AWS KMS (s3:// data roots, the aws-kms key provider,
+# multi-node serving - see docker-compose.yml): boto3, ~90 MB installed.
+#   docker build --build-arg MEMD_S3=1 -t memd/memd:cluster .
+ARG MEMD_S3=0
+RUN if [ "$MEMD_S3" = "1" ]; then \
+      pip install --no-cache-dir ".[s3]" \
+      && python -c "import boto3, memd.storage.s3store; print('boto3', boto3.__version__)"; \
+    fi
+
+# run as unprivileged user; /data (node-local) and /state (shared by the
+# nodes of a cluster: API keys, hosted admin db) are the writable volumes
+RUN useradd -m -u 10001 memd && mkdir -p /data /state && chown memd:memd /data /state
 USER memd
 
 ENV MEMD_DATA=/data \

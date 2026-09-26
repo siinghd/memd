@@ -21,16 +21,18 @@ any probe fails the build.
   fails fast with `NamespaceBusyError`. `uvicorn --workers N` with N>1 and two
   containers on one volume do not work. `MEMD_ALLOW_MULTI_PROCESS=1` disables
   the check and re-enables silent data loss; it exists for recovery tooling.
-- **At-rest encryption is local-file envelope encryption.** It protects the
-  volume and makes crypto-shred possible. It is *not* protection against
-  someone with filesystem read access on the same machine. Hosted deployments
-  are expected to swap the root-key provider for a KMS; that provider does not
-  ship yet.
-- **Key custody fails closed.** Restore the keys directory together with the
-  data it was written with. A key that is valid but not that data's (another
-  deployment's `keys/`, a replaced `root.key`), no key at all, or encryption
-  turned off for an encrypted namespace makes the open raise
-  `KeyCustodyError`; nothing is read, truncated or deleted, no key is
+- **At-rest encryption with the default `local` key provider is local-file
+  envelope encryption.** It protects the volume and makes crypto-shred
+  possible. It is *not* protection against someone with filesystem read
+  access on the same machine (the root key file sits beside the data). See
+  "Key custody" below for the KMS / Vault providers.
+- **Key custody fails closed.** Restore the keys together with the data they
+  were written with (the keys directory for `local`; the `keys/` objects for
+  a remote provider). A key that is valid but not that data's (another
+  deployment's `keys/` directory or `keys/<ns>.dek` object, a replaced
+  `root.key`), no key at all, or encryption turned off for an encrypted
+  namespace makes the open raise `KeyCustodyError`; nothing is read,
+  truncated or deleted, no key is
   created, and the namespace opens normally once the right keys are back.
   The manifest holds a fingerprint of each namespace's data key (an HMAC of
   a fixed label under the key) to check this before anything is touched; it
@@ -47,18 +49,26 @@ any probe fails the build.
   could not apply to it stay pending until it reads again); a damaged log
   frame refuses the open - see "Recovering from an unreadable log frame"
   below.
-- **With the S3 backend, data is remote but KEYS ARE LOCAL.** That is a
-  deliberate, load-bearing asymmetry: crypto-shred still works (the key never
-  left the node, so destroying it makes the remote ciphertext inert), but a
-  second node cannot decrypt the bucket. Back up the local key directory
-  separately and treat it as the crown jewels - losing it is equivalent to
-  shredding every namespace. This is "one node with remote durability", not
-  "any node serves any namespace".
+- **With the S3 backend and `local` keys, data is remote but KEYS ARE LOCAL.**
+  Crypto-shred works (destroying the local key makes the remote ciphertext
+  inert), but a second node cannot decrypt the bucket - it refuses to open a
+  namespace it has no key for (it used to mint a new one). Back up the local
+  key directory separately and treat it as the crown jewels - losing it is
+  equivalent to shredding every namespace. Cluster mode refuses `local` keys.
 - **Single-writer on S3 is a LEASE, not a distributed lock.** The first writer
   claims `ns/<ns>/.owner` with a conditional PUT and a second gets
-  `NamespaceBusyError`; a lease older than the TTL is reclaimable so a crashed
-  node cannot wedge a namespace. It makes split-brain loud, not impossible.
-  Do not run two writers and rely on it.
+  `NamespaceBusyError`; a lease older than the TTL is reclaimable (by
+  compare-and-swap: one winner) so a crashed node cannot wedge a namespace. A
+  holder that cannot renew for 2/3 of the TTL stops writing, a node taking
+  over a stale lease fences the previous holder's append logs, and every
+  object rewritten in place - the manifest commit above all - is written
+  with compare-and-swap, so a holder frozen between its check and its write
+  fails when it resumes instead of overwriting its successor. What remains
+  open (ADR-12): the audit ledger's rotation can still overwrite a
+  successor's sealed audit segment in that window (the hash chain then fails
+  verification), and clock skew between nodes must stay under TTL/3. Do not
+  run two writers on one namespace and rely on it; the cluster router
+  (ADR-12) never does.
 - **The local data directory is trusted.** Derived caches under it (the
   SQLite index, the tantivy and usearch sidecars) are checksummed or
   rebuildable against accidental damage, not against someone who can write
@@ -67,6 +77,66 @@ any probe fails the build.
   during its probation is rebuilt at the next open, one whose structure or
   first answers disagree with SQLite is rebuilt - but does not make usearch
   safe to load it. Protect the data directory like the key directory.
+
+## Key custody (ADR-12)
+
+- **Where the root key lives.** `MEMD_KEY_PROVIDER=local` (default): a file,
+  `<local_dir>/keys/root.key` (0600), on the node. `aws-kms`: in AWS KMS; memd
+  holds only wrapped data keys (`keys/<ns>.dek` in the bucket) and asks KMS to
+  unwrap them. `vault-transit`: in Vault's transit engine, likewise. With a
+  remote provider neither the bucket alone (ciphertext + wrapped keys) nor
+  the provider alone (no data) is enough; an attacker needs both bucket read
+  and `kms:Decrypt` (or the transit `decrypt` policy). Grant the latter only
+  to memd nodes, with the encryption context condition
+  `kms:EncryptionContext:memd:namespace` if you want per-tenant policies.
+- **Binding.** Each wrapped data key is bound to its namespace (KMS encryption
+  context / transit `associated_data`): a wrapped key copied under another
+  namespace's name does not unwrap. A Vault that silently ignores
+  `associated_data` is refused rather than used unbound.
+- **Custody fails closed.** An unreadable `keys/_custody.json` refuses the
+  open on every root (never delete it to get past that - restore it). A
+  namespace with encrypted data is never given a freshly minted key, and a
+  data key that is not its data's is refused before anything is read, on
+  every root and under every provider ("Key custody fails closed" above: the
+  manifest's key fingerprint, or a probe of the data). The two checks are
+  complementary: the custody marker says which PROVIDER wraps the store's
+  data keys and refuses a node configured for another one before it can
+  mint anything; the fingerprint is of the data key itself, so it survives
+  `memd keys migrate` and `memd keys rotate` (both re-wrap the same key) and
+  catches a wrapped key that unwraps fine but is not this data's - another
+  deployment's `keys/<ns>.dek` restored over this one's. A remote provider
+  resolves the key when the namespace opens, and refuses to mint one for a
+  namespace that already has a manifest (`MEMD_KEYS_ALLOW_MINT_EXISTING=1`
+  only for a namespace that was never encrypted). Log frames that are
+  complete but do not read are never truncated as a "torn tail" - the open
+  is refused instead.
+- **Plaintext data keys are in node memory** while a namespace is open (they
+  must be, to encrypt), LRU-bounded to 1024 namespaces per process.
+- **Crypto-shred with a SHARED CMK / transit key** (the normal deployment)
+  deletes the namespace's wrapped key object - including every noncurrent
+  version on a versioned bucket (a versioned bucket whose versions API memd
+  may not use makes the destroy fail loudly). It cannot delete the CMK, which
+  every other namespace needs. So a copy of the wrapped key made BEFORE the
+  shred - a bucket backup, cross-region replication, a snapshot - together
+  with `kms:Decrypt` on the CMK still recovers the data key. Keep backups of
+  the `keys/` prefix under the same retention you promise for erasure, or
+  exclude it from them. For tenants who need the stronger guarantee, give them
+  their OWN key (`MEMD_KMS_KEY_ID=alias/memd-{namespace}` /
+  `MEMD_VAULT_TRANSIT_KEY=memd-{namespace}`) and set
+  `MEMD_KMS_SHRED=schedule-deletion` (or `disable`) / `MEMD_VAULT_SHRED=delete-key`:
+  the shred then also destroys that key, and old copies of the wrapped key
+  are dead. These key-level actions are refused at startup for a shared key.
+  The destroy is recorded in the node's audit ledger with what the provider
+  did.
+- **Migration** (`memd keys migrate`) removes the local key files only after
+  every namespace verified under the new provider; `--keep-local` keeps them,
+  and then crypto-shred does NOT cover those copies until they are removed.
+- **Cluster traffic.** Nodes proxy requests to each other over plain HTTP
+  unless you front them with TLS; `MEMD_CLUSTER_SECRET` authenticates the
+  routing header (HMAC over node, time, client, method and path, 60 s
+  window) but does not encrypt anything. Run the node-to-node network as a
+  private segment. A request without a valid signature is simply routed like
+  any client request.
 - **Audit retention is bounded** (16 sealed segments, 64MB each by default).
   Past that the oldest is dropped and the hash chain is re-anchored, so
   `verify()` proves tamper-evidence over the *retained window*.
@@ -102,6 +172,15 @@ any probe fails the build.
   `memd[fast]`, the tantivy index (`<ns>.tantivy/` beside it) contain record
   text unencrypted, with owner-only permissions. Both are deleted on
   crypto-shred and are rebuildable from the (encrypted) log.
+  In a multi-node deployment each node keeps its own local copy for the
+  namespaces it has served, and a hard delete is scrubbed physically only
+  on the node that owns the namespace when it runs. A node that served a
+  namespace earlier and has not taken it back since still holds the text
+  it indexed then, including records hard-deleted later on another node,
+  until it next opens that namespace (its stale copy is then discarded) or
+  its cache directory is removed. It never serves that copy, but it is on
+  its disk: when a hard delete must reach every disk, clear the local cache
+  directory (`local_dir`) of the nodes that no longer own the namespace.
 
 - **Hosted mode & billing (`--hosted`, off by default).**
   - *The Stripe webhook is authenticated by its signature only.*

@@ -50,9 +50,9 @@ from memd.query.rerank import (
     resolve_reranker,
 )
 from memd.storage.audit import AuditLog, BufferedAuditLog
-from memd.storage.crypto import LocalKeyEnvelope, NullKeyEnvelope
+from memd.storage.crypto import envelope_from_config
 from memd.storage.engine import StorageEngine
-from memd.storage.objectstore import count_io
+from memd.storage.objectstore import LocalObjectStore, count_io
 
 _log = logging.getLogger(__name__)
 
@@ -593,9 +593,11 @@ class Memory:
             # implementation detail:
             #   - the SQLite derived index (rebuildable by contract; the pass-22
             #     snapshot is what makes a cold node cheap), and
-            #   - envelope keys, which is why this is "one node with remote
-            #     durability" rather than "any node serves any namespace".
-            #     Crypto-shred still works; a second node cannot decrypt.
+            #   - envelope keys WITH THE DEFAULT `local` KEY PROVIDER, which
+            #     makes this "one node with remote durability". A remote
+            #     provider (key_provider="aws-kms" | "vault-transit", ADR-12)
+            #     keeps the wrapped keys in the bucket instead, and then any
+            #     authorised node can serve any namespace.
             from memd.storage.s3store import S3ObjectStore
 
             rest = str(path)[len("s3://"):]
@@ -605,24 +607,35 @@ class Memory:
             store = S3ObjectStore(
                 bucket=bucket, prefix=s3_prefix,
                 endpoint_url=cfg.get("s3_endpoint_url") or os.environ.get("MEMD_S3_ENDPOINT"),
-                access_key=cfg.get("s3_access_key"),
-                secret_key=cfg.get("s3_secret_key"),
+                # separate from AWS_* so a MinIO / R2 bucket and AWS KMS can
+                # use different credentials in one process
+                access_key=cfg.get("s3_access_key") or os.environ.get("MEMD_S3_ACCESS_KEY"),
+                secret_key=cfg.get("s3_secret_key") or os.environ.get("MEMD_S3_SECRET_KEY"),
                 region=cfg.get("s3_region") or os.environ.get("AWS_REGION"),
+                lease_ttl_s=float(cfg.get("lease_ttl_s") or os.environ.get("MEMD_LEASE_TTL_S") or 60.0),
+                lease_holder=cfg.get("lease_holder"),
             )
             path = str(cfg.get("local_dir")
                        or os.environ.get("MEMD_LOCAL_DIR")
                        or os.path.join(".memd-local", bucket, s3_prefix or "_"))
         os.makedirs(path, exist_ok=True)
-        keys_dir = os.path.join(path, "keys")
-        # (with encryption off, the keys directory still tells an open that a
-        # namespace was written with it on: see NamespaceStore._verify_key)
-        envelope = LocalKeyEnvelope(keys_dir) if encrypt else NullKeyEnvelope(keys_dir)
+        remote = store is not None
+        if store is None:
+            store = LocalObjectStore(os.path.join(path, "store"))
+        # ADR-12: who holds the root key. `local` (default) keeps it in a file
+        # under <path>/keys exactly as before; a remote provider (aws-kms,
+        # vault-transit) keeps wrapped data keys as objects in `store`, so any
+        # node authorised on the provider can open any namespace. (With
+        # encryption off, the keys directory - and the store's wrapped keys -
+        # still tell an open that a namespace was written with it on: see
+        # NamespaceStore._verify_key)
+        envelope = envelope_from_config(cfg, path, store, encrypt=encrypt)
         # resolved before any namespace opens: the accelerators attach at open
         self.lexical_backend = resolve_lexical_backend(cfg)
         self.vector_index = resolve_vector_index(cfg)
         self.engine = StorageEngine(os.path.join(path, "store"), envelope=envelope,
                                     store=store,
-                                    cache_dir=os.path.join(path, "_cache") if store else None,
+                                    cache_dir=os.path.join(path, "_cache") if remote else None,
                                     lexical={
                                         "backend": self.lexical_backend,
                                         "commit_ms": int(cfg.get("lexical_commit_ms", DEFAULT_COMMIT_MS)),
@@ -648,6 +661,7 @@ class Memory:
         # namespace legitimately exists again.
         self._shredded: "OrderedDict[str, None]" = OrderedDict()
         self.engine.audit_hook = self._audit_engine_event
+        self.engine.close_hook = self._namespace_closing
         self.ns = self.engine.namespace(namespace)
         # the facade holds a direct reference to this store for its lifetime:
         # pin it so LRU churn of other namespaces can't close it underneath us
@@ -1025,6 +1039,28 @@ class Memory:
                 except Exception:
                     METRICS.inc("memd_audit_flush_failures_total", ns=victim_name)
             return log
+
+    def _namespace_closing(self, ns_name: str, lost: bool) -> None:
+        """The engine is closing `ns_name` (LRU eviction, shutdown) or dropped
+        it after another writer took it over. Its ledger's buffered entries
+        are written now, while this process still holds the namespace - or
+        dropped when it no longer does (writing them would be a write without
+        the lease) - and the ledger object goes: the next tenure reloads the
+        tail another node may have extended. Cached searches go stale too."""
+        if ns_name == self.namespace_name:
+            return   # the facade's pinned namespace is never evicted
+        with self._audit_lock:
+            log = self._audits.pop(ns_name, None)
+        if log is not None and not lost:
+            try:
+                log.flush()
+            except Exception:
+                METRICS.inc("memd_audit_flush_failures_total", ns=ns_name)
+        elif log is not None:
+            METRICS.inc("memd_audit_entries_dropped_total",
+                        help="buffered audit entries of a namespace lost to another writer",
+                        ns=ns_name)
+        self._bump_epoch(ns_name)
 
     def _audit_engine_event(self, ns_name: str, action: str, target: str, detail: dict) -> None:
         """StorageEngine.audit_hook: engine-initiated events land in the
@@ -1819,6 +1855,12 @@ class Memory:
             raise RuntimeError("has_namespace is embedded-only")
         return self.engine.has_namespace(namespace)
 
+    def open_namespaces(self) -> list[str]:
+        """Namespaces open in this process (embedded-only)."""
+        if self._hosted() is not None:
+            raise RuntimeError("open_namespaces is embedded-only")
+        return self.engine.open_namespaces()
+
     def destroy_namespace(self, namespace: str | None = None, actor: str = "api") -> bool:
         impl = self._hosted()
         if impl is not None:
@@ -1856,8 +1898,13 @@ class Memory:
             self.audit = self._audit_for(name)
         METRICS.inc("memd_destroys_total", ns=name)
         # destroy is an ADMINISTRATIVE act on the engine, so it lands in the
-        # facade's own ledger - never in the ledger of the namespace just shredded
-        self.audit.append(actor=actor, action="destroy_namespace", target=name)
+        # facade's own ledger - never in the ledger of the namespace just
+        # shredded. It records what the key provider did (ADR-12): the wrapped
+        # key deleted, and any KMS-side disable / scheduled deletion
+        env = self.engine.envelope
+        shred = env.destroy_report(name) if env is not None and hasattr(env, "destroy_report") else {}
+        self.audit.append(actor=actor, action="destroy_namespace", target=name,
+                          detail={"key_shred": shred} if shred else None)
         return ok
 
     def export_jsonl_iter(self, namespace: str | None = None):

@@ -7,6 +7,27 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
 ## [Unreleased]
 
 ### Added
+- **Key providers (ADR-12).** `MEMD_KEY_PROVIDER=local|aws-kms|vault-transit`
+  (`Memory(config={"key_provider": ...})`). `local` stays the default and
+  byte-compatible; `aws-kms` (boto3, encryption context per namespace) and
+  `vault-transit` (httpx, associated data per namespace) keep the wrapped
+  data keys as objects in the store (`keys/<ns>.dek`), so any authorised
+  node can open any namespace. A namespace with data but no wrapped key is
+  refused instead of silently re-keyed; a custody marker makes a node still
+  on `local` refuse a migrated store. Crypto-shred deletes the wrapped key
+  (every version on a versioned bucket); with a per-namespace key template
+  it can also disable or schedule deletion of the CMK / delete the transit
+  key. `memd keys status|migrate|rotate` (migrate is crash-safe and
+  idempotent, holds every namespace's writer lock, and removes local key
+  files only after verification). See SECURITY.md "Key custody".
+- **Multi-node serving (ADR-12).** `memd serve --http --node-id N` (with
+  `MEMD_CLUSTER_SECRET`, `MEMD_STATE_DIR`, an `s3://` `MEMD_DATA`): nodes
+  heartbeat a registry object in the bucket and proxy each namespace's
+  requests to the node holding its lease (rendezvous hashing over live nodes
+  for a free namespace). Graceful shutdown hands leases off immediately; a
+  crashed node's namespaces move after the lease TTL. Hosted usage is metered
+  once, on the executing node. See "Multi-node" in README-engine.md; read
+  replicas are not built yet.
 - **Hosted mode: tenancy, usage metering and Stripe billing** (off by
   default; `memd serve --http --hosted` or `MEMD_HOSTED=1`; Stripe SDK in the
   new optional extra `memd[billing]`, imported lazily - embedded and
@@ -221,6 +242,85 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   retries until the WAL is truncated; it no longer gives up after the busy
   timeout, which left the erased text and vectors in the local SQLite
   file until the next open (D7).
+
+### Changed
+- **The S3 owner lease is a compare-and-swap** on its ETag for every write
+  after the create (refresh, stale reclaim, heartbeat): of several nodes
+  reclaiming one stale lease exactly one wins, and a holder that stalled
+  between reading and renewing fences itself instead of overwriting the new
+  owner's lease. A holder that cannot renew for 2/3 of the TTL refuses to
+  write (`LeaseLostError`, a `RuntimeError`); taking over a stale lease
+  burns the next part of the WAL/ops/audit logs so a stalled previous
+  holder's resumed append conflicts instead of landing unseen; a namespace
+  that fails to open releases its lease; `MEMD_LEASE_TTL_S` sets the TTL for
+  `s3://` roots. Endpoints without conditional writes keep the old
+  behaviour.
+- With `local` keys on an `s3://` root, a node that has no key for a
+  namespace that already has encrypted data refuses to open it
+  (`KeyCustodyError`, the manifest's key check or a probe of the data - see
+  "A wrong encryption key destroyed the data" above) instead of minting a
+  new key - which made the existing data unreadable and wrote new data under
+  a different key. With a remote provider the key is resolved when the
+  namespace opens, and one is never minted for a namespace that already has
+  a manifest; `MEMD_KEYS_ALLOW_MINT_EXISTING=1` overrides that (e.g. a
+  namespace written unencrypted).
+- **Conditional writes for every object rewritten in place** (ADR-12):
+  the manifest commit, the migration report, the audit checkpoint sidecar,
+  the key-custody marker, wrapped-key rotation, the cluster registry and the
+  lease release (a CAS'd "released" tombstone instead of read-then-delete)
+  use compare-and-swap - S3 If-Match / If-None-Match, emulated under the
+  process lock on a local root. A failed precondition on the manifest
+  fences the namespace (`LeaseLostError`, 503 `lease_lost`), never retried.
+  A takeover rewrites the manifest before replay; log deletes after a commit
+  are bounded to what the commit read, and part numbers never go backwards.
+- **Handoffs no longer lose acked writes** (ADR-12 re-verification): the
+  S3 store's part counters were cached per process, so a node taking a
+  namespace back (A -> B -> A, no fault needed) numbered new parts below the
+  ones written meanwhile, and a retaking node failed writes with "append
+  conflict". Every (re)acquisition now re-seeds from the bucket and the
+  manifest's recorded per-log high-water mark (`log_hw`); the takeover fence
+  takes the next slot above every part; an incomplete takeover releases with
+  an "aborted" (not clean) tombstone; buffered audit entries are flushed
+  before a lease is released.
+- **A retaken namespace no longer serves what other nodes deleted**: a node
+  taking a namespace back kept its local index cache and replayed only past
+  its old watermark, but a compaction another node ran meanwhile had retired
+  the deletes it folded - soft and hard deletes (purges) came back through
+  GET and search while export was right. The manifest now records the
+  `lineage` of the tenure that opened the namespace last; a cache is caught
+  up only in its own lineage, and any other is deleted - file, WAL and
+  tantivy copy and the usearch sidecar's files, so purged text and vectors
+  go with it (D7) - and rebuilt from the snapshot plus the tail. An open
+  killed between committing its lineage and stamping its cache (a crash in a
+  usearch sidecar load lands there) keeps that cache: a pending stamp,
+  written once the replay is flushed, says it is current for that lineage. A clean release racing a heartbeat renewal no
+  longer leaves the lease live (the next node waited out the TTL and took
+  over); a local data key wrapped by another root key raises
+  `KeyCustodyError`, not a raw `InvalidTag`.
+- **Key custody fails closed on every root and under every provider**: an
+  unreadable custody marker refuses the open; the data-key check and probe
+  above hold for remote providers too - a `keys/<ns>.dek` object that
+  unwraps fine but is another deployment's (a restore mix-up) is refused
+  before anything is read, nothing deleted (the key check fingerprints the
+  data key, not its wrapping, so it stays valid across `memd keys migrate`
+  and `memd keys rotate`); a key-custody refusal answers REST
+  `500 key_custody`.
+- An invalid namespace name is answered before any cluster routing; a single
+  server no longer imports the cluster module; a refused open of a
+  namespace that does not exist leaves no lease object behind.
+- REST: a namespace another process holds answers `503 not_owner` (with
+  `Retry-After` and `X-Memd-Not-Owner`) instead of `500`; a lease lost
+  mid-request answers `503 lease_lost`.
+- `MEMD_STATE_DIR` (optional; required in cluster mode) moves the server's
+  own state - `keys.toml.json`, the hosted admin database - out of the data
+  root. Unset, nothing moves.
+- The `dev` extra now includes `moto[server]` (KMS for the key-provider and
+  multi-node tests).
+- `MEMD_S3_ACCESS_KEY` / `MEMD_S3_SECRET_KEY` set bucket credentials apart
+  from the `AWS_*` chain (a MinIO/R2 bucket beside AWS KMS).
+- Deploy: `docker-compose.yml` (MinIO + 3 memd nodes + optional Vault) and a
+  `fly.toml` template (not deployed); the image takes
+  `--build-arg MEMD_S3=1` for boto3 and has a `/state` volume.
 
 ## [0.2.0] - 2026-09-26
 

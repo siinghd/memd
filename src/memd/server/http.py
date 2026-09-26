@@ -1,6 +1,7 @@
 """REST server (D4 §4.1) - the substrate; SDK and MCP are thin over it."""
 from __future__ import annotations
 
+import logging
 import math
 import os
 import sqlite3
@@ -20,6 +21,9 @@ from memd.core.schema import Kind
 from memd.engine.memory import ForgetPreviewMismatch, Memory, forget_fingerprint
 from memd.metrics import METRICS
 from memd.server.auth import FailureLimiter, KeyStore, Principal, RateLimiter
+from memd.storage.engine import NamespaceBusyError
+
+_log = logging.getLogger("memd.http")
 
 
 class EventIn(BaseModel):
@@ -227,11 +231,31 @@ def create_app(
     plans: Any = None,
     billing_config: Any = None,
     stripe_client: Any = None,
+    cluster: Any = None,
+    state_dir: str | None = None,
 ) -> FastAPI:
     """`hosted` (default: MEMD_HOSTED) turns on tenancy, metering and
     billing (memd.hosted); off, nothing of it is imported - stripe least of
-    all - and the server behaves exactly as before."""
-    os.makedirs(data_dir, exist_ok=True)
+    all - and the server behaves exactly as before.
+
+    `cluster` (a memd.server.cluster.ClusterConfig; `memd serve --node-id`)
+    makes this process one node of a fleet on one s3:// data root: requests
+    for a namespace another node holds are proxied there (ADR-12).
+    `state_dir` (default MEMD_STATE_DIR, else `data_dir`) holds the server's
+    own state - keys.toml.json and the hosted admin database. Cluster nodes
+    must share it (hosted: one admin database for the fleet)."""
+    state_dir = state_dir or os.environ.get("MEMD_STATE_DIR") or None
+    if cluster is not None:
+        if not str(data_dir).startswith("s3://"):
+            raise ValueError("cluster mode needs an s3:// data root: the bucket holds the leases, "
+                             "the node registry and (with a KMS key provider) the wrapped keys")
+        if state_dir is None:
+            raise ValueError("cluster mode needs MEMD_STATE_DIR: the API keys / hosted admin "
+                             "database every node shares")
+    state_dir = state_dir or data_dir
+    os.makedirs(state_dir, exist_ok=True)
+    if not str(data_dir).startswith("s3://"):
+        os.makedirs(data_dir, exist_ok=True)
     from memd.hosted import hosted_enabled
 
     hosted_ctx = None
@@ -243,7 +267,7 @@ def create_app(
         billing_config = billing_config or BillingConfig.from_env()
         keystore = None
     else:
-        keys_path = keys_path or os.path.join(data_dir, "keys.toml.json")
+        keys_path = keys_path or os.path.join(state_dir, "keys.toml.json")
         keystore = KeyStore(keys_path, admin_key=admin_key)
     limiter = RateLimiter()
     failures = FailureLimiter()
@@ -254,26 +278,70 @@ def create_app(
     # heavy maintenance endpoints get a separate small budget: they are
     # O(namespace) operations and must not be spam-able by a normal key
     heavy_limiter = RateLimiter(max_buckets=1000)
-    engine = Memory(data_dir)
+    node = None
+    if cluster is None:
+        engine = Memory(data_dir)
+    else:
+        from memd.server.cluster import Cluster
+        from memd.storage.crypto import resolve_key_provider_name
+
+        if resolve_key_provider_name({}) == "local":
+            raise ValueError(
+                "cluster mode needs a remote key provider (MEMD_KEY_PROVIDER=aws-kms or "
+                "vault-transit): with `local` keys only the node that created a namespace can "
+                "decrypt it. Existing stores: `memd keys migrate --to ...` first")
+        # node-local state (derived index cache) is per NODE, even when every
+        # node on a host was given the same MEMD_LOCAL_DIR: two nodes sharing
+        # one namespace's SQLite cache across a handoff would corrupt it
+        local_dir = os.path.join(os.environ.get("MEMD_LOCAL_DIR") or ".memd-local",
+                                 f"node-{cluster.node_id}")
+        # The facade's own namespace is per node (every node pins its facade
+        # namespace, so a shared "default" would be leased by one node
+        # forever). A node restarted right after a crash finds it still
+        # leased by its previous process: wait that lease out (reclaimable
+        # after the TTL) rather than fail to start.
+        deadline = time.monotonic() + cluster.lease_ttl_s + 5
+        while True:
+            try:
+                engine = Memory(data_dir, namespace=cluster.node_namespace,
+                                config={"lease_holder": cluster.holder,
+                                        "lease_ttl_s": cluster.lease_ttl_s, "local_dir": local_dir})
+                break
+            except NamespaceBusyError:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(1.0)
+        node = Cluster(cluster, engine.engine.store)
     bill: Any = _Unmetered()
     if is_hosted:
         from memd.hosted.app import Hosted
 
-        hosted_ctx = Hosted(data_dir, engine, admin_key=admin_key, plans=plans,
-                            billing_config=billing_config, stripe_client=stripe_client)
+        hosted_ctx = Hosted(state_dir, engine, admin_key=admin_key, plans=plans,
+                            billing_config=billing_config, stripe_client=stripe_client,
+                            router=node.router if node is not None else None)
         keystore = hosted_ctx.keystore
         bill = hosted_ctx.metering
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        if node is not None:
+            node.start()
         if hosted_ctx is not None:
             hosted_ctx.jobs.start()
         try:
             yield
         finally:
+            # Graceful handoff: stop advertising first (peers stop hashing
+            # new namespaces here), then close - which flushes every open
+            # namespace and RELEASES its lease, so a peer takes it over on
+            # its next request instead of waiting out the TTL.
+            if node is not None:
+                node.stop_advertising()
             if hosted_ctx is not None:
                 hosted_ctx.close()
             engine.close()
+            if node is not None:
+                await node.aclose()
 
     # Interactive docs and the OpenAPI schema were served unauthenticated,
     # handing an anonymous prober the full route inventory and request shapes
@@ -318,6 +386,7 @@ def create_app(
         except Exception:
             METRICS.inc("memd_http_errors_total", route=route_label, method=method_label)
             # sanitized 500: tracebacks go to the server log, never the client
+            _log.exception("internal error on %s %s", method_label, route_label)
             return _error(500, "internal error")
         finally:
             METRICS.observe("memd_http_request_ms", (time.monotonic() - t0) * 1000,
@@ -325,6 +394,35 @@ def create_app(
         METRICS.inc("memd_http_requests_total", route=route_label, method=method_label,
                     status=str(response.status_code))
         return response
+
+    @app.exception_handler(NamespaceBusyError)
+    async def namespace_busy_handler(request: Request, exc: NamespaceBusyError):
+        # another process (another node) holds this namespace's writer lease:
+        # retryable, and the cluster router re-resolves on the header
+        METRICS.inc("memd_http_not_owner_total", help="requests for a namespace another writer holds")
+        return _error(503, "namespace is held by another node; retry", "not_owner",
+                      headers={"Retry-After": "1", "X-Memd-Not-Owner": "1"})
+
+    from memd.storage.crypto import KeyCustodyError
+    from memd.storage.objectstore import LeaseLostError
+
+    @app.exception_handler(KeyCustodyError)
+    async def key_custody_handler(request: Request, exc: KeyCustodyError):
+        # data under a key this node does not hold: not retryable here, and
+        # never "repaired" - an operator must restore the key
+        METRICS.inc("memd_http_key_custody_errors_total",
+                    help="requests refused: the namespace's data key is not available")
+        return _error(500, "the namespace's data key is not available on this node "
+                           "(key custody); see the server log", "key_custody")
+
+    @app.exception_handler(LeaseLostError)
+    async def lease_lost_handler(request: Request, exc: LeaseLostError):
+        # this node was fenced mid-request: the mutation did not happen, but
+        # earlier steps of the request may have - so no transparent retry
+        # (no X-Memd-Not-Owner); the client's retry is routed to the new owner
+        METRICS.inc("memd_http_lease_lost_total", help="requests failed by a lost writer lease")
+        return _error(503, "this node lost the namespace's writer lease mid-request; retry",
+                      "lease_lost", headers={"Retry-After": "1"})
 
     @app.exception_handler(RuntimeError)
     async def runtime_error_handler(request: Request, exc: RuntimeError):
@@ -336,6 +434,9 @@ def create_app(
         if "evicted" in msg:
             return _error(503, "namespace re-opening; retry", headers={"Retry-After": "1"})
         METRICS.inc("memd_http_errors_total", route=_route_label(request.url.path))
+        # the client gets no internals; the operator gets the traceback
+        _log.error("internal error on %s %s", request.method, _route_label(request.url.path),
+                   exc_info=exc)
         return _error(500, "internal error")
 
     @app.exception_handler(StarletteHTTPException)
@@ -355,6 +456,9 @@ def create_app(
         # Behind a trusted proxy: the forwarded-for first hop is spoofable, so
         # we use it only when a proxy header exists AND the socket peer is
         # loopback (a deployment that terminates untrusted traffic locally).
+        routed = getattr(request.state, "memd_client", None)
+        if routed:
+            return routed  # a cluster peer proxied it: the client it verified
         client_host = request.client.host if request.client else "unknown"
         fwd = request.headers.get("x-forwarded-for")
         if fwd and client_host in ("127.0.0.1", "::1"):
@@ -724,6 +828,9 @@ def create_app(
 
     if hosted_ctx is not None:
         hosted_ctx.install(app, auth)
+    if node is not None:
+        node.install(app)  # outermost: routes before any auth, metering or handler
+    app.state.cluster = node
     return app
 
 

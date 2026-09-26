@@ -46,9 +46,11 @@ import json
 import re
 import threading
 import time
+import zlib
 
 from memd.metrics import METRICS
-from memd.storage.objectstore import (ObjectStore, _count_op, adopt_io_tally,
+from memd.storage.objectstore import (AppendConflict, LeaseLostError, ObjectStore,  # noqa: F401
+                                      PreconditionFailed, _count_op, adopt_io_tally,
                                       current_io_tally)
 
 # Append parts are SIBLINGS of the logical key, not children.
@@ -103,6 +105,7 @@ class S3ObjectStore(ObjectStore):
         client=None,
         lease_ttl_s: float = 60.0,
         fetch_concurrency: int = 32,
+        lease_holder: str | None = None,
     ):
         try:
             import boto3
@@ -127,6 +130,24 @@ class S3ObjectStore(ObjectStore):
                           # concurrent GETs serialize on connections instead
                           max_pool_connections=max(10, int(fetch_concurrency) + 4)),
         )
+        # Control-plane client: lease objects and the cluster registry, with
+        # SHORT timeouts and few retries. On MinIO a conditional PUT holds the
+        # object's lock until its body arrives, so a peer frozen mid-renewal
+        # (SIGSTOP, a VM pause) blocks every reader of that object for
+        # MinIO's ~30 s lock timeout. With the data-plane client's 60 s read
+        # timeout and 5 retries a router thread waited that out - per request,
+        # until the pool was exhausted. A control-plane call instead fails in
+        # seconds and is treated as "busy, retry" (AWS S3 does not lock).
+        self._ctl = client or boto3.client(
+            "s3",
+            endpoint_url=endpoint_url,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name=region,
+            config=Config(retries={"total_max_attempts": 2, "mode": "standard"},
+                          signature_version="s3v4", connect_timeout=2, read_timeout=4,
+                          max_pool_connections=10),
+        )
         # Next part number per logical key. Single-writer per data root (see
         # try_acquire_owner), so an in-process counter is authoritative once
         # seeded; seeding costs one LIST on the first append to a key, not one
@@ -145,10 +166,36 @@ class S3ObjectStore(ObjectStore):
         self._last_beat: dict[str, float] = {}
         self._lease_stop = threading.Event()
         self._lease_thread: threading.Thread | None = None
+        # Serialize this process's writes of one namespace's lease object (a
+        # renewal - heartbeat, fence check, fresh read - and the release): a
+        # renewal in flight while the lease was released left it LIVE after a
+        # clean close (see release_owner). Striped by namespace: bounded, and
+        # nothing to clean up when a namespace goes.
+        self._lease_locks = tuple(threading.RLock() for _ in range(64))
         # running logical size per key, so an append does not re-LIST the log
         self._size_cache: dict[str, int] = {}
         self._seq_lock = threading.Lock()
         self._leases: dict[str, str] = {}
+        # ETag of our last write of each held lease: renewals are
+        # compare-and-swap on it (None: the endpoint has no conditional PUT)
+        self._lease_etag: dict[str, str | None] = {}
+        self._took_over: set[str] = set()
+        # per append log: one past the highest part this process has SEEN
+        # (listed by a read). With _next_part it is the log_bound a commit
+        # captures, so the delete after the commit cannot reach parts a
+        # successor wrote while this process was paused
+        self._seen_hw: dict[str, int] = {}
+        self._hw_lock = threading.Lock()
+        # Per append log: a part number this process must never number BELOW
+        # again - its own earlier counters (kept when a namespace's cached
+        # state is dropped) and the high-water mark the namespace's manifest
+        # records (set_log_floor). Numbering is strictly monotonic across
+        # every tenure of every node, so no part number is ever reused.
+        self._floor: dict[str, int] = {}
+        # who this store claims leases as; NamespaceStore falls back to
+        # host:pid. A cluster node names itself here so the router can map a
+        # lease to the node serving it (see memd.server.cluster)
+        self.lease_holder = lease_holder
 
     # ------------------------------------------------------------- plumbing
 
@@ -204,18 +251,18 @@ class S3ObjectStore(ObjectStore):
     def _raw_get(self, full: str) -> bytes | None:
         _count_op("get_object")   # the per-part fan-out was invisible before
         try:
-            return self._client.get_object(Bucket=self.bucket, Key=full)["Body"].read()
+            return self._client_for(full).get_object(Bucket=self.bucket, Key=full)["Body"].read()
         except Exception as ex:
             if self._is_missing(ex):
                 return None
             raise
 
     def _raw_put(self, full: str, data: bytes) -> None:
-        self._client.put_object(Bucket=self.bucket, Key=full, Body=data)
+        self._client_for(full).put_object(Bucket=self.bucket, Key=full, Body=data)
 
     def _raw_delete(self, full: str) -> None:
         try:
-            self._client.delete_object(Bucket=self.bucket, Key=full)
+            self._client_for(full).delete_object(Bucket=self.bucket, Key=full)
         except Exception as ex:
             if not self._is_missing(ex):
                 raise
@@ -232,10 +279,16 @@ class S3ObjectStore(ObjectStore):
         _count_op("delete_batch")
         self._client.delete_objects(Bucket=self.bucket, Delete={"Objects": batch})
 
+    def _client_for(self, full: str):
+        """The control-plane client for lease and registry objects."""
+        if full.endswith("/.owner") or f"/{_REGISTRY_DIR}/" in f"/{full}":
+            return self._ctl
+        return self._client
+
     def _raw_head(self, full: str) -> int | None:
         """Object size, or None when absent."""
         try:
-            return int(self._client.head_object(Bucket=self.bucket, Key=full)["ContentLength"])
+            return int(self._client_for(full).head_object(Bucket=self.bucket, Key=full)["ContentLength"])
         except Exception as ex:
             if self._is_missing(ex):
                 return None
@@ -282,6 +335,14 @@ class S3ObjectStore(ObjectStore):
                 hint_seq, hint_bytes = 0, 0
         if not hint_seq:
             return self._seed_seq_full(key)
+        if hint_bytes and self._raw_head(
+                f"{self._full(key)}{_PART_SEP}{hint_seq - 1:0{_PART_WIDTH}d}") is None:
+            # The part the hint counts up to is gone: the prefix it sums was
+            # deleted after it was written (a writer that lost its lease and
+            # resumed wrote it late, ADR-12). Rescan - but never let the
+            # numbering go back below the hint's.
+            seq, size = self._seed_seq_full(key)
+            return max(seq, hint_seq), size
 
         # Resume from the hint. The hint carries BOTH the next sequence number
         # and the logical size AT that point, because knowing only the sequence
@@ -353,12 +414,20 @@ class S3ObjectStore(ObjectStore):
             yield base, head
 
     def _parts(self, key: str) -> list[tuple[str, int]]:
-        """(full key, size) of this logical key's append parts, in order."""
+        """(full key, size) of this logical key's append parts, in order.
+
+        Remembers the highest part seen (see log_bound)."""
         out = []
         for full, size in self._iter_keys(self._full(key) + _PART_SEP):
             if _PART_RE.match(full):
                 out.append((full, size))
         out.sort()
+        if out:
+            m = _PART_RE.match(out[-1][0])
+            if m:
+                # its own lock: _parts also runs under _seq_lock (seeding)
+                with self._hw_lock:
+                    self._seen_hw[key] = max(self._seen_hw.get(key, 0), int(m.group("seq")) + 1)
         return out
 
     def _segments(self, key: str) -> list[tuple[str, int]]:
@@ -389,6 +458,176 @@ class S3ObjectStore(ObjectStore):
             self._size_cache.pop(key, None)
         self._raw_delete(self._seq_hint_key(key))
         self._raw_put(self._full(key), data)
+
+    def put_if_absent(self, key: str, data: bytes) -> bool:
+        """Conditional create (If-None-Match: *): exactly one of several
+        racing creators wins, the rest get False. Only for whole objects that
+        are never appended to (wrapped data keys, the key-custody marker)."""
+        _count_op("put_if_absent")
+        _validate_key(key)
+        self._check_fence(key)
+        try:
+            self._client.put_object(Bucket=self.bucket, Key=self._full(key), Body=data,
+                                    IfNoneMatch="*")
+            return True
+        except Exception as ex:
+            code = getattr(ex, "response", {}).get("Error", {}).get("Code", "")
+            if code in ("PreconditionFailed", "412", "ConditionalRequestConflict"):
+                return False
+            if code in ("NotImplemented", "InvalidRequest", "InvalidArgument"):
+                # no conditional writes on this endpoint: best effort
+                if self._raw_head(self._full(key)) is not None:
+                    return False
+                self._raw_put(self._full(key), data)
+                return True
+            raise
+
+    # ------------------------------------------------ conditional writes
+
+    def get_versioned(self, key: str) -> tuple[bytes, str] | None:
+        """(body, ETag) of a whole object (never an append log)."""
+        _count_op("get")
+        _validate_key(key)
+        return self._raw_get_meta(self._full(key))
+
+    def fence(self, namespace: str) -> None:
+        """Stop writing `namespace`: drop our lease record WITHOUT touching
+        the lease object (it may be someone else's now). Every later
+        mutation raises LeaseLostError until the namespace is reopened."""
+        self._fence(namespace)
+
+    def put_if_match(self, key: str, data: bytes, version: str | None, *,
+                     hint: bool = False, fence: bool = True) -> str:
+        """Conditional PUT: If-Match on `version` (the ETag this process last
+        observed or wrote), If-None-Match: * when `version` is None. A
+        failed precondition means another writer changed the object: the
+        namespace is FENCED (unless fence=False: the one caller that expects
+        to race, a takeover re-reading the manifest) and PreconditionFailed
+        raised. Never retried here."""
+        _count_op("put_if_match")
+        _validate_key(key)
+        self._check_fence(key)
+        full = self._full(key)
+        try:
+            etag = self._raw_cas_put(full, data, if_match=version,
+                                     if_none_match=version is None)
+        except _NoConditional:
+            # an endpoint without conditional writes: best effort, loud metric
+            METRICS.inc("memd_s3_unconditional_writes_total",
+                        help="conditional writes degraded to plain PUTs (endpoint lacks If-Match)")
+            self._raw_put(full, data)
+            return ""
+        if etag is None:
+            METRICS.inc("memd_s3_precondition_failures_total",
+                        help="conditional writes that found the object changed (ownership lost)")
+            ns = self._ns_of(key)
+            if fence and ns is not None:
+                self._fence(ns)
+            raise PreconditionFailed(
+                f"{key!r} was changed by another writer since this process last wrote it; "
+                + (f"namespace {ns!r} is fenced" if fence and ns else "not overwritten"))
+        return etag
+
+    def list_meta(self, prefix: str) -> list[dict]:
+        """Objects under `prefix` with {key, size, etag, age_s} - `age_s`
+        on the SERVER's clock (its Date header minus LastModified), so no
+        node's clock skew enters it. One LIST, no per-object reads: LIST is
+        never blocked by an object a frozen peer holds locked (see _ctl)."""
+        from email.utils import parsedate_to_datetime
+
+        _count_op("list")
+        out: list[dict] = []
+        kw = {"Bucket": self.bucket, "Prefix": self._full(prefix)}
+        while True:
+            r = self._ctl.list_objects_v2(**kw)
+            date = (r.get("ResponseMetadata", {}).get("HTTPHeaders", {}) or {}).get("date")
+            now = parsedate_to_datetime(date).timestamp() if date else time.time()
+            for o in r.get("Contents", []) or []:
+                out.append({"key": self._rel(o["Key"]), "size": int(o["Size"]),
+                            "etag": o.get("ETag", ""),
+                            # Date is truncated to the second, so this never
+                            # reports a write as older than it is
+                            "age_s": max(0.0, now - o["LastModified"].timestamp())})
+            if not r.get("IsTruncated"):
+                return out
+            kw["ContinuationToken"] = r["NextContinuationToken"]
+
+    def log_bound(self, key: str) -> int | None:
+        with self._seq_lock:
+            nxt = max(self._next_part.get(key, 0), self._floor.get(key, 0))
+        with self._hw_lock:
+            hw = max(nxt, self._seen_hw.get(key, 0))
+        return hw if hw else None
+
+    def delete_log(self, key: str, upto: int | None) -> None:
+        """Delete the parts of an append log numbered below `upto` (and its
+        base object) - never a part numbered at or above it, and never an
+        EMPTY part (a successor's takeover fence, which must outlive any
+        paused writer: see NamespaceStore._fence_previous_writer). Part
+        numbering then continues from `upto` - persisted in the seq hint -
+        so no later part can reuse a number a paused writer still means to
+        delete or create."""
+        if upto is None:
+            return self.delete(key)
+        _count_op("delete")
+        _validate_key(key)
+        self._check_fence(key)
+        doomed: list[dict] = []
+        above = 0
+        for full, size in self._parts(key):
+            n = int(_PART_RE.match(full).group("seq"))
+            if n >= upto:
+                above += size
+            elif size > 0:
+                doomed.append({"Key": full})
+        for i in range(0, len(doomed), 1000):
+            self._delete_batch(doomed[i:i + 1000])
+        self._raw_delete(self._full(key))
+        with self._seq_lock:
+            self._next_part[key] = max(self._next_part.get(key, 0), upto)
+            self._size_cache[key] = above
+        try:
+            self._raw_put(self._seq_hint_key(key), json.dumps({"seq": upto, "bytes": 0}).encode())
+        except Exception:
+            self._raw_delete(self._seq_hint_key(key))   # a hint may be absent, never wrong
+
+    def shred(self, key: str) -> None:
+        """Delete `key` AND every noncurrent version of it.
+
+        On a versioned bucket a plain DELETE only stacks a delete marker on
+        top: the old version - here, a wrapped data key - stays readable to
+        anyone with s3:GetObjectVersion, and crypto-shred silently becomes
+        "hidden". Remove each version explicitly. When the versions API is
+        unavailable (an endpoint without it, a policy denying it) the plain
+        delete is enough ONLY for a bucket that is not versioned - otherwise
+        this raises rather than report a shred that did not happen."""
+        _count_op("shred")
+        _validate_key(key)
+        self._check_fence(key)
+        full = self._full(key)
+        try:
+            batch: list[dict] = []
+            paginator = self._client.get_paginator("list_object_versions")
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=full):
+                for v in (page.get("Versions") or []) + (page.get("DeleteMarkers") or []):
+                    if v.get("Key") == full and v.get("VersionId"):
+                        batch.append({"Key": full, "VersionId": v["VersionId"]})
+            for i in range(0, len(batch), 1000):
+                self._delete_batch(batch[i:i + 1000])
+        except Exception as ex:
+            code = getattr(ex, "response", {}).get("Error", {}).get("Code", "")
+            if code not in ("NotImplemented", "AccessDenied", "MethodNotAllowed"):
+                raise
+            try:
+                status = self._client.get_bucket_versioning(Bucket=self.bucket).get("Status")
+            except Exception:
+                status = "unknown"
+            if status:   # Enabled, Suspended - or we cannot tell
+                raise RuntimeError(
+                    f"cannot remove old versions of {key!r} (bucket versioning: {status}): "
+                    "grant s3:ListBucketVersions and s3:DeleteObjectVersion, or crypto-shred "
+                    "leaves the wrapped key readable") from ex
+        self._raw_delete(full)
 
     def get(self, key: str) -> bytes | None:
         _count_op("get")
@@ -450,8 +689,10 @@ class S3ObjectStore(ObjectStore):
         with self._seq_lock:
             seq = self._next_part.get(key)
             if seq is None:
-                # first append to this key in this process
+                # first append to this key in this tenure: from the bucket,
+                # never below this key's floor (see _floor)
                 seq, base = self._seed_seq(key)
+                seq = max(seq, self._floor.get(key, 0))
             else:
                 base = self._size_cache.get(key)
                 if base is None:
@@ -469,7 +710,7 @@ class S3ObjectStore(ObjectStore):
             if code in ("PreconditionFailed", "412"):
                 METRICS.inc("memd_s3_append_conflicts_total",
                             help="append part already existed: another writer holds this log")
-                raise RuntimeError(
+                raise AppendConflict(
                     f"append conflict on {key!r}: part {seq} already exists. "
                     "Another process is writing this data root - memd is "
                     "single-writer.") from None
@@ -639,6 +880,23 @@ class S3ObjectStore(ObjectStore):
         return len(logical)
 
     # -------------------------------------------------------- owner leasing
+    #
+    # The lease object `ns/<ns>/.owner` holds "<holder>\n<wall-clock stamp>".
+    # Every write of it after the first is a COMPARE-AND-SWAP on its ETag
+    # (If-Match): renewals, refreshes and stale reclaims alike. Read-then-put
+    # left two holes a multi-node fleet hits for real (ADR-12):
+    #   - two nodes reclaiming one stale lease both "won" (last PUT wins, the
+    #     first keeps writing until its next beat notices), and
+    #   - a holder that stalled between reading its lease and renewing it
+    #     overwrote the NEW owner's lease and took the namespace back.
+    # With CAS exactly one reclaimer wins, and a renewal that finds the ETag
+    # moved fences instead of overwriting. Endpoints without conditional
+    # writes fall back to the old read-then-put (loud, not impossible).
+    #
+    # Self-fencing: a holder whose last SUCCESSFUL renewal is older than
+    # 2/3 of the TTL (its own monotonic clock) refuses to mutate until a
+    # renewal succeeds - another node may reclaim at TTL, so the last third
+    # is the margin for clock skew between the two machines.
 
     def _owner_key(self, namespace: str) -> str:
         return self._full(f"ns/{namespace}/.owner")
@@ -651,20 +909,152 @@ class S3ObjectStore(ObjectStore):
     def _beat_period(self) -> float:
         return max(1.0, self.lease_ttl_s / 3.0)
 
-    def _verify_owner(self, ns: str, holder: str) -> None:
-        """Synchronously confirm we still hold `ns`; fence if we do not."""
+    def _valid_for(self) -> float:
+        """How long after a successful renewal this process may still write."""
+        return self.lease_ttl_s * 2.0 / 3.0
+
+    @staticmethod
+    def _code(ex: Exception) -> str:
+        return getattr(ex, "response", {}).get("Error", {}).get("Code", "")
+
+    def _raw_get_meta(self, full: str) -> tuple[bytes, str] | None:
+        """(body, ETag) or None when absent."""
+        _count_op("get_object")
         try:
-            cur = (self._raw_get(self._owner_key(ns)) or b"").decode()
-        except Exception:
-            return          # transient: the heartbeat will retry
-        who = cur.split("\n", 1)[0] if cur else ""
-        if cur and who != holder:
-            self._fenced.add(ns)
-            self._leases.pop(ns, None)
+            r = self._client_for(full).get_object(Bucket=self.bucket, Key=full)
+            return r["Body"].read(), r.get("ETag", "")
+        except Exception as ex:
+            if self._is_missing(ex):
+                return None
+            raise
+
+    def _raw_cas_put(self, full: str, data: bytes, *, if_match: str | None = None,
+                     if_none_match: bool = False) -> str | None:
+        """Conditional PUT. Returns the new ETag, or None when the condition
+        failed (412, or 404 for If-Match on a vanished object). Raises
+        _NoConditional on an endpoint that does not support the condition."""
+        kw: dict = {}
+        if if_match is not None:
+            kw["IfMatch"] = if_match
+        if if_none_match:
+            kw["IfNoneMatch"] = "*"
+        try:
+            r = self._client_for(full).put_object(Bucket=self.bucket, Key=full, Body=data, **kw)
+            return r.get("ETag", "") or ""
+        except Exception as ex:
+            code = self._code(ex)
+            if code in ("PreconditionFailed", "412", "ConditionalRequestConflict") or \
+                    (if_match is not None and self._is_missing(ex)):
+                return None
+            if code in ("NotImplemented", "InvalidRequest", "InvalidArgument"):
+                raise _NoConditional() from ex
+            raise
+
+    def _lease_body(self, holder: str) -> bytes:
+        return f"{holder}\n{time.time()}".encode()
+
+    def _hold(self, namespace: str, holder: str, etag: str | None, t0: float) -> None:
+        # Every (re)acquisition starts from the bucket, not from what this
+        # process remembered of an EARLIER tenure: other nodes may have
+        # appended, folded and deleted since. A stale part counter numbered
+        # new parts below existing ones (the log order is the part order) and
+        # placed the takeover fence below a paused writer's next part - acked
+        # writes were lost across an A -> B -> A handoff.
+        self._forget_ns(namespace)
+        self._leases[namespace] = holder
+        self._lease_etag[namespace] = etag
+        self._fenced.discard(namespace)
+        self._last_beat[namespace] = t0
+        self._start_lease_thread()
+
+    def _fence(self, ns: str) -> None:
+        if ns in self._leases or ns not in self._fenced:
             METRICS.inc("memd_s3_owner_lease_lost_total",
                         help="single-writer leases lost to another holder")
-        else:
-            self._last_beat[ns] = time.monotonic()
+        self._fenced.add(ns)
+        self._leases.pop(ns, None)
+        self._lease_etag.pop(ns, None)
+        self._forget_ns(ns)
+
+    def _forget_ns(self, ns: str) -> None:
+        """Drop every cached per-key state of namespace `ns` (part counters,
+        sizes, seen high-water marks), keeping only the monotonic floor."""
+        pre = f"ns/{ns}/"
+        with self._seq_lock:
+            for k in [k for k in self._next_part if k.startswith(pre)]:
+                self._floor[k] = max(self._floor.get(k, 0), self._next_part.pop(k))
+            for k in [k for k in self._size_cache if k.startswith(pre)]:
+                self._size_cache.pop(k, None)
+        with self._hw_lock:
+            for k in [k for k in self._seen_hw if k.startswith(pre)]:
+                self._floor[k] = max(self._floor.get(k, 0), self._seen_hw.pop(k))
+
+    def set_log_floor(self, key: str, floor: int) -> None:
+        """Never number a part of `key` below `floor` (the high-water mark a
+        manifest recorded - it survives the parts a fold deleted, which a
+        LIST cannot see)."""
+        if floor <= 0:
+            return
+        with self._seq_lock:
+            self._floor[key] = max(self._floor.get(key, 0), int(floor))
+            if key in self._next_part and self._next_part[key] < floor:
+                self._next_part[key] = int(floor)
+
+    def _lease_lock(self, ns: str) -> threading.RLock:
+        return self._lease_locks[zlib.crc32(ns.encode()) % len(self._lease_locks)]
+
+    def _renew_one(self, ns: str, holder: str) -> bool | None:
+        """One renewal. True: renewed. False: not ours - lost (fenced) or
+        released meanwhile. None: transient failure (not renewed, not fenced
+        - the next attempt retries)."""
+        with self._lease_lock(ns):
+            if self._leases.get(ns) != holder:
+                # released (or fenced) since the caller looked: renewing now
+                # would write a live lease over the released tombstone
+                return False
+            return self._renew_one_locked(ns, holder)
+
+    def _renew_one_locked(self, ns: str, holder: str) -> bool | None:
+        key = self._owner_key(ns)
+        t0 = time.monotonic()        # validity counts from BEFORE the request
+        body = self._lease_body(holder)
+        etag = self._lease_etag.get(ns)
+        try:
+            if etag:
+                try:
+                    new = self._raw_cas_put(key, body, if_match=etag)
+                except _NoConditional:
+                    self._lease_etag[ns] = None
+                    return self._renew_one(ns, holder)
+                if new is None:
+                    # The ETag moved. Usually another holder took the lease -
+                    # but a renewal whose response was lost and got retried
+                    # also lands here, with OUR body in place: adopt that.
+                    cur = self._raw_get_meta(key)
+                    if cur is not None and cur[0].decode(errors="replace").split("\n", 1)[0] == holder:
+                        self._lease_etag[ns] = cur[1]
+                        self._last_beat[ns] = t0
+                        return True
+                    self._fence(ns)
+                    return False
+                self._lease_etag[ns] = new
+            else:
+                # no conditional writes on this endpoint: read, then put
+                cur = (self._raw_get(key) or b"").decode(errors="replace")
+                who = cur.split("\n", 1)[0] if cur else ""
+                if cur and who != holder:
+                    self._fence(ns)
+                    return False
+                self._raw_put(key, body)
+            self._last_beat[ns] = t0
+            METRICS.inc("memd_s3_owner_lease_renewals_total", help="single-writer lease heartbeats")
+            return True
+        except Exception:
+            # a transient failure must not fence us; the next beat retries,
+            # and self-fencing stops writes if it keeps failing
+            METRICS.inc("memd_s3_owner_lease_renew_failures_total",
+                        help="lease heartbeats that failed")
+            return None
 
     def _check_fence(self, key: str) -> None:
         ns = self._ns_of(key)
@@ -680,14 +1070,23 @@ class S3ObjectStore(ObjectStore):
                 # part creation is a conditional PUT, but put/delete/truncate
                 # are unconditional: a stalled writer's put() overwrote the new
                 # owner's manifest, silently, with no error to either side.
-                # If our own heartbeat has gone stale, confirm ownership before
-                # mutating anything. Free when the beat is healthy; one GET
-                # exactly when the process has been stalled, which is when it
-                # is dangerous.
-                if time.monotonic() - self._last_beat.get(ns, 0.0) > self._beat_period():
-                    self._verify_owner(ns, holder)
+                # If our own heartbeat has gone stale, renew (CAS) before
+                # mutating anything. Free when the beat is healthy; one round
+                # trip exactly when the process has been stalled, which is
+                # when it is dangerous.
+                age = time.monotonic() - self._last_beat.get(ns, 0.0)
+                if age > self._beat_period():
+                    self._renew_one(ns, holder)
+                    age = time.monotonic() - self._last_beat.get(ns, 0.0)
+                if ns not in self._fenced and age > self._valid_for():
+                    METRICS.inc("memd_s3_owner_lease_unconfirmed_total",
+                                help="writes refused: the lease could not be renewed in time")
+                    raise LeaseLostError(
+                        f"single-writer lease on namespace {ns!r} could not be renewed for "
+                        f"{age:.1f}s; refusing to write - another node may reclaim it at the "
+                        "TTL. Retry once the object store is reachable again.")
         if ns in self._fenced:
-            raise RuntimeError(
+            raise LeaseLostError(
                 f"lost the single-writer lease on namespace {ns!r}; this "
                 "process has been fenced. Another writer owns it - continuing "
                 "would interleave two writers on one data root, which silently "
@@ -702,32 +1101,14 @@ class S3ObjectStore(ObjectStore):
         the lease exists to prevent, delayed by one TTL.
 
         Renewal alone is not enough either: a partition can let someone else
-        take the lease while we still think we hold it. So a renewal that finds
-        a different holder FENCES the namespace, and writes to it then fail
-        loudly rather than corrupting the log.
+        take the lease while we still think we hold it. So a renewal whose CAS
+        finds a different holder FENCES the namespace, and writes to it then
+        fail loudly rather than corrupting the log.
         """
-        period = max(1.0, self.lease_ttl_s / 3.0)
+        period = self._beat_period()
         while not self._lease_stop.wait(period):
             for ns, holder in list(self._leases.items()):
-                key = self._owner_key(ns)
-                try:
-                    cur = (self._raw_get(key) or b"").decode()
-                    who = cur.split("\n", 1)[0] if cur else ""
-                    if cur and who != holder:
-                        self._fenced.add(ns)
-                        self._leases.pop(ns, None)
-                        METRICS.inc("memd_s3_owner_lease_lost_total",
-                                    help="single-writer leases lost to another holder")
-                        continue
-                    self._raw_put(key, f"{holder}\n{time.time()}".encode())
-                    self._last_beat[ns] = time.monotonic()
-                    METRICS.inc("memd_s3_owner_lease_renewals_total",
-                                help="single-writer lease heartbeats")
-                except Exception:
-                    # a transient failure must not fence us; the next beat
-                    # retries, and the TTL is 3 beats wide
-                    METRICS.inc("memd_s3_owner_lease_renew_failures_total",
-                                help="lease heartbeats that failed")
+                self._renew_one(ns, holder)
 
     def _start_lease_thread(self) -> None:
         if self._lease_thread is not None:
@@ -738,42 +1119,71 @@ class S3ObjectStore(ObjectStore):
         self._lease_thread.start()
 
     def try_acquire_owner(self, namespace: str, holder: str) -> bool:
+        """See _try_acquire_owner. A control-plane TIMEOUT (the lease object
+        is locked by a frozen peer's in-flight write, the endpoint is slow)
+        answers "not acquired" - the caller's busy/retry path - instead of an
+        opaque transport error."""
+        try:
+            return self._try_acquire_owner(namespace, holder)
+        except Exception as ex:
+            from botocore.exceptions import BotoCoreError
+
+            if isinstance(ex, BotoCoreError):
+                METRICS.inc("memd_s3_owner_lease_acquire_timeouts_total",
+                            help="lease acquisitions that timed out on the control plane")
+                return False
+            raise
+
+    def _try_acquire_owner(self, namespace: str, holder: str) -> bool:
         """Claim single-writer ownership of a namespace.
 
         The local backend uses `flock`, which cannot see another machine. Here
         the lock is a leased object created with a conditional PUT: the first
-        writer wins, and a lease older than `lease_ttl_s` is reclaimable so a
-        crashed node does not wedge the namespace forever.
+        writer wins, and a lease older than `lease_ttl_s` is reclaimable - by
+        a compare-and-swap on its ETag, so of several nodes racing for one
+        stale lease exactly one wins - and a crashed node does not wedge the
+        namespace forever.
 
-        This is deliberately a lease, not a distributed lock - it makes
-        split-brain LOUD rather than impossible. Two writers on one data root
-        silently destroyed acked data, and a loud failure is the improvement
-        that matters; a correct multi-writer protocol (manifest CAS on ETag)
-        is a larger design and is not built.
+        This is deliberately a lease, not a distributed lock. Correctness
+        leans on the TTL and self-fencing (see above) plus conditional part
+        creation in append(); a correct multi-writer protocol (manifest CAS
+        on ETag) is a larger design and is deferred (ADR-12 item 4).
         """
         key = self._owner_key(namespace)
+        t0 = time.monotonic()
+        body = self._lease_body(holder)
         now = time.time()
-        body = f"{holder}\n{now}".encode()
         try:
-            self._client.put_object(Bucket=self.bucket, Key=key, Body=body,
-                                    IfNoneMatch="*")
-            self._leases[namespace] = holder
-            self._fenced.discard(namespace)
-            self._last_beat[namespace] = time.monotonic()
-            self._start_lease_thread()
+            etag = self._raw_cas_put(key, body, if_none_match=True)
+        except _NoConditional:
+            # no conditional writes on this endpoint: best-effort claim
+            self._raw_put(key, body)
+            self._hold(namespace, holder, None, t0)
             return True
-        except Exception as ex:
-            code = getattr(ex, "response", {}).get("Error", {}).get("Code", "")
-            if code not in ("PreconditionFailed", "412"):
-                if code in ("NotImplemented", "InvalidRequest", "InvalidArgument"):
-                    # no conditional writes on this endpoint: best-effort claim
-                    self._raw_put(key, body)
-                    self._leases[namespace] = holder
-                    self._fenced.discard(namespace)
-                    self._start_lease_thread()
-                    return True
-                raise
-        existing = self._raw_get(key) or b""
+        if etag is not None:
+            self._hold(namespace, holder, etag, t0)
+            return True
+        cur = self._raw_get_meta(key)
+        if cur is None:
+            # released between our create and our read: try once more
+            etag = self._raw_cas_put(key, body, if_none_match=True)
+            if etag is not None:
+                self._hold(namespace, holder, etag, t0)
+                return True
+            return False
+        existing, cur_etag = cur
+        if existing == _RELEASED:
+            # cleanly released: free, and no paused writer can be behind it
+            try:
+                etag = self._raw_cas_put(key, body, if_match=cur_etag)
+            except _NoConditional:
+                self._raw_put(key, body)
+                self._hold(namespace, holder, None, t0)
+                return True
+            if etag is None:
+                return False            # someone else took it first
+            self._hold(namespace, holder, etag, t0)
+            return True
         try:
             who, ts = existing.decode().split("\n", 1)
             age = now - float(ts)
@@ -789,46 +1199,141 @@ class S3ObjectStore(ObjectStore):
                 age = self.lease_ttl_s + 1
         except Exception:
             who, age = "?", self.lease_ttl_s + 1
-        if who == holder:
-            self._raw_put(key, body)      # our own lease: refresh
-            self._leases[namespace] = holder
-            self._fenced.discard(namespace)
-            self._last_beat[namespace] = time.monotonic()
-            self._start_lease_thread()
-            return True
-        if age > self.lease_ttl_s:
-            # Only reclaimable because the holder stopped heartbeating: a live
-            # writer renews every ttl/3, so exceeding the TTL means three
-            # missed beats, not merely a long-running process.
-            METRICS.inc("memd_s3_owner_lease_reclaimed_total",
-                        help="stale single-writer leases reclaimed")
-            self._raw_put(key, body)
-            self._leases[namespace] = holder
-            self._fenced.discard(namespace)
-            self._last_beat[namespace] = time.monotonic()
-            self._start_lease_thread()
+        if who == holder or age > self.lease_ttl_s:
+            # our own lease (refresh), or one whose holder stopped
+            # heartbeating: a live writer renews every ttl/3, so exceeding the
+            # TTL means three missed beats, not merely a long-running process
+            try:
+                etag = self._raw_cas_put(key, self._lease_body(holder), if_match=cur_etag)
+            except _NoConditional:
+                self._raw_put(key, self._lease_body(holder))   # If-Match unsupported
+                self._hold(namespace, holder, None, t0)
+                return True
+            if etag is None:
+                return False            # someone else changed it first
+            if who != holder:
+                METRICS.inc("memd_s3_owner_lease_reclaimed_total",
+                            help="stale single-writer leases reclaimed")
+                self._took_over.add(namespace)
+            self._hold(namespace, holder, etag, t0)
             return True
         return False
 
-    def release_owner(self, namespace: str) -> None:
+    def took_over(self, namespace: str) -> bool:
+        """True (once) when the last acquire of `namespace` reclaimed a lease
+        another holder had let go stale - that holder may be merely STALLED
+        and resume mid-write. NamespaceStore then burns the next part number
+        of each append log (see NamespaceStore._fence_previous_writer)."""
+        if namespace in self._took_over:
+            self._took_over.discard(namespace)
+            return True
+        return False
+
+    def read_owner(self, namespace: str) -> dict | None:
+        """Who holds `namespace` right now, for routing (never fenced, never
+        written): {"holder", "stamp", "age_s", "fresh"} or None when unheld."""
+        raw = self._raw_get(self._owner_key(namespace))
+        if not raw or raw == _RELEASED:
+            return None
+        try:
+            who, ts = raw.decode().split("\n", 1)
+            stamp = float(ts)
+        except Exception:
+            return {"holder": "?", "stamp": 0.0, "age_s": float("inf"), "fresh": False}
+        age = time.time() - stamp
+        fresh = -max(5.0, self.lease_ttl_s) <= age <= self.lease_ttl_s
+        return {"holder": who, "stamp": stamp, "age_s": age, "fresh": fresh}
+
+    def holds_lease(self, namespace: str, fresh: bool = False) -> bool:
+        """We hold `namespace`'s lease (and have not been fenced). `fresh`:
+        also prove it - a holder whose heartbeat is stale (a process that
+        was paused) renews synchronously first, so a router never serves a
+        READ locally from a lease another node may have taken meanwhile."""
+        holder = self._leases.get(namespace)
+        if holder is None or namespace in self._fenced:
+            return False
+        if fresh and time.monotonic() - self._last_beat.get(namespace, 0.0) > self._beat_period():
+            self._renew_one(namespace, holder)
+            return (namespace in self._leases and namespace not in self._fenced
+                    and time.monotonic() - self._last_beat.get(namespace, 0.0) <= self._valid_for())
+        return True
+
+    def release_owner(self, namespace: str, *, clean: bool = True, discard: bool = False) -> None:
         """Drop our lease - but only if it is still OURS.
 
         An unconditional delete would remove whichever lease is present,
         including one a different node legitimately reclaimed after we stalled,
         leaving that node writing an unowned namespace that a third process
-        could then claim.
+        could then claim. (S3 has no conditional DELETE that MinIO honours, so
+        this is read-then-delete; the loser of that race is FENCED on its
+        next renewal - a liveness hiccup, never two writers.)
+
+        Serialized with this process's renewals of the lease (_lease_lock).
+        A heartbeat renewal landing between this release dropping the ETag
+        and writing the tombstone made the tombstone's compare-and-swap fail
+        - silently - and left the lease LIVE after a clean close; one that
+        had listed the lease before the release renewed it after, with no
+        ETag, by an unconditional put over the tombstone. The next node then
+        waited out the TTL and took over a cleanly closed namespace as stale.
         """
+        with self._lease_lock(namespace):
+            self._release_owner_locked(namespace, clean=clean, discard=discard)
+
+    def _release_owner_locked(self, namespace: str, *, clean: bool, discard: bool) -> None:
         holder = self._leases.pop(namespace, None)
+        etag = self._lease_etag.pop(namespace, None)
+        self._forget_ns(namespace)
         if holder is None:
             return
         key = self._owner_key(namespace)
         try:
+            if discard:
+                # the namespace does not exist (a refused open of a name that
+                # was never created): leave no lease object behind
+                cur = (self._raw_get(key) or b"").decode(errors="replace")
+                if cur.split("\n", 1)[0] == holder:
+                    self._raw_delete(key)
+                return
+            if not clean:
+                # An ABORTED tenure (a takeover whose fence or manifest claim
+                # did not complete): not a clean close, so the next holder
+                # must treat it like a stale lease - fence the append logs,
+                # claim the manifest - instead of trusting a clean release
+                try:
+                    self._raw_cas_put(key, _ABORTED, if_match=etag) if etag else \
+                        self._raw_put(key, _ABORTED)
+                except _NoConditional:
+                    self._raw_put(key, _ABORTED)
+                return
+            if etag:
+                # a RELEASED tombstone, compare-and-swapped onto the lease we
+                # last wrote: if anyone took it meanwhile, nothing is written
+                # (a read-then-delete could delete THEIR lease, letting a
+                # third node in beside them)
+                try:
+                    self._raw_cas_put(key, _RELEASED, if_match=etag)
+                    return
+                except _NoConditional:
+                    pass
             cur = (self._raw_get(key) or b"").decode()
             if cur and cur.split("\n", 1)[0] != holder:
                 return                      # someone else owns it now
-        except Exception:
-            pass
-        self._raw_delete(key)
-        if not self._leases and self._lease_thread is not None:
-            self._lease_stop.set()
-            self._lease_thread = None
+            self._raw_delete(key)
+        finally:
+            if not self._leases and self._lease_thread is not None:
+                self._lease_stop.set()
+                self._lease_thread = None
+
+
+# the body of a lease its holder released CLEANLY (see release_owner); the
+# ONLY lease body a new holder may acquire without fencing and claiming
+_RELEASED = b"\n0"
+# a tenure that ended without completing its takeover: reads as a stale
+# lease (holder "aborted", stamped at the epoch), so the next holder fences
+_ABORTED = b"aborted\n0"
+# the cluster node registry's directory (memd.server.cluster.NODE_PREFIX)
+_REGISTRY_DIR = "_cluster"
+
+
+class _NoConditional(Exception):
+    """The endpoint does not implement conditional PUT headers."""
