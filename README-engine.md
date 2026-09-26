@@ -356,9 +356,10 @@ key; the local heuristic extractor is never billed.
   crypto-shred; record-level hard delete with ≤72h physical purge deadline.
 - **Retrieval**: rules-based planner (no reflection loop) → fan-out over
   BM25 (SQLite FTS5/porter, ranked by bm25; optionally accelerated by
-  tantivy), the entity lane, the time lane on recency intent, and an exact
-  flat vector scan with a real embedder (numpy; IVF-PQ slot reserved for
-  ≥50K-vector namespaces) → RRF fusion with trust-aware tie-breaks →
+  tantivy), the entity lane, the time lane on recency intent, and the
+  vector lane with a real embedder (an exact flat scan; from
+  `ann_min_vectors` vectors on, an optional usearch HNSW sidecar) → RRF
+  fusion with trust-aware tie-breaks →
   optional rerank of the lexical top-30 → validity filter (current/as_of) →
   lineage-deduped, budget-cut packing that keeps prefix-stable order
   (KV-cache friendly), or, as an experimental opt-in, gated evidence packing.
@@ -388,6 +389,8 @@ fully functional, honestly degraded, clearly labeled in `stats()`.
 | `rerank_gate` | gated-packing threshold (opt-in mode) | 0.5 |
 | `fuse_vector` / `MEMD_FUSE_VECTOR` | `auto` \| `true` \| `false` | `auto`: fuse unless the embedder is the hash embedder |
 | `lexical_backend` / `MEMD_LEXICAL_BACKEND` | `auto` \| `fts5` \| `tantivy` | `auto`: tantivy when installed (`pip install "memd[fast]"`) |
+| `vector_index` / `MEMD_VECTOR_INDEX` | `auto` \| `flat` \| `usearch` | `auto`: the usearch sidecar (`pip install "memd[ann]"`) for a namespace holding ≥ `ann_min_vectors` vectors, else the exact scan; an explicit `usearch` that cannot be honoured raises |
+| `ann_min_vectors`, `ann_overfetch`, `ann_exact_max`, `ann_dtype`, `ann_expansion_search` | auto threshold, candidate over-fetch, exact-answer cutoff, stored precision, HNSW search-depth floor | 20000, 4, 2000, `f16` (or `i8`), 0 (usearch's default; a search for k candidates explores at least k) |
 
 - **Reranker.** The top-30 of the bm25 lane (plus the vector lane with a real
   embedder) is reordered by a relevance judge; the rest follows in fused
@@ -423,6 +426,28 @@ fully functional, honestly degraded, clearly labeled in `stats()`.
   merge, so the same history committed in a different rhythm can order two
   near-equal docs differently.
 
+- **usearch sidecar** (vector lane). A derived HNSW index (cosine,
+  connectivity 16, f16) beside SQLite, keyed by record rowid and holding the
+  live records' vectors; SQLite's vectors table stays the source of truth.
+  Vectors reach it as the embed worker applies them (queued under the index
+  lock, applied right after it: the write ack never waits on it); deletes,
+  supersession, quarantine and hard deletes remove entries at once. A query
+  takes usearch's top k × `ann_overfetch` (widened once), then the same SQL
+  filter and post-check as every lane, re-scored exactly from SQLite, ties
+  ordered like fusion. Answered exactly instead: filters admitting at most
+  `ann_exact_max` rows, sweeps (`find_ids`), a window still short after
+  widening, and a sidecar not ready yet (`stats()["vector_index"]` counts
+  them in `fallback_exact_total`). Its file is used only when it matches the
+  SQLite file's vector watermark exactly; missing, corrupt, foreign, stale or
+  pre-purge files are rebuilt in the background (temp file + fsync +
+  rename; a kill never leaves a torn file in use) while the exact scan
+  serves. A hard-delete purge deletes its files and rebuilds it from SQLite
+  (usearch removal only marks entries), and it is published with the index
+  snapshot so a cold node installs it instead of rebuilding. recall@10 is
+  0.99+ on dense embeddings up to 1M vectors, ~0.94 on the hash embedder's
+  sparse vectors (see BENCHMARKS.md); a crash costs a rebuild (~5 min at 1M
+  on 4 threads), during which the exact scan serves.
+
 ## Ops
 
 ```bash
@@ -430,6 +455,7 @@ python bench/slo_bench.py                        # D2 acceptance numbers
 python -m memd.harness.run --suite all --gate    # quality+cost gate (D5)
 python bench/lme_gate.py                         # real-data gate: LongMemEval_S, 60 q (nightly)
 python bench/lexical_bench.py                    # FTS5 vs tantivy, filtered, 10K-150K records
+python bench/ann_bench.py                        # vector lane: usearch vs exact, 50K-1M vectors
 memd export --out backup.jsonl                   # anti-lock-in, symmetric
 memd import mem0 --export mem0.json              # migration path
 memd migrate --report ./memd-data                # store-format upgrade: preview / what it did (JSON)

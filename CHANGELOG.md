@@ -84,6 +84,30 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   they are offline (signed webhook payloads, an in-process fake with
   Stripe's idempotency semantics, and `stripe/stripe-mock` in docker for the
   end-to-end test, skipped without docker).
+- **usearch ANN sidecar for the vector lane** (`pip install "memd[ann]"`,
+  `vector_index` / `MEMD_VECTOR_INDEX` = `auto | flat | usearch`; decision
+  D6). `auto` serves namespaces with at least `ann_min_vectors` (20000)
+  vectors from an HNSW index (usearch >= 2.25, cosine, f16 or `ann_dtype`
+  i8, connectivity 16) keyed by record rowid, and smaller ones from the
+  exact scan; an explicit `usearch` that cannot be honoured raises. The
+  index is derived from SQLite's vectors table: changes are queued under the
+  index lock with a watermark committed alongside and applied right after
+  (the write ack never waits on it), and a file whose watermark, SQLite
+  file, format, dtype, metric or purge generation does not match is rebuilt
+  in the background (temp file, fsync, rename) while the exact scan serves.
+  Queries over-fetch k x `ann_overfetch` (4), widen once, and keep the SQL
+  filter, `_passes_filter` post-check and fusion's tie order; selective
+  filters (<= `ann_exact_max`, 2000 rows), sweeps and short windows are
+  answered exactly (`stats()["vector_index"]["fallback_exact_total"]`).
+  A hard-delete purge deletes the sidecar's files and rebuilds it from
+  SQLite, because usearch `remove` only marks entries (D7). The sidecar is
+  published with the index snapshot (`vector-*.snap`, same generation and
+  purge rules), so a cold node installs it instead of rebuilding.
+  `bench/ann_bench.py` measures it at 50K / 200K / 1M vectors: recall@10
+  1.000 / 0.999 / 0.993 on dense synthetic vectors, lane p50 14-19 ms
+  (exact scan: 37 ms at 50K, 54 ms at 200K), no write-ack cost; ~0.94 on
+  the hash embedder's sparse vectors. `ann_expansion_search` sets the
+  HNSW search-depth floor.
 
 ## [0.2.0] - 2026-09-26
 
