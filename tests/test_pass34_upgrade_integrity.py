@@ -481,17 +481,25 @@ from memd.storage import objectstore
 from memd.storage.engine import NamespaceStore
 
 NamespaceStore.SNAPSHOT_MIN_RECORDS = 1   # publish snapshots at test scale
+NamespaceStore.VECTOR_SNAPSHOT_MIN_VECTORS = 1
 root, ack = sys.argv[1:3]
 m = Memory(root, encrypt=False, config={cfg!r})
 victim = m.add("record {marker} for erasure", user_id="u")[0]
 keep = m.add("unrelated keeper note", user_id="u")[0]
 m.flush()
+vec = m.ns.index._con.execute("SELECT vec FROM vectors WHERE id=?", (victim,)).fetchone()[0]
 m.ns.rotate("probe")                      # the victim's bytes now sit in a segment
 m.ns.compact(force=True)                  # ...and in a published index snapshot
+ann = m.ns.index.ann
+if ann is not None:                       # ...and in the ANN sidecar's local file
+    with ann._apply_lock:
+        cap = ann._capture_locked()
+    if cap:
+        ann._persist(cap)
 m.delete(victim, hard=True)               # acked hard delete; purge pending
 m.flush()
 with open(ack, "w") as f:
-    f.write(victim + " " + keep)
+    f.write(victim + " " + keep + " " + bytes(vec).hex())
     f.flush()
     os.fsync(f.fileno())
 real = objectstore.LocalObjectStore.delete
@@ -525,14 +533,28 @@ def _files_with(root: str, needle: bytes) -> list[str]:
     return sorted(out)
 
 
-def test_a_killed_compaction_leaves_no_hard_deleted_bytes_after_reopen(tmp_path):
+def _usearch() -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec("usearch") is not None
+
+
+@pytest.mark.parametrize("vector_index", [
+    None, pytest.param("usearch", marks=pytest.mark.skipif(not _usearch(), reason="needs memd[ann]"))])
+def test_a_killed_compaction_leaves_no_hard_deleted_bytes_after_reopen(tmp_path, vector_index):
+    """With the usearch sidecar the victim's VECTOR is checked too: its f16
+    bytes sit in the sidecar file and the sidecar snapshot published with
+    the index image (usearch `remove` only marks an entry), and must be in
+    no file once the reopen has finished the purge."""
     root, ack = str(tmp_path / "data"), str(tmp_path / "ack")
+    cfg = dict(CFG, vector_index=vector_index) if vector_index else CFG
     src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
     child = subprocess.run(
-        [sys.executable, "-c", GC_CHILD.format(src=src, cfg=CFG, marker=MARKER), root, ack],
+        [sys.executable, "-c", GC_CHILD.format(src=src, cfg=cfg, marker=MARKER), root, ack],
         capture_output=True, timeout=120)
     assert child.returncode == 9, child.stderr.decode()[-2000:]
-    victim, keep = open(ack).read().split()
+    victim, keep, vec_hex = open(ack).read().split()
+    vec = bytes.fromhex(vec_hex)
     nsdir = os.path.join(root, "store", "ns", "default")
     m = _manifest(os.path.join(root, "store"), "default")
     orphans = [f for f in os.listdir(nsdir)
@@ -549,8 +571,14 @@ def test_a_killed_compaction_leaves_no_hard_deleted_bytes_after_reopen(tmp_path)
     assert any(f.startswith("store/ns/default/seg-") for f in before), before
     assert f"store/ns/default/{stale_snap}" in before, before
     assert any(f.startswith("store/_cache/") for f in before), before
+    stale_vec = [f for f in os.listdir(nsdir) if f.startswith("vector-")]
+    assert not m.get("vector_snapshot"), "unreferenced with the index image"
+    if vector_index:
+        vbefore = _files_with(root, vec)
+        assert len(stale_vec) == 1 and f"store/ns/default/{stale_vec[0]}" in vbefore, vbefore
+        assert any(".usearch/" in f for f in vbefore), vbefore
 
-    mem = Memory(root, encrypt=False, config=CFG)
+    mem = Memory(root, encrypt=False, config=cfg)
     try:
         assert mem.get(victim) is None and mem.get(keep) is not None
         st = mem.stats()
@@ -561,11 +589,14 @@ def test_a_killed_compaction_leaves_no_hard_deleted_bytes_after_reopen(tmp_path)
     finally:
         mem.close()
     assert _files_with(root, MARKER.encode()) == [], "hard-deleted bytes survived the reopen"
-    left = [f for f in os.listdir(nsdir) if f.startswith(("seg-", "index-"))]
+    if vector_index or stale_vec:
+        assert _files_with(root, vec) == [], "the hard-deleted vector survived the reopen"
+    left = [f for f in os.listdir(nsdir) if f.startswith(("seg-", "index-", "vector-"))]
     assert left == [s["name"] for s in _manifest(os.path.join(root, "store"), "default")["segments"]]
     assert st.get("segments_collected") == len(orphans)
-    assert st.get("snapshots_collected") == 1
-    assert gc == sorted([("segment_gc", o) for o in orphans] + [("snapshot_gc", stale_snap)]), \
+    assert st.get("snapshots_collected") == 1 + len(stale_vec)
+    assert gc == sorted([("segment_gc", o) for o in orphans] + [("snapshot_gc", stale_snap)]
+                        + [("snapshot_gc", v) for v in stale_vec]), \
         "each deletion must be in the audit ledger"
 
 

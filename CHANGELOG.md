@@ -84,6 +84,53 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   they are offline (signed webhook payloads, an in-process fake with
   Stripe's idempotency semantics, and `stripe/stripe-mock` in docker for the
   end-to-end test, skipped without docker).
+- **usearch ANN sidecar for the vector lane** (`pip install "memd[ann]"`,
+  `vector_index` / `MEMD_VECTOR_INDEX` = `auto | flat | usearch`; decision
+  D6). `auto` serves namespaces with at least `ann_min_vectors` (20000)
+  vectors from an HNSW index (usearch >= 2.25, cosine, f16 or `ann_dtype`
+  i8, connectivity 16) keyed by record rowid, and smaller ones from the
+  exact scan; an explicit `usearch` that cannot be honoured raises. The
+  index is derived from SQLite's vectors table: changes are queued under the
+  index lock with a watermark committed alongside and applied right after
+  (the write ack never waits on it), and a file whose watermark, SQLite
+  file, format, dtype, metric or purge generation does not match is rebuilt
+  in the background (temp file, fsync, rename) while the exact scan serves.
+  Queries over-fetch k x `ann_overfetch` (4), widen once, and keep the SQL
+  filter, `_passes_filter` post-check and fusion's tie order; selective
+  filters (<= `ann_exact_max`, 2000 rows), sweeps and short windows are
+  answered exactly (`stats()["vector_index"]["fallback_exact_total"]`).
+  A hard-delete purge deletes the sidecar's files and rebuilds it from
+  SQLite, because usearch `remove` only marks entries (D7). The sidecar is
+  published with the index snapshot (`vector-*.snap`, same generation and
+  purge rules), so a cold node installs it instead of rebuilding.
+  `bench/ann_bench.py` measures it at 50K / 200K / 1M vectors: recall@10
+  1.000 / 0.999 / 0.993 on dense synthetic vectors, lane p50 14-19 ms
+  (exact scan: 37 ms at 50K, 54 ms at 200K), no write-ack cost; ~0.94 on
+  the hash embedder's sparse vectors. `ann_expansion_search` sets the
+  HNSW search-depth floor. While the sidecar loads, rebuilds or failed to
+  attach, a namespace over `flat_max_vectors` (200000) never loads the
+  exact scan's float32 matrix: sweeps and selective filters are answered
+  exactly from SQLite, other queries skip the vector lane
+  (`memd_vector_lane_skipped_total{reason="ann_rebuilding"}`) and are not
+  cached. Sidecar load (at open) and final save (at close, evictions
+  included) run on background threads; usearch holds the GIL for them, so
+  the process pauses ~100 ms per save or load at 200K vectors (a memory
+  copy: files up to 256 MB are read and written outside the GIL).
+  Sidecar files and published images are checksummed (blake2b) and
+  verified before usearch reads them; a corrupt file, or a process that
+  died while usearch was loading one, is rebuilt from SQLite instead of
+  crashing every restart. A snapshot install starts a new local vector
+  lineage. Writes still queued for the index are searched exactly
+  (read-your-writes); find_ids sweeps stream exactly from SQLite; every
+  vector path admits only live rows; after each build poorly linked nodes
+  are re-inserted and at least 100 candidates are re-ranked exactly, so
+  independent rebuilds answer identically.
+
+### Fixed
+- `test_mcp_budget_clamped` skips when the optional `mcp` extra is not
+  installed (it failed with `ModuleNotFoundError`), like `test_mcp.py`.
+- The flat vector scan returned nothing for a sweep-size limit (>= 1024)
+  with no restrictive filter.
 
 ## [0.2.0] - 2026-09-26
 
