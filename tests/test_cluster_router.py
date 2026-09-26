@@ -45,6 +45,7 @@ pytest.importorskip("moto.server")
 httpx = pytest.importorskip("httpx")
 
 SRC = os.path.join(os.path.dirname(__file__), "..", "src")
+NODE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cluster_node.py")
 TTL = 4.0
 ADMIN = "memd-admin-" + uuid.uuid4().hex
 EPSILON = 3.0      # routing retry cadence + reclaim + cold open from the bucket
@@ -115,13 +116,14 @@ class Fleet:
         self.urls: dict[str, str] = {}
         self.logs: dict[str, str] = {}
 
-    def start(self, nid: str) -> str:
+    def start(self, nid: str, **env_extra) -> str:
         port = _free_port()
-        env = dict(self.env, MEMD_LOCAL_DIR=str(self.tmp / f"local-{nid}"))
+        env = dict(self.env, MEMD_LOCAL_DIR=str(self.tmp / f"local-{nid}"), **env_extra)
         log = str(self.tmp / f"{nid}.log")
         self.logs[nid] = log
+        # tests/cluster_node.py is `memd` plus opt-in test hooks (env)
         self.procs[nid] = subprocess.Popen(
-            [sys.executable, "-m", "memd.cli", "serve", "--http", "--node-id", nid,
+            [sys.executable, NODE, "serve", "--http", "--node-id", nid,
              "--port", str(port)], env=env, stdout=open(log, "ab"), stderr=subprocess.STDOUT)
         url = f"http://127.0.0.1:{port}"
         self.urls[nid] = url
@@ -395,8 +397,9 @@ def test_graceful_shutdown_hands_off_without_waiting_for_the_ttl(fleet_factory):
     assert f.procs[owner].returncode in (0, -signal.SIGTERM), f.log_tail()
     assert "Application shutdown complete" in open(f.logs[owner]).read()
     assert took < TTL, f"graceful handoff took {took:.2f}s - the lease was not released"
-    reg = f.s3.list_objects_v2(Bucket=BUCKET, Prefix=f"{f.prefix}/_cluster/nodes/{owner}.json")
-    assert not reg.get("Contents"), "a gracefully stopped node stayed registered"
+    reg = json.loads(f.s3.get_object(Bucket=BUCKET, Key=f"{f.prefix}/_cluster/nodes/{owner}.json")
+                     ["Body"].read())
+    assert reg.get("stopped") is True, f"a gracefully stopped node stayed registered: {reg}"
     _assert_all_acked_readable(f, ns, w.acked, [n for n in nodes if n != owner])
 
 
@@ -457,6 +460,126 @@ def test_a_frozen_leaseholder_cannot_split_brain(fleet_factory, kms):
         cold.close()
     assert replayed == served, (f"cold replay differs from what the owner served: "
                                 f"+{len(replayed - served)} -{len(served - replayed)}")
+
+
+# ------------------------------------ a stale commit after a takeover fails
+
+
+def _stopped(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] == "T"
+    except OSError:
+        return False
+
+
+def _cold_replay_ids(f: "Fleet", ns: str, kms) -> set:
+    from memd.engine.memory import Memory
+
+    kms_url, arn = kms
+    c = boto3.client("kms", endpoint_url=kms_url, region_name="us-east-1",
+                     aws_access_key_id=KEY, aws_secret_access_key=SECRET)
+    cold = Memory(f"s3://{BUCKET}/{f.prefix}", namespace=ns, config={
+        "s3_endpoint_url": ENDPOINT, "s3_access_key": KEY, "s3_secret_key": SECRET,
+        "s3_region": "us-east-1", "local_dir": str(f.tmp / f"cold-{uuid.uuid4().hex[:6]}"),
+        "embedder": "hash", "key_provider": "aws-kms", "kms_client": c, "kms_key_id": arn})
+    try:
+        return {json.loads(line)["id"] for line in cold.export_jsonl(namespace=ns).splitlines()
+                if line.strip()}
+    finally:
+        cold.close()
+
+
+@pytest.mark.parametrize("where", ["compact", "rotate"])
+def test_a_commit_paused_past_the_takeover_fails_instead_of_clobbering(fleet_factory, kms, where):
+    """The window no lease check can close: the owner passed its fence check
+    and is about to PUT the manifest (inside a compaction / a rotation) when
+    it is frozen. Another node takes the namespace over and writes. When the
+    frozen node resumes, its PUT reaches the bucket - and must FAIL (a
+    compare-and-swap on the manifest version it last saw), fence the
+    namespace, and delete nothing: every ack survives, and a cold replay of
+    the bucket equals what the new owner serves."""
+    f = fleet_factory()
+    mark = str(f.tmp / f"paused-{where}")
+    hooks = {"MEMD_TEST_PAUSE_AT": where, "MEMD_TEST_PAUSE_MARK": mark}
+    if where == "rotate":
+        hooks["MEMD_TEST_ROTATE_FRAMES"] = "25"
+    nodes = ["n1", "n2", "n3"]
+    f.start("n1", **hooks)
+    f.start("n2")
+    f.start("n3")
+    from memd.server.cluster import rendezvous
+
+    ns = next(n for n in (f"stale{i}" for i in range(200)) if rendezvous(n, set(nodes))[0] == "n1")
+    acked: list[tuple[str, str, float]] = []
+    for i in range(20):                       # the owner is n1 (the hash's choice)
+        content = f"before the stall {i} {uuid.uuid4().hex[:6]}"
+        r = _remember(f.urls["n1"], ns, content)
+        assert r.status_code == 201, (r.status_code, r.text, f.log_tail())
+        acked.append((r.json()["id"], content, time.monotonic()))
+    assert f.owner(ns) == "n1"
+
+    # trigger the commit that freezes n1 between its check and its PUT
+    outcome: dict = {}
+
+    def trigger():
+        try:
+            if where == "compact":
+                outcome["r"] = httpx.post(f"{f.urls['n1']}/v1/ns/{ns}/compact?force=true",
+                                          headers=H, timeout=120)
+            else:
+                for i in range(40):           # the 25th frame rotates
+                    r = _remember(f.urls["n1"], ns, f"rotation filler {i}", timeout=120)
+                    if r.status_code != 201:
+                        outcome["r"] = r
+                        return
+                    acked.append((r.json()["id"], f"rotation filler {i}", time.monotonic()))
+                outcome["r"] = None
+        except httpx.HTTPError as ex:
+            outcome["err"] = ex
+    t = threading.Thread(target=trigger, daemon=True)
+    t.start()
+    deadline = time.time() + 60
+    while not (os.path.exists(mark) and _stopped(f.procs["n1"].pid)):
+        assert time.time() < deadline, f"n1 never reached the pause point\n{f.log_tail()}"
+        assert t.is_alive() or os.path.exists(mark), f"trigger ended without pausing: {outcome}"
+        time.sleep(0.05)
+    t_stop = time.monotonic()
+
+    # another node takes over (after the TTL) and writes
+    w = Writer(f.urls["n2"], ns, "after-takeover")
+    w.start()
+    took = _takeover_after(w, t_stop, TTL + 20)
+    time.sleep(1.5)
+    new_owner = f.owner(ns)
+    assert new_owner in ("n2", "n3"), new_owner
+    manifest_before = f.s3.get_object(Bucket=BUCKET, Key=f"{f.prefix}/ns/{ns}/manifest.json")["Body"].read()
+
+    f.send("n1", signal.SIGCONT)            # the frozen PUT goes out now
+    t.join(timeout=90)
+    assert not t.is_alive(), "the paused request never finished"
+    r = outcome.get("r")
+    assert r is not None and r.status_code == 503, \
+        (f"the stale {where} commit did not fail: {getattr(r, 'status_code', None)} "
+         f"{getattr(r, 'text', outcome)}\n{f.log_tail()}")
+    assert "lease_lost" in r.text
+    time.sleep(1.0)
+    w.stop.set()
+    w.join(timeout=60)
+    manifest_after = f.s3.get_object(Bucket=BUCKET, Key=f"{f.prefix}/ns/{ns}/manifest.json")["Body"].read()
+    gen = lambda raw: json.loads(raw)["gen"]  # noqa: E731
+    assert gen(manifest_after) >= gen(manifest_before), "the stale commit rolled the manifest back"
+    print(f"\nSTALE-{where.upper()}: owner n1 -> {new_owner} in {took:.2f}s; stale commit answered "
+          f"{r.status_code}; acked {len(acked)} before + {len(w.acked)} after")
+    all_acked = acked + w.acked
+    _assert_all_acked_readable(f, ns, all_acked, nodes)     # n1 routes to the new owner now
+    served = _export_ids(f.urls[new_owner], ns)
+    assert {rid for rid, _c, _t in all_acked} <= served
+    for n in nodes:
+        f.stop(n)
+    replayed = _cold_replay_ids(f, ns, kms)
+    assert replayed == served, (f"cold replay differs from what the new owner served: "
+                                f"+{sorted(replayed - served)[:5]} -{sorted(served - replayed)[:5]}")
 
 
 # ------------------------------------------------------ hosted, via router

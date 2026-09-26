@@ -166,11 +166,29 @@ class NodeRegistry:
         self._seen: dict[str, dict] = {}      # every node ever listed: id -> info
         self._live_at = 0.0
         self._live: dict[str, dict] = {}
+        self._ver: str | None = None      # our entry's version, as last read or written
+        self.lost = False
 
-    def _beat(self) -> None:
+    def _beat(self, *, stopped: bool = False) -> None:
+        """Write our registry entry - conditionally, on the version we last
+        read or wrote (ADR-12): if anyone else wrote it since (a twin with
+        our node id, an operator), we stop advertising rather than fight."""
+        from memd.storage.objectstore import PreconditionFailed
+
         body = {"node": self.cfg.node_id, "url": self.cfg.advertise_url,
-                "incarnation": self.cfg.incarnation, "beat": time.time()}
-        self.store.put(self.key, json.dumps(body).encode())
+                "incarnation": self.cfg.incarnation, "beat": 0.0 if stopped else time.time()}
+        if stopped:
+            body["stopped"] = True
+        try:
+            self._ver = self.store.put_if_match(self.key, json.dumps(body).encode(), self._ver)
+        except PreconditionFailed:
+            METRICS.inc("memd_cluster_registry_conflicts_total",
+                        help="registry entries changed by another process (duplicate node id?)")
+            _log.error("memd cluster: registry entry %s was changed by another process; this "
+                       "node stops advertising (duplicate --node-id?)", self.key)
+            self._stop.set()
+            self.lost = True
+            raise
 
     def start(self) -> None:
         """Register. A registration of the same node id that is still
@@ -180,7 +198,9 @@ class NodeRegistry:
         deadline = time.time() + self.cfg.lease_ttl_s + 2
         while True:
             try:
-                cur = json.loads(self.store.get(self.key) or b"{}")
+                got = self.store.get_versioned(self.key)
+                self._ver = got[1] if got else None
+                cur = json.loads(got[0]) if got else {}
             except Exception:
                 cur = {}
             age = time.time() - float(cur.get("beat", 0) or 0)
@@ -198,9 +218,13 @@ class NodeRegistry:
 
     def _loop(self) -> None:
         period = max(0.5, self.cfg.lease_ttl_s / 3.0)
+        from memd.storage.objectstore import PreconditionFailed
+
         while not self._stop.wait(period):
             try:
                 self._beat()
+            except PreconditionFailed:
+                return            # another process owns our entry: stop (see _beat)
             except Exception:  # noqa: BLE001 - the next beat retries
                 METRICS.inc("memd_cluster_registry_beat_failures_total",
                             help="node registry heartbeats that failed")
@@ -211,10 +235,12 @@ class NodeRegistry:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=5)
+        if self.lost:
+            return
         try:
-            raw = self.store.get(self.key)
-            if raw and json.loads(raw).get("incarnation") == self.cfg.incarnation:
-                self.store.delete(self.key)
+            # a "stopped" entry, compare-and-swapped onto ours: never removes
+            # or overwrites an entry another process wrote since
+            self._beat(stopped=True)
         except Exception:  # noqa: BLE001 - it expires on its own
             pass
 
@@ -232,6 +258,8 @@ class NodeRegistry:
             except Exception:
                 continue
             seen[nid] = info
+            if info.get("stopped"):
+                continue
             age = time.time() - float(info.get("beat", 0))
             if -self.cfg.lease_ttl_s <= age <= self.cfg.lease_ttl_s:
                 out[nid] = info
