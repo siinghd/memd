@@ -135,6 +135,15 @@ and the ciphertext is inert), but a second node cannot decrypt. With a remote
 key provider (`aws-kms` or `vault-transit`, below) the wrapped keys live in
 the bucket too, and any authorised node can serve any namespace.
 
+Back the keys up with the data and restore them together (the keys directory
+for `local`; the `keys/` objects for a remote provider). A namespace opened
+with a key its data was not written with (another deployment's key files or
+wrapped key object, a replaced root key), without one, or with encryption off
+raises `KeyCustodyError` and nothing is changed — it is never read as empty,
+and never compacted away. A complete log frame that does not read is never cut
+off as a torn tail either; [SECURITY.md](SECURITY.md) has the recovery
+procedure for one that is damaged.
+
 Single-writer is still enforced, by a **lease** rather than a file lock (`flock`
 cannot see another machine): the first writer claims `ns/<ns>/.owner` with a
 conditional PUT, a second gets `NamespaceBusyError`, and a lease older than the
@@ -455,9 +464,10 @@ key; the local heuristic extractor is never billed.
   crypto-shred; record-level hard delete with ≤72h physical purge deadline.
 - **Retrieval**: rules-based planner (no reflection loop) → fan-out over
   BM25 (SQLite FTS5/porter, ranked by bm25; optionally accelerated by
-  tantivy), the entity lane, the time lane on recency intent, and an exact
-  flat vector scan with a real embedder (numpy; IVF-PQ slot reserved for
-  ≥50K-vector namespaces) → RRF fusion with trust-aware tie-breaks →
+  tantivy), the entity lane, the time lane on recency intent, and the
+  vector lane with a real embedder (an exact flat scan; from
+  `ann_min_vectors` vectors on, an optional usearch HNSW sidecar) → RRF
+  fusion with trust-aware tie-breaks →
   optional rerank of the lexical top-30 → validity filter (current/as_of) →
   lineage-deduped, budget-cut packing that keeps prefix-stable order
   (KV-cache friendly), or, as an experimental opt-in, gated evidence packing.
@@ -487,6 +497,9 @@ fully functional, honestly degraded, clearly labeled in `stats()`.
 | `rerank_gate` | gated-packing threshold (opt-in mode) | 0.5 |
 | `fuse_vector` / `MEMD_FUSE_VECTOR` | `auto` \| `true` \| `false` | `auto`: fuse unless the embedder is the hash embedder |
 | `lexical_backend` / `MEMD_LEXICAL_BACKEND` | `auto` \| `fts5` \| `tantivy` | `auto`: tantivy when installed (`pip install "memd[fast]"`) |
+| `vector_index` / `MEMD_VECTOR_INDEX` | `auto` \| `flat` \| `usearch` | `auto`: the usearch sidecar (`pip install "memd[ann]"`) for a namespace holding ≥ `ann_min_vectors` vectors, else the exact scan; an explicit `usearch` that cannot be honoured raises |
+| `ann_min_vectors`, `ann_overfetch`, `ann_exact_max`, `ann_dtype`, `ann_expansion_search` | auto threshold, candidate over-fetch, exact-answer cutoff, stored precision, HNSW search-depth floor | 20000, 4, 2000, `f16` (or `i8`), 128 (a search for k candidates explores at least k) |
+| `flat_max_vectors` | while the sidecar is loading or rebuilding, a namespace with more vectors than this never loads the exact scan's float32 matrix | 200000 |
 
 - **Reranker.** The top-30 of the bm25 lane (plus the vector lane with a real
   embedder) is reordered by a relevance judge; the rest follows in fused
@@ -522,6 +535,60 @@ fully functional, honestly degraded, clearly labeled in `stats()`.
   merge, so the same history committed in a different rhythm can order two
   near-equal docs differently.
 
+- **usearch sidecar** (vector lane). A derived HNSW index (cosine,
+  connectivity 16, f16) beside SQLite, keyed by record rowid and holding the
+  live records' vectors; SQLite's vectors table stays the source of truth.
+  Vectors reach it as the embed worker applies them (queued under the index
+  lock, applied right after it: the write ack never waits on it); deletes,
+  supersession, quarantine and hard deletes remove entries at once. A query
+  takes usearch's top k × `ann_overfetch` (widened once), then the same SQL
+  filter and post-check as every lane, re-scored exactly from SQLite, ties
+  ordered like fusion. Answered exactly instead: filters admitting at most
+  `ann_exact_max` rows, sweeps (`find_ids`), a window still short after
+  widening, and a sidecar not ready yet (`stats()["vector_index"]` counts
+  them in `fallback_exact_total`). Its file is used only when it matches the
+  SQLite file's vector watermark exactly; missing, corrupt, foreign, stale or
+  pre-purge files are rebuilt in the background (temp file + fsync +
+  rename; a kill never leaves a torn file in use). A hard-delete purge
+  deletes its files and rebuilds it from SQLite (usearch removal only marks
+  entries), and it is published with the index snapshot so a cold node
+  installs it instead of rebuilding. recall@10 is 0.99+ on dense embeddings
+  up to 1M vectors, ~0.94 on the hash embedder's sparse vectors (see
+  BENCHMARKS.md); a crash costs a rebuild (~5 min at 1M on 4 threads).
+  Files and published images carry a blake2b checksum, verified before
+  usearch reads them (usearch trusts what it loads: a file corrupted in
+  place crashed the process in search); a failed check, or a process that
+  died while a loaded graph was still on probation (until it has served
+  200 searches or 300 s; a clean close ends it), rebuilds it from SQLite.
+  A loaded graph's bookkeeping is checked at load and its first answers
+  against the exact scan (recall < 0.8 rebuilds it). A checksum-valid
+  file that memd did not write takes write access to the data directory:
+  an adversarial local file, outside the threat model (see SECURITY.md). At least 100
+  candidates are re-ranked by exact cosine, writes still queued for the
+  index are searched exactly (read-your-writes), and after each build
+  poorly linked nodes are re-inserted (a duplicate vector's too, when a
+  search reaches only its identical twin), so independent rebuilds give
+  the same top-10 and a scoped search that drops the twin still finds it. Every vector path admits only live rows, whatever
+  `include_quarantined` / `include_invalid` ask, and sweeps beside the
+  sidecar stream exactly from SQLite.
+- **While the sidecar is not serving** (loading at open, rebuilding, or
+  failed to attach), the exact scan serves up to `flat_max_vectors`. Above
+  that its float32 matrix (1.5 GB at 1M × 384) is never loaded: sweeps and
+  filters admitting at most `ann_exact_max` rows are answered exactly,
+  streamed from SQLite, and other queries skip the vector lane (bm25 and the
+  other lanes serve them; `memd_vector_lane_skipped_total{reason="ann_rebuilding"}`,
+  `stats()["vector_index"]["skipped_total"]`; such results are not cached).
+- **Sidecar save and load are off the request path.** Opening a namespace
+  does not wait for its sidecar to load (a background thread does it), and
+  closing hands the final save to a background thread (engine close waits
+  for it; a destroy cancels it). usearch holds the GIL for the whole of a
+  save or load, so the process pauses for it wherever it runs: measured at
+  200K × 384 f16, ~100 ms per save and ~105 ms per load (files up to 256 MB
+  are read and written by Python outside the GIL, so the pause is a memory
+  copy; larger ones are saved and loaded by usearch directly and pause
+  longer). `stats()["vector_index"]["last_gil_hold_ms"]` and
+  `memd_vector_index_gil_hold_ms` report it.
+
 ## Ops
 
 ```bash
@@ -529,6 +596,7 @@ python bench/slo_bench.py                        # D2 acceptance numbers
 python -m memd.harness.run --suite all --gate    # quality+cost gate (D5)
 python bench/lme_gate.py                         # real-data gate: LongMemEval_S, 60 q (nightly)
 python bench/lexical_bench.py                    # FTS5 vs tantivy, filtered, 10K-150K records
+python bench/ann_bench.py                        # vector lane: usearch vs exact, 50K-1M vectors
 memd export --out backup.jsonl                   # anti-lock-in, symmetric
 memd import mem0 --export mem0.json              # migration path
 memd migrate --report ./memd-data                # store-format upgrade: preview / what it did (JSON)

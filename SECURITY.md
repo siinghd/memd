@@ -26,6 +26,29 @@ any probe fails the build.
   possible. It is *not* protection against someone with filesystem read
   access on the same machine (the root key file sits beside the data). See
   "Key custody" below for the KMS / Vault providers.
+- **Key custody fails closed.** Restore the keys together with the data they
+  were written with (the keys directory for `local`; the `keys/` objects for
+  a remote provider). A key that is valid but not that data's (another
+  deployment's `keys/` directory or `keys/<ns>.dek` object, a replaced
+  `root.key`), no key at all, or encryption turned off for an encrypted
+  namespace makes the open raise `KeyCustodyError`; nothing is read,
+  truncated or deleted, no key is
+  created, and the namespace opens normally once the right keys are back.
+  The manifest holds a fingerprint of each namespace's data key (an HMAC of
+  a fixed label under the key) to check this before anything is touched; it
+  reveals nothing about the key. A manifest without one (every namespace
+  0.2.0 wrote) is probed: its encrypted objects are tried until one
+  decrypts, and the key is refused only if none does; with encryption off,
+  a namespace none of whose data parses as plaintext is refused. The
+  fingerprint is written only once the key has decrypted something, or when
+  nothing encrypted exists yet. A complete WAL or ops frame that does not
+  read - does not decrypt, or does not parse - is never cut off or folded
+  away, under any key and with encryption on or off: only a frame cut short
+  by its length prefix is a torn tail. Under the proven key a damaged
+  segment is skipped by reads but kept on disk (and the deletes a compaction
+  could not apply to it stay pending until it reads again); a damaged log
+  frame refuses the open - see "Recovering from an unreadable log frame"
+  below.
 - **With the S3 backend and `local` keys, data is remote but KEYS ARE LOCAL.**
   Crypto-shred works (destroying the local key makes the remote ciphertext
   inert), but a second node cannot decrypt the bucket - it refuses to open a
@@ -46,6 +69,14 @@ any probe fails the build.
   verification), and clock skew between nodes must stay under TTL/3. Do not
   run two writers on one namespace and rely on it; the cluster router
   (ADR-12) never does.
+- **The local data directory is trusted.** Derived caches under it (the
+  SQLite index, the tantivy and usearch sidecars) are checksummed or
+  rebuildable against accidental damage, not against someone who can write
+  there: a crafted, checksum-valid usearch file is an adversarial local
+  file. memd bounds what one can do - a graph that crashes the process
+  during its probation is rebuilt at the next open, one whose structure or
+  first answers disagree with SQLite is rebuilt - but does not make usearch
+  safe to load it. Protect the data directory like the key directory.
 
 ## Key custody (ADR-12)
 
@@ -63,11 +94,22 @@ any probe fails the build.
   namespace's name does not unwrap. A Vault that silently ignores
   `associated_data` is refused rather than used unbound.
 - **Custody fails closed.** An unreadable `keys/_custody.json` refuses the
-  open on every root (never delete it to get past that - restore it); a
-  namespace that has data is never given a freshly minted key (local roots
-  included; `MEMD_KEYS_ALLOW_MINT_EXISTING=1` only for a namespace that was
-  never encrypted); and log frames that are complete but do not decrypt are
-  never truncated as a "torn tail" - the open is refused instead.
+  open on every root (never delete it to get past that - restore it). A
+  namespace with encrypted data is never given a freshly minted key, and a
+  data key that is not its data's is refused before anything is read, on
+  every root and under every provider ("Key custody fails closed" above: the
+  manifest's key fingerprint, or a probe of the data). The two checks are
+  complementary: the custody marker says which PROVIDER wraps the store's
+  data keys and refuses a node configured for another one before it can
+  mint anything; the fingerprint is of the data key itself, so it survives
+  `memd keys migrate` and `memd keys rotate` (both re-wrap the same key) and
+  catches a wrapped key that unwraps fine but is not this data's - another
+  deployment's `keys/<ns>.dek` restored over this one's. A remote provider
+  resolves the key when the namespace opens, and refuses to mint one for a
+  namespace that already has a manifest (`MEMD_KEYS_ALLOW_MINT_EXISTING=1`
+  only for a namespace that was never encrypted). Log frames that are
+  complete but do not read are never truncated as a "torn tail" - the open
+  is refused instead.
 - **Plaintext data keys are in node memory** while a namespace is open (they
   must be, to encrypt), LRU-bounded to 1024 namespaces per process.
 - **Crypto-shred with a SHARED CMK / transit key** (the normal deployment)
@@ -175,6 +217,59 @@ any probe fails the build.
     ids, key hashes and usage counts (no content). It is not encrypted by the
     namespace envelope keys and is not included in exports; back it up with
     the data root.
+
+## Recovering from an unreadable log frame
+
+An open that refuses raises `KeyCustodyError`, and its message says which
+case it is. Nothing was changed in any of them.
+
+- *"the key does not match"*, *"none of its data decrypts"*, *"no data
+  key"*: key custody. Restore the `keys/` directory the data was written
+  with (`root.key` and `ns-<namespace>.key` together) and open again with
+  encryption on. Nothing is lost.
+- *"looks encrypted ... opened it with encryption off"*: open with
+  encryption on (the default) and those keys.
+- *"a complete WAL frame (at byte N of ns/<namespace>/wal) is unreadable
+  although the data key in hand is the right one: the frame is damaged"*
+  (or an `ops` frame; with encryption off, *"(it does not parse)"*): the log
+  is damaged on disk - bit rot, a bad copy, a hand edit. memd will not cut it
+  off, because it may hold acknowledged writes, and everything logged after
+  it is behind it. To recover:
+  1. Stop memd and back up the data root (`store/` and `keys/`; on S3 the
+     `ns/<namespace>/` prefix and the local keys directory).
+  2. If a backup holds the log from before the damage, restoring it is the
+     lossless fix.
+  3. Otherwise remove exactly the frame the message names - its 4-byte
+     length prefix and the payload that prefix announces - and nothing
+     else. Frames are self-contained (each carries its own sequence
+     number), so the ones after it keep their place; only the writes or ops
+     in the damaged frame are lost, and the backup from step 1 still holds
+     its bytes:
+
+     ```python
+     p, n = "store/ns/<namespace>/wal", N   # the path and byte from the message
+     b = open(p, "rb").read()
+     ln = int.from_bytes(b[n:n + 4], "big")
+     open(p, "wb").write(b[:n] + b[n + 4 + ln:])
+     ```
+
+     On S3 the log is not one object: it is stored as part objects
+     (`ns/<namespace>/wal.__part-NNN`, plus `wal.__seq`), and byte N counts
+     across the parts in order. Find the part that holds byte N and delete
+     that one part object (every frame in it is lost; the backup from step 1
+     still holds them). Do not re-upload an edited single `wal` object: memd
+     does not read one.
+
+     Removing an `ops` frame loses the deletes it held: records it
+     tombstoned come back, and a hard delete in it is undone, so the purged
+     text is served again. After recovering, repeat any delete that was
+     acknowledged around the time of the damage.
+  4. Open again; another damaged frame, if any, is reported the same way.
+
+A damaged segment never blocks an open: it is skipped by reads, kept by
+compaction (`"unreadable": true` in the manifest,
+`memd_segments_quarantined_total`), and served again once its bytes are
+restored from a backup.
 
 ## Hardening checklist for a real deployment
 

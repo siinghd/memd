@@ -293,6 +293,62 @@ def test_a_reopen_no_other_tenure_came_between_keeps_its_warm_cache(tmp_path):
             e.close()
 
 
+def test_a_discarded_cache_takes_the_ann_sidecar_with_it(tmp_path, monkeypatch):
+    """The lineage check (ADR-12) with the usearch sidecar: a cache of
+    another lineage is deleted and rebuilt - and so are the sidecar's files,
+    derived from it: they hold the vectors of records another node may have
+    hard-deleted and purged since (D7). Removed before the sidecar attaches,
+    so nothing of the old lineage is loaded from them either."""
+    pytest.importorskip("usearch")
+    import numpy as np
+
+    from memd.core.schema import MemoryRecord
+    from memd.storage.engine import StorageEngine
+
+    root, cache = str(tmp_path / "store"), str(tmp_path / "cache")
+    vcfg = {"mode": "usearch", "min_vectors": 0, "overfetch": 4, "exact_max": 0,
+            "dtype": "f16", "build_threads": 1}
+    e = StorageEngine(root, cache_dir=cache, vector_index=vcfg)
+    ns = e.namespace("t")
+    recs = [MemoryRecord.create(namespace="t", kind="raw_event", content=f"r {i}") for i in range(50)]
+    ns.append(recs)
+    x = np.random.default_rng(0).standard_normal((50, 16)).astype(np.float32)
+    ns.index.set_vectors([r.id for r in recs], x, "m")
+    assert ns.index.ann.drain(60) and ns.index.ann.size() == 50
+    side = os.path.splitext(ns.index.path)[0] + ".usearch"
+    e.close()
+    assert os.path.isdir(side) and os.listdir(side), "no sidecar files to discard"
+    sentinel = os.path.join(side, "stale-lineage")
+    with open(sentinel, "wb") as f:
+        f.write(b"vectors of another lineage")
+    # another tenure opened the namespace since (another node, a handoff)
+    mpath = os.path.join(root, "ns", "t", "manifest.json")
+    with open(mpath) as f:
+        m = json.load(f)
+    m["lineage"] = "01OTHERTENURE0000000000000"
+    with open(mpath, "w") as f:
+        json.dump(m, f)
+    from memd.index.ann_usearch import UsearchSidecar
+
+    seen = []
+    real = UsearchSidecar._open_step
+
+    def spy(self, job):
+        seen.append(os.path.exists(sentinel))   # what the sidecar's load finds
+        return real(self, job)
+
+    monkeypatch.setattr(UsearchSidecar, "_open_step", spy)
+    e = StorageEngine(root, cache_dir=cache, vector_index=vcfg)
+    try:
+        ns = e.namespace("t")
+        assert ns._replayed_at_open and ns.index.stats()["records"] == 50
+        assert ns.index.ann.drain(60)
+        assert seen == [False], "the new lineage's sidecar found the discarded cache's files"
+        assert not os.path.exists(sentinel)
+    finally:
+        e.close()
+
+
 # ------------------------------------------- handoffs with a paused writer
 
 
@@ -477,7 +533,9 @@ def test_complete_frames_that_do_not_decrypt_are_never_truncated(tmp_path):
     os.replace(os.path.join(other, "keys", "root.key"), os.path.join(data, "keys", "root.key"))
     logs = {n: open(os.path.join(data, "store", "ns", "default", n), "rb").read()
             for n in ("wal", "ops") if os.path.exists(os.path.join(data, "store", "ns", "default", n))}
-    with pytest.raises(KeyCustodyError, match="nothing was truncated"):
+    # (master's key custody: the manifest's key check refuses it before any
+    # frame is read - "nothing was read, truncated or deleted")
+    with pytest.raises(KeyCustodyError, match=r"nothing was (read, )?truncated"):
         Memory(data, config={"embedder": "hash"})
     for n, before in logs.items():
         assert open(os.path.join(data, "store", "ns", "default", n), "rb").read() == before, n

@@ -32,6 +32,9 @@ s3 = ["boto3>=1.34"]
 local-embeddings = ["fastembed>=0.4"]
 # tantivy lexical accelerator for the bm25 lane (FTS5 stays the source of truth)
 fast = ["tantivy>=0.26"]
+# usearch HNSW sidecar for the vector lane (SQLite vectors stay the source of
+# truth); >= 2.25: earlier versions slowed ~90x on ascending sparse int keys
+ann = ["usearch>=2.25"]
 # Jev reranker (TypeSafe System One); active only when TYPESAFE_API_KEY is set
 jev = ["typesafe-sdk>=0.7"]
 # hosted mode only (memd serve --http --hosted): Stripe billing. Imported

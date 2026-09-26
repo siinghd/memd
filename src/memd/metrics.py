@@ -468,6 +468,9 @@ CORE_HISTOGRAMS = {
     "memd_lane_ms": ("per-lane candidate fetch duration (ms)", DEFAULT_BUCKETS),
     "memd_rerank_ms": ("reranker call duration (ms), including fallbacks", DEFAULT_BUCKETS),
     "memd_lexical_commit_ms": ("tantivy indexer batch: read + index + commit (ms)", DEFAULT_BUCKETS),
+    "memd_vector_index_build_ms": ("usearch sidecar build from SQLite (ms)", DEFAULT_BUCKETS),
+    "memd_vector_index_save_ms": ("vector sidecar save (ms)", DEFAULT_BUCKETS),
+    "memd_vector_index_gil_hold_ms": ("usearch save/restore calls, which hold the GIL (ms)", DEFAULT_BUCKETS),
 }
 
 CORE_COUNTERS = {
@@ -544,6 +547,18 @@ CORE_COUNTERS = {
     "memd_lexical_indexed_total": "rows (re)indexed into tantivy",
     "memd_lexical_index_failures_total": "tantivy indexer steps that failed (the lane serves from FTS5)",
     "memd_lexical_attach_failures_total": "namespaces opened without the tantivy accelerator (FTS5 serves)",
+    "memd_vector_index_searches_total": "vector-lane queries served by the usearch sidecar",
+    "memd_vector_index_fallback_total": "vector-lane queries answered exactly instead of by the usearch sidecar",
+    "memd_vector_index_rebuilds_total": "usearch sidecar rebuilds",
+    "memd_vector_index_failures_total": "usearch sidecar operations that failed (rebuilt; the exact scan serves)",
+    "memd_vector_index_attach_failures_total": "namespaces opened without the usearch sidecar (the exact scan serves)",
+    "memd_vector_index_activations_total": "namespaces that crossed ann_min_vectors (auto: flat -> usearch)",
+    "memd_vector_index_snapshots_written_total": "vector sidecar images published with an index snapshot",
+    "memd_vector_index_snapshots_loaded_total": "vector sidecars installed from a published snapshot",
+    "memd_vector_index_snapshot_failures_total": "vector sidecar snapshots that could not be used (rebuilt instead)",
+    "memd_vector_lane_skipped_total": "vector-lane queries skipped: the sidecar is not serving and the namespace is over flat_max_vectors (other lanes serve)",
+    "memd_vector_index_corrupt_total": "sidecar files and snapshots rejected as corrupt (rebuilt from SQLite)",
+    "memd_vector_index_repaired_total": "poorly linked HNSW nodes re-inserted after a build",
 }
 
 CORE_GAUGES = {

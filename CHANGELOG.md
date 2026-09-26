@@ -105,6 +105,143 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   they are offline (signed webhook payloads, an in-process fake with
   Stripe's idempotency semantics, and `stripe/stripe-mock` in docker for the
   end-to-end test, skipped without docker).
+- **usearch ANN sidecar for the vector lane** (`pip install "memd[ann]"`,
+  `vector_index` / `MEMD_VECTOR_INDEX` = `auto | flat | usearch`; decision
+  D6). `auto` serves namespaces with at least `ann_min_vectors` (20000)
+  vectors from an HNSW index (usearch >= 2.25, cosine, f16 or `ann_dtype`
+  i8, connectivity 16) keyed by record rowid, and smaller ones from the
+  exact scan; an explicit `usearch` that cannot be honoured raises. The
+  index is derived from SQLite's vectors table: changes are queued under the
+  index lock with a watermark committed alongside and applied right after
+  (the write ack never waits on it), and a file whose watermark, SQLite
+  file, format, dtype, metric or purge generation does not match is rebuilt
+  in the background (temp file, fsync, rename) while the exact scan serves.
+  Queries over-fetch k x `ann_overfetch` (4), widen once, and keep the SQL
+  filter, `_passes_filter` post-check and fusion's tie order; selective
+  filters (<= `ann_exact_max`, 2000 rows), sweeps and short windows are
+  answered exactly (`stats()["vector_index"]["fallback_exact_total"]`).
+  A hard-delete purge deletes the sidecar's files and rebuilds it from
+  SQLite, because usearch `remove` only marks entries (D7). The sidecar is
+  published with the index snapshot (`vector-*.snap`, same generation and
+  purge rules), so a cold node installs it instead of rebuilding.
+  `bench/ann_bench.py` measures it at 50K / 200K / 1M vectors: recall@10
+  1.000 / 0.999 / 0.993 on dense synthetic vectors, lane p50 14-19 ms
+  (exact scan: 37 ms at 50K, 54 ms at 200K), no write-ack cost; ~0.94 on
+  the hash embedder's sparse vectors. `ann_expansion_search` sets the
+  HNSW search-depth floor. While the sidecar loads, rebuilds or failed to
+  attach, a namespace over `flat_max_vectors` (200000) never loads the
+  exact scan's float32 matrix: sweeps and selective filters are answered
+  exactly from SQLite, other queries skip the vector lane
+  (`memd_vector_lane_skipped_total{reason="ann_rebuilding"}`) and are not
+  cached. Sidecar load (at open) and final save (at close, evictions
+  included) run on background threads; usearch holds the GIL for them, so
+  the process pauses ~100 ms per save or load at 200K vectors (a memory
+  copy: files up to 256 MB are read and written outside the GIL).
+  Sidecar files and published images are checksummed (blake2b) and
+  verified before usearch reads them; a corrupt file, or a process that
+  died while usearch was loading one, is rebuilt from SQLite instead of
+  crashing every restart. A snapshot install starts a new local vector
+  lineage. Writes still queued for the index are searched exactly
+  (read-your-writes); find_ids sweeps stream exactly from SQLite; every
+  vector path admits only live rows; after each build poorly linked nodes
+  are re-inserted and at least 100 candidates are re-ranked exactly, so
+  independent rebuilds answer identically.
+
+### Fixed - data integrity / security
+- **A wrong encryption key destroyed the data it could not read**
+  (predates this release). A valid key that is not the one the data was
+  written with - another deployment's `keys/` directory restored over this
+  one, a replaced `root.key` - opened a namespace whose data lived in
+  compacted segments as EMPTY: every decrypt failure was swallowed and read
+  as corruption, the segments were skipped, and the next compaction deleted
+  them. Restoring the right key then served nothing. WAL frames were cut off
+  as a "torn tail" the same way, ops too, and a restore without the keys
+  directory minted a fresh key over the existing data. Now a complete WAL or
+  ops frame, or a segment, that does not authenticate under the key in hand
+  is a key-custody failure, not damage: the open raises `KeyCustodyError`
+  (`memd.storage.crypto`; decryption no longer surfaces cryptography's bare
+  `InvalidTag`) and nothing is truncated, rewritten or deleted, and no key
+  is created (a root key too is only created with the first data key it
+  wraps) - put the right keys back and the namespace opens with everything.
+  Rotation, compaction, migration and export refuse the same way instead of
+  folding past such data. The namespace manifest now carries a fingerprint
+  of its data key (`key_check`: HMAC-SHA256 under the key of a fixed label,
+  128 bits; it reveals nothing about the key), checked before an open reads
+  or repairs anything - so a warm open that replays nothing refuses a wrong
+  key too, and never mints a key for a namespace that has encrypted data. A
+  namespace written by an older version has no fingerprint and is probed:
+  its encrypted objects (WAL frames, ops records, segments, and the
+  checkpoint the manifest names) are tried until one decrypts, and the key
+  is refused only if none does - a damaged segment does not make the right
+  key look wrong. The fingerprint is written only once the key has
+  decrypted something, or when nothing encrypted exists yet, so a wrong key
+  never stamps its own over data it could not read. v0.2.0 ignores the
+  field. An encrypted namespace opened with encryption off is refused as
+  well: by its fingerprint, or - a namespace an older version wrote - when
+  none of its data parses as plaintext (one open and close of such a store
+  with encryption off, no write, cut its WAL off and emptied its ops log:
+  acked records lost, an acked delete undone). Only a frame cut short by
+  its length prefix is a torn tail and still repaired: a complete WAL or ops
+  frame that does not read - does not decrypt, or does not parse, with
+  encryption on or off - is never cut off or folded away, and the refusal
+  says which it is: the key does not match, a ciphertext read with
+  encryption off, or a frame damaged under the right key (with its byte
+  offset; [SECURITY.md](SECURITY.md) has the recovery procedure). Legacy
+  plaintext frames and segments (written before encryption was on) still
+  load. Once the key is proven, a segment that still does not authenticate
+  or parse is damage: it is still skipped by reads - and compaction now
+  keeps it, quarantined in place (`"unreadable": true` in the manifest,
+  `memd_segments_quarantined_total`), instead of deleting it. The deletes
+  such a compaction cannot apply to it ride on in its output's header, and
+  a hard delete among them stays pending (`pending_hard_deletes`,
+  `memd_pending_purges`; not counted in `hard_deleted_purged`) until a
+  compaction that reads the segment again purges it: a repaired segment
+  never serves a deleted or hard-deleted record again. Refusals count in
+  `memd_key_custody_refusals_total`; a refused open releases the
+  namespace's lock or lease and its index handle, so it opens again, in
+  the same process, once the keys are fixed.
+
+### Fixed
+- `test_mcp_budget_clamped` skips when the optional `mcp` extra is not
+  installed (it failed with `ModuleNotFoundError`), like `test_mcp.py`.
+- The flat vector scan returned nothing for a sweep-size limit (>= 1024)
+  with no restrictive filter.
+- The flat vector scan's matrix now follows every eligibility change made
+  after it loaded. A record unquarantined (by hand or by the rotate-time
+  quarantine expiry) or restored by a re-add was invisible to the default
+  vector lane and its sweeps until a compaction; a re-embedded record kept
+  its old vector beside the new one; and rows that stopped being live
+  stayed in it, so enough of them near a query crowded every eligible row
+  out of its windows.
+- A usearch sidecar graph loaded from a file or snapshot stays on
+  probation: the loading marker is kept until it has served 200 searches
+  or 300 s without damage (a clean close clears it), so a graph that
+  crashes the process only in a real query is rebuilt at the next open
+  instead of crashing every restart. Its bookkeeping (count, dims,
+  connectivity, kind, capacity, levels, edges) is checked at load, and its
+  first answers are re-checked against the exact scan in the background:
+  recall below 0.8 rebuilds it (`memd_vector_index_corrupt_total`
+  `source="structure"` / `"recall"`).
+- The sidecar's post-build repair pass no longer re-inserts every
+  duplicate vector, only those a search cannot reach: a self-search
+  answered by an identical twin is repeated top-16 and counts as found
+  only if it returns the node itself (30% duplicates at 50K x 64: ~300
+  re-inserts instead of ~15200, repair 1.2 s instead of 5.3-6.2 s). A
+  twin alone was not enough - an unreachable duplicate stayed invisible
+  to a scoped search that drops its twin (another user's copy, or one
+  quarantined or deleted since): 1-19 misses in 6000-9000 such searches,
+  now none, and none at three copies either (12-30 before).
+- Vector-lane searches no longer stall behind a snapshot publish and a
+  write backlog (p99 9-16 s, max up to 38 s, under a publish loop, a bulk
+  writer and 4 writer-searchers; now 0.4-0.5 s): the sidecar's search lock
+  is phase-fair, the SQLite image is copied from a pinned read snapshot
+  with no lock held, and the read-your-writes pass filters in SQL only the
+  queued rows that can make the page. A hard-delete purge that scrubs the
+  index meanwhile aborts that copy (its image predates the purge and is
+  never published), waits for it to let go without the index lock, and
+  retries until the WAL is truncated; it no longer gives up after the busy
+  timeout, which left the erased text and vectors in the local SQLite
+  file until the next open (D7).
 
 ### Changed
 - **The S3 owner lease is a compare-and-swap** on its ETag for every write
@@ -119,10 +256,14 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   `s3://` roots. Endpoints without conditional writes keep the old
   behaviour.
 - With `local` keys on an `s3://` root, a node that has no key for a
-  namespace that already has data refuses to open it (`KeyCustodyError`)
-  instead of minting a new key - which made the existing data unreadable and
-  wrote new data under a different key. `MEMD_KEYS_ALLOW_MINT_EXISTING=1`
-  overrides (e.g. a namespace written unencrypted).
+  namespace that already has encrypted data refuses to open it
+  (`KeyCustodyError`, the manifest's key check or a probe of the data - see
+  "A wrong encryption key destroyed the data" above) instead of minting a
+  new key - which made the existing data unreadable and wrote new data under
+  a different key. With a remote provider the key is resolved when the
+  namespace opens, and one is never minted for a namespace that already has
+  a manifest; `MEMD_KEYS_ALLOW_MINT_EXISTING=1` overrides that (e.g. a
+  namespace written unencrypted).
 - **Conditional writes for every object rewritten in place** (ADR-12):
   the manifest commit, the migration report, the audit checkpoint sidecar,
   the key-custody marker, wrapped-key rotation, the cluster registry and the
@@ -148,15 +289,19 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   GET and search while export was right. The manifest now records the
   `lineage` of the tenure that opened the namespace last; a cache is caught
   up only in its own lineage, and any other is deleted - file, WAL and
-  tantivy copy, so purged text goes with it (D7) - and rebuilt from the
-  snapshot plus the tail. A clean release racing a heartbeat renewal no
+  tantivy copy and the usearch sidecar's files, so purged text and vectors
+  go with it (D7) - and rebuilt from the snapshot plus the tail. A clean release racing a heartbeat renewal no
   longer leaves the lease live (the next node waited out the TTL and took
   over); a local data key wrapped by another root key raises
   `KeyCustodyError`, not a raw `InvalidTag`.
-- **Key custody fails closed on every root**: an unreadable custody marker
-  refuses the open; a local root no longer mints a new key for a namespace
-  that has data; the torn-tail repair never truncates complete frames that
-  fail to decrypt (REST: `500 key_custody`).
+- **Key custody fails closed on every root and under every provider**: an
+  unreadable custody marker refuses the open; the data-key check and probe
+  above hold for remote providers too - a `keys/<ns>.dek` object that
+  unwraps fine but is another deployment's (a restore mix-up) is refused
+  before anything is read, nothing deleted (the key check fingerprints the
+  data key, not its wrapping, so it stays valid across `memd keys migrate`
+  and `memd keys rotate`); a key-custody refusal answers REST
+  `500 key_custody`.
 - An invalid namespace name is answered before any cluster routing; a single
   server no longer imports the cluster module; a refused open of a
   namespace that does not exist leaves no lease object behind.

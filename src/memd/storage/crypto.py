@@ -26,6 +26,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -36,10 +37,13 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 KEY_LEN = 32
 _log = logging.getLogger(__name__)
+# the label a data key's public fingerprint is taken over (KeyEnvelope.key_check)
+_KEY_CHECK_LABEL = b"memd/key-check/v1"
 
 PROVIDERS = ("local", "aws-kms", "vault-transit")
 # object-store layout for wrapped keys (remote providers)
@@ -51,7 +55,14 @@ class KeyCustodyError(RuntimeError):
     """A namespace's data key is held somewhere this process is not
     configured for (or not at all while the namespace has data). Minting a
     fresh key instead would make the existing ciphertext unreadable, so the
-    open is refused with a message saying what to do."""
+    open is refused with a message saying what to do.
+
+    Also what a ciphertext that does not authenticate under the key in hand
+    raises (never cryptography's bare InvalidTag): a valid key that is not
+    the one the data was written with - another deployment's keys directory
+    restored over this one, a replaced root key, another deployment's
+    wrapped key object under a remote provider - is a custody failure, not
+    damage. Storage never skips, truncates or deletes such data."""
 
 
 class KeyUnavailableError(RuntimeError):
@@ -149,8 +160,6 @@ class LocalKeyProvider(KeyProvider):
         return WrappedKey(self.name, self._fp, "1", ct)
 
     def unwrap(self, namespace: str, wrapped: WrappedKey) -> bytes:
-        from cryptography.exceptions import InvalidTag
-
         ct = wrapped.ciphertext
         try:
             return AESGCM(self._root).decrypt(ct[:12], ct[12:], namespace.encode())
@@ -423,48 +432,106 @@ class KeyEnvelope:
 
     def decrypt(self, namespace: str, blob: bytes) -> bytes:
         key = self.data_key(namespace)
-        return AESGCM(key).decrypt(blob[:12], blob[12:], namespace.encode())
+        try:
+            return AESGCM(key).decrypt(blob[:12], blob[12:], namespace.encode())
+        except InvalidTag:
+            raise KeyCustodyError(
+                f"a ciphertext of namespace {namespace!r} does not authenticate under its data "
+                "key: the key is not the one it was written with (lost, replaced, restored from "
+                "another deployment) or the ciphertext is damaged") from None
+
+    def key_check(self, namespace: str) -> str:
+        """A public fingerprint of `namespace`'s data key: HMAC-SHA256 under
+        the key of a fixed label, 128 bits. Kept beside the data (the
+        namespace manifest), it lets an open tell whether the key in hand is
+        the one the data was written with before it reads, repairs or
+        rewrites anything. It reveals nothing about the key (a PRF output on
+        a public input - the audit chain key is derived the same way, under
+        another label). Resolves the key: callers ask has_key() first where
+        minting one would be wrong.
+
+        It fingerprints the DATA key, not its wrapping: `memd keys migrate`
+        (local -> a remote provider) and `memd keys rotate` re-wrap the same
+        data key, so a stamp stays valid across them. Which provider holds
+        the wrapping is the store's custody marker (read_custody); the two
+        checks are complementary - the marker refuses a node on the wrong
+        provider before it can mint anything, the stamp refuses a data key
+        that unwraps fine but is not this data's (another deployment's
+        wrapped key object restored over this one's)."""
+        return hmac.new(self.data_key(namespace), _KEY_CHECK_LABEL, hashlib.sha256).hexdigest()[:32]
 
 
 class LocalKeyEnvelope(KeyEnvelope):
-    """Root key + per-namespace wrapped keys under {root}/keys/.
+    """Root key + per-namespace wrapped keys under {root}/keys/ (the `local`
+    KeyProvider: LocalKeyProvider over the root key file).
 
     Threat model (documented honestly per D7): protects data at rest on the
     volume and makes crypto-shred possible; not protection against a user
     with full filesystem read access on the same machine.
+
+    Nothing here guards against minting a key for a namespace that already
+    has data under another one (a restore without the keys directory, a
+    namespace another node created on a shared bucket): NamespaceStore
+    settles key custody at open, before anything is read or written, from
+    the manifest's key check or a probe of the data itself (see
+    NamespaceStore._verify_key), and resolves a key only once the open is
+    past that. A namespace written before encryption was on, with no key
+    anywhere, is legitimately keyed on its first encrypted write.
     """
 
     provider_name = "local"
 
-    def __init__(self, dir_path: str, root_key: bytes | None = None, *,
-                 guard_store: Any = None, allow_mint_existing: bool = False):
+    def __init__(self, dir_path: str, root_key: bytes | None = None):
         self.dir = dir_path
-        # a REMOTE store (s3://) this node shares with others: a namespace
-        # there may have been created - and keyed - on another node, and
-        # minting a local key for it would orphan its data (see
-        # ObjectStoreKeyEnvelope._guard_mint). Local roots keep the old
-        # behaviour.
-        self._guard_store = guard_store
-        self._allow_mint_existing = allow_mint_existing
-        self.prefetch_at_open = guard_store is not None
-        os.makedirs(dir_path, exist_ok=True)
         # unwrapped per-namespace data keys, LRU-bounded. Caching is sound:
         # every encrypt/decrypt needs the raw key in process memory anyway.
         # Without this, each WAL append/replay frame paid a file read +
         # AESGCM unwrap for the SAME namespace key.
         self._cache: "OrderedDict[str, bytes]" = OrderedDict()
         self.CACHE_MAX = 1024  # namespaces; matches hosted per-node open set
-        rk_path = os.path.join(dir_path, "root.key")
-        if root_key is not None:
-            self._root = root_key
-            if not os.path.exists(rk_path):
-                self._write_secret(rk_path, root_key)
-        elif os.path.exists(rk_path):
-            self._root = self._read_secret(rk_path)
-        else:
-            self._root = secrets.token_bytes(KEY_LEN)
-            self._write_secret(rk_path, self._root)
-        self.provider = LocalKeyProvider(self._root)
+        self._rk_path = os.path.join(dir_path, "root.key")
+        # Loaded - or created - on first use, not here: an open that refuses
+        # (a restore without the keys directory: see KeyCustodyError) must
+        # not leave a fresh root key behind, and neither may a tool that
+        # only reads (`memd keys status|migrate`). One is minted only
+        # together with the first data key it wraps (data_key).
+        self._root_key: bytes | None = root_key
+        self._provider: LocalKeyProvider | None = None
+        if root_key is not None and not os.path.exists(self._rk_path):
+            self._write_secret(self._rk_path, root_key)
+
+    @property
+    def _root(self) -> bytes:
+        """The root key on disk. Raises KeyCustodyError when there is none:
+        a wrapped data key without it cannot be unwrapped, and minting one
+        here would not change that."""
+        if self._root_key is None:
+            if not os.path.exists(self._rk_path):
+                raise KeyCustodyError(
+                    f"no root key at {self._rk_path}: the data keys under {self.dir} cannot be "
+                    "unwrapped without the root key they were wrapped with. Restore it")
+            self._root_key = self._read_secret(self._rk_path)
+        return self._root_key
+
+    def _root_or_mint(self) -> bytes:
+        """The root key, minted if this keys directory has none yet (only
+        ever to wrap a data key being minted)."""
+        if self._root_key is None and not os.path.exists(self._rk_path):
+            fresh = secrets.token_bytes(KEY_LEN)
+            try:
+                self._write_secret(self._rk_path, fresh)
+                self._root_key = fresh
+            except FileExistsError:
+                pass  # a concurrent creator won; use theirs
+        return self._root
+
+    @property
+    def provider(self) -> LocalKeyProvider:
+        """The `local` KeyProvider over the root key on disk (KeyCustodyError
+        without one - see _root). Never mints a root key."""
+        if self._provider is None:
+            self._provider = LocalKeyProvider(self._root)
+        return self._provider
 
     @staticmethod
     def _read_secret(path: str) -> bytes:
@@ -473,6 +540,7 @@ class LocalKeyEnvelope(KeyEnvelope):
 
     @staticmethod
     def _write_secret(path: str, data: bytes) -> None:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             os.write(fd, data)
@@ -484,7 +552,14 @@ class LocalKeyEnvelope(KeyEnvelope):
         return legacy_key_path(self.dir, namespace)
 
     def _unwrap_file(self, namespace: str, path: str) -> bytes:
-        return self.provider.unwrap(namespace, WrappedKey("local", "", "1", self._read_secret(path)))
+        provider = self.provider   # (no root key at all: KeyCustodyError, as it says)
+        try:
+            return provider.unwrap(namespace, WrappedKey("local", "", "1", self._read_secret(path)))
+        except KeyCustodyError as ex:
+            raise KeyCustodyError(
+                f"{ex} (namespace {namespace!r}'s wrapped data key {path} does not unwrap under "
+                f"the root key {self._rk_path}: the key files come from different deployments, "
+                "or the root key was replaced)") from None
 
     def data_key(self, namespace: str) -> bytes:
         cached = self._cache.get(namespace)
@@ -495,15 +570,7 @@ class LocalKeyEnvelope(KeyEnvelope):
         if os.path.exists(p):
             dk = self._unwrap_file(namespace, p)
         else:
-            if (self._guard_store is not None and not self._allow_mint_existing
-                    and self._guard_store.exists(f"ns/{namespace}/manifest.json")):
-                raise KeyCustodyError(
-                    f"namespace {namespace!r} has data but no data key here ({p}): its key is "
-                    "lost or held elsewhere (with the `local` provider only the node - or the "
-                    "keys directory - that created a namespace can decrypt it). Restore the "
-                    "keys directory, or serve it where the key is; minting a new key would "
-                    "make the existing data unreadable (MEMD_KEYS_ALLOW_MINT_EXISTING=1 only "
-                    "for a namespace that was never encrypted)")
+            self._root_or_mint()
             dk, wk = self.provider.generate(namespace)
             try:
                 self._write_secret(p, wk.ciphertext)
@@ -525,7 +592,11 @@ class LocalKeyEnvelope(KeyEnvelope):
     def namespaces(self) -> list[str]:
         """Namespaces with a wrapped key file here."""
         out = []
-        for fn in sorted(os.listdir(self.dir)):
+        try:
+            names = sorted(os.listdir(self.dir))
+        except FileNotFoundError:
+            return out   # no keys directory (yet): no keys
+        for fn in names:
             # names are taken verbatim: a namespace never contains "/", but
             # may contain "__" (a legal name), which must not be rewritten
             if fn.startswith("ns-") and fn.endswith(".key"):
@@ -579,9 +650,12 @@ class ObjectStoreKeyEnvelope(KeyEnvelope):
     Minting is guarded. A missing wrapped key for a namespace that already
     HAS data means the key lives elsewhere (a `local` key file this node
     does not have, a different provider) - minting a fresh one would write
-    new data under a key that can never read the old, and the replay would
-    treat the old frames as garbage. So that open is refused
-    (KeyCustodyError) and says to run `memd keys migrate`.
+    new data under a key that can never read the old. So that open is
+    refused (KeyCustodyError) and says to run `memd keys migrate`. A wrapped
+    key that IS here and unwraps, but is not the one the data was written
+    with (another deployment's `keys/<ns>.dek` restored over this one's),
+    is the namespace store's to refuse: the manifest's key check, or a probe
+    of the data (NamespaceStore._verify_key).
     """
 
     # NamespaceStore resolves the key at open, before it writes a manifest
@@ -754,13 +828,32 @@ class ObjectStoreKeyEnvelope(KeyEnvelope):
 
 
 class NullKeyEnvelope(KeyEnvelope):
-    """No encryption at rest (testing / explicit opt-out)."""
+    """No encryption at rest (testing / explicit opt-out).
+
+    `keys_dir`, if given, is where this deployment keeps its `local` keys
+    when encryption is on, and `store` the object store a remote provider
+    keeps its wrapped keys in (keys/<ns>.dek): key_on_disk() tells an open
+    that a namespace has a data key in either - it was written with
+    encryption on at some point - so it looks for ciphertext before it
+    reads anything as plaintext (see NamespaceStore._refuse_sealed_data)."""
 
     enabled = False
     provider_name = "none"
 
-    def __init__(self) -> None:
+    def __init__(self, keys_dir: str | None = None, store: Any = None) -> None:
         self._keys: dict[str, bytes] = {}
+        self._keys_dir = keys_dir
+        self._store = store
+
+    def key_on_disk(self, namespace: str) -> bool:
+        if self._keys_dir and os.path.exists(legacy_key_path(self._keys_dir, namespace)):
+            return True
+        if self._store is None:
+            return False
+        try:
+            return bool(self._store.exists(wrapped_key_object(namespace)))
+        except Exception:  # noqa: BLE001 - unknown counts as keyed: look harder
+            return True
 
     def encrypt(self, namespace: str, plaintext: bytes) -> bytes:
         return plaintext
@@ -893,11 +986,13 @@ def envelope_from_config(cfg: dict | None, local_dir: str, store: Any, *,
     otherwise mint fresh keys over data it can no longer read).
     Remote: ObjectStoreKeyEnvelope over `store`, with `<local_dir>/keys` as
     the legacy directory the mint guard checks."""
+    keys_dir = os.path.join(local_dir, "keys")
     if not encrypt:
-        return NullKeyEnvelope()
+        # (the keys it would have: an open still tells an encrypted namespace
+        # from a plaintext one - see NullKeyEnvelope.key_on_disk)
+        return NullKeyEnvelope(keys_dir, store)
     cfg = cfg or {}
     name = resolve_key_provider_name(cfg)
-    keys_dir = os.path.join(local_dir, "keys")
     custody = read_custody(store) if store is not None else None
     if name == "local":
         if custody and custody.get("provider") not in (None, "local"):
@@ -905,13 +1000,12 @@ def envelope_from_config(cfg: dict | None, local_dir: str, store: Any, *,
                 f"this store's data keys are held by {custody.get('provider')!r} "
                 f"(key {custody.get('key_id')!r}); set MEMD_KEY_PROVIDER={custody.get('provider')} "
                 "and its settings - the local provider cannot read them")
-        # The mint guard applies to EVERY root: a namespace that has data but
-        # no key file here (keys lost or moved, a restore without the keys
-        # directory, another node's namespace on a shared bucket) is refused
-        # instead of silently re-keyed - new data under a new key, the old
-        # frames unreadable and cut off by the torn-tail repair.
-        allow = str(_opt(cfg, "keys_allow_mint_existing", "MEMD_KEYS_ALLOW_MINT_EXISTING", "")) in ("1", "true")
-        return LocalKeyEnvelope(keys_dir, guard_store=store, allow_mint_existing=allow)
+        # A namespace that has encrypted data but no key file here (keys lost
+        # or moved, a restore without the keys directory, another node's
+        # namespace on a shared bucket) is refused at open, nothing minted:
+        # NamespaceStore._verify_key, on every root. The key is resolved
+        # lazily, only once that check passed (and the root key with it).
+        return LocalKeyEnvelope(keys_dir)
     if custody and custody.get("provider") != name:
         raise KeyCustodyError(
             f"this store's data keys are held by {custody.get('provider')!r}, not {name!r}")

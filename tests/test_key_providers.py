@@ -68,13 +68,14 @@ class TestLocalProvider:
 
         d = str(tmp_path / "keys")
         env = LocalKeyEnvelope(d)
+        assert not os.path.exists(os.path.join(d, "root.key")), "the root key is minted lazily"
+        fresh = env.data_key("new")   # ...together with the first data key it wraps
         root = open(os.path.join(d, "root.key"), "rb").read()
         dk = os.urandom(32)
         nonce = os.urandom(12)
         with open(legacy_key_path(d, "old"), "wb") as f:
             f.write(nonce + AESGCM(root).encrypt(nonce, dk, b"old"))
         assert LocalKeyEnvelope(d).data_key("old") == dk
-        fresh = env.data_key("new")
         blob = open(legacy_key_path(d, "new"), "rb").read()
         assert AESGCM(root).decrypt(blob[:12], blob[12:], b"new") == fresh
 
@@ -216,6 +217,56 @@ class TestAwsKms:
         os.unlink(legacy_key_path(str(tmp_path / "d" / "keys"), "default"))
         with pytest.raises(KeyCustodyError, match="has data"):
             _kms_mem(tmp_path, kms)
+
+    @pytest.mark.parametrize("stamped", [True, False], ids=["stamped", "unstamped"])
+    def test_another_deployments_wrapped_key_is_refused_and_nothing_is_touched(
+            self, tmp_path, kms, stamped):
+        """A restore mix-up under a remote provider: another deployment's
+        keys/<ns>.dek (same CMK, same namespace name - it unwraps fine) put
+        over this one's. The data key is simply not this data's: the open is
+        refused before anything is read (the manifest's key check; a probe
+        of the data on a manifest without one), nothing is truncated,
+        rewritten or deleted, and the right wrapped key serves everything."""
+        m = _kms_mem(tmp_path, kms)
+        for i in range(5):
+            m.remember(f"precious fact {i}")
+        m.compact(force=True)
+        m.remember("and one in the WAL")
+        m.close()
+        store_root = tmp_path / "d" / "store"
+        man_path = store_root / "ns" / "default" / "manifest.json"
+        man = json.loads(man_path.read_bytes())
+        assert man.get("key_check"), "a remote key is resolved at open: stamped from the start"
+        if not stamped:
+            man.pop("key_check")
+            man_path.write_text(json.dumps(man))
+        other = _kms_mem(tmp_path, kms, name="otherdeploy")
+        other.remember("unrelated")
+        other.close()
+        dek = store_root / "keys" / "default.dek"
+        saved = dek.read_bytes()
+        dek.write_bytes((tmp_path / "otherdeploy" / "store" / "keys" / "default.dek").read_bytes())
+        before = {k: v for k, v in _all_objects(str(store_root)).items() if k.startswith("ns")}
+        for _attempt in range(2):
+            with pytest.raises(KeyCustodyError, match="key"):
+                _kms_mem(tmp_path, kms, name="d")
+            assert {k: v for k, v in _all_objects(str(store_root)).items()
+                    if k.startswith("ns")} == before, "a refused open changed the store"
+        dek.write_bytes(saved)
+        m = _kms_mem(tmp_path, kms)
+        assert len([ln for ln in m.export_jsonl().splitlines() if ln.strip()]) == 6
+        m.close()
+
+    def test_a_provider_backed_store_never_mints_a_local_root_key(self, tmp_path, kms):
+        m = _kms_mem(tmp_path, kms)
+        _write_secret(m, "default")
+        m.close()
+        os.unlink(tmp_path / "d" / "store" / "keys" / "default.dek")   # the wrapped key is lost
+        with pytest.raises(KeyCustodyError):
+            _kms_mem(tmp_path, kms)
+        assert not (tmp_path / "d" / "store" / "keys" / "default.dek").exists(), "a key was minted"
+        assert not (tmp_path / "d" / "keys").exists(), \
+            "a KMS-held store must never mint a local root key (or any local key file)"
 
     def test_rewrap_keeps_the_data_key(self, tmp_path, kms):
         m = _kms_mem(tmp_path, kms)

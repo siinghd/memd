@@ -42,6 +42,34 @@ The single-record write ack is unchanged (FTS5 remains the synchronous source of
 derived accelerator). The 60-question real-data gate scores 0.874 (tantivy) vs 0.867 (FTS5). Measured on a
 loaded, shared 8-core host (`bench/lexical_bench.py`).
 
+## Vector index scale (optional `memd[ann]` = usearch sidecar)
+
+The vector lane as `Memory.search` calls it (user-scoped filter over 8 users, limit = the planner's
+`candidate_k`), 200 queries, 384-d vectors; recall@10 against the lane's exact answer
+(`bench/ann_bench.py`, each size in its own process):
+
+| vectors | recall@10 | usearch lane p50 / p99 | exact flat lane p50 / p99 | build from SQLite | peak RSS |
+|---|---|---|---|---|---|
+| 50K synthetic | 1.000 | 14.3 / 54.7 ms | 37.3 / 84.3 ms | 8.0 s | 0.44 GB |
+| 200K synthetic | 0.999 | 14.1 / 31.9 ms | 54.4 / 123.5 ms | 31.4 s | 1.04 GB (0.47 GB before the flat matrix loads) |
+| 1M synthetic | 0.993 | 19.4 / 74.2 ms | not run: its float32 matrix alone is 1.5 GB | 315 s | 1.36 GB |
+| 50K LongMemEval turns, hash embedder | 0.966 | 20.4 / 61.2 ms | 48.4 / 135.3 ms | 18.8 s | 0.52 GB |
+| 199K LongMemEval turns, hash embedder | 0.938 | 25.6 / 77.1 ms | 63.5 / 125.6 ms | 91.9 s | 1.31 GB |
+
+Synthetic = unit vectors around 256 random centers (dense, like a real embedder's). The hash
+embedder's sparse n-gram vectors are hard for HNSW: neither `ann_expansion_search` 512 (0.943) nor
+`ann_overfetch` 8 (0.936, 2x the latency) lifts the filtered 199K recall, and ties are not the
+cause (tie-aware recall is the same). The hash lane is not fused into ranking by default
+(`fuse_vector`), and sweeps (`find_ids`) are always exact.
+
+The write path does not wait on the sidecar: `add_events` (100 events) ack p50 / p99 was
+18.8 / 57.8, 20.8 / 36.3 and 19.1 / 44.9 ms with it at 50K / 200K / 1M, against 23.8 / 51.0,
+24.8 / 37.4 and 20.5 / 54.2 ms with the exact scan, while the embed worker fed each batch's
+vectors into it. The sidecar file is 46 / 183 / 917 MB (f16). Builds use 4 threads. Save and load
+run on background threads, but usearch holds the GIL throughout: at 200K the longest stall any
+thread saw was 100 ms per save and 105 ms per load (the final save took 236 ms in the
+background). Measured on a loaded, shared 8-core ARM host (Neoverse-N1).
+
 ## End-to-end QA (preliminary)
 
 Stratified 120-question sample (all 6 question types + abstention). Reader `openai/gpt-6-luna`, judge

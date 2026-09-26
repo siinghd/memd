@@ -300,6 +300,7 @@ def test_rest_rejects_type_abuse(app_ctx):
 
 
 def test_mcp_budget_clamped(tmp_path):
+    pytest.importorskip("mcp")  # the optional memd[mcp] extra, as in test_mcp.py
     from memd.server.mcp_server import build_mcp
     import asyncio
 
