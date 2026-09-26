@@ -157,13 +157,16 @@ class TestAuditRotation:
         return store, log
 
     def test_ledger_stays_bounded_and_readable(self, tmp_path):
+        # within KEEP_SEGMENTS (16 x 40KB): past it the oldest segment is
+        # pruned by design. Keyed (HMAC) entries are ~270 bytes encrypted.
         store, log = self._log(tmp_path)
-        for i in range(3000):
+        for i in range(2000):
             log.append(actor="search", action="search", target=f"q{i}")
         log.flush()
         assert log._segments > 0, "ledger never rotated"
+        assert log._pruned == 0
         assert store.size("ns/t/audit") <= 40_000
-        assert len(log.read()) == 3000, "rotation must not lose entries"
+        assert len(log.read()) == 2000, "rotation must not lose entries"
         assert log.verify(), "chain must survive rotation"
 
     def test_rotation_survives_a_reopen(self, tmp_path):

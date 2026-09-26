@@ -60,6 +60,15 @@ suite. Session retrieval ndcg@5 on LongMemEval_S dev: 0.727 (0.1.0) -> 0.866 (ze
 default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
 
 ### Added
+- **`memd migrate --report <data_root>`** (and
+  `StorageEngine.migration_report()`): JSON, per namespace - its store
+  format, whether its migration is pending, the ids whose ledger delete was
+  kept live on ambiguous evidence (with the reason), the deletes recovered
+  and applied, and the losses an older version left that cannot be
+  recovered (batch/forget deletes the ledger logged as a count; records
+  served that the old local index had no row for; ledger entries past a
+  chain break). Read-only: a pending namespace is previewed, never
+  migrated, locked or written. See Upgrade notes.
 - **Reranker plug-in** (`memd.query.rerank`): the top-30 of the bm25 lane
   (plus the vector lane with a real embedder) is reordered by a relevance
   judge. `reranker` / `MEMD_RERANKER` = `auto | none | jev | local`; `auto`
@@ -175,17 +184,44 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
   was killed between a fold's ops-log delete and its re-append of the
   pending hard deletes, the delete survived nowhere the migration read. The
   migration now also reads the namespace's audit ledger - read-only,
-  decoded like the engine reads it (encrypted too), its hash chain verified
-  first - and deletes every record durable data still holds that a
-  `hard_delete` or `delete` entry names, last in history (a delete wins;
-  only a copy ingested after the entry is kept, as a later re-add). A hard
-  delete no durable op still schedules gets a purge due now. Past a break in
-  the chain nothing is applied, and the break is logged as an error. On the
-  verifier's histories that lost one (replayed through the old versions'
-  facade: 2, 2 and 3 runs on the three builds) the upgraded store now serves
-  what the old warm open served, warm and cold, and after a compaction the
-  text is in no file; a cold upgrade also keeps the soft deletes an old
-  rotate dropped, which the local index used to be the only record of.
+  decoded like the engine reads it (encrypted too) - and applies a
+  `hard_delete` or `delete` entry to a record durable data still holds
+  (last in history; a hard delete no durable op still schedules gets a
+  purge due now) only on unambiguous evidence: the hash chain verifies up
+  to the entry; the entry is this namespace's (no released build wrote a
+  namespace field and v0.1 filed every namespace's entries in the default
+  namespace's ledger, so no other namespace under the data root may hold
+  the id); durable data no longer has a delete op for it (if it does,
+  nothing was lost, and replaying that op in its place keeps a restore that
+  followed it); and nothing says the id was written after it - no later
+  ledger entry for it or restore marker, no copy ingested after it, no copy
+  in the WAL or in a segment a rotate wrote after it, the old local index
+  not still serving it, and the entry not dated after the logs were last
+  reset (no fold since could have lost it) or in the future. Anything else
+  keeps the record, logs a warning with its id and the reason, and lists it
+  in the migration report (`memd migrate --report`, see Added). (The first
+  cut applied every entry: a record deleted in one namespace and restored
+  into another was deleted by v0.1's misfiled entry, and a restore after a
+  delete in the same namespace was deleted again.) On the verifier's
+  histories that lost a hard delete (replayed through the old versions'
+  facade: 2, 2 and 3 runs on the three builds) the upgraded store serves
+  what the old warm open served, warm and cold; the purge runs as the
+  namespace opens and the text is in no file; a cold upgrade also keeps the
+  soft deletes an old rotate dropped, which the local index used to be the
+  only record of.
+- **An upgrade deleted records restored after their delete.** A
+  full-fidelity restore (`memd import memd`) writes the original id and
+  ingest time again; the migration placed any copy ingested before a
+  delete on its id before that delete, so the restore was deleted, and a
+  hard-deleted id re-added with a fresh ingest time lost its re-add as well
+  (the hard delete op carries a deadline, not a time). A copy of an id that
+  already had one (an earlier frame, an older segment) now keeps the place
+  the seq counts give it - after the delete, it is the restore - unless a
+  first copy had to be moved before its own delete, which proves those
+  places wrong; a hard delete takes its tombstone's time. The old
+  versions' own stores with a restore or re-add after a soft and a hard
+  delete, same namespace or across two: the upgrade serves what the old
+  warm open served (it deleted the restores on all three builds before).
 - **A cold open served soft deletes acked since the last index snapshot.**
   A snapshot was installed whenever it was newer than the last purge, but a
   compaction retires the tombstones it applies - the records they deleted
@@ -253,6 +289,17 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
 - A due hard-delete purge ran a full-namespace compaction inline on the next
   ordinary write: 804ms write ack at 20K records, now 6.9ms on a maintenance
   thread. The D7 purge guarantee is unchanged.
+- **A purge that came due while the process was down waited for a write.**
+  Only a write to the namespace checked the D7 deadline, so on one that
+  only served reads - or right after an upgrade that recovered hard
+  deletes from the ledger, due at once - the text stayed on disk past the
+  deadline. Opening a namespace now hands a due purge to the maintenance
+  thread immediately (the default namespace at startup, any other on first
+  use).
+- A clean close or an LRU eviction of a namespace listed its objects (to
+  collect garbage) while holding the engine-wide lock, stalling every other
+  namespace's open for that store round trip. It now runs under the
+  namespace's own lock only, and a reopen of that namespace waits for it.
 - A clean `close()` discarded queued embeddings (1 of 40 vectors kept, now 40).
 - ABBA deadlock between namespace destroy and engine shutdown.
 - A segfault when the index closed under a live reader.
@@ -306,6 +353,17 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
   tenant's record ids in another's exportable SIEM trail.
 - The audit hash chain reset on every reopen under encryption, so `verify()`
   returned False forever after the first restart.
+- **The audit chain was forgeable by anyone who could write the store**: a
+  forged entry re-chained with plain SHA-256 - or a whole plaintext ledger
+  put where the encrypted one was, which the reader passed through -
+  verified. An encrypted namespace's ledger is now chained with HMAC-SHA256
+  under a key derived from the namespace's envelope key (entries say
+  `"alg": "hmac-sha256"`); an unkeyed entry after a keyed one, and a
+  plaintext ledger object in an encrypted namespace, break the chain.
+  Without encryption there is no key: the chain stays unkeyed SHA-256,
+  which shows damage and naive edits, not a deliberate forgery. Ledgers
+  written before (unkeyed entries) still verify by the unkeyed rule and
+  continue keyed.
 - `/metrics`, `/v1/metrics/json` and `/v1/status` returned the whole fleet's
   telemetry and namespace inventory to any authenticated key.
 - A wrong-namespace 403 was booked as an authentication failure, letting any
@@ -315,6 +373,27 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
 - Interactive docs and the OpenAPI schema are no longer public by default.
 - `kinds` is bounded and validated; the Dockerfile no longer masks a failed
   core install.
+
+### Fixed - REST API
+- **A confirmed `forget` ignored `as_of` and `kinds`** (data loss): only
+  the preview applied them, so a preview filtered to `kinds: ["fact"]`
+  followed by the confirm deleted every kind the query matched. The
+  confirm (`POST /v1/ns/{ns}/forget`, `Memory.forget`, the SDK) now applies
+  exactly the preview's filters, and the preview returns a `fingerprint`:
+  a confirm that passes it back is refused with 409 (`preview_mismatch`)
+  and deletes nothing if the matches changed since.
+- **A hard `DELETE` of a soft-deleted record answered 404**, so its text
+  could not be purged through REST (D7): hard delete now accepts it.
+- **`?history=true` served soft-deleted content** until a compaction purged
+  it. Deleted records are no longer returned by `GET .../memories/{id}` or
+  in a `history` chain (superseded versions still are), unless an
+  override-capable key passes `include_deleted=true` (403 otherwise).
+- 429 responses carry `Retry-After` (whole seconds).
+- `DELETE /v1/ns/{ns}` on a namespace that does not exist answers 404 (it
+  used to create it, shred it and answer 200).
+- Error bodies carry a machine-readable `code` next to `detail`
+  (`validation_error`, `unauthorized`, `forbidden`, `not_found`,
+  `preview_mismatch`, `rate_limited`, ...); `detail` is unchanged.
 
 ### Fixed - observability
 - **Every latency quantile in the system was the mean.** Millisecond values
@@ -364,12 +443,23 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
   INFO. A local index built by a pre-release format-2 build is rebuilt once
   on its first open by this version.
 - **Upgrade on the node that holds the local cache** (`<data>/_cache`, or
-  `local_dir` with S3) where you can. Older rotates dropped some deletes
-  and supersedes from durable data; the old local index still applies
-  them, and the migration keeps what it proves. A first open without that
-  cache recovers only the deletes the audit ledger names (see Known
-  limitations), not the supersedes (an old cold open served all of them
-  again too).
+  `local_dir` with S3). Older rotates dropped some deletes and supersedes
+  from durable data; the old local index still applies them, and the
+  migration keeps what it proves. It is also what lets the migration tell
+  a lost delete from one the old version never applied (a live row keeps
+  the record). A first open without that cache recovers only the deletes
+  the audit ledger unambiguously names (see Known limitations), not the
+  supersedes (an old cold open served all of them again too).
+- **Run `memd migrate --report <data_root>` before and after upgrading**,
+  on that node, with the service stopped. Before: the new binary previews
+  every namespace still in the old format without changing anything -
+  which ledger deletes it would apply, which it would keep live as
+  ambiguous and why, and what cannot be recovered. After: the same report
+  for what each namespace's migration did (it is written with the
+  migration). Review `ambiguous_deletes` (records kept live; delete them
+  again if they should be gone) and `legacy_losses` (deletes an older
+  version lost that no evidence names - re-issue them if you know them).
+  Migration warnings are also logged, with the ids.
 - **No downgrades.** Once this version has opened a namespace, older
   versions stop at its manifest with `ValueError: invalid literal for int()
   ... 'memd store format 2: ... downgrades are not supported'` and change
@@ -387,15 +477,21 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
 - The Jev reranker adds ~1 s per search (network) and sends candidate texts to TypeSafe.
 - Single writer per data root, on every backend. `uvicorn --workers N` with
   N>1 does not work.
-- Deletes an older version lost from durable data are recovered from the
-  namespace's audit ledger (see Fixed) only where the ledger has them: a
-  batch delete or `forget()` logged a count, not ids; with the default
-  buffered ledger (`audit_flush_every` 32) a crash can lose the last
-  entries; nothing past a break in the hash chain is applied - including
-  v0.1 encrypted ledgers, whose chain restarted at every reopen (fixed in
-  0.2.0), so only their first session counts (logged as an error); and
-  v0.1 filed every namespace's entries in the facade default namespace's
-  ledger, so only that namespace is covered.
+- Recovering deletes an older version lost from durable data is
+  best-effort (see Fixed): it applies only what the namespace's audit
+  ledger unambiguously names. A batch delete or `forget()` logged a count,
+  not ids; with the default buffered ledger (`audit_flush_every` 32) a
+  crash can lose the last entries; nothing past a break in the hash chain
+  is applied - including v0.1 encrypted ledgers, whose chain restarted at
+  every reopen (fixed in 0.2.0), so only their first session counts
+  (logged as an error); an entry v0.1 misfiled from another namespace, or
+  one for an id another namespace also holds, is kept live as ambiguous.
+  Ledgers written before this release are chained with unkeyed SHA-256:
+  anyone who could write an UNENCRYPTED store could have re-chained a
+  forged delete, and one dated before the last fold that names a record in
+  an older segment is indistinguishable from a real lost delete - with the
+  old local cache present, a record its index still serves is kept.
+  `memd migrate --report` lists what was applied and what was not.
 - With the S3 backend, envelope keys stay local: a second node cannot decrypt
   the bucket. A KMS key provider is not built.
 - BM25 tokenization is `ascii`, so CJK is not indexed by the lexical lane.

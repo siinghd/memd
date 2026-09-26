@@ -348,6 +348,16 @@ class FailureLimiter:
         with self._lock:
             self._events.pop(client, None)
 
+    def retry_after(self, client: str, now: float | None = None) -> float:
+        """Seconds until `client` is no longer blocked (0 if it is not)."""
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            evts = sorted(t for t in self._events.get(client, []) if t > now - self.window_s)
+        if len(evts) < self.max_failures:
+            return 0.0
+        # blocked until enough of them age out of the window
+        return max(0.0, evts[len(evts) - self.max_failures] + self.window_s - now)
+
 
 class RateLimiter:
     """Per-principal token bucket (D6 noisy-neighbor containment)."""
@@ -370,6 +380,19 @@ class RateLimiter:
                 b[0] -= 1
                 return True
             return False
+
+    def retry_after(self, key_id: str, limit_per_min: int) -> float:
+        """Seconds until `key_id`'s bucket holds a whole token again."""
+        rate = limit_per_min / 60.0
+        if rate <= 0:
+            return 60.0
+        now = time.monotonic()
+        with self._lock:
+            b = self._buckets.get(key_id)
+            if b is None:
+                return 0.0
+            tokens = min(limit_per_min, b[0] + (now - b[1]) * rate)
+        return max(0.0, (1 - tokens) / rate)
 
     def forget(self, key_id: str) -> None:
         """Drop state for a revoked/deleted principal (bounded-memory hook)."""

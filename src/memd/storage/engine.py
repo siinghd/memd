@@ -36,7 +36,8 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
-from memd.core.schema import MemoryRecord, now_ms, records_from_jsonl, records_to_jsonl, ulid_new
+from memd.core.schema import (MemoryRecord, now_ms, records_from_jsonl, records_to_jsonl, ulid_new,
+                              ulid_ts_ms)
 from memd.metrics import METRICS
 from memd.index.sqlite_index import NamespaceIndex
 from memd.storage.crypto import KeyEnvelope, NullKeyEnvelope
@@ -275,17 +276,32 @@ def _frame_seq(payload: bytes) -> int:
 # anyway), gap-filling is used, but an unstamped copy still may not undo an
 # op on its id that it lands after unless its record was created after that
 # op: a record ingested before its delete cannot be the re-add that follows it.
+#
+# Unless it is a RE-WRITE: the id already had a copy (in an older segment, or
+# an earlier frame). A full-fidelity restore (`memd import memd`) writes the
+# original id and t_ingested again, so its copy is ingested before the delete
+# it undoes, and the rule above deleted it: the user put the record back and
+# the upgrade took it away again. A re-write keeps the slot gap-filling gave
+# it - its seq is the evidence that it follows the delete - unless some FIRST
+# copy had to be held, which proves the gap-filled slots wrong: then every
+# copy that landed after an op on its id is held.
+#
+# A hard delete op carries a deadline, not a time: its time is its
+# tombstone's (every hard delete writes one first), so a re-add ingested after
+# it keeps its slot too.
 
 
 def _legacy_events(frames: list[tuple[int | None, list[MemoryRecord]]], ops: list[dict],
-                   base: int, floor: int) -> tuple[list[tuple[int, object]], str, int]:
+                   base: int, floor: int, prior: set[str] | frozenset = frozenset()
+                   ) -> tuple[list[tuple[int, object]], str, int]:
     """Order a format-1 WAL (frames as (stamp or None, records), in log order)
     and its ops log into one stream for _fold_events -> (events, how, top).
 
     how is "exact", "guarded" (some copies were held before an op) or
     "conservative" (reuse proven); top is the highest seq the stream holds,
-    at least `floor`. Seqs in the result only order it: fold it over an
-    empty base."""
+    at least `floor`. `prior`: ids an older segment already holds a copy of
+    (a frame of one is a re-write). Seqs in the result only order it: fold it
+    over an empty base."""
     op_seqs = [int(o.get("seq", 0)) for o in ops]
     stamps = [s for s, _ in frames if s is not None]
     used = op_seqs + stamps
@@ -310,25 +326,43 @@ def _legacy_events(frames: list[tuple[int | None, list[MemoryRecord]]], ops: lis
                     + [(s, 1, j, o) for j, (s, o) in enumerate(zip(op_seqs, ops))],
                     key=lambda e: (e[0], e[1]))
     events: list[tuple[int, object]] = []
-    seen: dict[str, list[tuple[int, dict]]] = {}  # id -> (event index, op) so far
+    seen: dict[str, list[tuple[int, int | None]]] = {}  # id -> (event index, op time) so far
     held: dict[int, list[MemoryRecord]] = {}      # event index -> copies moved before it
+    written: set[str] = set(prior)                # ids a copy was written for already
+    rewrites: list[tuple[int, MemoryRecord, int]] = []  # (event index, copy, op index) kept
     for s, kind, i, ev in stream:
         if kind:
-            seen.setdefault(_op_target(ev), []).append((len(events), ev))
+            rid, at = _op_target(ev), _op_at(ev)
+            if at is None and ev.get("op") == "hard_delete":
+                # its tombstone's time (written just before it)
+                at = next((a for _, a in reversed(seen.get(rid, [])) if a is not None), None)
+            seen.setdefault(rid, []).append((len(events), at))
             events.append((s, ev))
             continue
         if frames[i][0] is not None:  # stamped: its seq is a fact
+            written.update(r.id for r in ev)
             events.append((s, ev))
             continue
         keep = []
         for r in ev:
-            at = next((pos for pos, op in seen.get(r.id, ())
-                       if _op_at(op) is None or _op_at(op) >= r.time.t_ingested), None)
+            at = next((pos for pos, t in seen.get(r.id, ())
+                       if t is None or t >= r.time.t_ingested), None)
             if at is None:
                 keep.append(r)
+            elif r.id in written:  # a re-write: its slot says it follows the op
+                keep.append(r)
+                rewrites.append((len(events), r, at))
             else:
                 held.setdefault(at, []).append(r)
+        written.update(r.id for r in ev)
         events.append((s, keep))
+    if held:
+        # a first copy landed after an op on its id: the slots are wrong, so
+        # no re-write's slot proves anything either
+        for pos, r, at in rewrites:
+            copies = events[pos][1]
+            del copies[next(k for k, c in enumerate(copies) if c is r)]
+            held.setdefault(at, []).append(r)
     if not held:
         return events, "exact", top
     out: list[tuple[int, object]] = []
@@ -465,6 +499,21 @@ def _held(rid: str, fold: int, before: dict[str, int]) -> int:
     return min(fold, before[rid] - 1) if rid in before else fold
 
 
+def _rotated_after(seg: dict, ts: int) -> bool:
+    """A format-1 segment a ROTATE wrote after `ts` (ms; its name is a ULID).
+    A rotate folded the WAL and applied the ops log to it, so a copy of a
+    record deleted before it is in its output only if it was written again
+    after that delete. A compaction (or an adopted orphan) rewrote older
+    segments' copies, so it proves nothing."""
+    name = str(seg.get("name", ""))
+    if not name.startswith("seg-") or seg.get("reason") in ("compact", "orphan-adopted", "migrate"):
+        return False
+    try:
+        return ulid_ts_ms(name[4:]) > ts
+    except ValueError:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Single-writer enforcement.
 #
@@ -545,6 +594,8 @@ class NamespaceStore:
 
     SINGLE WRITER per data root - see _acquire_owner above.
     """
+
+    _PREVIEW = False  # a _MigrationPreview: plans, never writes, stays quiet
 
     def __init__(
         self,
@@ -1116,8 +1167,11 @@ class NamespaceStore:
         Folds its WAL + ops log, in the order _legacy_events settles, into
         one new segment exactly as a rotate would (ops it cannot retire ride
         in the header), adds what the old binary's own index proves its
-        durable data lost (_legacy_index_evidence), then commits a format-2
-        manifest referencing it and deletes the old logs.
+        durable data lost (_legacy_index_evidence) and the deletes its audit
+        ledger unambiguously records it lost (_legacy_audit_deletes), writes
+        the migration report (see StorageEngine.migration_report), then
+        commits a format-2 manifest referencing it and deletes the old logs.
+        _plan_legacy computes all of it without changing anything.
 
         Idempotent up to the commit. The manifest put is the commit point,
         and nothing the migration reads is changed before it: a crash (or a
@@ -1135,37 +1189,20 @@ class NamespaceStore:
         rebuilt from the result, so every node serves the same state."""
         t0 = time.monotonic()
         m = self.manifest
-        base = m.wal_base_seq
         _log.info("namespace %s: migrating from store format %d to %d (%d segments, "
                   "%d WAL bytes, %d ops); other namespaces keep serving", self.namespace,
                   m.format, STORE_FORMAT, len(m.segments), m.wal_size, len(ops))
-        frames = self._legacy_wal_frames()
-        top_fold = max((int(s.get("fold_seq", 0)) for s in m.segments), default=0)
-        events, how, top = _legacy_events(frames, ops, base, max(m.seq, top_fold))
-        # what the older segments hold, read once for both kinds of evidence
-        versions, carried, _ = (self._load_checkpoints(where="migrate-segment")
-                                if m.segments else ({}, [], 0))
-        evidence = self._legacy_index_evidence(ops, frames, versions, carried)
-        _log.info("namespace %s: migration read the local index: %d lost delete/supersede "
-                  "op(s) kept, %d ms so far", self.namespace, len(evidence),
-                  int((time.monotonic() - t0) * 1000))
-        intents = self._legacy_audit_deletes(ops, frames, versions, carried)
-        # both go LAST in history (a delete wins over any write it may have
-        # followed) and are folded with the logs, so a record still in the
-        # WAL is dropped from the new segment rather than kept in it
-        for i, op in enumerate(evidence + intents, 1):
-            op["seq"] = top + i
-            events.append((op["seq"], op))
-        fold = top + len(evidence) + len(intents)
-        kept, _pending, _unq, folded, deferred = _fold_events({}, events, now_ms(), force=False)
-        out = _carry_forward(folded, kept)
-        _log.info("namespace %s: migration folded %d WAL frames and %d ops into %d "
-                  "records (%s order) in %d ms", self.namespace, len(frames), len(ops),
-                  len(kept), how, int((time.monotonic() - t0) * 1000))
+        plan = self._plan_legacy(ops, t0)
+        kept, out, deferred, fold = plan["kept"], plan["out"], plan["deferred"], plan["fold"]
+        report = plan["report"]
         name = f"seg-{ulid_new()}" if kept or out else ""
         if name:
             self._write_segment(name, kept, fold, out, deferred)
             m.segments.append(self._segment_entry(name, kept, fold, "migrate", out))
+        # before the commit, so a committed migration always has its report
+        # (a retry rewrites it from the same evidence)
+        report["migrated_at"] = now_ms()
+        self._write_migration_report(report)
         stale_snapshot = m.snapshot_name  # an image of a format-1 index
         m.format = STORE_FORMAT
         m.checkpoint, m.checkpoint_seq = name, fold
@@ -1187,6 +1224,7 @@ class NamespaceStore:
                 self.store.delete(self._snapshot_key(stale_snapshot))
             except Exception:  # noqa: BLE001 - unreferenced now; only costs space
                 pass
+        how = report["order"]
         METRICS.inc("memd_store_migrations_total",
                     help="namespaces migrated to the current store format",
                     ns=self.namespace, order=how)
@@ -1194,21 +1232,86 @@ class NamespaceStore:
             _log.warning(
                 "namespace %s: format-1 WAL (%d frames) and ops log (%d ops) do not "
                 "reconcile with seq %d over wal_base_seq %d; read %s, so a delete "
-                "wins over a write it may have followed", self.namespace, len(frames),
-                len(ops), top, base, how)
-        if evidence:
+                "wins over a write it may have followed", self.namespace, report["wal_frames"],
+                len(ops), plan["top"], plan["base"], how)
+        if report["index_evidence"]:
             _log.warning(
                 "namespace %s: kept %d delete/supersede op(s) the local index had "
-                "applied but format-1 durable data had lost", self.namespace, len(evidence))
-        if intents:
+                "applied but format-1 durable data had lost", self.namespace,
+                report["index_evidence"])
+        if report["recovered_deletes"]:
             _log.warning(
                 "namespace %s: applied %d delete(s) the audit ledger records for records "
-                "format-1 durable data still held", self.namespace,
-                sum(1 for o in intents if o["op"] == "tombstone"))
+                "format-1 durable data still held: %s", self.namespace,
+                len(report["recovered_deletes"]),
+                ", ".join(d["id"] for d in report["recovered_deletes"]))
         _log.info("namespace %s: committed store format %d at seq %d in %d ms; "
                   "rebuilding the local index from it", self.namespace, STORE_FORMAT, fold,
                   int((time.monotonic() - t0) * 1000))
         self._migrated_t0 = t0
+
+    def _plan_legacy(self, ops: list[dict], t0: float | None = None) -> dict:
+        """What migrating this format-1 namespace does, computed without
+        changing anything: the folded records ("kept"), the ops the new
+        segment carries ("out", "deferred") at seq "fold", and the report
+        (see migration_report). _migrate_legacy commits it; a dry run
+        (StorageEngine.migration_report) only reads it."""
+        t0 = time.monotonic() if t0 is None else t0
+        m = self.manifest
+        base = m.wal_base_seq
+        frames = self._legacy_wal_frames()
+        # what the older segments hold, read once for every kind of evidence
+        holders: dict[str, list[dict]] = {}
+        versions, carried, _ = (self._load_checkpoints(where="migrate-segment", holders=holders)
+                                if m.segments else ({}, [], 0))
+        top_fold = max((int(s.get("fold_seq", 0)) for s in m.segments), default=0)
+        events, how, top = _legacy_events(frames, ops, base, max(m.seq, top_fold),
+                                          prior=set(versions))
+        idx = self._legacy_index_rows()
+        evidence, unproven = self._legacy_index_evidence(ops, frames, versions, carried, idx)
+        _log.info("namespace %s: migration read the local index: %d lost delete/supersede "
+                  "op(s) kept, %d ms so far", self.namespace, len(evidence),
+                  int((time.monotonic() - t0) * 1000))
+        intents, led = self._legacy_audit_deletes(ops, frames, versions, carried, holders, idx)
+        # both go LAST in history (a delete wins over any write it may have
+        # followed) and are folded with the logs, so a record still in the
+        # WAL is dropped from the new segment rather than kept in it
+        for i, op in enumerate(evidence + intents, 1):
+            op["seq"] = top + i
+            events.append((op["seq"], op))
+        fold = top + len(evidence) + len(intents)
+        kept, _pending, _unq, folded, deferred = _fold_events({}, events, now_ms(), force=False)
+        out = _carry_forward(folded, kept)
+        _log.info("namespace %s: migration folded %d WAL frames and %d ops into %d "
+                  "records (%s order) in %d ms", self.namespace, len(frames), len(ops),
+                  len(kept), how, int((time.monotonic() - t0) * 1000))
+        served = {r.id for r in kept} - set(deferred)
+        recovered = {d["id"] for d in led["recovered_deletes"]}
+        report = {
+            "format_from": m.format,
+            "format_to": STORE_FORMAT,
+            "order": how,
+            "records": len(served),
+            "wal_frames": len(frames),
+            "ops": len(ops),
+            "local_index": idx is not None,
+            "index_evidence": len(evidence),
+            "recovered_deletes": led["recovered_deletes"],
+            "ambiguous_deletes": led["ambiguous_deletes"],
+            "legacy_losses": {
+                # batch deletes and forget() logged a count, not ids
+                "count_only_deletes": led["count_only_deletes"],
+                # the old local index had no row for them (warm only): a
+                # hard delete an older version lost looks like this - and so
+                # does an interrupted rebuild, so they are served
+                "served_without_old_index_row": sorted(i for i in unproven
+                                                       if i in served and i not in recovered),
+                "ledger_entries_past_chain_break": led["unverified_entries"],
+            },
+            "ledger": led["ledger"],
+        }
+        return {"kept": kept, "out": out, "deferred": deferred, "fold": fold, "top": top,
+                "base": base, "report": report}
 
     def _legacy_wal_frames(self) -> list[tuple[int | None, list[MemoryRecord]]]:
         """A format-1 WAL as (stamp or None, records) per frame, in log order.
@@ -1226,12 +1329,29 @@ class NamespaceStore:
             out.append((_wal_seq(payload), recs))
         return out
 
+    def _legacy_index_rows(self) -> tuple[int, dict[str, tuple]] | None:
+        """The format-1 local index this node kept -> (applied_seq, id ->
+        (deleted, superseded_by, invalidated_at)), or None without one (a
+        cold node, or an index no fold ever stamped)."""
+        try:
+            applied = int(self.index.get_meta("applied_seq") or 0)
+        except ValueError:
+            applied = 0
+        if applied <= 0:
+            return None
+        with self.index._lock:
+            rows = self.index._con.execute(
+                "SELECT id, deleted, superseded_by, invalidated_at FROM records").fetchall()
+        return applied, {r[0]: (r[1], r[2], r[3]) for r in rows}
+
     def _legacy_index_evidence(self, ops: list[dict],
                                frames: list[tuple[int | None, list[MemoryRecord]]],
                                versions: dict[str, tuple[MemoryRecord, int]],
-                               carried: list[dict]) -> list[dict]:
+                               carried: list[dict],
+                               idx: tuple[int, dict[str, tuple]] | None
+                               ) -> tuple[list[dict], set[str]]:
         """Deletes and supersedes the format-1 index proves and its durable
-        data lost.
+        data lost -> (ops, ids it has no row for).
 
         A format-1 rotate folded only the WAL, then deleted the ops log: a
         tombstone or supersede whose target already lived in an older
@@ -1242,7 +1362,8 @@ class NamespaceStore:
         and no durable op or frame touches that id, a row it marks deleted
         or superseded is taken at its word - a delete wins. Only such
         restrictions count: a MISSING row proves nothing (an interrupted
-        rebuild leaves the watermark over an emptied index).
+        rebuild leaves the watermark over an emptied index), so those ids
+        are only returned, for the migration report.
 
         Every released format-1 build (v0.1.x through v0.2.0) recorded a
         hard delete in its index by DELETING the row - no tombstone, no
@@ -1252,104 +1373,296 @@ class NamespaceStore:
         (_legacy_audit_deletes). A row the old index still marks deleted -
         the tombstone that precedes every hard delete, where the row removal
         never ran - is kept as a delete here."""
-        try:
-            applied = int(self.index.get_meta("applied_seq") or 0)
-        except ValueError:
-            applied = 0
-        if applied <= 0 or not versions:
-            return []
+        if idx is None or not versions:
+            return [], set()
+        applied, rows = idx
         touched = ({_op_target(o) for o in carried + ops}
                    | {r.id for _, recs in frames for r in recs})
         seg = {rid: rec for rid, (rec, held) in versions.items()
                if held <= applied and rid not in touched}
-        if not seg:
-            return []
-        with self.index._lock:
-            rows = self.index._con.execute(
-                "SELECT id, deleted, superseded_by, invalidated_at FROM records "
-                "WHERE deleted=1 OR superseded_by IS NOT NULL").fetchall()
         now = now_ms()
         out: list[dict] = []
-        for rid, deleted, sup, inv in rows:
-            rec = seg.get(rid)
-            if rec is None:
+        for rid, rec in seg.items():
+            row = rows.get(rid)
+            if row is None:
                 continue
+            deleted, sup, inv = row
             at = int(inv) if inv is not None else now
             if deleted:
                 out.append({"op": "tombstone", "id": rid, "at": at})
-            elif sup != rid and not rec.time.superseded_by:
+            elif sup is not None and sup != rid and not rec.time.superseded_by:
                 out.append({"op": "supersede", "old": rid, "new": sup, "at": at})
-        return out
+        return out, {rid for rid in seg if rid not in rows}
+
+    # A ledger delete is applied only on unambiguous evidence (see
+    # _legacy_audit_deletes); these name the entries it reads.
+    _LEDGER_DELETES = ("hard_delete", "delete")
+    _LEDGER_COUNT_ONLY = ("delete_batch", "hard_delete_batch", "forget")
+    _LEDGER_RESTORE_MARKERS = ("import", "restore")
+    _LEDGER_FUTURE_SLACK_MS = 5 * 60 * 1000
 
     def _legacy_audit_deletes(self, ops: list[dict],
                               frames: list[tuple[int | None, list[MemoryRecord]]],
                               versions: dict[str, tuple[MemoryRecord, int]],
-                              carried: list[dict]) -> list[dict]:
-        """Deletes the namespace's audit ledger records, as ops for the
-        migration to apply last: a delete wins.
+                              carried: list[dict],
+                              holders: dict[str, list[dict]],
+                              idx: tuple[int, dict[str, tuple]] | None
+                              ) -> tuple[list[dict], dict]:
+        """Deletes the namespace's audit ledger records that format-1
+        durable data lost, as ops for the migration to apply last (a delete
+        wins) -> (ops, report).
 
         The old facade appended `hard_delete` / `delete` (target: the record
-        id) to `ns/<ns>/audit` after the ops were durable. A hard delete a
+        id) to the audit ledger after the ops were durable. A hard delete a
         format-1 fold lost (killed between deleting the ops log and
         re-appending the pending hard deletes) survives nowhere else - the
-        old index removed the row - so every record durable data still
-        holds that the ledger says was deleted is deleted again: a tombstone,
-        and for a hard delete a purge due now unless the durable ops still
-        schedule one (its deadline stands). A copy ingested AFTER the
-        entry's time is a later re-add of the same id, not what it deleted,
-        and is kept.
+        old index removed the row. But a ledger entry is weaker evidence than
+        durable data, and deleting a record the user still has is worse than
+        serving one they deleted, so the newest delete entry for an id that
+        durable data still holds is applied (a tombstone, and for a hard
+        delete a purge due now) only if ALL of these hold:
 
-        The hash chain is verified first; past a break (tampering, or a
-        chain an older build forked) nothing is applied and the break is
-        logged as an error. Batch and forget entries carry a count, not ids,
-        and an entry a crash lost from the buffered ledger (flush_every > 1)
-        is gone: neither can be recovered here. v0.1 builds filed every
-        namespace's entries in the facade default namespace's ledger; only
-        that namespace's own ledger is read."""
+          (c) the hash chain verifies up to it (nothing past a break counts);
+          (a) it is this namespace's: its own `ns` field says so, or - no
+              released build wrote one, and v0.1 filed every namespace's
+              entries in the facade default namespace's ledger - no other
+              namespace under the data root holds the id;
+          (b) nothing shows the id was written after it: no later ledger
+              entry for it (an add, a remember) and no restore/import marker
+              after it; no copy ingested after it; no copy in the current
+              WAL (the fold that lost the delete deleted the WAL before the
+              ops log, so every frame there was written after it); no copy
+              in a segment a rotate wrote after it; the old local index does
+              not still serve it; and it is not dated in the future - nor
+              after the logs were last reset (the ops log holds an op older
+              than it, or the fold that set the current base predates it):
+              no fold since could have lost it;
+          and durable data no longer has a delete op for the id - if it does,
+          nothing was lost, and replaying it in its place in history keeps
+          a restore that followed it.
+
+        Anything else is ambiguous: the record is kept, logged as a warning
+        with its id and listed in the migration report. Batch and forget
+        entries carry a count, not ids, and an entry a crash lost from the
+        buffered ledger (flush_every > 1) is gone: neither can be recovered
+        (the report lists the former)."""
         from memd.storage.audit import read_verified
 
+        rep: dict = {"recovered_deletes": [], "ambiguous_deletes": [],
+                     "count_only_deletes": [], "unverified_entries": 0,
+                     "ledger": {"readable": True}}
         key = f"{self.prefix}/audit"
         try:
-            entries, ok, total = read_verified(self.store, key, self.envelope)
+            led = read_verified(self.store, key, self.envelope)
         except Exception as ex:  # noqa: BLE001 - an unreadable ledger: nothing to apply
-            _log.error("namespace %s: audit ledger unreadable (%s): no deletes recovered "
-                       "from it", self.namespace, type(ex).__name__)
-            METRICS.inc("memd_migration_audit_unverified_total",
-                        help="migrations whose audit ledger failed hash-chain verification",
-                        ns=self.namespace)
-            return []
-        if not ok:
+            if not self._PREVIEW:
+                _log.error("namespace %s: audit ledger unreadable (%s): no deletes recovered "
+                           "from it", self.namespace, type(ex).__name__)
+                METRICS.inc("memd_migration_audit_unverified_total",
+                            help="migrations whose audit ledger failed hash-chain verification",
+                            ns=self.namespace)
+            rep["ledger"] = {"readable": False, "error": type(ex).__name__}
+            return [], rep
+        entries = led.entries
+        rep["ledger"] = {"readable": True, "entries": led.total, "verified_entries": len(entries),
+                         "chain_intact": led.ok}
+        rep["unverified_entries"] = led.total - len(entries)
+        if not led.ok and not self._PREVIEW:
             _log.error(
                 "namespace %s: audit ledger hash chain BROKEN after entry %d of %d "
                 "(tampered, or forked by an older build): deletes recorded past the "
                 "break are NOT applied by this migration - review them", self.namespace,
-                len(entries), total)
+                len(entries), led.total)
             METRICS.inc("memd_migration_audit_unverified_total",
                         help="migrations whose audit ledger failed hash-chain verification",
                         ns=self.namespace)
-        want: dict[str, tuple[bool, int]] = {}  # id -> (hard, newest delete's time)
-        for e in entries:
-            rid, act = e.get("target"), e.get("action")
-            if act not in ("hard_delete", "delete") or not isinstance(rid, str) or not rid:
+        # the newest delete entry per id since its last write, in chain order
+        newest: dict[str, tuple[int, dict, bool]] = {}  # id -> (index, entry, any hard)
+        wrote: dict[str, str] = {}   # id -> a write the ledger records after its delete
+        marker = -1                  # index of the newest restore/import marker
+        for i, e in enumerate(entries):
+            act, rid = e.get("action"), e.get("target")
+            if act in self._LEDGER_COUNT_ONLY:
+                detail = e.get("detail") if isinstance(e.get("detail"), dict) else {}
+                rep["count_only_deletes"].append({
+                    "action": act, "ts": e.get("ts"),
+                    "count": detail.get("count", detail.get("deleted"))})
                 continue
-            hard, ts = want.get(rid, (False, 0))
-            want[rid] = (hard or act == "hard_delete", max(ts, int(e.get("ts") or 0)))
-        if not want:
-            return []
-        copies = {rid: rec for rid, (rec, _) in versions.items()}
+            if act in self._LEDGER_RESTORE_MARKERS:
+                marker = i
+            if not isinstance(rid, str) or not rid:
+                continue
+            ns = e.get("ns")
+            if ns is not None and ns != self.namespace:
+                continue  # another namespace's entry
+            if act in self._LEDGER_DELETES:
+                hard = act == "hard_delete" or (rid in newest and rid not in wrote
+                                                and newest[rid][2])
+                newest[rid] = (i, e, hard)
+                wrote.pop(rid, None)
+            elif rid in newest and act != "search":
+                wrote[rid] = act
+        # entries past a break name deletes this migration will not apply
+        past = [e for e in led.unverified
+                if e.get("action") in self._LEDGER_DELETES and isinstance(e.get("target"), str)]
+        if not newest and not past:
+            return [], rep
+        # every durable copy of an id: (record, where) - where is "wal" or a segment entry
+        copies: dict[str, list[tuple[MemoryRecord, dict | None]]] = {}
+        for rid, (rec, _) in versions.items():
+            copies.setdefault(rid, []).append((rec, None))
         for _s, recs in frames:
-            copies.update((r.id, r) for r in recs)
+            for r in recs:
+                copies.setdefault(r.id, []).append((r, {"name": "wal"}))
+        deleted_ops = {_op_target(o) for o in carried + ops
+                       if o.get("op") in ("tombstone", "hard_delete")}
         scheduled = {o.get("id") for o in carried + ops if o.get("op") == "hard_delete"}
         now = now_ms()
+        # When the logs were last reset: a delete after that still has its
+        # ops in them, so only a delete before it can have been lost. The
+        # ops log holds nothing older than the fold that reset it, and the
+        # newest segment dates that fold if it wrote the current base.
+        oldest_op = min((a for a in map(_op_at, ops) if a is not None), default=None)
+        last = max(self.manifest.segments, key=lambda g: int(g.get("fold_seq", 0)), default=None)
+        last_fold = None
+        if last is not None and int(last.get("fold_seq", 0)) == self.manifest.wal_base_seq:
+            try:
+                last_fold = ulid_ts_ms(str(last.get("name", ""))[4:])
+            except ValueError:
+                pass
+
+        def ambiguous(rid: str, e: dict, why: str) -> None:
+            rep["ambiguous_deletes"].append({"id": rid, "action": e.get("action"),
+                                             "ts": e.get("ts"), "reason": why})
+
+        for e in past:
+            rid = e["target"]
+            if rid in copies and rid not in deleted_ops and rid not in newest:
+                ambiguous(rid, e, "recorded past a break in the ledger's hash chain")
+        cands: list[tuple[str, int, dict, bool, int, list]] = []
+        for rid, (i, e, hard) in newest.items():
+            held = copies.get(rid)
+            if not held or rid in deleted_ops:
+                continue  # nothing durable holds it, or durable history still deletes it
+            try:
+                ts = int(e.get("ts"))
+            except (TypeError, ValueError):
+                ambiguous(rid, e, "the entry has no usable time")
+                continue
+            cands.append((rid, i, e, hard, ts, held))
+        # (a): an entry without a namespace of its own may be another's
+        elsewhere = self._ids_elsewhere({c[0] for c in cands if c[2].get("ns") is None})
+        for rid, i, e, hard, ts, held in cands:
+            why: list[str] = []
+            if e.get("ns") is None and rid in elsewhere:
+                why.append("the entry names no namespace and namespace(s) "
+                           f"{', '.join(elsewhere[rid])} also hold the id")
+            # (b): anything that says the id was written after it
+            if rid in wrote:
+                why.append(f"the ledger records a later {wrote[rid]} of it")
+            if marker > i:
+                why.append("the ledger records a restore/import after it")
+            if any(r.time.t_ingested > ts for r, _ in held):
+                why.append("a copy was ingested after it")
+            if any(w is not None and w["name"] == "wal" for _, w in held):
+                why.append("a copy was written to the WAL after the fold that lost it")
+            if any(_rotated_after(h, ts) for h in holders.get(rid, ())):
+                why.append("a copy was folded into a segment a rotate wrote after it")
+            if oldest_op is not None and oldest_op < ts:
+                why.append("no fold since could have lost it (the ops log holds an older op)")
+            elif last_fold is not None and last_fold < ts:
+                why.append("no fold since could have lost it (the newest fold predates it)")
+            if ts > now + self._LEDGER_FUTURE_SLACK_MS:
+                why.append("the entry is dated in the future")
+            if (idx is not None and rid in idx[1] and not idx[1][rid][0]
+                    and rid in versions and versions[rid][1] <= idx[0]):
+                why.append("the old local index still serves it")
+            if why:
+                ambiguous(rid, e, "; ".join(why))
+            else:
+                rep["recovered_deletes"].append({"id": rid, "action": e.get("action"),
+                                                 "ts": ts, "hard": hard})
+        if rep["ambiguous_deletes"] and not self._PREVIEW:
+            _log.warning(
+                "namespace %s: the audit ledger records %d delete(s) of records durable data "
+                "still holds that this migration did NOT apply (the evidence is ambiguous, "
+                "so they stay live - review them with `memd migrate --report`): %s",
+                self.namespace, len(rep["ambiguous_deletes"]),
+                "; ".join(f"{d['id']} ({d['reason']})" for d in rep["ambiguous_deletes"]))
+            METRICS.inc("memd_migration_ambiguous_deletes_total",
+                        len(rep["ambiguous_deletes"]),
+                        help="ledger deletes a migration kept live on ambiguous evidence",
+                        ns=self.namespace)
         out: list[dict] = []
-        for rid, (hard, ts) in want.items():
-            rec = copies.get(rid)
-            if rec is None or rec.time.t_ingested > ts:
-                continue  # nothing durable holds it, or only a later re-add
-            out.append({"op": "tombstone", "id": rid, "at": ts})
-            if hard and rid not in scheduled:
-                out.append({"op": "hard_delete", "id": rid, "deadline": now})
-        return out
+        for d in rep["recovered_deletes"]:
+            out.append({"op": "tombstone", "id": d["id"], "at": d["ts"]})
+            if d["hard"] and d["id"] not in scheduled:
+                out.append({"op": "hard_delete", "id": d["id"], "deadline": now})
+        return out, rep
+
+    def _ids_elsewhere(self, ids: set[str]) -> dict[str, list[str]]:
+        """Which of `ids` another namespace under this store holds -> id ->
+        namespaces. Every durable object there is searched (WAL, ops log,
+        every segment); one this node cannot read counts as holding them all
+        - it cannot be ruled out."""
+        found: dict[str, set[str]] = {}
+        if not ids:
+            return {}
+        try:
+            keys = self.store.list("ns/")
+        except Exception:  # noqa: BLE001 - nothing can be ruled out
+            return {rid: ["?"] for rid in ids}
+        for key in keys:
+            parts = key.split("/")
+            if len(parts) != 3 or parts[1] == self.namespace:
+                continue
+            other, name = parts[1], parts[2]
+            if name not in ("wal", "ops") and not name.startswith("seg-"):
+                continue
+            try:
+                text = self._plaintext_of(other, name, self.store.get(key) or b"")
+            except Exception:  # noqa: BLE001 - unreadable: cannot be ruled out
+                text = None
+            for rid in ids:
+                if text is None or rid.encode() in text:
+                    found.setdefault(rid, set()).add(other)
+        return {rid: sorted(v) for rid, v in found.items()}
+
+    def _plaintext_of(self, ns: str, name: str, blob: bytes) -> bytes | None:
+        """Another namespace's WAL, ops log or segment, decrypted with ITS
+        key (None: it has none this node can use)."""
+        env = self.envelope
+        if not env.enabled or blob[:1] == b"{":
+            return blob
+        if not env.has_key(ns):
+            return None  # never mint a key for a namespace just to read it
+        if name.startswith("seg-"):
+            return env.decrypt(ns, blob)
+        return b"\n".join(env.decrypt(ns, fr) for fr in _frame_iter(blob))
+
+    # ------------------------------------------------------- migration report
+
+    @staticmethod
+    def _report_key(namespace: str) -> str:
+        return f"ns/{namespace}/migration-report.json"
+
+    def _write_migration_report(self, report: dict) -> None:
+        data = json.dumps(report, sort_keys=True).encode()
+        if self.envelope.enabled:
+            data = self.envelope.encrypt(self.namespace, data)
+        self.store.put(self._report_key(self.namespace), data)
+
+    @classmethod
+    def read_migration_report(cls, store: ObjectStore, namespace: str,
+                              envelope: KeyEnvelope | None = None) -> dict | None:
+        """The report the format-1 migration of `namespace` wrote, or None
+        (created by this version, or migrated before reports existed)."""
+        raw = store.get(cls._report_key(namespace))
+        if not raw:
+            return None
+        if raw[:1] != b"{" and envelope is not None and envelope.enabled:
+            raw = envelope.decrypt(namespace, raw)
+        return json.loads(raw)
 
     def _read_ops(self, repair: bool = False) -> list[dict]:
         """The ops log, parsed (see _scan_ops). repair=True - open, before
@@ -1426,7 +1739,8 @@ class NamespaceStore:
             good_end = i
         return ops, good_end
 
-    def _load_checkpoints(self, applied: int = 0, where: str = "segment-load"
+    def _load_checkpoints(self, applied: int = 0, where: str = "segment-load",
+                          holders: dict[str, list[dict]] | None = None
                           ) -> tuple[dict[str, tuple[MemoryRecord, int]], list[dict], int]:
         """Segment state for a fold -> (versions, carried ops, max fold_seq).
 
@@ -1434,7 +1748,8 @@ class NamespaceStore:
         it, over segments an index at `applied` does not reflect yet (all of
         them when applied is 0). carried = ops earlier rotates could not
         retire; the headers of already-reflected segments are read too when
-        they hold hard deletes, because those are the purge schedule."""
+        they hold hard deletes, because those are the purge schedule.
+        `holders`, if given, collects id -> every segment entry holding it."""
         versions: dict[str, tuple[MemoryRecord, int]] = {}
         src_fold: dict[str, int] = {}  # newest segment wins, by fold_seq
         carried: list[dict] = []
@@ -1461,6 +1776,8 @@ class NamespaceStore:
                 continue
             carried.extend(ops)
             for rec in recs:
+                if holders is not None:
+                    holders.setdefault(rec.id, []).append(seg)
                 if src_fold.get(rec.id, -1) <= fold:
                     src_fold[rec.id] = fold
                     versions[rec.id] = (rec, _held(rec.id, fold, before))
@@ -2314,6 +2631,59 @@ class NamespaceStore:
             self._owner_lease = None
 
 
+class _MigrationPreview(NamespaceStore):
+    """A format-1 namespace read WITHOUT opening it: the inputs of
+    _plan_legacy only. No owner lock, no index cache created (a node's old
+    index is read read-only if it has one), nothing written - what a report
+    before the upgrade needs."""
+
+    _PREVIEW = True
+
+    def __init__(self, namespace: str, store: ObjectStore, envelope: KeyEnvelope | None,
+                 cache_dir: str):
+        self.namespace = namespace
+        self.store = store
+        self.envelope = envelope or NullKeyEnvelope()
+        if self.envelope.enabled and not self.envelope.has_key(namespace):
+            # nothing of it can be encrypted, and a key must not be minted
+            self.envelope = NullKeyEnvelope()
+        self.prefix = f"ns/{namespace}"
+        self.wal_key = f"{self.prefix}/wal"
+        self.ops_key = f"{self.prefix}/ops"
+        self.manifest_key = f"{self.prefix}/manifest.json"
+        raw = store.get(self.manifest_key)
+        self.manifest = Manifest.from_dict(json.loads(raw)) if raw else Manifest()
+        self._index_path = os.path.join(cache_dir, f"{namespace.replace('/', '__')}.sqlite")
+
+    def _legacy_index_rows(self) -> tuple[int, dict[str, tuple]] | None:
+        import sqlite3
+
+        if not os.path.exists(self._index_path):
+            return None
+        # read-only, and without creating the -wal/-shm files a WAL-mode
+        # reader otherwise leaves behind - unless a live -wal holds rows
+        mode = "mode=ro" if os.path.exists(self._index_path + "-wal") else "immutable=1"
+        try:
+            con = sqlite3.connect(f"file:{self._index_path}?{mode}", uri=True)
+        except sqlite3.Error:
+            return None
+        try:
+            row = con.execute("SELECT v FROM meta WHERE k='applied_seq'").fetchone()
+            applied = int(row[0]) if row and row[0] else 0
+            if applied <= 0:
+                return None
+            rows = con.execute(
+                "SELECT id, deleted, superseded_by, invalidated_at FROM records").fetchall()
+        except (sqlite3.Error, ValueError):
+            return None
+        finally:
+            con.close()
+        return applied, {r[0]: (r[1], r[2], r[3]) for r in rows}
+
+    def preview(self) -> dict:
+        return self._plan_legacy(self._read_ops())["report"]
+
+
 class StorageEngine:
     """Manages namespaces over an ObjectStore. Stateless compute: any process
     can open any namespace by replaying the object-store log."""
@@ -2356,6 +2726,12 @@ class StorageEngine:
         # them into the ledger it owns; without one they are appended to the
         # namespace's ledger directly.
         self.audit_hook = None
+        # open_hook(ns, store): called (outside every lock) after a namespace
+        # is opened. The Memory facade schedules the purges that are due at
+        # open there - a hard delete whose deadline passed while the process
+        # was down, or one the migration recovered - instead of leaving the
+        # text on disk until the next write happens to check.
+        self.open_hook = None
 
     def pin_namespace(self, ns: str) -> None:
         """Mark a namespace as process-resident (never LRU-evicted). The
@@ -2367,44 +2743,76 @@ class StorageEngine:
             if ns in self._namespaces:
                 self._namespaces.move_to_end(ns)
 
-    def _evict_locked(self) -> list[tuple[str, dict]]:
-        """Close + drop least-recently-used stores past the cap. A store
-        whose ns-lock cannot be taken without blocking has an operation in
-        flight - skip it this round rather than yank its index out from
-        under the caller. Returns what their clean close collected, for the
-        caller to audit outside the engine lock."""
-        notes: list[tuple[str, dict]] = []
+    def _evict_locked(self) -> list[tuple[str, "NamespaceStore", list]]:
+        """Pick least-recently-used stores past the cap and take them out of
+        the table. A store whose ns-lock cannot be taken without blocking has
+        an operation in flight - skip it this round rather than yank its
+        index out from under the caller. Each victim is write-closed and
+        returned with its ns lock and open lock held: the caller closes it
+        with _close_claimed OUTSIDE the engine lock. Its clean close lists
+        and collects the namespace's objects (_collect_garbage_now), an
+        O(namespace objects) store round trip that stalled every other
+        namespace's open while it ran under the engine lock; the open lock
+        keeps a reopen of the same namespace waiting until it is done."""
+        victims: list[tuple[str, NamespaceStore, list]] = []
         while len(self._namespaces) > self.max_open_namespaces:
             evicted_any = False
             for name in list(self._namespaces):  # oldest first (LRU order)
                 if len(self._namespaces) <= self.max_open_namespaces:
-                    return notes
+                    return victims
                 if name in self._pinned:
                     continue  # process-resident: never evicted
                 victim = self._namespaces[name]
                 if not victim._lock.acquire(blocking=False):
                     continue  # in-flight op on this store; retry next pass
-                try:
-                    # write-close BEFORE close(): a straggler holding an old
-                    # reference must fail fast instead of appending alongside
-                    # the store's reopened successor (forked WAL/seq state)
-                    victim._closed = True
-                    victim._evicted = True
-                    try:
-                        victim.close()  # flushes manifest + index watermark durably
-                    except Exception:
-                        METRICS.inc("memd_ns_evict_close_errors_total",
-                                    help="errors while closing an evicted namespace store")
-                finally:
+                ent = self._claim_open_locked(name)
+                if ent is None:  # being destroyed: that closes it
                     victim._lock.release()
-                notes += [(name, d) for d in victim.take_collected()]
+                    continue
+                # write-close BEFORE close(): a straggler holding an old
+                # reference must fail fast instead of appending alongside
+                # the store's reopened successor (forked WAL/seq state)
+                victim._closed = True
+                victim._evicted = True
                 del self._namespaces[name]
+                victims.append((name, victim, ent))
                 METRICS.inc("memd_ns_evictions_total",
                             help="open namespace stores closed by the LRU cap")
                 evicted_any = True
             if not evicted_any:
-                return notes  # everything pinned or busy: cap exceeded by design
-        return notes
+                return victims  # everything pinned or busy: cap exceeded by design
+        return victims
+
+    def _claim_open_locked(self, ns: str) -> list | None:
+        """Take `ns`'s open lock without blocking (the caller holds the engine
+        lock, which may not wait on it): None if an open or destroy holds it."""
+        ent = self._opening.setdefault(ns, [threading.Lock(), 0])
+        if not ent[0].acquire(blocking=False):
+            return None
+        ent[1] += 1
+        return ent
+
+    def _close_claimed(self, name: str, nstore: "NamespaceStore", ent: list,
+                       held: bool) -> list[tuple[str, dict]]:
+        """Close a store taken out of the table (outside the engine lock),
+        then release its claim; `held`: this thread holds its ns lock too.
+        Returns what its clean close collected, for the caller to audit."""
+        try:
+            try:
+                nstore.close()  # flushes manifest + index watermark durably
+            except Exception:
+                METRICS.inc("memd_ns_evict_close_errors_total",
+                            help="errors while closing an evicted namespace store")
+            finally:
+                if held:
+                    nstore._lock.release()
+            return [(name, d) for d in nstore.take_collected()]
+        finally:
+            ent[0].release()
+            with self._lock:
+                ent[1] -= 1
+                if ent[1] == 0 and self._opening.get(name) is ent:
+                    del self._opening[name]
 
     @contextlib.contextmanager
     def _ns_open_lock(self, ns: str):
@@ -2424,7 +2832,8 @@ class StorageEngine:
 
     def namespace(self, ns: str) -> NamespaceStore:
         ns = _validate_ns(ns)
-        evicted: list[tuple[str, dict]] = []
+        evicted: list[tuple[str, NamespaceStore, list]] = []
+        opened = False
         with self._lock:
             nstore = self._namespaces.get(ns)
             if nstore is not None:
@@ -2444,17 +2853,27 @@ class StorageEngine:
                         ns, self.store, self.cache_dir, self.envelope, self.wal_rotate_bytes,
                         self.wal_rotate_frames, lexical=self.lexical,
                     )
+                    opened = True
                     with self._lock:
                         self._namespaces[ns] = nstore
                         evicted = self._evict_locked()
+        notes: list[tuple[str, dict]] = []
+        for name, victim, ent in evicted:  # outside the engine lock (see _evict_locked)
+            notes += self._close_claimed(name, victim, ent, held=True)
         with self._lock:
             collected = nstore.take_collected()
             if nstore._audit_sink is None:
                 nstore._audit_sink = lambda action, target, detail, _ns=ns: self._audit(
                     _ns, action, target, detail)
         # outside the engine lock: the hook takes its own
-        for name, ev in evicted + [(ns, ev) for ev in collected]:
+        for name, ev in notes + [(ns, ev) for ev in collected]:
             self._audit(name, ev["action"], ev["target"], ev)
+        if opened and self.open_hook is not None:
+            try:
+                self.open_hook(ns, nstore)
+            except Exception:  # noqa: BLE001 - scheduling maintenance never fails an open
+                METRICS.inc("memd_open_hook_failures_total",
+                            help="namespace-open hooks (due purges) that raised", ns=ns)
         return nstore
 
     def _audit(self, ns: str, action: str, target: str, detail: dict) -> None:
@@ -2484,6 +2903,14 @@ class StorageEngine:
             if nstore is not None:
                 self._namespaces.move_to_end(ns)
             return nstore
+
+    def has_namespace(self, ns: str) -> bool:
+        """True if `ns` is open here or has a manifest; never materializes it."""
+        ns = _validate_ns(ns)
+        with self._lock:
+            if ns in self._namespaces:
+                return True
+        return self.store.exists(f"ns/{ns}/manifest.json")
 
     def list_namespaces(self) -> list[str]:
         out = []
@@ -2545,14 +2972,63 @@ class StorageEngine:
         for lock in opening:
             with lock:
                 pass
-        notes: list[tuple[str, dict]] = []
+        # Out of the table under the engine lock, closed OUTSIDE it: a clean
+        # close lists and collects the namespace's objects, and that must
+        # not hold every other namespace's open (see _evict_locked). Each
+        # keeps its open lock until it is closed, so it is not reopened
+        # meanwhile; one a destroy is claiming stays for the destroy.
+        claimed: list[tuple[str, NamespaceStore, list]] = []
         with self._lock:
-            for name, ns in self._namespaces.items():
-                ns.close()
-                notes += [(name, d) for d in ns.take_collected()]
-            self._namespaces.clear()
+            for name in list(self._namespaces):
+                ent = self._claim_open_locked(name)
+                if ent is None:
+                    continue
+                claimed.append((name, self._namespaces.pop(name), ent))
+        notes: list[tuple[str, dict]] = []
+        for name, nstore, ent in claimed:
+            with nstore._lock:  # an operation in flight on it finishes first
+                pass
+            notes += self._close_claimed(name, nstore, ent, held=False)
         for name, d in notes:  # outside the engine lock, as at open
             self._audit(name, d["action"], d["target"], d)
+
+    def migration_report(self) -> dict:
+        """What the format-1 upgrade did - or, for a namespace not migrated
+        yet, would do - per namespace, as JSON-ready data (`memd migrate
+        --report`): its store format, whether its migration is pending, the
+        ids whose ledger delete was not applied because the evidence was
+        ambiguous (kept live, with the reason), the deletes recovered from
+        the ledger and applied, and the losses an older version left that
+        cannot be recovered (batch/forget deletes logged as a count; records
+        served that the old local index had no row for; ledger entries past
+        a chain break). Read-only: a pending namespace is previewed from its
+        durable data and this node's old local index, never migrated."""
+        out: dict[str, dict] = {}
+        for ns in self.list_namespaces():
+            try:
+                out[ns] = self._migration_entry(ns)
+            except Exception as ex:  # noqa: BLE001 - report the others
+                out[ns] = {"error": f"{type(ex).__name__}: {ex}"}
+        return {"store_format": STORE_FORMAT, "namespaces": out}
+
+    def _migration_entry(self, ns: str) -> dict:
+        raw = self.store.get(f"ns/{ns}/manifest.json")
+        fmt = Manifest.from_dict(json.loads(raw)).format if raw else STORE_FORMAT
+        pending = fmt < STORE_FORMAT
+        if pending:
+            rep = _MigrationPreview(ns, self.store, self.envelope, self.cache_dir).preview()
+        else:
+            env = self.envelope
+            if env is not None and env.enabled and not env.has_key(ns):
+                env = None  # never mint a key to read a report
+            rep = NamespaceStore.read_migration_report(self.store, ns, env)
+        entry: dict = {"format": fmt, "pending_migration": pending, "preview": pending}
+        rep = dict(rep or {})
+        entry["ambiguous_deletes"] = rep.pop("ambiguous_deletes", [])
+        entry["recovered_deletes"] = rep.pop("recovered_deletes", [])
+        entry["legacy_losses"] = rep.pop("legacy_losses", {})
+        entry["migration"] = rep or None  # None: created by this version (nothing migrated)
+        return entry
 
 
 import re as _re

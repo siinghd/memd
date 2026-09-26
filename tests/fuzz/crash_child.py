@@ -374,7 +374,10 @@ for step in range(int(P["steps"])):
             if r is None:
                 continue
             q = r.content.split()[0]
-            J(t="i", op=op, ids=ids, q=q)
+            # the intent names every id the sweep may delete: a forget killed
+            # after its durable batch deleted all of them, not just the pick
+            may = sorted(set(ids) | set(m.find_ids(q, user_id="u")))
+            J(t="i", op=op, ids=may, q=q)
             got = m.forget(q, user_id="u")
             J(t="a", op=op, ids=list(got), q=q)
             for i in got:

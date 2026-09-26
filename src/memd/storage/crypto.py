@@ -30,6 +30,11 @@ class KeyEnvelope:
     def data_key(self, namespace: str) -> bytes:
         raise NotImplementedError
 
+    def has_key(self, namespace: str) -> bool:
+        """True if `namespace` already has a data key. data_key() MINTS one
+        otherwise - a reader that must not create keys asks this first."""
+        return True
+
     def destroy(self, namespace: str) -> bool:
         raise NotImplementedError
 
@@ -114,6 +119,9 @@ class LocalKeyEnvelope(KeyEnvelope):
         if len(self._cache) > self.CACHE_MAX:
             self._cache.popitem(last=False)
         return dk
+
+    def has_key(self, namespace: str) -> bool:
+        return namespace in self._cache or os.path.exists(self._key_path(namespace))
 
     def destroy(self, namespace: str) -> bool:
         # shred order matters: drop the cached copy BEFORE the file so no

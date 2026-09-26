@@ -235,6 +235,7 @@ python bench/lme_gate.py                         # real-data gate: LongMemEval_S
 python bench/lexical_bench.py                    # FTS5 vs tantivy, filtered, 10K-150K records
 memd export --out backup.jsonl                   # anti-lock-in, symmetric
 memd import mem0 --export mem0.json              # migration path
+memd migrate --report ./memd-data                # store-format upgrade: preview / what it did (JSON)
 memd key create --ns acme [--pin-user u1]        # scoped API keys
 ```
 

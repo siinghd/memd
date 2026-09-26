@@ -104,6 +104,28 @@ def test_a_hard_delete_the_old_build_lost_is_not_served_after_the_upgrade(tmp_pa
         m.close()
 
 
+@pytest.mark.parametrize("cold", [False, True], ids=["warm", "cold"])
+@pytest.mark.parametrize("name", ["f979ea8-108-e0", "18246db-110-e0"])
+def test_a_recovered_hard_delete_is_purged_at_open_without_a_write(tmp_path, name, cold):
+    """The migration schedules the purge of a recovered hard delete due at
+    once, but the older segments that hold its text were only compacted
+    when the next write came: an upgraded node that only served reads kept
+    it on disk. Opening the namespace now runs the due purge."""
+    root, meta, ids = _fixture(tmp_path, name)
+    data = os.path.join(root, "data")
+    if cold:
+        shutil.rmtree(os.path.join(data, "store", "_cache"))
+    m = Memory(data, encrypt=meta["enc"], config=CFG)
+    try:
+        m.flush()  # background maintenance drained - no write, no compact()
+        assert _state(m, ids)[0] == meta["live"]
+    finally:
+        m.close()
+    for tag in _hard_deleted(meta):
+        assert _files_with(data, f'"content {tag}"'.encode()) == [], \
+            f"{tag}'s text outlived the purge due at open"
+
+
 def _ledger(root: str) -> str:
     return os.path.join(root, "data", "store", "ns", "default", "audit")
 

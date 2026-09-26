@@ -1,5 +1,5 @@
 """CLI: `memd serve --http|--mcp`, `memd key create`, `memd export`,
-`memd import mem0`, `memd status`."""
+`memd import mem0`, `memd status`, `memd migrate --report`."""
 from __future__ import annotations
 
 import argparse
@@ -240,6 +240,34 @@ def _cmd_status(args) -> int:
     return 0
 
 
+def _cmd_migrate(args) -> int:
+    """`memd migrate --report DATA`: per namespace, its store format, whether
+    its format-1 migration is still pending (previewed, not run), the ledger
+    deletes kept live on ambiguous evidence, the deletes recovered and
+    applied, and the losses an older version left that cannot be recovered.
+    Read-only: nothing is migrated, locked or written - run it before an
+    upgrade and after it (see the CHANGELOG's upgrade notes)."""
+    from memd.storage.crypto import LocalKeyEnvelope, NullKeyEnvelope
+    from memd.storage.engine import StorageEngine
+
+    data = args.report
+    if str(data).startswith("s3://"):
+        print("migrate --report reads a local data root; for S3, run it on the node that "
+              "holds local_dir and the keys", file=sys.stderr)
+        return 2
+    store_dir = os.path.join(data, "store")
+    if not os.path.isdir(store_dir):
+        print(f"no memd data root at {data!r} (expected {store_dir})", file=sys.stderr)
+        return 1
+    keys = os.path.join(data, "keys")
+    # an encrypted root has its keys here; never create them just to read
+    env = (LocalKeyEnvelope(keys) if os.path.exists(os.path.join(keys, "root.key"))
+           else NullKeyEnvelope())
+    rep = StorageEngine(store_dir, envelope=env).migration_report()
+    print(json.dumps(rep, indent=1, sort_keys=True))
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="memd", description="memd - agent memory engine")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -290,6 +318,11 @@ def main(argv=None) -> int:
 
     mt = sub.add_parser("metrics", help="dump in-process metrics snapshot (JSON)")
     mt.set_defaults(fn=_cmd_metrics)
+
+    mg = sub.add_parser("migrate", help="store-format upgrade: report what it did or would do")
+    mg.add_argument("--report", metavar="DATA", required=True,
+                    help="data root to report on (read-only; JSON on stdout)")
+    mg.set_defaults(fn=_cmd_migrate)
 
     args = p.parse_args(argv)
     return args.fn(args)
