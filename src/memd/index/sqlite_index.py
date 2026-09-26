@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -35,6 +36,8 @@ from memd.metrics import METRICS
 
 # entity segments are dot-parts of normalize_entity_key output: [a-z0-9_-]+
 _SEG_CHARS = re.compile(r"[^a-z0-9_-]")
+
+_log = logging.getLogger(__name__)
 
 # Minimum cosine for the vector lane to report a hit: kills zero-evidence
 # matches that are harmless in ranked search but dangerous for unbounded
@@ -66,6 +69,41 @@ def _vec_from_blob(blob: bytes, dim: int) -> "np.ndarray":
     """Decode one stored vector, tolerating pre-v2 float32 blobs."""
     dtype = VEC_DTYPE if dim and len(blob) == dim * 2 else np.float32
     return np.frombuffer(blob, dtype=dtype).astype(np.float32)
+
+
+class ImageAborted(RuntimeError):
+    """A pinned image was given up (or refused): a hard-delete purge is
+    scrubbing the index, and an image older than that scrub may hold the
+    erased text - it could not be published anyway."""
+
+
+class ImagePin:
+    """A read transaction on the index file as committed when it was pinned
+    (NamespaceIndex.pin_image), copied with no lock held. While it is open
+    the WAL cannot be checkpointed past it, so a purge's scrub aborts it:
+    the copy stops at its next step (ImageAborted). The caller closes it."""
+
+    STEP_PAGES = 1024  # pages copied per backup step: how soon an abort is noticed
+
+    def __init__(self, index: "NamespaceIndex", con: sqlite3.Connection):
+        self._index, self.con = index, con
+        self.aborted = threading.Event()
+
+    def backup(self, dst: sqlite3.Connection) -> None:
+        """Copy the pinned image into `dst` (WAL snapshot isolation: exactly
+        that image, whatever is written meanwhile)."""
+        def step(_status, _remaining, _total):
+            if self.aborted.is_set():
+                raise ImageAborted("a purge is scrubbing the index")
+        step(0, 0, 0)
+        self.con.backup(dst, pages=self.STEP_PAGES, progress=step)
+
+    def close(self) -> None:
+        """End the read transaction (idempotent)."""
+        try:
+            self.con.close()
+        finally:
+            self._index._unpin(self)
 
 
 @dataclass(frozen=True)
@@ -137,6 +175,11 @@ class NamespaceIndex:
         # so concurrency is unaffected.
         self._readers_active = 0
         self._readers_gone = threading.Condition(self._reader_lock)
+        # images pinned for a snapshot copy (pin_image), and purge scrubs in
+        # progress: a scrub aborts the pins, and none is taken while it runs
+        self._pins: set[ImagePin] = set()
+        self._pins_cv = threading.Condition()
+        self._scrubbing = 0
         self._pending = False  # writes committed lazily, not yet visible cross-connection
         self._lazy_commits = 0
         self._commit_threshold = 64
@@ -325,14 +368,17 @@ class NamespaceIndex:
             self._con.commit()
         return old
 
-    def pin_image(self) -> sqlite3.Connection:
+    def pin_image(self) -> ImagePin:
         """(write lock held, just committed) A read-only connection of its
         own, holding a read transaction on this file as committed now. A
         backup from it copies exactly that image - WAL snapshot isolation -
         while writes and searches go on, with no lock held; the caller
-        closes it (that ends the transaction)."""
+        closes it (that ends the transaction). A purge's scrub aborts it,
+        and none is pinned while one runs (ImageAborted): see scrub()."""
         from urllib.parse import quote
 
+        if self._scrubbing:
+            raise ImageAborted("a purge is scrubbing the index")
         con = sqlite3.connect(f"file:{quote(os.path.abspath(self.path))}?mode=ro", uri=True,
                               isolation_level=None, check_same_thread=False)
         try:
@@ -342,7 +388,33 @@ class NamespaceIndex:
         except BaseException:
             con.close()
             raise
-        return con
+        pin = ImagePin(self, con)
+        with self._pins_cv:
+            self._pins.add(pin)
+        return pin
+
+    def _unpin(self, pin: ImagePin) -> None:
+        with self._pins_cv:
+            self._pins.discard(pin)
+            self._pins_cv.notify_all()
+
+    def _abort_pins(self) -> None:
+        """(scrub) Tell every pinned image's copy to stop at its next step."""
+        with self._pins_cv:
+            for pin in self._pins:
+                pin.aborted.set()
+
+    def _wait_unpinned(self) -> bool:
+        """(scrub, index lock NOT held: a copy never needs it to let go)
+        Abort every pinned image and wait until each is closed. False when
+        the index was closed first."""
+        self._abort_pins()
+        with self._pins_cv:
+            while self._pins:
+                if self._closed:
+                    return False
+                self._pins_cv.wait(0.1)
+        return not self._closed
 
     def set_vector_limits(self, flat_max: int, exact_max: int) -> None:
         """A sidecar is configured: while it is not serving, a namespace over
@@ -816,28 +888,66 @@ class NamespaceIndex:
         images. Run when a hard-delete purge happened: merge the FTS index
         into one segment, vacuum every free page out of the file (one full
         VACUUM for a file created before auto_vacuum was set), truncate the
-        WAL, and rebuild the tantivy copy from the rows that remain. False
-        when a reader kept the WAL from being truncated: scrub again later."""
+        WAL, and rebuild the tantivy copy from the rows that remain.
+
+        The WAL is truncated only once no reader holds a snapshot older than
+        the scrub. A snapshot publish's pinned image (pin_image) is one for
+        as long as its copy runs - longer than the busy timeout on a big
+        index - and that image predates the purge, so it could never be
+        published: the scrub aborts it (no image is pinned until the scrub
+        is done), waits for the copy to let go WITHOUT the index lock (a
+        search or a write never waits for the copy), and checkpoints again
+        until the WAL is truncated. It used to give up after the busy
+        timeout, leaving the erased bytes in the file until the next open.
+        False only when the index was closed first: the next open scrubs."""
         with self._lock:
             if self._closed:
                 return False
-            self.flush()
-            c = self._con
-            c.execute("INSERT INTO fts(fts) VALUES('optimize')")
-            c.commit()
-            if int(c.execute("PRAGMA auto_vacuum").fetchone()[0]) != 2:
-                c.execute("PRAGMA auto_vacuum=INCREMENTAL")
-                c.execute("VACUUM")
-            else:
-                c.execute("PRAGMA incremental_vacuum").fetchall()
-            busy = c.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
-            self._invalidate_stats()
+            self._scrubbing += 1
+        done = False
+        try:
+            self._abort_pins()  # their copies stop while the file is vacuumed
+            with self._lock:
+                if self._closed:
+                    return False
+                self.flush()
+                c = self._con
+                c.execute("INSERT INTO fts(fts) VALUES('optimize')")
+                c.commit()
+                if int(c.execute("PRAGMA auto_vacuum").fetchone()[0]) != 2:
+                    c.execute("PRAGMA auto_vacuum=INCREMENTAL")
+                    c.execute("VACUUM")
+                else:
+                    c.execute("PRAGMA incremental_vacuum").fetchall()
+                self._invalidate_stats()
+            t0 = warned = time.monotonic()
+            while True:
+                if not self._wait_unpinned():
+                    return False
+                with self._lock:
+                    if self._closed:
+                        return False
+                    self.flush()  # a write since the vacuum may have left its transaction open
+                    done = not self._con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+                if done:
+                    break
+                # another reader (a search, a streamed scan) still holds an
+                # older snapshot; each attempt already waited the busy timeout
+                now = time.monotonic()
+                if now - warned >= 60.0:
+                    warned = now
+                    _log.warning("memd: scrubbing %s of purged content: a reader has kept its WAL "
+                                 "from being truncated for %d s; still retrying", self.path, int(now - t0))
+                time.sleep(0.05)
+        finally:
+            with self._lock:
+                self._scrubbing -= 1
+            METRICS.inc("memd_index_scrubs_total",
+                        help="index caches scrubbed of hard-deleted content",
+                        ns=getattr(self, "_ns_hint", ""), complete=str(done).lower())
         if self.lexical is not None:
             self.lexical.reset()
-        METRICS.inc("memd_index_scrubs_total",
-                    help="index caches scrubbed of hard-deleted content",
-                    ns=getattr(self, "_ns_hint", ""), complete=str(not busy).lower())
-        return not busy
+        return True
 
     def hard_delete(self, record_id: str) -> bool:
         """Physical removal inside the index (compaction deadline path)."""

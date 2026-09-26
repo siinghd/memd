@@ -161,7 +161,12 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   writer and 4 writer-searchers; now 0.4-0.5 s): the sidecar's search lock
   is phase-fair, the SQLite image is copied from a pinned read snapshot
   with no lock held, and the read-your-writes pass filters in SQL only the
-  queued rows that can make the page.
+  queued rows that can make the page. A hard-delete purge that scrubs the
+  index meanwhile aborts that copy (its image predates the purge and is
+  never published), waits for it to let go without the index lock, and
+  retries until the WAL is truncated; it no longer gives up after the busy
+  timeout, which left the erased text and vectors in the local SQLite
+  file until the next open (D7).
 
 ## [0.2.0] - 2026-09-26
 

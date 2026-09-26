@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from memd.core.schema import (MemoryRecord, now_ms, records_from_jsonl, records_to_jsonl, ulid_new,
                               ulid_ts_ms)
 from memd.metrics import METRICS
-from memd.index.sqlite_index import NamespaceIndex
+from memd.index.sqlite_index import ImageAborted, NamespaceIndex
 from memd.storage.crypto import KeyEnvelope, NullKeyEnvelope
 from memd.storage.objectstore import LocalObjectStore, ObjectStore, tmp_is_foreign
 
@@ -850,6 +850,10 @@ class NamespaceStore:
                     # not be the source outside the lock: sqlite's backup API
                     # cannot make progress while its source holds an open
                     # write transaction, and the embed worker reopens one.)
+                    # The pinned snapshot keeps the WAL from being truncated:
+                    # a purge's scrub aborts the copy (ImageAborted - an image
+                    # older than the purge is refused below anyway) instead
+                    # of giving up and leaving the erased bytes in the file.
                     with self.index._lock:
                         if self.index._closed:
                             return False
@@ -882,6 +886,11 @@ class NamespaceStore:
                     vec_payload = UsearchSidecar.snapshot_payload(*vec_img)
                     if self.envelope.enabled:
                         vec_payload = self.envelope.encrypt(self.namespace, vec_payload)
+            except ImageAborted:
+                # a purge is scrubbing the index (see NamespaceIndex.scrub)
+                METRICS.inc("memd_index_snapshot_failures_total",
+                            ns=self.namespace, detail="purged_meanwhile")
+                return False
             finally:
                 if src is not None:
                     src.close()
@@ -1164,7 +1173,7 @@ class NamespaceStore:
         if not self.index.created:
             self._replayed_at_open = True  # tantivy is rebuilt from the scrubbed rows
             if not self.index.scrub():
-                return  # a reader held the WAL: the next open scrubs again
+                return  # closed first: the next open scrubs again
         self.index.set_meta("scrubbed_seq", str(m.scrub_seq))
 
     def _drop_snapshot(self, reason: str) -> None:
@@ -2623,8 +2632,9 @@ class NamespaceStore:
                 if op.get("id"):
                     self._track_pending_hard(op["id"], int(op.get("deadline", 0)))
             self._persist_manifest()
-            # the text is gone from durable data; now from this cache (an
-            # incomplete scrub is redone by the next open)
+            # the text is gone from durable data; now from this cache (the
+            # scrub waits out - aborts - a snapshot copy's pinned image, and
+            # one cut short by a close is redone by the next open)
             if purged and self.index.scrub():
                 self.index.set_meta("scrubbed_seq", str(self.manifest.scrub_seq))
             # ...and from the ANN sidecar: its files go now (usearch removal
