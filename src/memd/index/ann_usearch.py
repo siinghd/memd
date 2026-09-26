@@ -1220,8 +1220,13 @@ class UsearchSidecar:
         (200/200 identical top-10s, recall 1.0 at 60K clustered). Costs about
         a quarter of the build time. A search answered by a node holding the
         very same vector (a duplicate record: the same text embedded twice)
-        counts as found - k=1 returns one of the tied twins, and re-inserting
-        every duplicate doubled the build at 30% duplicates. Returns the
+        proves only that the TWIN is reachable - k=1 returns one of the tied
+        twins - so such a node is searched again, top-REPAIR_EXPANSION, and
+        counts as found only if that returns the node itself. (Counting the
+        twin as enough left the few unreachable duplicates unreachable: a
+        scoped search that drops the twin - another user's copy, or one
+        quarantined or deleted since - never saw them. Re-inserting every
+        duplicate instead doubled the build at 30% duplicates.) Returns the
         nodes re-inserted."""
         n = len(ix)
         if not n:
@@ -1245,6 +1250,13 @@ class UsearchSidecar:
                         twin[twin] = np.all(np.asarray(ix.get(mk[twin])).reshape(int(twin.sum()), -1)
                                             == np.asarray(ix.get(mg[twin])).reshape(int(twin.sum()), -1),
                                             axis=1)
+                    if twin.any():
+                        # a tied twin answered: found only if the node itself is reachable
+                        tk = mk[twin]
+                        wide = np.asarray(ix.search(_stored(ix, tk), REPAIR_EXPANSION,
+                                                    threads=self.build_threads).keys)
+                        wide = wide.reshape(len(tk), -1).astype(np.uint64)
+                        twin[twin] = (wide == tk[:, None]).any(axis=1)
                     bad.extend(mk[~twin].tolist())
             if bad:
                 b = np.asarray(bad, dtype=np.uint64)

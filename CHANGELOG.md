@@ -148,8 +148,14 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   recall below 0.8 rebuilds it (`memd_vector_index_corrupt_total`
   `source="structure"` / `"recall"`).
 - The sidecar's post-build repair pass no longer re-inserts every
-  duplicate vector (30% duplicates: 15107 re-inserts instead of 139 at
-  50K, about doubling the build).
+  duplicate vector, only those a search cannot reach: a self-search
+  answered by an identical twin is repeated top-16 and counts as found
+  only if it returns the node itself (30% duplicates at 50K x 64: ~300
+  re-inserts instead of ~15200, repair 1.2 s instead of 5.3-6.2 s). A
+  twin alone was not enough - an unreachable duplicate stayed invisible
+  to a scoped search that drops its twin (another user's copy, or one
+  quarantined or deleted since): 1-19 misses in 6000-9000 such searches,
+  now none, and none at three copies either (12-30 before).
 - Vector-lane searches no longer stall behind a snapshot publish and a
   write backlog (p99 9-16 s, max up to 38 s, under a publish loop, a bulk
   writer and 4 writer-searchers; now 0.4-0.5 s): the sidecar's search lock
