@@ -27,6 +27,7 @@ from typing import Any, Callable
 import numpy as np
 
 from memd.core.schema import ExtractorInfo, Kind, MemoryRecord, Scope, Source, now_ms
+from memd.index.ann_usearch import requested_vector_index, resolve_vector_index, vector_index_config
 from memd.index.sqlite_index import IndexFilter
 from memd.index.tantivy_lexical import (
     DEFAULT_COMMIT_DOCS,
@@ -613,8 +614,9 @@ class Memory:
                        or os.path.join(".memd-local", bucket, s3_prefix or "_"))
         os.makedirs(path, exist_ok=True)
         envelope = LocalKeyEnvelope(os.path.join(path, "keys")) if encrypt else NullKeyEnvelope()
-        # resolved before any namespace opens: the accelerator attaches at open
+        # resolved before any namespace opens: the accelerators attach at open
         self.lexical_backend = resolve_lexical_backend(cfg)
+        self.vector_index = resolve_vector_index(cfg)
         self.engine = StorageEngine(os.path.join(path, "store"), envelope=envelope,
                                     store=store,
                                     cache_dir=os.path.join(path, "_cache") if store else None,
@@ -622,7 +624,8 @@ class Memory:
                                         "backend": self.lexical_backend,
                                         "commit_ms": int(cfg.get("lexical_commit_ms", DEFAULT_COMMIT_MS)),
                                         "commit_docs": int(cfg.get("lexical_commit_docs", DEFAULT_COMMIT_DOCS)),
-                                    })
+                                    },
+                                    vector_index=vector_index_config(cfg, self.vector_index))
         self.namespace_name = namespace
         # D7 #7 ledgers are PER NAMESPACE. They are held in an LRU keyed by
         # namespace (mirroring the engine's namespace table) and routed by the
@@ -655,6 +658,7 @@ class Memory:
         self.pack_mode: str = resolve_pack_mode(cfg)
         self.rerank_gate: float = float(cfg.get("rerank_gate", DEFAULT_RERANK_GATE))
         self._lexical_flush_drain_s = float(cfg.get("lexical_flush_drain_s", 60.0))
+        self._vector_flush_drain_s = float(cfg.get("vector_flush_drain_s", 60.0))
         self.extractor: Extractor = resolve_extractor(cfg)
         self.quarantine = QuarantinePolicy(
             rate_max_writes=int(cfg.get("rate_max_writes", 120)),
@@ -696,11 +700,12 @@ class Memory:
                   namespace, self.embedder.name, self.embedder.kind, requested_embedder(cfg))
         # the reranker decides whether search text leaves the machine: say so
         _log.info("memd: reranker %s (model=%s, requested=%s, pack_mode=%s); "
-                  "lexical backend %s (requested=%s); fuse_vector=%s",
+                  "lexical backend %s (requested=%s); vector index %s (requested=%s); "
+                  "fuse_vector=%s",
                   self.rerank.name if self.rerank else "none",
                   self.rerank.model if self.rerank else "-", requested_reranker(cfg),
                   self.pack_mode, self.lexical_backend, requested_lexical_backend(cfg),
-                  self.fuse_vector)
+                  self.vector_index, requested_vector_index(cfg), self.fuse_vector)
         if self.rerank is not None and callable(getattr(self.rerank.reranker, "load", None)):
             # warm the reranker off the caller's path: a local cross-encoder
             # takes seconds to load (a first download is ~1GB) and the Jev SDK
@@ -1930,6 +1935,10 @@ class Memory:
         st["pack_mode"] = self.pack_mode
         lex = ns.index.lexical
         st["lexical"] = lex.stats() if lex is not None else {"backend": "fts5"}
+        ann = ns.index.ann
+        st["vector_index"] = ann.stats() if ann is not None else {
+            "kind": "flat", "mode": self.vector_index, "ready": True, "size": 0, "rebuilds": 0,
+            "last_build_ms": None, "fallback_exact_total": 0}
         st["extractor"] = self.extractor.name
         # live gauges so /metrics and stats() agree on current state
         METRICS.set_gauge("memd_records", st.get("records", 0), ns=ns.namespace)
@@ -2010,8 +2019,8 @@ class Memory:
             METRICS.inc("memd_embed_target_missing_total",
                         help="embeddings dropped because the target namespace is gone")
             return
-        for i, rid in enumerate(ids):
-            ns.index.set_vector(rid, vecs[i], self.embedder.name)
+        # one batch: one index lock hold and one ANN sidecar change
+        ns.index.set_vectors(list(ids), [vecs[i] for i in range(len(ids))], self.embedder.name)
 
     def reembed(self, *, namespace: str | None = None, batch_size: int = 256) -> dict:
         """Batch re-embedding job (ADR-8): rebuild the vector lane from raw.
@@ -2033,9 +2042,8 @@ class Memory:
             chunk = stale[i : i + batch_size]
             ids, texts = embed_order({r.id: r.content for r in chunk}, self._embed_max_chars)
             vecs = self.embedder.embed(texts)
-            for j, rid in enumerate(ids):
-                ns.index.set_vector(rid, vecs[j], self.embedder.name)
-                done += 1
+            ns.index.set_vectors(list(ids), [vecs[j] for j in range(len(ids))], self.embedder.name)
+            done += len(ids)
         METRICS.observe("memd_reembed_ms", (time.monotonic() - t0) * 1000,
                         help="re-embedding batch duration (ms)", ns=ns.namespace)
         try:
@@ -2080,6 +2088,10 @@ class Memory:
             # the tantivy accelerator is derived and serves its tail from
             # FTS5 meanwhile, so this is about speed, not visibility
             lex.drain(timeout_s=self._lexical_flush_drain_s)
+        ann = self.ns.index.ann
+        if ann is not None:
+            # likewise the ANN sidecar (the exact scan serves while it builds)
+            ann.drain(timeout_s=self._vector_flush_drain_s)
         self._flush_all_audits()
 
     def close(self) -> None:

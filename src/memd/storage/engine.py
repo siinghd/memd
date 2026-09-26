@@ -125,6 +125,10 @@ class Manifest:
     # retires only ops whose effect its output copies carry, so replay does
     # catch an older image up across it.
     compact_seq: int = 0
+    # The ANN sidecar's image published with the index snapshot above:
+    # {"name", "seq", "uid", "wm"} - usable only on top of that index image
+    # (the same vec_uid and vec_wm; see memd.index.ann_usearch)
+    vector_snapshot: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -144,6 +148,7 @@ class Manifest:
             "checkpoint_gen": self.checkpoint_gen,
             "scrub_seq": self.scrub_seq,
             "compact_seq": self.compact_seq,
+            "vector_snapshot": self.vector_snapshot,
         }
 
     @classmethod
@@ -171,6 +176,7 @@ class Manifest:
             # a manifest written before the field: any checkpoint may have
             # been a compaction, so its snapshot must cover the newest one
             compact_seq=int(d.get("compact_seq", checkpoint_seq) or 0),
+            vector_snapshot=dict(d.get("vector_snapshot") or {}),
         )
 
 
@@ -606,8 +612,11 @@ class NamespaceStore:
         wal_rotate_bytes: int = DEFAULT_WAL_ROTATE_BYTES,
         wal_rotate_frames: int = DEFAULT_WAL_ROTATE_FRAMES,
         lexical: dict | None = None,
+        vector_index: dict | None = None,
     ):
         self.namespace = namespace
+        # {"mode": "flat"|"auto"|"usearch", ...} - see ann_usearch.vector_index_config
+        self._vector_cfg = dict(vector_index or {})
         self.store = store
         self.envelope = envelope or NullKeyEnvelope()
         self.wal_rotate_bytes = wal_rotate_bytes
@@ -711,9 +720,60 @@ class NamespaceStore:
                         help="namespaces opened without the tantivy accelerator (FTS5 serves)",
                         ns=self.namespace, detail=type(ex).__name__)
 
+    def _attach_vector_index(self) -> None:
+        """Optional usearch sidecar for the vector lane (derived, local,
+        rebuildable - see memd.index.ann_usearch). Attached before replay, so
+        replayed changes reach it like live ones; loaded from its file, else
+        from the published snapshot, else rebuilt in the background. It must
+        never stop a namespace opening: the exact scan serves without it."""
+        path = os.path.splitext(self.index.path)[0] + ".usearch"
+        if self._vector_cfg.get("mode") not in ("auto", "usearch"):
+            # opened without it: rows changed now would be missing from a file
+            # kept around
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            return
+        ann = None
+        try:
+            from memd.index.ann_usearch import UsearchSidecar
+
+            ann = UsearchSidecar(self.index, path, cfg=self._vector_cfg,
+                                 scrub_seq=self.manifest.scrub_seq)
+            self.index.attach_ann(ann)
+            ann.start(fetch_snapshot=self._fetch_vector_snapshot)
+        except Exception as ex:  # noqa: BLE001 - the exact scan serves the lane
+            self.index.ann = None
+            if ann is not None:
+                try:
+                    ann.close()
+                except Exception:
+                    pass
+            shutil.rmtree(path, ignore_errors=True)
+            METRICS.inc("memd_vector_index_attach_failures_total",
+                        help="namespaces opened without the usearch sidecar (the exact scan serves)",
+                        ns=self.namespace, detail=type(ex).__name__)
+
+    def _fetch_vector_snapshot(self, uid: str, wm: int) -> bytes | None:
+        """The published sidecar image, decrypted - only when the manifest
+        says it was taken with an index image of exactly this vec_uid/vec_wm
+        (i.e. the one just installed) and it covers the snapshot floor, the
+        same validity rule as the index snapshot."""
+        vs = self.manifest.vector_snapshot or {}
+        if (not vs.get("name") or vs.get("uid") != uid or int(vs.get("wm", -1)) != int(wm)
+                or int(vs.get("seq", 0)) < self._snapshot_floor()):
+            return None
+        blob = self.store.get(self._snapshot_key(vs["name"]))
+        if not blob:
+            return None
+        return self.envelope.decrypt(self.namespace, blob) if self.envelope.enabled else blob
+
     # ---------------------------------------------------------- index snapshot
 
     SNAPSHOT_MIN_RECORDS = 2_000   # below this, full replay is already fast
+    # below this many vectors a sidecar rebuild takes well under a second:
+    # publishing its image is not worth an object
+    VECTOR_SNAPSHOT_MIN_VECTORS = 10_000
+    VECTOR_PURGE_REBUILD_WAIT_S = 900.0
 
     def _snapshot_key(self, name: str) -> str:
         return f"{self.prefix}/{name}"
@@ -745,39 +805,68 @@ class NamespaceStore:
                 return False
             scrub_seq = self.manifest.scrub_seq
             self.index.flush()
+            # The ANN sidecar's image must be taken at exactly the vec_wm the
+            # index image holds: its appliers are held off (writes go on, and
+            # queue) from before the backup until it is saved at that value.
+            ann = self.index.ann
+            freeze = (ann.frozen() if ann is not None
+                      and ann.publishable(self.VECTOR_SNAPSHOT_MIN_VECTORS)
+                      else contextlib.nullcontext())
+            vec_img = None  # (open file, state) of the sidecar at the image's vec_wm
             fd, tmp = _tf.mkstemp(prefix="memd-snap-", suffix=".sqlite")
             os.close(fd)
             try:
-                dst = _sq.connect(tmp)
-                try:
-                    # sqlite's backup API cannot make progress while the
-                    # SOURCE connection holds an open write transaction - it
-                    # retries forever - and this index commits LAZILY, so a
-                    # transaction is usually open. Commit inside the lock,
-                    # immediately before the copy, so nothing can reopen one in
-                    # between. (Flushing outside the lock was not enough: the
-                    # embed worker reopened a transaction in the gap and the
-                    # backup wedged the whole namespace - maintenance thread
-                    # holding index._lock, every writer queued behind it.)
-                    with self.index._lock:
-                        if self.index._closed:
-                            return False
-                        if self.index._con.in_transaction:
-                            self.index._con.commit()
-                        # what the image covers, and the purge it is scrubbed to
-                        img_seq = int(self.index.get_meta("applied_seq") or 0)
-                        img_scrubbed = int(self.index.get_meta("scrubbed_seq") or 0)
-                        self.index._con.backup(dst)
-                finally:
-                    dst.close()
+                with freeze:
+                    dst = _sq.connect(tmp)
+                    try:
+                        # sqlite's backup API cannot make progress while the
+                        # SOURCE connection holds an open write transaction - it
+                        # retries forever - and this index commits LAZILY, so a
+                        # transaction is usually open. Commit inside the lock,
+                        # immediately before the copy, so nothing can reopen one in
+                        # between. (Flushing outside the lock was not enough: the
+                        # embed worker reopened a transaction in the gap and the
+                        # backup wedged the whole namespace - maintenance thread
+                        # holding index._lock, every writer queued behind it.)
+                        with self.index._lock:
+                            if self.index._closed:
+                                return False
+                            if self.index._con.in_transaction:
+                                self.index._con.commit()
+                            # what the image covers, and the purge it is scrubbed to
+                            img_seq = int(self.index.get_meta("applied_seq") or 0)
+                            img_scrubbed = int(self.index.get_meta("scrubbed_seq") or 0)
+                            img_vec_wm = self.index._vec_wm
+                            self.index._con.backup(dst)
+                    finally:
+                        dst.close()
+                    if ann is not None and not isinstance(freeze, contextlib.nullcontext):
+                        try:
+                            vec_img = ann.image_at(img_vec_wm)
+                        except Exception as ex:  # noqa: BLE001 - published without it
+                            METRICS.inc("memd_vector_index_snapshot_failures_total", ns=self.namespace,
+                                        detail=type(ex).__name__)
                 with open(tmp, "rb") as f:
                     blob = gzip.compress(f.read(), compresslevel=1)
+                vec_payload = None
+                if vec_img is not None:
+                    from memd.index.ann_usearch import UsearchSidecar
+
+                    vf, vst = vec_img
+                    try:
+                        vec_payload = UsearchSidecar.snapshot_payload(vf, vst)
+                    finally:
+                        vf.close()
+                    if self.envelope.enabled:
+                        vec_payload = self.envelope.encrypt(self.namespace, bytes(vec_payload))
             finally:
                 for suffix in ("", "-wal", "-shm"):
                     try:
                         os.unlink(tmp + suffix)
                     except OSError:
                         pass
+                if vec_img is not None and not vec_img[0].closed:
+                    vec_img[0].close()
             # The expensive part (backup + gzip) ran WITHOUT the namespace lock
             # on purpose. Publishing must take it: a destroy racing this would
             # otherwise put() an object under a crypto-SHREDDED namespace and,
@@ -810,15 +899,30 @@ class NamespaceStore:
                 name = f"index-{ulid_new()}.g{self.manifest.version}.snap"
                 payload = self.envelope.encrypt(self.namespace, blob) if self.envelope.enabled else blob
                 self.store.put(self._snapshot_key(name), payload)
+                vs = {}
+                if vec_payload is not None:
+                    # published under the same rules: generation-stamped for
+                    # collection, referenced only together with its index image
+                    vname = f"vector-{ulid_new()}.g{self.manifest.version}.snap"
+                    self.store.put(self._snapshot_key(vname), vec_payload)
+                    vs = {"name": vname, "seq": self.manifest.seq, "uid": vec_img[1]["uid"],
+                          "wm": int(vec_img[1]["wm"])}
                 old = self.manifest.snapshot_name
+                old_vec = (self.manifest.vector_snapshot or {}).get("name", "")
                 self.manifest.snapshot_name = name
                 self.manifest.snapshot_seq = self.manifest.seq
+                self.manifest.vector_snapshot = vs
                 self._persist_manifest()
-            if old and old != name:      # only after the new one is referenced
-                try:
-                    self.store.delete(self._snapshot_key(old))
-                except Exception:
-                    pass
+            for stale in (old, old_vec):  # only after the new ones are referenced
+                if stale and stale not in (name, vs.get("name")):
+                    try:
+                        self.store.delete(self._snapshot_key(stale))
+                    except Exception:
+                        pass
+            if vs:
+                METRICS.inc("memd_vector_index_snapshots_written_total",
+                            help="vector sidecar images published with an index snapshot",
+                            ns=self.namespace)
             METRICS.inc("memd_index_snapshots_written_total", ns=self.namespace)
             METRICS.observe("memd_index_snapshot_bytes", float(len(payload)),
                             help="index snapshot size (bytes)",
@@ -941,6 +1045,8 @@ class NamespaceStore:
             # replay only the tail past it.
             applied = self._install_index_snapshot()
             self._replayed_at_open = True
+        # BEFORE replay: the replayed changes reach it through the index hooks
+        self._attach_vector_index()
         versions, carried, max_fold = self._load_checkpoints(applied, where="segment-replay")
         max_fold = self._adopt_orphan_segments(versions, carried, applied, max_fold)
         wal = self.store.get(self.wal_key) or b""
@@ -1014,8 +1120,12 @@ class NamespaceStore:
         data alone, and the tantivy copy is rebuilt. A snapshot older than
         the newest compaction is dropped as well (see _snapshot_floor)."""
         m = self.manifest
-        if m.snapshot_name and m.snapshot_seq < self._snapshot_floor():
-            self._drop_snapshot("predates a purge" if m.snapshot_seq < m.scrub_seq
+        vs = m.vector_snapshot or {}
+        stale = [seq for name, seq in ((m.snapshot_name, m.snapshot_seq),
+                                       (vs.get("name"), int(vs.get("seq", 0) or 0)))
+                 if name and seq < self._snapshot_floor()]
+        if stale:
+            self._drop_snapshot("predates a purge" if min(stale) < m.scrub_seq
                                 else "predates a compaction")
         try:
             done = int(self.index.get_meta("scrubbed_seq") or 0)
@@ -1030,19 +1140,25 @@ class NamespaceStore:
         self.index.set_meta("scrubbed_seq", str(m.scrub_seq))
 
     def _drop_snapshot(self, reason: str) -> None:
-        """Unreference and delete the index snapshot (a replay replaces it)."""
+        """Unreference and delete the index snapshot (a replay replaces it),
+        and the sidecar image published with it."""
         with self._lock:
             name = self.manifest.snapshot_name
-            if not name:
+            vname = (self.manifest.vector_snapshot or {}).get("name", "")
+            if not name and not vname:
                 return
             self.manifest.snapshot_name, self.manifest.snapshot_seq = "", 0
+            self.manifest.vector_snapshot = {}
             self._persist_manifest()
-        try:
-            self.store.delete(self._snapshot_key(name))
-        except Exception:  # noqa: BLE001 - unreferenced now: collected at a later open
-            return
-        self.snapshots_collected += 1
-        self._note_collected("snapshot_gc", name, {"reason": reason})
+        for n in (name, vname):
+            if not n:
+                continue
+            try:
+                self.store.delete(self._snapshot_key(n))
+            except Exception:  # noqa: BLE001 - unreferenced now: collected at a later open
+                continue
+            self.snapshots_collected += 1
+            self._note_collected("snapshot_gc", n, {"reason": reason})
 
     def _note_collected(self, action: str, target: str, detail: dict) -> None:
         detail = dict(detail, action=action, target=target)
@@ -1080,7 +1196,8 @@ class NamespaceStore:
         m = self.manifest
         if m.checkpoint_gen <= 0 or not (self._owner_path or self._owner_lease):
             return
-        live = {s["name"] for s in m.segments} | {m.checkpoint, m.snapshot_name}
+        live = ({s["name"] for s in m.segments} | {m.checkpoint, m.snapshot_name}
+                | {(m.vector_snapshot or {}).get("name", "")})
         try:
             keys = self.store.list(f"{self.prefix}/")
         except Exception:  # noqa: BLE001 - collection is retried on every open
@@ -1098,7 +1215,7 @@ class NamespaceStore:
                 _log.info("namespace %s: deleted %s, left by an interrupted put",
                           self.namespace, name)
                 continue
-            if name.startswith("index-") and name.endswith(".snap"):
+            if name.startswith(("index-", "vector-")) and name.endswith(".snap"):
                 g = _re.search(r"\.g(\d+)\.snap$", name)
                 gen = int(g.group(1)) if g else 0
                 if gen >= m.checkpoint_gen:
@@ -2442,8 +2559,10 @@ class NamespaceStore:
             # published below (if the namespace is past the size floor)
             # replaces it.
             self.manifest.compact_seq = self.manifest.seq
-            stale_snapshot = self.manifest.snapshot_name
+            stale_snapshots = [n for n in (self.manifest.snapshot_name,
+                                           (self.manifest.vector_snapshot or {}).get("name", "")) if n]
             self.manifest.snapshot_name, self.manifest.snapshot_seq = "", 0
+            self.manifest.vector_snapshot = {}
             # a purge of hard-deleted records: every cache of them must follow
             purged = sum(1 for op in folded if op.get("op") == "hard_delete") > len(pending_ops)
             if purged:
@@ -2460,7 +2579,7 @@ class NamespaceStore:
             self.store.delete(self.ops_key)
             for on in old_names:
                 self.store.delete(f"{self.prefix}/{on}")
-            if stale_snapshot:
+            for stale_snapshot in stale_snapshots:
                 try:
                     self.store.delete(self._snapshot_key(stale_snapshot))
                 except Exception:  # noqa: BLE001 - unreferenced now: collected later
@@ -2480,6 +2599,10 @@ class NamespaceStore:
             # incomplete scrub is redone by the next open)
             if purged and self.index.scrub():
                 self.index.set_meta("scrubbed_seq", str(self.manifest.scrub_seq))
+            # ...and from the ANN sidecar: its files go now (usearch removal
+            # only marked the purged vectors), and it is rebuilt from SQLite
+            ann_ticket = (self.index.ann.purged(self.manifest.scrub_seq)
+                          if purged and self.index.ann is not None else 0)
             METRICS.set_gauge("memd_pending_purges", len(self._pending_hard), ns=self.namespace)
             rep.segments_out = len(self.manifest.segments)
             rep.records_folded = len(kept)
@@ -2495,6 +2618,11 @@ class NamespaceStore:
         # every writer on the namespace for its whole duration (a writer sat
         # 900s on `with self._lock` in append). It reads a consistent image via
         # sqlite's online backup API, so it needs no such exclusion.
+        if ann_ticket and self.index.ann is not None:
+            # the purge's sidecar rebuild, so the snapshot below carries a
+            # sidecar image without the purged vectors (outside the namespace
+            # lock: writes go on meanwhile; the old sidecar serves)
+            self.index.ann.wait_built(ann_ticket, timeout_s=self.VECTOR_PURGE_REBUILD_WAIT_S)
         self.write_index_snapshot()
         if self.manifest.snapshot_name and self.manifest.snapshot_seq < self._snapshot_floor():
             self._drop_snapshot("predates a purge")  # (publish refuses such an image; belt and braces)
@@ -2698,10 +2826,13 @@ class StorageEngine:
         wal_rotate_frames: int = DEFAULT_WAL_ROTATE_FRAMES,
         max_open_namespaces: int = 64,
         lexical: dict | None = None,
+        vector_index: dict | None = None,
     ):
         self.root = root
         # {"backend": "fts5"|"tantivy", "commit_ms", "commit_docs"}
         self.lexical = dict(lexical or {})
+        # {"mode": "flat"|"auto"|"usearch", ...}: the vector lane's ANN sidecar
+        self.vector_index = dict(vector_index or {})
         self.store = store or LocalObjectStore(root)
         self.envelope = envelope
         self.cache_dir = cache_dir or os.path.join(root, "_cache")
@@ -2852,6 +2983,7 @@ class StorageEngine:
                     nstore = NamespaceStore(
                         ns, self.store, self.cache_dir, self.envelope, self.wal_rotate_bytes,
                         self.wal_rotate_frames, lexical=self.lexical,
+                        vector_index=self.vector_index,
                     )
                     opened = True
                     with self._lock:
@@ -2961,6 +3093,8 @@ class StorageEngine:
                 pass
         # the tantivy accelerator holds the same text (tokenized): shred it too
         shutil.rmtree(os.path.join(self.cache_dir, f"{safe}.tantivy"), ignore_errors=True)
+        # and the ANN sidecar holds its vectors
+        shutil.rmtree(os.path.join(self.cache_dir, f"{safe}.usearch"), ignore_errors=True)
         if self.envelope is not None:
             self.envelope.destroy(ns)
         return existed or n > 0

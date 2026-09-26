@@ -2,9 +2,11 @@
 
 Backing: SQLite (WAL mode) providing
   - BM25 via FTS5 (tantivy-class sparse retrieval without a second service)
-  - flat exact vector scan via a cached numpy matrix (size-adaptive strategy:
-    namespaces < ~50K vectors - the vast majority - get perfect recall here;
-    IVF-PQ slots behind VectorSearchStrategy later without API change)
+  - flat exact vector scan via a cached numpy matrix (namespaces below
+    ~20K vectors - the vast majority - get perfect recall here); larger ones
+    are served by an optional usearch HNSW sidecar (memd[ann]; see
+    memd.index.ann_usearch), a derived view of the vectors table attached by
+    the namespace store
   - btree columns for time / entity / scope / validity filtering
   - optionally, a tantivy accelerator for the bm25 lane (memd[fast]; see
     memd.index.tantivy_lexical): a derived view of this index, attached by
@@ -136,6 +138,10 @@ class NamespaceIndex:
         # optional lexical accelerator (TantivyLexical); every mutation below
         # tells it which rows changed BEFORE the change becomes visible
         self.lexical = None
+        # optional ANN sidecar (UsearchSidecar); every mutation that can
+        # change the (rowid -> vector) set it mirrors bumps vec_wm in its
+        # own transaction and queues the rows' new state (see _ann_note_locked)
+        self.ann = None
         # Hard-deleted text must not survive in this file (D7): zero every
         # freed cell and page, and keep the freelist vacuumable (auto_vacuum
         # only takes effect before the first table exists - see scrub()).
@@ -151,6 +157,19 @@ class NamespaceIndex:
         row = self._con.execute("SELECT v FROM meta WHERE k='rowid_hwm'").fetchone()
         self._rowid_hwm = int(row[0]) if row else 0
         self._rowid_gap = self._rowid_hwm > 0
+        # the vector watermark: bumped with every change the ANN sidecar must
+        # mirror, committed with it; a sidecar file saved at another value (or
+        # for another file: vec_uid) is not this index's and is rebuilt
+        row = self._con.execute("SELECT v FROM meta WHERE k='vec_wm'").fetchone()
+        self._vec_wm = int(row[0]) if row else 0
+        row = self._con.execute("SELECT v FROM meta WHERE k='vec_uid'").fetchone()
+        if row is None:
+            import uuid
+
+            self._con.execute("INSERT INTO meta(k,v) VALUES('vec_uid',?)", (uuid.uuid4().hex,))
+            self._con.commit()
+            row = self._con.execute("SELECT v FROM meta WHERE k='vec_uid'").fetchone()
+        self.vec_uid = str(row[0])
 
     def _migrate(self) -> None:
         c = self._con
@@ -276,12 +295,22 @@ class NamespaceIndex:
     def attach_lexical(self, lexical) -> None:
         self.lexical = lexical
 
+    def attach_ann(self, ann) -> None:
+        self.ann = ann
+
     def close(self) -> None:
         lex, self.lexical = self.lexical, None
         if lex is not None:
             # its final batch reads this index, so it goes first
             try:
                 lex.close()
+            except Exception:
+                pass
+        ann, self.ann = self.ann, None
+        if ann is not None:
+            # it saves at a committed watermark, which it reads from here
+            try:
+                ann.close()
             except Exception:
                 pass
         with self._lock:
@@ -317,12 +346,15 @@ class NamespaceIndex:
                 return
             c = self._con
             try:
+                ann_on = self.ann is not None and self.ann.tracking()
+                existing = (self._existing_ids(c, [rec.id for rec, _, _ in items])
+                            if self.lexical is not None or ann_on else [])
                 if self.lexical is not None:
                     # an upsert that overwrites an existing id (a native
                     # import keeps ids) changes a row the accelerator may
                     # already hold: its content, scope or flags must be
                     # re-indexed, not just rows above the watermark
-                    self._lex_touch(self._existing_ids(c, [rec.id for rec, _, _ in items]))
+                    self._lex_touch(existing)
                 rowid = self._next_rowid_locked(c)
                 for rec, vec, model in items:
                     p = rec.provenance
@@ -381,6 +413,12 @@ class NamespaceIndex:
                 # tail serves them until the accelerator indexes them
                 if self.lexical is not None:
                     self.lexical.note_new(len(items))
+                # a new row has no vector yet (the embed worker adds it); an
+                # overwritten one may have changed its vector or liveness
+                changed = set(existing) | {rec.id for rec, vec, _ in items if vec is not None}
+                if changed:
+                    self._bump_vec_wm_locked(c)
+                    self._ann_note_locked(c, sorted(changed))
                 # no per-batch commit: lazy via _maybe_commit (replay-safe)
             except Exception:
                 self.flush()  # don't leave a broken transaction open
@@ -389,6 +427,7 @@ class NamespaceIndex:
                 pass  # vector cache updates flow through set_vector (incremental)
         self._stats_cache = None  # writes invalidate the stats cache
         self._maybe_commit()
+        self._ann_apply()
 
     def set_meta(self, k: str, v: str) -> None:
         with self._lock:
@@ -469,38 +508,104 @@ class NamespaceIndex:
     OVERFLOW_MAX = 4096
 
     def set_vector(self, record_id: str, vec: np.ndarray, model: str) -> None:
-        blob = _vec_blob(vec)
-        # the in-RAM cache keeps float32 (BLAS scans it); only the DURABLE
-        # copy is halved, so search precision is untouched
-        v = np.asarray(vec, dtype=np.float32).ravel()
-        _n = float(np.linalg.norm(v))
-        if _n > 0:
-            v = v / _n
+        self.set_vectors([record_id], [vec], model)
+
+    def set_vectors(self, record_ids: list[str], vecs, model: str) -> None:
+        """Store one batch of vectors (the embed worker's unit): one lock
+        hold, one watermark bump, one ANN sidecar change."""
+        if not record_ids:
+            return
+        items = []
+        for rid, vec in zip(record_ids, vecs):
+            # the in-RAM cache keeps float32 (BLAS scans it); only the DURABLE
+            # copy is halved, so search precision is untouched
+            v = np.asarray(vec, dtype=np.float32).ravel()
+            _n = float(np.linalg.norm(v))
+            if _n > 0:
+                v = v / _n
+            items.append((rid, v, _vec_blob(vec)))
         with self._lock:
             if self._closed:
                 METRICS.inc("memd_index_write_after_close_total", ns=self._ns_hint)
                 return
-            # durable store write always happens; the in-memory cache append
-            # is skipped only when the cache has not been built yet (the next
-            # search loads everything from sqlite)
-            self._con.execute(
-                "INSERT OR REPLACE INTO vectors(id,dim,model,vec) VALUES(?,?,?,?)",
-                (record_id, int(vec.shape[0]), model, blob),
-            )
-            self._con.execute("UPDATE records SET embedding_version=? WHERE id=?", (model, record_id))
-            if self._vec_loaded:
-                dim = self._main_mat.shape[1] if self._main_mat.size else int(v.shape[0])
-                if int(v.shape[0]) == dim or self._main_mat.size == 0:
-                    # v is already unit-norm; overflow append is O(P), P
-                    # bounded by fold threshold - never O(total) per write
-                    self._ovf_ids.append(record_id)
-                    self._ovf_vecs.append(v)
-                    if len(self._ovf_ids) >= self.OVERFLOW_MAX:
-                        self._fold_overflow_locked()
+            c = self._con
+            for record_id, v, blob in items:
+                # durable store write always happens; the in-memory cache append
+                # is skipped only when the cache has not been built yet (the next
+                # search loads everything from sqlite)
+                c.execute(
+                    "INSERT OR REPLACE INTO vectors(id,dim,model,vec) VALUES(?,?,?,?)",
+                    (record_id, int(v.shape[0]), model, blob),
+                )
+                c.execute("UPDATE records SET embedding_version=? WHERE id=?", (model, record_id))
+                if self._vec_loaded:
+                    dim = self._main_mat.shape[1] if self._main_mat.size else int(v.shape[0])
+                    if int(v.shape[0]) == dim or self._main_mat.size == 0:
+                        # v is already unit-norm; overflow append is O(P), P
+                        # bounded by fold threshold - never O(total) per write
+                        self._ovf_ids.append(record_id)
+                        self._ovf_vecs.append(v)
+                        if len(self._ovf_ids) >= self.OVERFLOW_MAX:
+                            self._fold_overflow_locked()
+                    else:
+                        self.invalidate_vec_cache()
+            self._bump_vec_wm_locked(c)
+            if self.ann is not None:
+                if self.ann.tracking():
+                    self._ann_note_locked(c, [rid for rid, _, _ in items])
                 else:
-                    self.invalidate_vec_cache()
+                    self.ann.count_hint(len(items))
         self._invalidate_stats()
         self._maybe_commit()
+        self._ann_apply()
+
+    # ------------------------------------------------------------ ANN hooks
+
+    def _bump_vec_wm_locked(self, c: sqlite3.Connection) -> None:
+        """(write lock held, inside the change's transaction) Advance the
+        vector watermark: committed with the change or lost with it."""
+        self._vec_wm += 1
+        c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('vec_wm',?)", (str(self._vec_wm),))
+
+    def _ann_note_locked(self, c: sqlite3.Connection, ids: list[str],
+                         removed_rowids: list[int] = ()) -> None:
+        """(write lock held, after the change) Queue these records' state for
+        the ANN sidecar: the vector of each live one, a removal for the rest
+        (and for `removed_rowids`, rows a hard delete already took away).
+        Read through the writer connection, so it sees the uncommitted change."""
+        ann = self.ann
+        if ann is None or not ann.tracking():
+            return
+        removes: list[int] = [int(r) for r in removed_rowids]
+        adds: list[tuple[int, bytes, int]] = []
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            for r in c.execute(
+                    "SELECT r.rowid, r.deleted, r.quarantined, r.invalidated_at, r.superseded_by, "
+                    "v.vec, v.dim FROM records r LEFT JOIN vectors v ON v.id = r.id "
+                    f"WHERE r.id IN ({','.join('?' * len(chunk))})", chunk).fetchall():  # nosec B608
+                live = (not r[1] and not r[2] and r[3] is None and r[4] is None)
+                if live and r[5] is not None:
+                    adds.append((int(r[0]), bytes(r[5]), int(r[6])))
+                else:
+                    removes.append(int(r[0]))
+        if removes or adds:
+            ann.note(self._vec_wm, removes, adds)
+
+    def _rowids_of(self, c: sqlite3.Connection, ids: list[str]) -> list[int]:
+        out: list[int] = []
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            out += [int(r[0]) for r in c.execute(
+                f"SELECT rowid FROM records WHERE id IN ({','.join('?' * len(chunk))})",  # nosec B608
+                chunk).fetchall()]
+        return out
+
+    def _ann_apply(self) -> None:
+        """(write lock released) Apply what the hooks queued."""
+        ann = self.ann
+        if ann is not None:
+            ann.apply_pending()
 
     def _lex_touch(self, ids) -> None:
         if self.lexical is not None:
@@ -552,8 +657,11 @@ class NamespaceIndex:
                 "UPDATE records SET invalidated_at=?, superseded_by=? WHERE id=?",
                 (at_ms, new_id, old_id),
             )
+            self._bump_vec_wm_locked(self._con)
+            self._ann_note_locked(self._con, [old_id])
             self._con.commit()
             self._invalidate_stats()
+        self._ann_apply()
 
     def mark_quarantined(self, record_id: str, flag: bool) -> None:
         with self._lock:
@@ -572,8 +680,12 @@ class NamespaceIndex:
                     "WHERE id=?",
                     (record_id,),
                 )
+            # an unquarantined record's vector goes back into the sidecar
+            self._bump_vec_wm_locked(self._con)
+            self._ann_note_locked(self._con, [record_id])
             self._con.commit()
             self._invalidate_stats()
+        self._ann_apply()
 
     def tombstone(self, record_id: str, at_ms: int) -> bool:
         with self._lock:
@@ -582,9 +694,12 @@ class NamespaceIndex:
                 "UPDATE records SET deleted=1, invalidated_at=COALESCE(invalidated_at,?) WHERE id=?",
                 (at_ms, record_id),
             )
+            self._bump_vec_wm_locked(self._con)
+            self._ann_note_locked(self._con, [record_id])
             self._con.commit()
             self._invalidate_stats()
-            return cur.rowcount > 0
+        self._ann_apply()
+        return cur.rowcount > 0
 
     def scrub(self) -> bool:
         """Remove what deleted rows left behind in the FILE (D7).
@@ -623,11 +738,15 @@ class NamespaceIndex:
         with self._lock:
             self._lex_touch([record_id])
             self._note_rowid_hwm(self._con)
+            gone = self._rowids_of(self._con, [record_id]) if self.ann is not None else []
             cur = self._con.execute("DELETE FROM records WHERE id=?", (record_id,))
             self._hard_delete_rows(self._con, record_id)
+            self._bump_vec_wm_locked(self._con)
+            self._ann_note_locked(self._con, [], removed_rowids=gone)
             self._con.commit()
             self._invalidate_stats()
-            return cur.rowcount > 0
+        self._ann_apply()
+        return cur.rowcount > 0
 
     @staticmethod
     def _hard_delete_rows(c: sqlite3.Connection, record_id: str) -> None:
@@ -661,8 +780,11 @@ class NamespaceIndex:
                              if (op.get("id") or op.get("old"))
                              and op.get("op") in ("tombstone", "supersede", "quarantine", "hard_delete")])
             try:
-                if any(op.get("op") == "hard_delete" for op in ops):
+                hard = [op.get("id") for op in ops if op.get("op") == "hard_delete" and op.get("id")]
+                if hard:
                     self._note_rowid_hwm(c)
+                # a hard-deleted row is gone after the batch: its rowid first
+                gone = self._rowids_of(c, hard) if hard and self.ann is not None else []
                 for op in ops:
                     kind = op.get("op")
                     rid = op.get("id") or op.get("old")
@@ -698,11 +820,18 @@ class NamespaceIndex:
                     elif kind == "hard_delete":
                         c.execute("DELETE FROM records WHERE id=?", (rid,))
                         self._hard_delete_rows(c, rid)
+                self._bump_vec_wm_locked(c)
+                self._ann_note_locked(
+                    c, sorted({op.get("id") or op.get("old") for op in ops
+                               if (op.get("id") or op.get("old"))
+                               and op.get("op") in ("tombstone", "supersede", "quarantine", "set_vector")}),
+                    removed_rowids=gone)
                 c.commit()
             except Exception:
                 self.flush()  # don't leave a broken transaction open
                 raise
             self._invalidate_stats()
+        self._ann_apply()
 
     # ------------------------------------------------------------------ reads
 
@@ -1046,6 +1175,159 @@ class NamespaceIndex:
         return {r[0] for r in rows}
 
     def search_vector(self, query_vec: np.ndarray, f: IndexFilter, limit: int = 50) -> list[Hit]:
+        """The vector lane: the ANN sidecar when it is kept and can answer
+        (see _search_vector_ann), else the exact flat scan. Either way every
+        hit passes the SQL filter and _passes_filter, and hits are ordered by
+        fusion's key (score, -t_event, content hash, id)."""
+        q = np.asarray(query_vec, dtype=np.float32).ravel()
+        nrm = float(np.linalg.norm(q))
+        if nrm > 0:
+            q = q / nrm
+        ann = self.ann
+        if ann is not None and ann.active() and not self._closed:
+            hits = self._search_vector_ann(ann, q, f, limit)
+            if hits is not None:
+                return hits
+        return self._search_vector_flat(q, f, limit)
+
+    @staticmethod
+    def _restrictive(f: IndexFilter) -> bool:
+        """Whether the filter can narrow the candidate set below the whole
+        live namespace (a scope with no component set cannot)."""
+        s = f.scope
+        return bool((s is not None and any(v is not None for v in (s.org, s.agent, s.user, s.session)))
+                    or f.kinds or f.sources or f.entity_keys or f.t_event_min is not None
+                    or f.t_event_max is not None or f.as_of is not None)
+
+    def _ann_where(self, f: IndexFilter, args: list) -> str:
+        """The SQL filter the ANN path applies to its candidates: the same
+        predicate set as every other lane (a seam the isolation tests
+        sabotage, to prove _passes_filter alone still holds the boundary)."""
+        return self._filter_where(f, args)
+
+    def _search_vector_ann(self, ann, q: np.ndarray, f: IndexFilter, limit: int) -> list[Hit] | None:
+        """usearch top-(limit x overfetch), widened once, then the SQL filter
+        and _passes_filter on the candidates, re-scored exactly from SQLite.
+        None: the sidecar cannot answer and the flat scan does. Answered
+        exactly here instead: a selective filter (<= ann.exact_max rows), a
+        sidecar no larger than that, and a window still short after widening."""
+        if limit >= _SWEEP_LIMIT:
+            # a destructive sweep must see every match: the flat scan's job
+            ann.note_fallback("sweep")
+            return None
+        if not ann.ready():
+            ann.note_fallback("not_ready")
+            return None
+        size = ann.size()
+        if size <= ann.exact_max:
+            ann.note_fallback("selective")
+            return self._exact_vector(q, f, limit)
+        if self._restrictive(f):
+            args: list = []
+            where = self._ann_where(f, args)
+            with self._read() as _c:
+                n = int(_c.execute(
+                    f"SELECT COUNT(*) FROM (SELECT 1 FROM records WHERE {where} LIMIT ?)",  # nosec B608
+                    args + [ann.exact_max + 1]).fetchone()[0])
+            if n <= ann.exact_max:
+                ann.note_fallback("selective")
+                return self._exact_vector(q, f, limit)
+        k = min(limit * ann.overfetch, size)
+        seen: set[int] = set()
+        hits: list[Hit] = []
+        full = False
+        for attempt in range(2):
+            got = ann.knn(q, k)
+            if got is None:
+                ann.note_fallback("error")
+                return None
+            keys, dists = got
+            fresh = [int(x) for x in keys if int(x) not in seen]
+            seen.update(fresh)
+            hits += self._score_rowids(q, f, fresh)
+            # a full window may hide eligible rows past it, unless its edge is
+            # already below the cosine floor (everything deeper is too)
+            full = len(keys) >= k and k < size and not (
+                len(dists) and 1.0 - float(dists[-1]) < MIN_COSINE)
+            if len(hits) >= limit or not full or attempt:
+                break
+            k = min(k * ann.overfetch, size)
+        if len(hits) < limit and full:
+            ann.note_fallback("short")
+            return self._exact_vector(q, f, limit)
+        ann.note_search()
+        return _vector_order(hits)[:limit]
+
+    def _score_rowids(self, q: np.ndarray, f: IndexFilter, rowids: list[int]) -> list[Hit]:
+        """Hydrate candidate rows that pass the SQL filter, score them exactly
+        from their stored vectors, and post-check them with _passes_filter."""
+        out: list[Hit] = []
+        if not rowids or self._closed:
+            return out
+        fargs: list = []
+        where = self._ann_where(f, fargs)
+        with self._read() as _c:
+            for i in range(0, len(rowids), 500):
+                chunk = rowids[i:i + 500]
+                rows = _c.execute(
+                    f"SELECT records.*, _v._vec, _v._dim FROM records {_VEC_JOIN} "  # nosec B608
+                    f"WHERE records.rowid IN ({','.join('?' * len(chunk))}) AND {where}",
+                    list(chunk) + fargs).fetchall()
+                for r in rows:
+                    if r["id"] in f.exclude_ids:
+                        continue
+                    v = _vec_from_blob(r["_vec"], int(r["_dim"]))
+                    if v.shape[0] != q.shape[0]:
+                        continue
+                    nv = float(np.linalg.norm(v))
+                    score = float(v @ q) / nv if nv > 0 else 0.0
+                    if score < MIN_COSINE:
+                        continue  # no-evidence match (see MIN_COSINE)
+                    rec = self._row_to_record(r)
+                    rec.namespace = self._ns_hint
+                    if not self._passes_filter(rec, f):
+                        continue
+                    out.append(Hit(record=rec, score=score, lane="vector"))
+        return out
+
+    def _exact_vector(self, q: np.ndarray, f: IndexFilter, limit: int) -> list[Hit]:
+        """Exact cosine top-`limit` over the rows the SQL filter admits,
+        streamed from SQLite (no resident matrix): the ANN path's exact
+        answer for selective filters and short windows."""
+        if self._closed:
+            return []
+        args: list = []
+        where = self._ann_where(f, args)
+        m = limit * 4 + len(f.exclude_ids)
+        best_s = np.zeros(0, dtype=np.float32)
+        best_r = np.zeros(0, dtype=np.int64)
+        with self._read() as _c:
+            cur = _c.execute(
+                f"SELECT records.rowid, _v._vec, _v._dim FROM records {_VEC_JOIN} WHERE {where}",  # nosec B608
+                args)
+            while True:
+                rows = cur.fetchmany(4096)
+                if not rows:
+                    break
+                keep = [r for r in rows if int(r[2]) == q.shape[0]]
+                if not keep:
+                    continue
+                mat = np.stack([_vec_from_blob(r[1], int(r[2])) for r in keep])
+                norms = np.linalg.norm(mat, axis=1)
+                norms[norms == 0] = 1.0
+                sc = (mat @ q) / norms
+                best_s = np.concatenate([best_s, sc.astype(np.float32)])
+                best_r = np.concatenate([best_r, np.asarray([r[0] for r in keep], dtype=np.int64)])
+                if best_s.shape[0] > m:
+                    top = np.argpartition(-best_s, m - 1)[:m]
+                    best_s, best_r = best_s[top], best_r[top]
+        if not best_s.shape[0]:
+            return []
+        order = np.argsort(-best_s, kind="stable")
+        hits = self._score_rowids(q, f, [int(best_r[i]) for i in order])
+        return _vector_order(hits)[:limit]
+
+    def _search_vector_flat(self, q: np.ndarray, f: IndexFilter, limit: int = 50) -> list[Hit]:
         """Flat cosine scan over main+overflow blocks. Per-query cost:
         O(V) BLAS dot + O(overflow) merge - never an O(total) rebuild.
 
@@ -1057,11 +1339,8 @@ class NamespaceIndex:
         deeper matches under fixed truncation - so after two speculative
         windows we fall back to ONE exact SQL restriction of the score
         vector. Bounded work per request: <= 2 speculative rounds + O(1)
-        fallback queries; hydration always chunked (500 ids/query)."""
-        q = np.asarray(query_vec, dtype=np.float32).ravel()
-        nrm = float(np.linalg.norm(q))
-        if nrm > 0:
-            q = q / nrm
+        fallback queries; hydration always chunked (500 ids/query). `q` is
+        unit-norm (search_vector)."""
         with self._lock:
             if self._closed:
                 return []
@@ -1112,7 +1391,7 @@ class NamespaceIndex:
                 top = top[np.argsort(-scores[top])]
                 _collect(top, seen, hits)
                 if len(hits) >= limit:
-                    return hits[:limit]
+                    return _vector_order(hits)[:limit]
         # phase 2: exact fallback - one SQL scan restricts scoring to rows
         # whose record satisfies every predicate, then rank within that set
         eligible = self._eligible_ids(f)
@@ -1127,7 +1406,7 @@ class NamespaceIndex:
             top = top[np.argsort(-sub_scores[top])]
             hits = []
             _collect(keep[top], set(), hits)
-        return hits[:limit]
+        return _vector_order(hits)[:limit]
 
     def _passes_filter(self, rec: MemoryRecord, f: IndexFilter) -> bool:
         """Python-side twin of _filter_where. Every predicate the SQL path
@@ -1484,12 +1763,16 @@ class NamespaceIndex:
                 "DELETE FROM vectors; DELETE FROM entities; "
                 "DELETE FROM entity_segments; DELETE FROM links; DELETE FROM records;"
             )
+            self._bump_vec_wm_locked(self._con)
             self._con.commit()
+            if self.ann is not None:
+                self.ann.note_reset(self._vec_wm)
             self._main_mat = np.zeros((0, 0), dtype=np.float32)
             self._main_ids = []
             self._ovf_ids = []
             self._ovf_vecs = []
             self._vec_loaded = True
+        self._ann_apply()
 
     def invalidate_vec_cache(self) -> None:
         """Fold-away hook after mass invalidation (compaction): next search
@@ -1548,3 +1831,33 @@ def _lane_order(rows: list) -> list:
         rank, t = _tie(r)
         return (rank, -t, content_sha(r["content"] or "") if groups[(rank, t)] > 1 else "", r["id"])
     return sorted(rows, key=key)
+
+
+# limits at or above this are sweeps (find_ids): answered by the exact scan
+_SWEEP_LIMIT = 1024
+# a record's stored vector, joined without ambiguating the unqualified
+# column names _filter_where emits (vectors has an `id` column too)
+_VEC_JOIN = ("JOIN (SELECT id AS _vid, vec AS _vec, dim AS _dim FROM vectors) AS _v "
+             "ON _v._vid = records.id")
+# scores closer than this are ties: the same stored vector scored by two
+# code paths (a BLAS scan, a per-row dot) can differ in the last bits
+_VEC_QUANTUM = 1e-6
+
+
+def _vector_order(hits: list[Hit]) -> list[Hit]:
+    """Vector-lane hits in fusion's order: (-score, -t_event, content hash,
+    id), the hash computed only inside groups of tied (score, t_event). The
+    flat scan and the ANN sidecar return tied rows in the same order."""
+    from collections import Counter
+
+    from memd.query.fusion import content_sha
+
+    def q(h: Hit) -> int:
+        return round(h.score / _VEC_QUANTUM)
+
+    groups = Counter((q(h), h.record.time.t_event) for h in hits)
+
+    def key(h: Hit) -> tuple:
+        t = h.record.time.t_event
+        return (-q(h), -t, content_sha(h.record.content) if groups[(q(h), t)] > 1 else "", h.record.id)
+    return sorted(hits, key=key)
