@@ -7,9 +7,10 @@ import httpx
 
 
 class HostedError(RuntimeError):
-    def __init__(self, status: int, message: str):
+    def __init__(self, status: int, message: str, code: str | None = None):
         super().__init__(f"[{status}] {message}")
         self.status = status
+        self.code = code  # machine-readable ("not_found", "rate_limited", ...)
 
 
 class HostedMemory:
@@ -106,9 +107,13 @@ class HostedMemory:
         out.insert(insert_at, {"role": "system", "content": res.packed_context})
         return out
 
-    def get(self, record_id: str, *, history: bool = False, **kw) -> dict | None:
+    def get(self, record_id: str, *, history: bool = False, include_deleted: bool = False,
+            **kw) -> dict | None:
         ns = self._ns(kw)
-        r = self._client.get(f"/v1/ns/{ns}/memories/{record_id}", params={"history": str(history).lower()})
+        params = {"history": str(history).lower()}
+        if include_deleted:  # admin keys only (403 otherwise)
+            params["include_deleted"] = "true"
+        r = self._client.get(f"/v1/ns/{ns}/memories/{record_id}", params=params)
         if r.status_code == 404:
             return None
         self._raise(r)
@@ -172,7 +177,7 @@ class HostedMemory:
         """Without confirm: returns the preview dict (what WOULD be deleted).
         With confirm=True: executes and returns the deleted id list."""
         body: dict[str, Any] = {"query": query, "confirm": confirm}
-        for k in self._FIND_KEYS:
+        for k in self._FIND_KEYS + ("fingerprint",):
             if kw.get(k) is not None:
                 body[k] = kw[k]
         r = self._client.post(f"/v1/ns/{self._ns(kw)}/forget", json=body)
@@ -195,11 +200,13 @@ class HostedMemory:
     @staticmethod
     def _raise(r: httpx.Response) -> None:
         if r.status_code >= 400:
+            code = None
             try:
-                detail = r.json().get("detail", r.text)
+                body = r.json()
+                detail, code = body.get("detail", r.text), body.get("code")
             except Exception:
                 detail = r.text
-            raise HostedError(r.status_code, str(detail))
+            raise HostedError(r.status_code, str(detail), code)
 
     def close(self) -> None:
         self._client.close()

@@ -1,7 +1,7 @@
 """REST server (D4 §4.1) - the substrate; SDK and MCP are thin over it."""
 from __future__ import annotations
 
-import json
+import math
 import os
 import sqlite3
 import time
@@ -9,12 +9,15 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, field_validator
 
 from memd.core.schema import Kind
-from memd.engine.memory import Memory
+from memd.engine.memory import ForgetPreviewMismatch, Memory, forget_fingerprint
 from memd.metrics import METRICS
 from memd.server.auth import FailureLimiter, KeyStore, Principal, RateLimiter
 
@@ -92,6 +95,38 @@ class FindIn(BaseModel):
     agent_id: str | None = None
     org_id: str | None = None
     confirm: bool = False  # forget only: two-phase like the MCP tool
+    # forget confirm only: the preview's fingerprint - refused (409) if the
+    # confirm would delete a different set
+    fingerprint: str | None = Field(default=None, max_length=128)
+
+
+# Error bodies: {"detail": <human text, unchanged>, "code": <machine-readable>}.
+_ERROR_CODES = {
+    400: "validation_error", 401: "unauthorized", 403: "forbidden", 404: "not_found",
+    405: "method_not_allowed", 409: "conflict", 410: "gone", 413: "payload_too_large",
+    422: "validation_error", 429: "rate_limited", 500: "internal_error", 503: "unavailable",
+}
+
+
+class ApiError(HTTPException):
+    """An HTTPException with a specific `code` for the error body."""
+
+    def __init__(self, status_code: int, detail: str, code: str | None = None,
+                 headers: dict | None = None):
+        super().__init__(status_code, detail, headers)
+        self.code = code
+
+
+def _error(status: int, detail: Any, code: str | None = None,
+           headers: dict | None = None) -> JSONResponse:
+    return JSONResponse(status_code=status, headers=headers,
+                        content={"detail": detail, "code": code or _ERROR_CODES.get(status, "error")})
+
+
+def _rate_limited(detail: str, retry_s: float) -> ApiError:
+    """429 with Retry-After: whole seconds until a retry can succeed."""
+    return ApiError(429, detail, code="rate_limited",
+                    headers={"Retry-After": str(max(1, math.ceil(retry_s)))})
 
 
 def _route_label(path: str) -> str:
@@ -160,8 +195,7 @@ def create_app(
         cl = request.headers.get("content-length")
         if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
             METRICS.inc("memd_oversized_requests_total", route=route_label)
-            return Response(status_code=413, content=json.dumps({"detail": "request body too large"}).encode(),
-                            media_type="application/json")
+            return _error(413, "request body too large")
         t0 = time.monotonic()
         try:
             response = await call_next(request)
@@ -169,17 +203,16 @@ def create_app(
             # engine-boundary guards (size caps, bad enum-ish values) are
             # caller errors: 400 with the guard's message
             METRICS.inc("memd_http_errors_total", route=route_label, method=request.method, kind="value")
-            return JSONResponse(status_code=400, content={"detail": str(ex)})
+            return _error(400, str(ex))
         except sqlite3.Error:
             # lifecycle races surface as driver errors (namespace destroyed /
             # index closed mid-request): clean 503, no internals leaked
             METRICS.inc("memd_http_errors_total", route=route_label, method=request.method, kind="storage")
-            return JSONResponse(status_code=503,
-                                content={"detail": "namespace unavailable (destroyed or rebuilding)"})
+            return _error(503, "namespace unavailable (destroyed or rebuilding)")
         except Exception:
             METRICS.inc("memd_http_errors_total", route=route_label, method=request.method)
             # sanitized 500: tracebacks go to the server log, never the client
-            return JSONResponse(status_code=500, content={"detail": "internal error"})
+            return _error(500, "internal error")
         finally:
             METRICS.observe("memd_http_request_ms", (time.monotonic() - t0) * 1000,
                             help="HTTP request duration (ms)", route=route_label, method=request.method)
@@ -193,12 +226,21 @@ def create_app(
         # responses instead of leaking driver internals ("closed database")
         msg = str(exc)
         if "destroyed" in msg:
-            return JSONResponse(status_code=410, content={"detail": "namespace destroyed"})
+            return _error(410, "namespace destroyed", "namespace_destroyed")
         if "evicted" in msg:
-            return JSONResponse(status_code=503,
-                                content={"detail": "namespace re-opening; retry"})
+            return _error(503, "namespace re-opening; retry", headers={"Retry-After": "1"})
         METRICS.inc("memd_http_errors_total", route=request.url.path)
-        return JSONResponse(status_code=500, content={"detail": "internal error"})
+        return _error(500, "internal error")
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error_handler(request: Request, exc: StarletteHTTPException):
+        # every raised error, the routing 404/405 included: detail + code
+        return _error(exc.status_code, exc.detail, getattr(exc, "code", None),
+                      getattr(exc, "headers", None))
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error_handler(request: Request, exc: RequestValidationError):
+        return _error(422, jsonable_encoder(exc.errors()))
 
     bearer = HTTPBearer(auto_error=False)
 
@@ -221,7 +263,8 @@ def create_app(
         client = _client_id(request)
         if failures.blocked(client):
             METRICS.inc("memd_auth_failures_total", reason="throttled")
-            raise HTTPException(429, "too many authentication failures; retry later")
+            raise _rate_limited("too many authentication failures; retry later",
+                                failures.retry_after(client))
         if creds is None:
             failures.record_failure(client)
             METRICS.inc("memd_auth_failures_total", reason="missing")
@@ -259,17 +302,20 @@ def create_app(
         single runaway client inside a tenant."""
         if not limiter.allow(p.key_id, p.rate_limit_per_min):
             METRICS.inc("memd_rate_limited_total", ns=ns, scope="key")
-            raise HTTPException(429, "rate limit exceeded")
+            raise _rate_limited("rate limit exceeded",
+                                limiter.retry_after(p.key_id, p.rate_limit_per_min))
         owner = p.namespace if p.namespace != "*" else (ns or "*")
         if owner != "*" and not ns_limiter.allow(f"ns:{owner}", ns_rate_limit_per_min):
             METRICS.inc("memd_rate_limited_total", ns=owner, scope="namespace")
-            raise HTTPException(429, "namespace rate limit exceeded")
+            raise _rate_limited("namespace rate limit exceeded",
+                                ns_limiter.retry_after(f"ns:{owner}", ns_rate_limit_per_min))
 
     def heavy(ns: str, route: str, p: Principal) -> None:
         """Separate small token budget for O(namespace) maintenance calls."""
         if not heavy_limiter.allow(f"{p.key_id}:{route}", 10):
             METRICS.inc("memd_heavy_throttled_total", ns=ns, route=route)
-            raise HTTPException(429, f"{route} rate limit exceeded; retry later")
+            raise _rate_limited(f"{route} rate limit exceeded; retry later",
+                                heavy_limiter.retry_after(f"{p.key_id}:{route}", 10))
 
     def apply_scope(p: Principal, body_user: str | None, body_session: str | None):
         """Scope pinning: a user-pinned key cannot widen its scope. Cross-user
@@ -364,8 +410,14 @@ def create_app(
         }
 
     @app.get("/v1/ns/{ns}/memories/{record_id}")
-    def get_memory(ns: str, record_id: str, history: bool = False, p: Principal = Depends(auth)):
-        got = engine.get(record_id, history=history, namespace=ns)
+    def get_memory(ns: str, record_id: str, history: bool = False, include_deleted: bool = False,
+                   p: Principal = Depends(auth)):
+        # a deleted record - or deleted version in its history - is served only
+        # to an administrative read; `history` alone used to serve soft-deleted
+        # content until a compaction purged it
+        if include_deleted and not p.scope_override:
+            raise HTTPException(403, "include_deleted requires an override-capable key")
+        got = engine.get(record_id, history=history, include_deleted=include_deleted, namespace=ns)
         if got is None:
             raise HTTPException(404, "not found")
         # user-pinned keys must not read other users' records by id (D7 #6);
@@ -377,7 +429,8 @@ def create_app(
 
     @app.delete("/v1/ns/{ns}/memories/{record_id}")
     def delete_memory(ns: str, record_id: str, hard: bool = False, p: Principal = Depends(auth)):
-        existing = engine.get(record_id, namespace=ns)
+        # a hard delete of a soft-deleted record is how its text gets purged (D7)
+        existing = engine.get(record_id, include_deleted=hard, namespace=ns)
         if existing is None:
             raise HTTPException(404, "not found")
         rec_scope = existing.get("scope") or {}
@@ -396,6 +449,9 @@ def create_app(
         if not p.scope_override:
             METRICS.inc("memd_destroy_forbidden_total", ns=ns)
             raise HTTPException(403, "namespace crypto-shred requires an override-capable key")
+        if not engine.has_namespace(ns):
+            # it used to be created here, shredded and answered 200
+            raise HTTPException(404, f"namespace {ns!r} not found")
         ok = engine.destroy_namespace(ns, actor=f"key:{p.key_id}")
         return {"destroyed": ns, "crypto_shred": True}
 
@@ -455,12 +511,19 @@ def create_app(
                 got = engine.get(rid, namespace=ns)
                 if got:
                     preview.append({"id": rid, "content": got["content"][:200]})
-            return {"will_delete": preview, "count": len(ids), "confirmed": False}
-        deleted = engine.forget(
-            body.query, user_id=user, session_id=body.session_id,
-            agent_id=body.agent_id, org_id=body.org_id,
-            actor=f"key:{p.key_id}", namespace=ns,
-        )
+            return {"will_delete": preview, "count": len(ids), "confirmed": False,
+                    "fingerprint": forget_fingerprint(ids)}
+        # the SAME filters as the preview: the confirm used to drop as_of and
+        # kinds and delete every kind the query matched
+        try:
+            deleted = engine.forget(
+                body.query, user_id=user, session_id=body.session_id,
+                agent_id=body.agent_id, org_id=body.org_id,
+                as_of=body.as_of, kinds=body.kinds, expected=body.fingerprint,
+                actor=f"key:{p.key_id}", namespace=ns,
+            )
+        except ForgetPreviewMismatch as ex:
+            raise ApiError(409, str(ex), code="preview_mismatch") from None
         METRICS.inc("memd_forgets_total", ns=ns)
         return {"deleted": deleted, "count": len(deleted), "confirmed": True}
 
@@ -494,7 +557,8 @@ def create_app(
             client = _client_id(request)
             if failures.blocked(client):
                 METRICS.inc("memd_auth_failures_total", reason="throttled")
-                raise HTTPException(429, "too many authentication failures; retry later")
+                raise _rate_limited("too many authentication failures; retry later",
+                                    failures.retry_after(client))
             p = keystore.authenticate(creds.credentials if creds else None)
             if p is None:
                 failures.record_failure(client)
@@ -505,7 +569,8 @@ def create_app(
             # without a budget made it the cheapest way to burn server CPU
             if not limiter.allow(f"metrics:{p.key_id}", 60):
                 METRICS.inc("memd_rate_limited_total", scope="metrics")
-                raise HTTPException(429, "metrics rate limit exceeded")
+                raise _rate_limited("metrics rate limit exceeded",
+                                    limiter.retry_after(f"metrics:{p.key_id}", 60))
             ns_filter = None if p.namespace == "*" else {p.namespace}
         else:
             ns_filter = None  # public scrape: operator opted the whole fleet in

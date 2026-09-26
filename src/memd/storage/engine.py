@@ -2904,6 +2904,14 @@ class StorageEngine:
                 self._namespaces.move_to_end(ns)
             return nstore
 
+    def has_namespace(self, ns: str) -> bool:
+        """True if `ns` is open here or has a manifest; never materializes it."""
+        ns = _validate_ns(ns)
+        with self._lock:
+            if ns in self._namespaces:
+                return True
+        return self.store.exists(f"ns/{ns}/manifest.json")
+
     def list_namespaces(self) -> list[str]:
         out = []
         for k in self.store.list("ns/"):

@@ -358,6 +358,18 @@ class _NullAuditLog:
         return True
 
 
+def forget_fingerprint(ids: list[str]) -> str:
+    """Identifies the exact set of ids a forget() preview showed: a confirm
+    that passes it back deletes nothing unless it would delete that set."""
+    import hashlib
+
+    return hashlib.sha256("\n".join(sorted(ids)).encode()).hexdigest()[:32]
+
+
+class ForgetPreviewMismatch(Exception):
+    """A confirmed forget() would delete a different set than its preview."""
+
+
 class _MaintenanceWorker:
     """Background runner for namespace-scale maintenance.
 
@@ -1298,17 +1310,24 @@ class Memory:
         out.insert(insert_at, block)
         return out
 
-    def get(self, record_id: str, *, history: bool = False, namespace: str | None = None) -> dict | None:
+    def get(self, record_id: str, *, history: bool = False, include_deleted: bool = False,
+            namespace: str | None = None) -> dict | None:
+        """One record, or None. history=True adds its supersedence chain.
+        A deleted record - and a deleted version in a chain - is served only
+        with include_deleted (an administrative read: `history` used to serve
+        soft-deleted content until compaction purged it)."""
         impl = self._hosted()
         if impl is not None:
-            return impl.get(record_id, history=history, namespace=namespace)
+            return impl.get(record_id, history=history, include_deleted=include_deleted,
+                            namespace=namespace)
         ns = self._ns_for(namespace)
         rec = ns.index.get_by_id(record_id, include_deleted=True)
-        if rec is None or (rec.deleted and not history):
+        if rec is None or (rec.deleted and not include_deleted):
             return None
         d = rec.to_dict()
         if history:
-            d["history"] = [h.to_dict() for h in ns.index.history(record_id)]
+            d["history"] = [h.to_dict() for h in ns.index.history(record_id)
+                            if include_deleted or not h.deleted]
         return d
 
     # ------------------------------------------------------------------ lifecycle
@@ -1704,20 +1723,33 @@ class Memory:
         session_id: str | None = None,
         agent_id: str | None = None,
         org_id: str | None = None,
+        as_of: int | None = None,
+        kinds: list[str] | None = None,
+        expected: str | None = None,
         actor: str = "api",
         namespace: str | None = None,
     ) -> list[str]:
         """User-driven deletion by query. Uses find_ids (unbounded), NOT the
-        budget-capped packed view - partial destruction is unacceptable."""
+        budget-capped packed view - partial destruction is unacceptable.
+
+        Deletes exactly what find_ids returns for the SAME filters (as_of,
+        kinds, scope) - a preview's. `expected`: the preview's
+        forget_fingerprint(); if what would be deleted now differs, nothing
+        is deleted and ForgetPreviewMismatch is raised."""
         impl = self._hosted()
         if impl is not None:
             return impl.forget(query, confirm=True, user_id=user_id,
                                session_id=session_id, agent_id=agent_id,
-                               org_id=org_id, namespace=namespace)
+                               org_id=org_id, as_of=as_of, kinds=kinds,
+                               fingerprint=expected, namespace=namespace)
         ids = self.find_ids(
             query, user_id=user_id, session_id=session_id, agent_id=agent_id,
-            org_id=org_id, namespace=namespace,
+            org_id=org_id, as_of=as_of, kinds=kinds, namespace=namespace,
         )
+        if expected is not None and forget_fingerprint(ids) != expected:
+            raise ForgetPreviewMismatch(
+                f"the query now matches {len(ids)} record(s), not the previewed set: "
+                "preview again and confirm that")
         # one durable batch for the whole sweep (delete_many), not an
         # fsync-per-id loop
         self.delete_many(ids, actor=actor, namespace=namespace)
@@ -1725,6 +1757,13 @@ class Memory:
             actor=actor, action="forget",
             target=self._audit_target_for_query(query), detail={"deleted": len(ids)})
         return ids
+
+    def has_namespace(self, namespace: str) -> bool:
+        """True if `namespace` exists; never creates it."""
+        impl = self._hosted()
+        if impl is not None:
+            raise RuntimeError("has_namespace is embedded-only")
+        return self.engine.has_namespace(namespace)
 
     def destroy_namespace(self, namespace: str | None = None, actor: str = "api") -> bool:
         impl = self._hosted()

@@ -366,6 +366,27 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
 - `kinds` is bounded and validated; the Dockerfile no longer masks a failed
   core install.
 
+### Fixed - REST API
+- **A confirmed `forget` ignored `as_of` and `kinds`** (data loss): only
+  the preview applied them, so a preview filtered to `kinds: ["fact"]`
+  followed by the confirm deleted every kind the query matched. The
+  confirm (`POST /v1/ns/{ns}/forget`, `Memory.forget`, the SDK) now applies
+  exactly the preview's filters, and the preview returns a `fingerprint`:
+  a confirm that passes it back is refused with 409 (`preview_mismatch`)
+  and deletes nothing if the matches changed since.
+- **A hard `DELETE` of a soft-deleted record answered 404**, so its text
+  could not be purged through REST (D7): hard delete now accepts it.
+- **`?history=true` served soft-deleted content** until a compaction purged
+  it. Deleted records are no longer returned by `GET .../memories/{id}` or
+  in a `history` chain (superseded versions still are), unless an
+  override-capable key passes `include_deleted=true` (403 otherwise).
+- 429 responses carry `Retry-After` (whole seconds).
+- `DELETE /v1/ns/{ns}` on a namespace that does not exist answers 404 (it
+  used to create it, shred it and answer 200).
+- Error bodies carry a machine-readable `code` next to `detail`
+  (`validation_error`, `unauthorized`, `forbidden`, `not_found`,
+  `preview_mismatch`, `rate_limited`, ...); `detail` is unchanged.
+
 ### Fixed - observability
 - **Every latency quantile in the system was the mean.** Millisecond values
   were recorded into second-scale buckets, so no observation was ever bucketed
