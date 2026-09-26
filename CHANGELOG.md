@@ -329,6 +329,9 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
 - A query-plan inversion made the lexical lane 22 seconds at 10K records.
 
 ### Fixed - security
+- An encrypted audit ledger silently skipped COMPLETE frames that failed to
+  decrypt, so junk appended at the end left `verify()` True. Such frames now
+  fail verification; a torn final frame (crash mid-append) is still tolerated.
 - **Exports contained deleted records.** `export_jsonl` (`memd export`,
   `POST /v1/ns/{ns}/export`, the SDK) dumped stored copies with no op
   applied: soft- and hard-deleted records came back out (444 across 69 of

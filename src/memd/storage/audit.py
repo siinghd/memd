@@ -214,14 +214,21 @@ class AuditLog:
         ns = self._ns()
         dec: list[bytes] = []
         i = 0
+        bad = 0
         while i + 4 <= len(data):
             ln = int.from_bytes(data[i : i + 4], "big")
             chunk = data[i + 4 : i + 4 + ln]
             try:
                 dec.append(self.envelope.decrypt(ns, chunk))
             except Exception:
-                pass  # torn/garbled frame: skip; chain verify will flag gaps
+                # A frame cut short by a crash (the tail) is expected and skipped.
+                # A COMPLETE frame that does not decrypt is tampering or junk -
+                # skipping it silently let appended garbage leave verify() True
+                # (the chain has no gap at the end), so count it.
+                if len(chunk) == ln:
+                    bad += 1
             i += 4 + ln
+        self._undecryptable_frames = getattr(self, "_undecryptable_frames", 0) + bad
         return b"".join(dec)
 
     def _size(self) -> int:
@@ -361,7 +368,10 @@ class AuditLog:
         so a reader can tell the two apart. Keyed entries verify by HMAC
         (see the module docstring).
         """
+        self._undecryptable_frames = 0
         entries, plain_at = self._read_tagged()
+        if getattr(self, "_undecryptable_frames", 0):
+            return False
         return _verified_prefix(entries, self._chain_start, self._chain_key,
                                 plain_at) == len(entries)
 

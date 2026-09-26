@@ -157,3 +157,30 @@ def test_destroyed_namespace_ledger_is_dropped_not_resurrected(tmp_path):
     # the administrative record lives in the facade's own ledger
     assert any(e["action"] == "destroy_namespace" for e in _entries(m, "keep"))
     m.close()
+
+
+def test_junk_appended_to_encrypted_ledger_fails_verify_but_torn_tail_does_not(tmp_path):
+    """Release-verification finding: a COMPLETE frame that fails to decrypt was
+    skipped silently, so junk appended to an encrypted ledger left verify() True
+    (no chain gap at the end). A torn tail (a crash mid-append) must still be
+    tolerated."""
+    import os as _os
+    root = str(tmp_path / "r")
+    env = LocalKeyEnvelope(root + "/keys")
+    store = LocalObjectStore(root + "/store")
+    KEY = "ns/t/audit"
+    a = BufferedAuditLog(store, KEY, env, flush_every=1)
+    for i in range(3):
+        a.append(actor="u", action="add", target=f"r{i}")
+    a.flush()
+    assert a.verify()
+    clean = store.get(KEY)
+
+    junk = _os.urandom(48)
+    store.put(KEY, clean + len(junk).to_bytes(4, "big") + junk)  # complete, bogus frame
+    assert not BufferedAuditLog(store, KEY, env, flush_every=1).verify(), \
+        "an undecryptable complete frame is tampering and must fail verification"
+
+    store.put(KEY, clean + (200).to_bytes(4, "big") + b"partial")  # torn tail: shorter than its length
+    assert BufferedAuditLog(store, KEY, env, flush_every=1).verify(), \
+        "a torn final frame (crash mid-append) is not tampering"
