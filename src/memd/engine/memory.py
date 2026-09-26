@@ -660,6 +660,12 @@ class Memory:
         self._embed_close_drain_s = float(cfg.get("embed_close_drain_s", 30.0))
         self._embed_flush_drain_s = float(cfg.get("embed_flush_drain_s", 60.0))
         self._maint = _MaintenanceWorker(self._run_maintenance)
+        # D7 #8 at open, too: a purge that came due while the process was down
+        # - or one the format-1 migration recovered from the audit ledger, due
+        # at once - is scheduled as the namespace opens, not left on disk
+        # until the next write there happens to check the deadline
+        self.engine.open_hook = lambda _name, store: self._enforce_purge_deadlines(store)
+        self._enforce_purge_deadlines(self.ns)
         self._embed_max_chars = int(cfg.get("embed_max_chars", DEFAULT_EMBED_MAX_CHARS))
         self._embed_worker = _EmbedWorker(
             self.embedder,

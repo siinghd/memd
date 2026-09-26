@@ -55,6 +55,33 @@ class TestSelfEnforcingPurge:
         assert marker.encode() not in _raw_namespace_bytes(mem, "default"), \
             "bytes must be gone from WAL/segments after the deadline passes"
 
+    def test_a_purge_due_at_open_runs_without_a_write(self, tmp_path):
+        """A hard delete whose deadline passed while the process was down was
+        enforced only by the next WRITE to its namespace: on one nothing
+        writes to, the text stayed on disk past the deadline indefinitely.
+        Opening the namespace now schedules the due purge - the default one
+        at startup, any other on first use (here a read)."""
+        path = str(tmp_path / "d")
+        cfg = {"hard_delete_deadline_ms": 60}
+        marker = "ERASE-AT-OPEN-q7v2"
+        m = Memory(path, encrypt=False, config=cfg)
+        rid = m.remember(f"record {marker}", user_id="u1")
+        other = m.add(f"other {marker}", user_id="u1", namespace="t2")[0]
+        m.delete(rid, hard=True)
+        m.delete(other, hard=True, namespace="t2")
+        m.close()  # before the deadline: nothing is purged yet
+        assert marker.encode() in _raw_namespace_bytes(m, "default")
+        assert marker.encode() in _raw_namespace_bytes(m, "t2")
+        time.sleep(0.1)
+        m = Memory(path, encrypt=False, config=cfg)
+        try:
+            m.stats(namespace="t2")  # opens it - a read, not a write
+            m.flush()                # drains the background maintenance
+            assert marker.encode() not in _raw_namespace_bytes(m, "default")
+            assert marker.encode() not in _raw_namespace_bytes(m, "t2")
+        finally:
+            m.close()
+
     def test_undue_purge_does_not_fire_early(self, tmp_path):
         m = Memory(str(tmp_path / "d"), encrypt=False)  # default 72h window
         try:
