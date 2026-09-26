@@ -497,6 +497,7 @@ class LocalKeyEnvelope(KeyEnvelope):
         # together with the first data key it wraps (data_key).
         self._root_key: bytes | None = root_key
         self._provider: LocalKeyProvider | None = None
+        _sweep_shreds(dir_path)
         if root_key is not None and not os.path.exists(self._rk_path):
             self._write_secret(self._rk_path, root_key)
 
@@ -624,14 +625,61 @@ def legacy_key_path(dir_path: str, namespace: str) -> str:
     return os.path.join(dir_path, f"ns-{safe}.key")
 
 
+_SHRED_SUFFIX = ".shred-"
+
+
+def _fsync_dir(d: str) -> None:
+    try:
+        fd = os.open(d or ".", os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def _overwrite_unlink(p: str) -> None:
+    """Shred a key file, crash-safely.
+
+    The file is first RENAMED out of its name (atomic), and only then
+    overwritten and unlinked. Overwriting in place meant a crash between
+    the overwrite and the unlink left random bytes under the live name:
+    every later open of that namespace name then failed as if the root key
+    were wrong. A crash now leaves at most a `*.shred-*` file, which no key
+    lookup reads and the next LocalKeyEnvelope sweeps (_sweep_shreds)."""
+    d = os.path.dirname(p)
+    tmp = f"{p}{_SHRED_SUFFIX}{secrets.token_hex(4)}"
+    os.replace(p, tmp)
+    _fsync_dir(d)
+    _shred_file(tmp)
+    _fsync_dir(d)
+
+
+def _shred_file(p: str) -> None:
     # overwrite before unlink so shred survives lazy fs behavior
     size = os.path.getsize(p)
-    with open(p, "wb") as f:
+    with open(p, "r+b") as f:
         f.write(secrets.token_bytes(size))
         f.flush()
         os.fsync(f.fileno())
     os.unlink(p)
+
+
+def _sweep_shreds(d: str) -> None:
+    """Finish shreds a crash interrupted (see _overwrite_unlink)."""
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return
+    for fn in names:
+        if _SHRED_SUFFIX in fn:
+            try:
+                _shred_file(os.path.join(d, fn))
+            except FileNotFoundError:
+                pass  # a concurrent sweep finished it
 
 
 def wrapped_key_object(namespace: str) -> str:

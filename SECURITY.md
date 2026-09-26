@@ -172,6 +172,15 @@ any probe fails the build.
   `memd[fast]`, the tantivy index (`<ns>.tantivy/` beside it) contain record
   text unencrypted, with owner-only permissions. Both are deleted on
   crypto-shred and are rebuildable from the (encrypted) log.
+  In a multi-node deployment each node keeps its own local copy for the
+  namespaces it has served, and a hard delete is scrubbed physically only
+  on the node that owns the namespace when it runs. A node that served a
+  namespace earlier and has not taken it back since still holds the text
+  it indexed then, including records hard-deleted later on another node,
+  until it next opens that namespace (its stale copy is then discarded) or
+  its cache directory is removed. It never serves that copy, but it is on
+  its disk: when a hard delete must reach every disk, clear the local cache
+  directory (`local_dir`) of the nodes that no longer own the namespace.
 
 - **Hosted mode & billing (`--hosted`, off by default).**
   - *The Stripe webhook is authenticated by its signature only.*
