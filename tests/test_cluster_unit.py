@@ -81,6 +81,81 @@ def test_cluster_mode_refuses_a_local_data_root(tmp_path):
         create_app(str(tmp_path / "d"), cluster=cfg)
 
 
+class _Scripted:
+    """A router that always answers the given decisions in turn."""
+
+    def __init__(self, *decisions):
+        self.decisions = list(decisions)
+        self.forgotten = 0
+
+    def resolve(self, ns, exclude=frozenset()):
+        return self.decisions.pop(0) if len(self.decisions) > 1 else self.decisions[0]
+
+    def forget(self, ns):
+        self.forgotten += 1
+
+
+def _drive(mw, path="/v1/ns/a/memories", body=b"payload", method="POST"):
+    import asyncio
+
+    sent = []
+    chunks = [{"type": "http.request", "body": body, "more_body": False}]
+
+    async def receive():
+        if chunks:
+            return chunks.pop(0)
+        await asyncio.sleep(3600)
+
+    async def send(msg):
+        sent.append(msg)
+
+    scope = {"type": "http", "method": method, "path": path, "raw_path": path.encode(),
+             "headers": [], "client": ("1.2.3.4", 5), "query_string": b""}
+    asyncio.run(mw(scope, receive, send))
+    return [m["status"] for m in sent if m["type"] == "http.response.start"], \
+        b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+
+
+def test_a_lost_lease_race_on_the_local_path_is_retried_invisibly():
+    """Resolve said "local", but another node won the lease between resolve
+    and open: the app's 503 not-owner must never reach the client - the
+    request is re-resolved and served (here: locally, on the second try)."""
+    from memd.server.cluster import ClusterMiddleware, Decision
+
+    seen = []
+
+    async def app(scope, receive, send):
+        seen.append((await receive())["body"])
+        if len(seen) == 1:
+            await send({"type": "http.response.start", "status": 503,
+                        "headers": [(b"x-memd-not-owner", b"1")]})
+            await send({"type": "http.response.body", "body": b"not owner"})
+            return
+        await send({"type": "http.response.start", "status": 201, "headers": []})
+        await send({"type": "http.response.body", "body": b"created"})
+
+    router = _Scripted(Decision("local", "n1"))
+    mw = ClusterMiddleware(app, router, ClusterConfig("n1", "http://127.0.0.1:1", "s" * 32))
+    statuses, body = _drive(mw)
+    assert statuses == [201] and body == b"created"
+    assert seen == [b"payload", b"payload"], "the body was not replayed to the second attempt"
+    assert router.forgotten == 1
+
+
+def test_middleware_reserved_namespaces_body_cap_and_giving_up():
+    from memd.server.cluster import ClusterMiddleware, Decision
+
+    async def app(scope, receive, send):
+        raise AssertionError("must not reach the app")
+
+    cfg = ClusterConfig("n1", "http://127.0.0.1:1", "s" * 32, route_retry_s=0.2)
+    mw = ClusterMiddleware(app, _Scripted(Decision("wait", reason="test")), cfg, max_body=10)
+    assert _drive(mw, path="/v1/ns/memd-node.n2/stats")[0] == [404]
+    assert _drive(mw, body=b"x" * 11)[0] == [413]
+    statuses, body = _drive(mw, body=b"ok")
+    assert statuses == [503] and b"namespace_unavailable" in body
+
+
 # ---------------------------------------------------------------------- S3
 
 

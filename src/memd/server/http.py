@@ -280,9 +280,6 @@ def create_app(
         engine = Memory(data_dir)
     else:
         from memd.server.cluster import Cluster
-
-        # the facade's own namespace is per node (every node pins its facade
-        # namespace, so a shared "default" would be leased by one node forever)
         from memd.storage.crypto import resolve_key_provider_name
 
         if resolve_key_provider_name({}) == "local":
@@ -295,9 +292,22 @@ def create_app(
         # one namespace's SQLite cache across a handoff would corrupt it
         local_dir = os.path.join(os.environ.get("MEMD_LOCAL_DIR") or ".memd-local",
                                  f"node-{cluster.node_id}")
-        engine = Memory(data_dir, namespace=cluster.node_namespace,
-                        config={"lease_holder": cluster.holder, "lease_ttl_s": cluster.lease_ttl_s,
-                                "local_dir": local_dir})
+        # The facade's own namespace is per node (every node pins its facade
+        # namespace, so a shared "default" would be leased by one node
+        # forever). A node restarted right after a crash finds it still
+        # leased by its previous process: wait that lease out (reclaimable
+        # after the TTL) rather than fail to start.
+        deadline = time.monotonic() + cluster.lease_ttl_s + 5
+        while True:
+            try:
+                engine = Memory(data_dir, namespace=cluster.node_namespace,
+                                config={"lease_holder": cluster.holder,
+                                        "lease_ttl_s": cluster.lease_ttl_s, "local_dir": local_dir})
+                break
+            except NamespaceBusyError:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(1.0)
         node = Cluster(cluster, engine.engine.store)
     bill: Any = _Unmetered()
     if is_hosted:

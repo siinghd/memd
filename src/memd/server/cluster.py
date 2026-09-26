@@ -518,7 +518,8 @@ class ClusterMiddleware:
                 return
             await send(msg)
 
-        await self.app(scope, self._replay(body, receive), send_wrapper)
+        # a fresh copy per attempt: the framework annotates the scope it runs
+        await self.app(dict(scope), self._replay(body, receive), send_wrapper)
         return not state["not_owner"]
 
     async def _await_response(self, d: Decision, ns: str, fut):

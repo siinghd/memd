@@ -362,6 +362,12 @@ def test_kill_the_leaseholder_another_node_takes_over_within_ttl(fleet_factory):
     assert took <= TTL + EPSILON, f"takeover took {took:.2f}s > TTL {TTL} + {EPSILON}"
     survivors = [n for n in nodes if n != owner]
     _assert_all_acked_readable(f, ns, w.acked, survivors)
+    # the crashed node restarts under the same id at once: it waits out its
+    # predecessor's registration and facade lease, then serves again
+    t0 = time.monotonic()
+    f.start(owner)
+    print(f"RESTART: {owner} back after {time.monotonic() - t0:.2f}s")
+    _assert_all_acked_readable(f, ns, w.acked, [owner])
 
 
 def test_graceful_shutdown_hands_off_without_waiting_for_the_ttl(fleet_factory):

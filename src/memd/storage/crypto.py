@@ -695,6 +695,9 @@ class ObjectStoreKeyEnvelope(KeyEnvelope):
         key = wrapped_key_object(namespace)
         existed = self.store.exists(key)
         self.store.shred(key)
+        # again: a racing data_key() may have re-read the record between the
+        # first pop and the shred
+        had_cached = (self._cache.pop(namespace, None) is not None) or had_cached
         detail: dict = {"provider": self.provider.name, "key_id": self.provider.key_id(namespace),
                         "wrapped_key_deleted": existed}
         try:
