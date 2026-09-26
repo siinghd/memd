@@ -482,8 +482,10 @@ def test_killed_mid_rebuild_serves_the_old_file_or_rebuilds(tmp_path, point, mor
         else:
             assert ann.loaded_from == "file" and ann.rebuilds == 0, "the old file, complete"
             assert _state(root) == old
-        # temp files and files no state names are gone
-        assert sorted(os.listdir(sdir)) == sorted([au.STATE_FILE, _state(root)["file"]])
+        # temp files and files no state names are gone (a graph loaded from
+        # its file keeps the loading marker until it has served cleanly)
+        probation = [au.LOADING_MARKER] if ann.loaded_from == "file" else []
+        assert sorted(os.listdir(sdir)) == sorted([au.STATE_FILE, _state(root)["file"]] + probation)
         assert ann.ready()
         assert _ids(ns.index.search_vector(x[5], IndexFilter(), limit=3))[0] == recs[5].id
     finally:
@@ -494,13 +496,16 @@ SIGKILL_CHILD = r"""
 import os, sys, time
 sys.path.insert(0, {src!r})
 import numpy as np
+import memd.index.ann_usearch as au
 from memd.core.schema import MemoryRecord, Scope
 from memd.storage.engine import StorageEngine
+au.MARKER_SECONDS = 0  # the loaded file is trusted at once: the kill below is not a crash on load
 root = sys.argv[1]
 cfg = {{"mode": "usearch", "min_vectors": 0, "overfetch": 4, "exact_max": 0, "dtype": "f16",
        "build_threads": 1}}
 e = StorageEngine(root, vector_index=cfg)
 ns = e.namespace("n")
+assert ns.index.ann.drain(60) and ns.index.ann.loaded_from == "file"
 rec = MemoryRecord.create(namespace="n", kind="raw_event", content="written after the last save",
                           scope=Scope(user="alice"))
 ns.append([rec])
@@ -936,9 +941,9 @@ def test_open_and_close_do_not_wait_for_the_sidecar_files(tmp_path, monkeypatch)
     e.close()
     real_restore, real_persist = UsearchSidecar._restore, UsearchSidecar._persist
 
-    def slow_restore(self, src):
+    def slow_restore(self, src, *a, **k):
         time.sleep(1.5)
-        return real_restore(self, src)
+        return real_restore(self, src, *a, **k)
 
     def slow_persist(self, cap, *, final=False):
         if final:
@@ -1317,3 +1322,222 @@ def sqlite3_rows(path):
         return con.execute("SELECT r.rowid FROM records r JOIN vectors v ON v.id = r.id").fetchall()
     finally:
         con.close()
+
+
+# ------------------------------------------------------------ a loaded graph on probation
+
+REAL_QUERY_CRASH = r"""
+import os, sys
+sys.path.insert(0, {src!r})
+import numpy as np
+from memd.index.sqlite_index import IndexFilter
+from memd.storage.engine import StorageEngine
+cfg = {{"mode": "usearch", "min_vectors": 0, "overfetch": 4, "exact_max": 0, "dtype": "f16",
+       "build_threads": 1}}
+e = StorageEngine(sys.argv[1], vector_index=cfg)
+ns = e.namespace("n")
+ann = ns.index.ann
+assert ann.drain(60) and ann.loaded_from == "file", ann.loaded_from
+for q in np.random.default_rng(3).standard_normal((20, {dim})):
+    ns.index.search_vector(q, IndexFilter(), limit=10)
+assert ann.searches >= 20
+os._exit(11)   # what a segfault inside a real usearch search does to the process
+"""
+
+
+def _replace_graph(root, build) -> dict:
+    """Swap the sidecar file for `build(rowids)` (a valid usearch image),
+    with a matching checksum and size in the state: checksum-valid."""
+    import hashlib
+
+    sdir = _sidecar_dir(root)
+    st = _state(root)
+    ix = build([r[0] for r in sqlite3_rows(os.path.join(str(root), "_cache", "n.sqlite"))])
+    buf = ix.save()
+    with open(os.path.join(sdir, st["file"]), "wb") as f:
+        f.write(buf)
+    st.update(size=len(buf), blake2b=hashlib.blake2b(buf, digest_size=32).hexdigest())
+    json.dump(st, open(os.path.join(sdir, au.STATE_FILE), "w"))
+    return st
+
+
+def test_a_crash_in_a_real_query_after_loading_does_not_loop(tmp_path):
+    """A checksum-valid graph usearch loads and smoke-searches fine can still
+    crash the process in a real query. The marker stays until the loaded
+    graph has served cleanly, so the next open rebuilds instead of loading
+    the same file into the same crash."""
+    root = tmp_path / "s"
+    e = _engine(root)
+    recs, x = _fill(e.namespace("n"), 1500, seed=42)
+    e.close()
+    child = subprocess.run([sys.executable, "-c", REAL_QUERY_CRASH.format(src=SRC, dim=DIM), str(root)],
+                           capture_output=True, text=True, timeout=120)
+    assert child.returncode == 11, child.stderr[-2000:]
+    before = _counter("memd_vector_index_corrupt_total", source="crash_on_load")
+    e = _engine(root)
+    try:
+        ns = e.namespace("n")
+        ann = ns.index.ann
+        assert ann.drain(60) and ann.loaded_from == "build" and ann.rebuilds == 1
+        assert _counter("memd_vector_index_corrupt_total", source="crash_on_load") == before + 1
+        assert _ids(ns.index.search_vector(x[3], IndexFilter(), limit=3))[0] == recs[3].id
+        assert not os.path.exists(os.path.join(ann.path, au.LOADING_MARKER)), "a built graph is ours"
+    finally:
+        e.close()
+
+
+def test_the_loading_marker_stays_until_the_loaded_graph_has_served(tmp_path, monkeypatch):
+    monkeypatch.setattr(au, "MARKER_SEARCHES", 30)
+    root = tmp_path / "s"
+    e = _engine(root)
+    recs, x = _fill(e.namespace("n"), 1500, seed=43)
+    e.close()
+    e = _engine(root)
+    try:
+        ns = e.namespace("n")
+        ann = ns.index.ann
+        marker = os.path.join(ann.path, au.LOADING_MARKER)
+        assert ann.drain(60) and ann.loaded_from == "file"
+        assert os.path.exists(marker), "a loaded graph is on probation"
+        for i in range(29):
+            assert _ids(ns.index.search_vector(x[i], IndexFilter(), limit=3))[0] == recs[i].id
+        assert os.path.exists(marker), "29 of 30 searches"
+        ns.index.search_vector(x[29], IndexFilter(), limit=3)
+        deadline = time.monotonic() + 20
+        while os.path.exists(marker) and time.monotonic() < deadline:
+            time.sleep(0.05)  # (after the background recall check of its first answers)
+        assert not os.path.exists(marker)
+        assert ann.rebuilds == 0 and ann.loaded_from == "file", "a healthy graph passes its recall check"
+    finally:
+        e.close()
+    # ...or after MARKER_SECONDS of serving without damage; and a clean close
+    # removes it (the process did not crash)
+    monkeypatch.setattr(au, "MARKER_SECONDS", 0.3)
+    e = _engine(root)
+    try:
+        ns = e.namespace("n")
+        ann = ns.index.ann
+        marker = os.path.join(ann.path, au.LOADING_MARKER)
+        assert ann.drain(60) and ann.loaded_from == "file" and os.path.exists(marker)
+        time.sleep(0.4)
+        r = MemoryRecord.create(namespace="n", kind="raw_event", content="late", scope=Scope(user="alice"))
+        ns.append([r])
+        ns.index.set_vectors([r.id], [x[0]], "test-model")  # applies: the time is checked
+        assert not os.path.exists(marker)
+    finally:
+        e.close()
+    monkeypatch.setattr(au, "MARKER_SECONDS", 300.0)
+    e = _engine(root)
+    ann = e.namespace("n").index.ann
+    assert ann.drain(60) and ann.loaded_from == "file" and os.path.exists(os.path.join(ann.path, au.LOADING_MARKER))
+    e.close()
+    assert not os.path.exists(os.path.join(ann.path, au.LOADING_MARKER)), "a clean close clears it"
+    e = _engine(root)
+    try:
+        ann = e.namespace("n").index.ann
+        assert ann.drain(60) and ann.loaded_from == "file" and ann.rebuilds == 0
+    finally:
+        e.close()
+
+
+def test_a_checksum_valid_graph_of_another_shape_is_rebuilt(tmp_path):
+    """The checksum proves the bytes are the ones written, not that memd
+    wrote them. A graph whose own bookkeeping disagrees with what the state
+    says was saved (here: connectivity 8) is rebuilt, never searched."""
+    root = tmp_path / "s"
+    e = _engine(root)
+    recs, x = _fill(e.namespace("n"), 1500, seed=44)
+    e.close()
+    from usearch.index import Index
+
+    def build(rowids):
+        ix = Index(ndim=DIM, metric="cos", dtype="f16", connectivity=8)
+        ix.add(np.asarray(rowids, dtype=np.uint64), x.astype(np.float16))
+        return ix
+    _replace_graph(root, build)
+    before = _counter("memd_vector_index_corrupt_total", source="structure")
+    e = _engine(root)
+    try:
+        ns = e.namespace("n")
+        ann = ns.index.ann
+        assert ann.drain(60) and ann.loaded_from == "build" and ann.rebuilds == 1
+        assert _counter("memd_vector_index_corrupt_total", source="structure") == before + 1
+        assert _ids(ns.index.search_vector(x[3], IndexFilter(), limit=3))[0] == recs[3].id
+        assert not os.path.exists(os.path.join(ann.path, au.LOADING_MARKER))
+    finally:
+        e.close()
+
+
+def test_the_structure_check_rejects_impossible_bookkeeping(tmp_path):
+    from types import SimpleNamespace as NS
+
+    e = _engine(tmp_path / "s")
+    try:
+        ann = e.namespace("n").index.ann
+
+        def graph(**over):
+            g = dict(ndim=DIM, size=20000, connectivity=16, dtype=NS(name="F16"), metric_kind=NS(name="Cos"),
+                     multi=False, capacity=20000, max_level=4, nlevels=5,
+                     levels_stats=[NS(nodes=20000, edges=502311, max_edges=640000),
+                                   NS(nodes=1196, edges=18848, max_edges=19136),
+                                   NS(nodes=80, edges=841, max_edges=1280),
+                                   NS(nodes=10, edges=90, max_edges=160),
+                                   NS(nodes=4, edges=12, max_edges=64)])
+            g.update(over)
+            return type("G", (), {**g, "__len__": lambda self: g["size"]})()
+
+        expect = {"ndim": DIM, "count": 20000}
+        assert ann._structure(graph(), expect) == ""
+        assert ann._structure(graph(size=19999), expect) == "count"
+        assert ann._structure(graph(dtype=NS(name="I8")), expect) == "kind"
+        assert ann._structure(graph(capacity=100), expect) == "size"
+        lv = graph().levels_stats
+        assert ann._structure(graph(max_level=40, nlevels=41, levels_stats=lv + [NS(nodes=1, edges=0, max_edges=32)] * 36),
+                              expect) == "levels", "far more levels than 20000 nodes can have"
+        bad = list(lv)
+        bad[1] = NS(nodes=1196, edges=10 ** 9, max_edges=19136)
+        assert ann._structure(graph(levels_stats=bad), expect) == "levels"
+        bad = list(lv)
+        bad[2] = NS(nodes=5000, edges=10, max_edges=80000)
+        assert ann._structure(graph(levels_stats=bad), expect) == "levels", "an upper level larger than the one below"
+        bad = list(lv)
+        bad[0] = NS(nodes=20000, edges=0, max_edges=640000)
+        assert ann._structure(graph(levels_stats=bad), expect) == "edges"
+    finally:
+        e.close()
+
+
+def test_a_loaded_graph_that_does_not_answer_is_rebuilt(tmp_path):
+    """Checksum-valid and well-formed, but not a graph of these vectors (an
+    adversarial local file, or damage its bookkeeping does not show): its
+    first answers are checked against the exact scan in the background, and
+    a recall below the threshold rebuilds it from SQLite."""
+    root = tmp_path / "s"
+    e = _engine(root)
+    recs, x = _fill(e.namespace("n"), 3000, seed=45)
+    e.close()
+    from usearch.index import Index
+
+    def build(rowids):
+        ix = Index(ndim=DIM, metric="cos", dtype="f16", connectivity=16)
+        ix.add(np.asarray(rowids, dtype=np.uint64), _vectors(len(rowids), seed=999).astype(np.float16))
+        return ix
+    _replace_graph(root, build)
+    before = _counter("memd_vector_index_corrupt_total", source="recall")
+    e = _engine(root)
+    try:
+        ns = e.namespace("n")
+        ann = ns.index.ann
+        assert ann.drain(60) and ann.loaded_from == "file"
+        for i in range(au.VERIFY_QUERIES):
+            ns.index.search_vector(x[i], IndexFilter(), limit=10)
+        deadline = time.monotonic() + 60
+        while ann.loaded_from != "build" and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert ann.drain(60) and ann.loaded_from == "build" and ann.rebuilds == 1
+        assert _counter("memd_vector_index_corrupt_total", source="recall") == before + 1
+        for i in range(20):
+            assert _ids(ns.index.search_vector(x[i], IndexFilter(), limit=3))[0] == recs[i].id
+        assert not os.path.exists(os.path.join(ann.path, au.LOADING_MARKER))
+    finally:
+        e.close()

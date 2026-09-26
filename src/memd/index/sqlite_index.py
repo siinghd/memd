@@ -1436,7 +1436,12 @@ class NamespaceIndex:
             ann.note_fallback("short")
             return self._exact_vector(q, f, limit)
         ann.note_search()
-        return self._hits_from_scored(f, scored, limit)
+        hits = self._hits_from_scored(f, scored, limit)
+        if ann.verify_due():
+            # a graph loaded from a file or snapshot: its first answers are
+            # checked against the exact scan (in the background)
+            ann.verify_later(q, f, limit, [h.record.id for h in hits])
+        return hits
 
     def _scored_rowids(self, q: np.ndarray, f: IndexFilter, rowids: list[int]) -> list[tuple[float, int]]:
         """(exact cosine, rowid) of the candidate rows that pass the SQL
