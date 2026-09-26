@@ -191,8 +191,9 @@ Point clients (or a plain load balancer) at ANY node:
   namespace nobody holds goes to the node that rendezvous hashing picks among
   the live nodes - a hint only; the lease is authoritative.
 - **Membership** is a heartbeat object per node in the bucket
-  (`_cluster/nodes/<id>.json`, every TTL/3). No gossip, no consensus, nothing
-  else to run. `--advertise` (`MEMD_ADVERTISE_URL`) is the URL peers use.
+  (`_cluster/nodes/<id>.json`, every TTL/3), judged from one LIST on the
+  bucket's own clock. No gossip, no consensus, nothing else to run.
+  `--advertise` (`MEMD_ADVERTISE_URL`) is the URL peers use.
 - **Handoff.** SIGTERM: the node deregisters, drains, flushes and releases
   its leases - peers take over at once. A crash: its leases go stale after
   `MEMD_LEASE_TTL_S` and the next request for each namespace is served (and
@@ -216,9 +217,11 @@ written with compare-and-swap, so a node frozen mid-commit and resumed after
 a takeover fails with `503 lease_lost` instead of overwriting its successor.
 
 Measured on 3 node processes (MinIO + moto KMS, TTL 4 s): leaseholder
-SIGKILLed → next write acked after 3.7-3.8 s (bound: TTL + ε); SIGTERM →
-0.04-1.1 s; frozen past its TTL → 4.8 s, with no acked write lost in any
-case. Not built yet: read replicas (every read goes to the leaseholder) and
+SIGKILLed → next write acked after 3.6-3.8 s (bound: TTL + ε); SIGTERM →
+0.03-1.1 s; frozen past its TTL → 4.8-6.2 s, with no acked write lost in any
+case. On MinIO a node frozen in the middle of a lease write holds that
+object's lock for MinIO's ~30 s timeout, and its takeover waits for it
+(observed in 2 of 14 frozen runs; AWS S3 does not lock). Not built yet: read replicas (every read goes to the leaseholder) and
 multiple writers inside one namespace.
 
 | setting | default | |
