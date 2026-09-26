@@ -413,6 +413,8 @@ def _keys_store(data: str):
         bucket, _, prefix = str(data)[len("s3://"):].partition("/")
         store = S3ObjectStore(bucket=bucket, prefix=prefix,
                               endpoint_url=os.environ.get("MEMD_S3_ENDPOINT"),
+                              access_key=os.environ.get("MEMD_S3_ACCESS_KEY"),
+                              secret_key=os.environ.get("MEMD_S3_SECRET_KEY"),
                               region=os.environ.get("AWS_REGION"))
         local = os.environ.get("MEMD_LOCAL_DIR") or os.path.join(".memd-local", bucket, prefix or "_")
         return store, local

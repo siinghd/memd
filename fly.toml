@@ -1,0 +1,86 @@
+# memd multi-node on Fly.io - a TEMPLATE. Nothing is deployed from this
+# repository (ADR-12: no deployment until a target is chosen). Every
+# CHANGE-ME must be filled in, and the result reviewed, before `fly deploy`.
+#
+# Shape: N identical machines, each one memd cluster node (ADR-12). The
+# bucket is the source of truth (Tigris, R2 or S3), data keys are wrapped by
+# AWS KMS, and machines find each other through the registry in the bucket,
+# advertising their 6PN private address. Fly's proxy may send a request to
+# any machine; memd proxies it to the namespace's leaseholder.
+#
+#   fly apps create memd-CHANGE-ME
+#   fly secrets set MEMD_ADMIN_KEY=... MEMD_CLUSTER_SECRET=$(openssl rand -hex 32) \
+#       MEMD_KMS_KEY_ID=arn:aws:kms:... AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
+#       MEMD_S3_ENDPOINT=https://... MEMD_S3_ACCESS_KEY=... MEMD_S3_SECRET_KEY=...
+#   fly volumes create memd_data --count 3 --region CHANGE-ME
+#   fly deploy && fly scale count 3
+#
+# Known limits of this template (see README-engine.md "Multi-node"):
+#   - MEMD_STATE_DIR lives on each machine's own volume, so API keys created
+#     with `memd key create` exist on ONE machine only. Use the operator key
+#     (MEMD_ADMIN_KEY) until keys move to a shared store; hosted mode
+#     (MEMD_HOSTED=1) needs one admin database for the fleet and is NOT
+#     supported across machines yet.
+#   - node-to-node traffic is plain HTTP on Fly's private WireGuard network;
+#     MEMD_CLUSTER_SECRET authenticates the routing header, nothing more.
+
+app = "memd-CHANGE-ME"
+primary_region = "CHANGE-ME"          # one region: leases assume low bucket latency
+# SIGTERM drains in-flight requests, deregisters, flushes and releases every
+# lease - give it time to finish before Fly SIGKILLs the machine
+kill_signal = "SIGTERM"
+kill_timeout = 30
+
+[build]
+  dockerfile = "Dockerfile"
+  [build.args]
+    MEMD_S3 = "1"                     # boto3: S3 + the aws-kms provider
+
+[env]
+  MEMD_DATA = "s3://CHANGE-ME-bucket/memd"
+  MEMD_KEY_PROVIDER = "aws-kms"
+  AWS_REGION = "CHANGE-ME"            # the KMS key's region
+  MEMD_LEASE_TTL_S = "30"             # failover bound; keep clock skew << TTL/3
+  MEMD_ROUTE_RETRY_S = "3"
+  MEMD_SHUTDOWN_GRACE_S = "20"
+  MEMD_LOCAL_DIR = "/data/local"
+  MEMD_STATE_DIR = "/data/state"
+  MEMD_HOST = "::"
+  MEMD_PORT = "8700"
+
+# The node id and the advertised address come from the machine itself:
+# FLY_MACHINE_ID is unique and stable per machine, FLY_PRIVATE_IP is its
+# 6PN address (peers proxy to it). The image's entrypoint is `memd`, so run
+# through a shell to expand them.
+[experimental]
+  entrypoint = ["/bin/sh", "-c"]
+  cmd = ["exec memd serve --http --node-id \"$FLY_MACHINE_ID\" --advertise \"http://[$FLY_PRIVATE_IP]:8700\""]
+
+[[mounts]]
+  source = "memd_data"
+  destination = "/data"               # derived index cache + (per machine) state
+
+[http_service]
+  internal_port = 8700
+  force_https = true
+  # a stopped machine releases its leases on SIGTERM (graceful handoff), but
+  # a fleet that scales to zero pays a cold open per namespace: keep it up
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 3
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 200
+    hard_limit = 400
+
+  [[http_service.checks]]
+    grace_period = "20s"
+    interval = "15s"
+    timeout = "3s"
+    method = "GET"
+    path = "/health"
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "1gb"

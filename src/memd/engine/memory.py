@@ -606,8 +606,10 @@ class Memory:
             store = S3ObjectStore(
                 bucket=bucket, prefix=s3_prefix,
                 endpoint_url=cfg.get("s3_endpoint_url") or os.environ.get("MEMD_S3_ENDPOINT"),
-                access_key=cfg.get("s3_access_key"),
-                secret_key=cfg.get("s3_secret_key"),
+                # separate from AWS_* so a MinIO / R2 bucket and AWS KMS can
+                # use different credentials in one process
+                access_key=cfg.get("s3_access_key") or os.environ.get("MEMD_S3_ACCESS_KEY"),
+                secret_key=cfg.get("s3_secret_key") or os.environ.get("MEMD_S3_SECRET_KEY"),
                 region=cfg.get("s3_region") or os.environ.get("AWS_REGION"),
                 lease_ttl_s=float(cfg.get("lease_ttl_s") or os.environ.get("MEMD_LEASE_TTL_S") or 60.0),
                 lease_holder=cfg.get("lease_holder"),

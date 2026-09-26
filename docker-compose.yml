@@ -1,0 +1,148 @@
+# memd multi-node (ADR-12) on one host: MinIO + 3 memd nodes, optional Vault.
+#
+# Any node serves any namespace (requests are proxied to the node holding
+# the namespace's writer lease); kill one and its namespaces move within the
+# lease TTL. Point clients at any of :8701-:8703.
+#
+#   export MEMD_ADMIN_KEY=$(openssl rand -hex 24) MEMD_CLUSTER_SECRET=$(openssl rand -hex 32)
+#
+#   A) data keys in the bundled Vault (dev mode: in-memory, THROWAWAY):
+#        MEMD_KEY_PROVIDER=vault-transit docker compose --profile vault up --build
+#   B) data keys in AWS KMS (your CMK; AWS_* credentials are used for KMS only):
+#        MEMD_KEY_PROVIDER=aws-kms MEMD_KMS_KEY_ID=arn:aws:kms:... AWS_REGION=... \
+#        AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... docker compose up --build
+#
+#   curl -H "Authorization: Bearer $MEMD_ADMIN_KEY" -d '{"content":"hello"}' \
+#        -H 'content-type: application/json' localhost:8701/v1/ns/demo/memories
+#   curl -H "Authorization: Bearer $MEMD_ADMIN_KEY" localhost:8703/v1/ns/demo/stats
+#
+# MEMD_STATE_DIR (/state) is ONE volume shared by the three containers: the
+# API keys file and, with MEMD_HOSTED=1, the hosted admin SQLite database -
+# which is why this layout is single-host (see README-engine.md "Multi-node").
+# Not a production deployment: MinIO and Vault run with default credentials,
+# node-to-node traffic is plain HTTP on the compose network.
+
+x-memd: &memd
+  image: memd/memd:cluster
+  pull_policy: never             # built once, by memd1
+  restart: unless-stopped
+  depends_on:
+    minio-init:
+      condition: service_completed_successfully
+    vault-init:
+      condition: service_completed_successfully
+      required: false          # only with --profile vault
+  environment: &memd-env
+    MEMD_DATA: s3://memd/cluster
+    MEMD_S3_ENDPOINT: http://minio:9000
+    MEMD_S3_ACCESS_KEY: ${MINIO_ROOT_USER:-memd}
+    MEMD_S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-memd-minio-secret}
+    MEMD_KEY_PROVIDER: ${MEMD_KEY_PROVIDER:?set MEMD_KEY_PROVIDER to vault-transit or aws-kms}
+    # vault-transit (with --profile vault)
+    VAULT_ADDR: http://vault:8200
+    VAULT_TOKEN: ${VAULT_DEV_TOKEN:-memd-dev-root}
+    MEMD_VAULT_TRANSIT_KEY: memd
+    # aws-kms
+    MEMD_KMS_KEY_ID: ${MEMD_KMS_KEY_ID:-}
+    AWS_REGION: ${AWS_REGION:-us-east-1}
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+    # cluster
+    MEMD_CLUSTER_SECRET: ${MEMD_CLUSTER_SECRET:?set MEMD_CLUSTER_SECRET (openssl rand -hex 32)}
+    MEMD_ADMIN_KEY: ${MEMD_ADMIN_KEY:?set MEMD_ADMIN_KEY}
+    MEMD_STATE_DIR: /state
+    MEMD_LOCAL_DIR: /data/local
+    MEMD_LEASE_TTL_S: ${MEMD_LEASE_TTL_S:-15}
+    MEMD_HOSTED: ${MEMD_HOSTED:-0}
+
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-memd}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-memd-minio-secret}
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    ports:
+      - "127.0.0.1:9001:9001"     # MinIO console
+
+  minio-init:                     # the bucket (idempotent)
+    image: minio/minio:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"
+        && mc mb --ignore-existing local/memd
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-memd}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-memd-minio-secret}
+
+  vault:
+    profiles: ["vault"]
+    image: hashicorp/vault:1.17
+    cap_add: ["IPC_LOCK"]
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_DEV_TOKEN:-memd-dev-root}
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    healthcheck:
+      test: ["CMD", "vault", "status", "-address=http://127.0.0.1:8200"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  vault-init:                     # transit engine + the "memd" key (idempotent)
+    profiles: ["vault"]
+    image: hashicorp/vault:1.17
+    depends_on:
+      vault:
+        condition: service_healthy
+    environment:
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: ${VAULT_DEV_TOKEN:-memd-dev-root}
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        (vault secrets list | grep -q '^transit/' || vault secrets enable transit)
+        && vault write -f transit/keys/memd
+
+  memd1:
+    <<: *memd
+    build:
+      context: .
+      args:
+        MEMD_S3: "1"
+    pull_policy: build
+    command: ["serve", "--http", "--node-id", "n1", "--advertise", "http://memd1:8700"]
+    environment: *memd-env
+    volumes: ["memd1-data:/data", "memd-state:/state"]
+    ports: ["127.0.0.1:8701:8700"]
+
+  memd2:
+    <<: *memd
+    command: ["serve", "--http", "--node-id", "n2", "--advertise", "http://memd2:8700"]
+    environment: *memd-env
+    volumes: ["memd2-data:/data", "memd-state:/state"]
+    ports: ["127.0.0.1:8702:8700"]
+
+  memd3:
+    <<: *memd
+    command: ["serve", "--http", "--node-id", "n3", "--advertise", "http://memd3:8700"]
+    environment: *memd-env
+    volumes: ["memd3-data:/data", "memd-state:/state"]
+    ports: ["127.0.0.1:8703:8700"]
+
+volumes:
+  minio-data:
+  memd-state:
+  memd1-data:
+  memd2-data:
+  memd3-data:
