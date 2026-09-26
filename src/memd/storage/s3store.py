@@ -46,6 +46,7 @@ import json
 import re
 import threading
 import time
+import zlib
 
 from memd.metrics import METRICS
 from memd.storage.objectstore import (AppendConflict, LeaseLostError, ObjectStore,  # noqa: F401
@@ -165,6 +166,12 @@ class S3ObjectStore(ObjectStore):
         self._last_beat: dict[str, float] = {}
         self._lease_stop = threading.Event()
         self._lease_thread: threading.Thread | None = None
+        # Serialize this process's writes of one namespace's lease object (a
+        # renewal - heartbeat, fence check, fresh read - and the release): a
+        # renewal in flight while the lease was released left it LIVE after a
+        # clean close (see release_owner). Striped by namespace: bounded, and
+        # nothing to clean up when a namespace goes.
+        self._lease_locks = tuple(threading.RLock() for _ in range(64))
         # running logical size per key, so an append does not re-LIST the log
         self._size_cache: dict[str, int] = {}
         self._seq_lock = threading.Lock()
@@ -993,9 +1000,21 @@ class S3ObjectStore(ObjectStore):
             if key in self._next_part and self._next_part[key] < floor:
                 self._next_part[key] = int(floor)
 
+    def _lease_lock(self, ns: str) -> threading.RLock:
+        return self._lease_locks[zlib.crc32(ns.encode()) % len(self._lease_locks)]
+
     def _renew_one(self, ns: str, holder: str) -> bool | None:
-        """One renewal. True: renewed. False: lost (fenced). None: transient
-        failure (not renewed, not fenced - the next attempt retries)."""
+        """One renewal. True: renewed. False: not ours - lost (fenced) or
+        released meanwhile. None: transient failure (not renewed, not fenced
+        - the next attempt retries)."""
+        with self._lease_lock(ns):
+            if self._leases.get(ns) != holder:
+                # released (or fenced) since the caller looked: renewing now
+                # would write a live lease over the released tombstone
+                return False
+            return self._renew_one_locked(ns, holder)
+
+    def _renew_one_locked(self, ns: str, holder: str) -> bool | None:
         key = self._owner_key(ns)
         t0 = time.monotonic()        # validity counts from BEFORE the request
         body = self._lease_body(holder)
@@ -1248,7 +1267,19 @@ class S3ObjectStore(ObjectStore):
         could then claim. (S3 has no conditional DELETE that MinIO honours, so
         this is read-then-delete; the loser of that race is FENCED on its
         next renewal - a liveness hiccup, never two writers.)
+
+        Serialized with this process's renewals of the lease (_lease_lock).
+        A heartbeat renewal landing between this release dropping the ETag
+        and writing the tombstone made the tombstone's compare-and-swap fail
+        - silently - and left the lease LIVE after a clean close; one that
+        had listed the lease before the release renewed it after, with no
+        ETag, by an unconditional put over the tombstone. The next node then
+        waited out the TTL and took over a cleanly closed namespace as stale.
         """
+        with self._lease_lock(namespace):
+            self._release_owner_locked(namespace, clean=clean, discard=discard)
+
+    def _release_owner_locked(self, namespace: str, *, clean: bool, discard: bool) -> None:
         holder = self._leases.pop(namespace, None)
         etag = self._lease_etag.pop(namespace, None)
         self._forget_ns(namespace)

@@ -407,6 +407,64 @@ def test_s3_release_is_a_tombstone_that_never_clobbers_a_successor():
 
 
 @pytest.mark.s3
+@pytest.mark.parametrize("when", ["renewal_landed", "renewal_after_release"])
+def test_s3_a_clean_release_racing_a_heartbeat_leaves_no_live_lease(when):
+    """A heartbeat renewal in flight while the namespace is released. Its
+    CAS landing just before the release's made the release's CAS (on the
+    ETag it popped) fail silently: the lease stayed live after a CLEAN
+    close, and the next node waited out the TTL and took it over as stale
+    (fence + claim). A heartbeat that had listed the lease before the
+    release, and renewed it after, found no ETag and fell back to an
+    unconditional put - over the released tombstone."""
+    from memd.storage import s3store
+
+    a = _s3(lease_ttl_s=30.0)
+    assert a.try_acquire_owner("ns1", "A:1")
+    orig = s3store.S3ObjectStore._raw_cas_put
+    gate, at_gate = threading.Event(), threading.Event()
+
+    def cas(self, full, data, **kw):
+        if self is a and not gate.is_set():
+            if when == "renewal_landed" and data != s3store._RELEASED:
+                etag = orig(self, full, data, **kw)   # lands, but its ETag is not stored yet
+                at_gate.set()
+                gate.wait(10)
+                return etag
+            if when == "renewal_after_release" and data == s3store._RELEASED:
+                at_gate.set()      # the release has dropped its state, not yet written
+                gate.wait(10)
+        return orig(self, full, data, **kw)
+    a._raw_cas_put = cas.__get__(a)
+    try:
+        if when == "renewal_landed":
+            beat = threading.Thread(target=a._renew_one, args=("ns1", "A:1"), daemon=True)
+            beat.start()
+            assert at_gate.wait(10)
+            rel = threading.Thread(target=a.release_owner, args=("ns1",), daemon=True)
+            rel.start()
+            rel.join(1.0)          # a release that waits for the renewal is fine
+        else:
+            rel = threading.Thread(target=a.release_owner, args=("ns1",), daemon=True)
+            rel.start()
+            assert at_gate.wait(10)
+            # the heartbeat listed the lease before the release dropped it
+            beat = threading.Thread(target=a._renew_one, args=("ns1", "A:1"), daemon=True)
+            beat.start()
+            beat.join(1.0)         # a renewal that waits for the release is fine
+        gate.set()
+        beat.join(10)
+        rel.join(10)
+        assert a.read_owner("ns1") is None, f"a clean release left a live lease: {a.read_owner('ns1')}"
+        b = _s3(prefix=a.prefix, lease_ttl_s=30.0)
+        assert b.try_acquire_owner("ns1", "B:2"), "the next node cannot take a cleanly released lease"
+        assert not b.took_over("ns1"), "a clean release was taken over as a stale lease"
+        b.release_owner("ns1")
+    finally:
+        gate.set()
+        del a._raw_cas_put
+
+
+@pytest.mark.s3
 def test_s3_put_if_match_fences_the_namespace_on_conflict():
     from memd.storage.objectstore import LeaseLostError, PreconditionFailed
 
