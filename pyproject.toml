@@ -37,7 +37,9 @@ jev = ["typesafe-sdk>=0.7"]
 # hosted mode only (memd serve --http --hosted): Stripe billing. Imported
 # lazily; embedded and self-hosted memd never import it.
 billing = ["stripe>=15"]
-dev = ["pytest>=8", "pytest-timeout>=2", "stripe>=15"]
+# moto[server]: the aws-kms provider tests (in-process) and the multi-node
+# router tests (a moto server the node processes share)
+dev = ["pytest>=8", "pytest-timeout>=2", "stripe>=15", "moto[server]>=5"]
 
 [project.scripts]
 memd = "memd.cli:main"

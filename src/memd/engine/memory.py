@@ -49,9 +49,9 @@ from memd.query.rerank import (
     resolve_reranker,
 )
 from memd.storage.audit import AuditLog, BufferedAuditLog
-from memd.storage.crypto import LocalKeyEnvelope, NullKeyEnvelope
+from memd.storage.crypto import envelope_from_config
 from memd.storage.engine import StorageEngine
-from memd.storage.objectstore import count_io
+from memd.storage.objectstore import LocalObjectStore, count_io
 
 _log = logging.getLogger(__name__)
 
@@ -592,9 +592,11 @@ class Memory:
             # implementation detail:
             #   - the SQLite derived index (rebuildable by contract; the pass-22
             #     snapshot is what makes a cold node cheap), and
-            #   - envelope keys, which is why this is "one node with remote
-            #     durability" rather than "any node serves any namespace".
-            #     Crypto-shred still works; a second node cannot decrypt.
+            #   - envelope keys WITH THE DEFAULT `local` KEY PROVIDER, which
+            #     makes this "one node with remote durability". A remote
+            #     provider (key_provider="aws-kms" | "vault-transit", ADR-12)
+            #     keeps the wrapped keys in the bucket instead, and then any
+            #     authorised node can serve any namespace.
             from memd.storage.s3store import S3ObjectStore
 
             rest = str(path)[len("s3://"):]
@@ -607,17 +609,26 @@ class Memory:
                 access_key=cfg.get("s3_access_key"),
                 secret_key=cfg.get("s3_secret_key"),
                 region=cfg.get("s3_region") or os.environ.get("AWS_REGION"),
+                lease_ttl_s=float(cfg.get("lease_ttl_s") or os.environ.get("MEMD_LEASE_TTL_S") or 60.0),
+                lease_holder=cfg.get("lease_holder"),
             )
             path = str(cfg.get("local_dir")
                        or os.environ.get("MEMD_LOCAL_DIR")
                        or os.path.join(".memd-local", bucket, s3_prefix or "_"))
         os.makedirs(path, exist_ok=True)
-        envelope = LocalKeyEnvelope(os.path.join(path, "keys")) if encrypt else NullKeyEnvelope()
+        remote = store is not None
+        if store is None:
+            store = LocalObjectStore(os.path.join(path, "store"))
+        # ADR-12: who holds the root key. `local` (default) keeps it in a file
+        # under <path>/keys exactly as before; a remote provider (aws-kms,
+        # vault-transit) keeps wrapped data keys as objects in `store`, so any
+        # node authorised on the provider can open any namespace
+        envelope = envelope_from_config(cfg, path, store, encrypt=encrypt)
         # resolved before any namespace opens: the accelerator attaches at open
         self.lexical_backend = resolve_lexical_backend(cfg)
         self.engine = StorageEngine(os.path.join(path, "store"), envelope=envelope,
                                     store=store,
-                                    cache_dir=os.path.join(path, "_cache") if store else None,
+                                    cache_dir=os.path.join(path, "_cache") if remote else None,
                                     lexical={
                                         "backend": self.lexical_backend,
                                         "commit_ms": int(cfg.get("lexical_commit_ms", DEFAULT_COMMIT_MS)),

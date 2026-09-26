@@ -1,5 +1,6 @@
-"""CLI: `memd serve --http|--mcp [--hosted]`, `memd key create`, `memd org`,
-`memd export`, `memd import mem0`, `memd status`, `memd migrate --report`."""
+"""CLI: `memd serve --http|--mcp [--hosted] [--node-id N]`, `memd key create`,
+`memd keys status|migrate|rotate`, `memd org`, `memd export`, `memd import
+mem0`, `memd status`, `memd migrate --report`."""
 from __future__ import annotations
 
 import argparse
@@ -395,6 +396,190 @@ def _cmd_migrate(args) -> int:
     return 0
 
 
+def _keys_store(data: str):
+    """(object store, local dir) for a data root: a local path, or s3://
+    with MEMD_LOCAL_DIR (the node-local dir that holds `local` key files)."""
+    if str(data).startswith("s3://"):
+        from memd.storage.s3store import S3ObjectStore
+
+        bucket, _, prefix = str(data)[len("s3://"):].partition("/")
+        store = S3ObjectStore(bucket=bucket, prefix=prefix,
+                              endpoint_url=os.environ.get("MEMD_S3_ENDPOINT"),
+                              region=os.environ.get("AWS_REGION"))
+        local = os.environ.get("MEMD_LOCAL_DIR") or os.path.join(".memd-local", bucket, prefix or "_")
+        return store, local
+    from memd.storage.objectstore import LocalObjectStore
+
+    return LocalObjectStore(os.path.join(data, "store")), data
+
+
+def _cmd_keys(args) -> int:
+    """`memd keys status|migrate|rotate`: data-key custody (ADR-12).
+
+    migrate --to aws-kms|vault-transit re-wraps every namespace's LOCAL data
+    key under the remote provider. The data key itself does not change, so
+    no data is re-encrypted; what moves is who can unwrap it. Crash-safe by
+    construction - every step is idempotent and ordered so that each
+    namespace always has at least one usable wrapped key:
+      1. per namespace: wrap under the provider, create keys/<ns>.dek
+         (conditional create), read it back and unwrap it, compare;
+      2. only when EVERY namespace verified: write the custody marker
+         (keys/_custody.json) - the swap: from here on a node still on the
+         `local` provider refuses to open the store instead of minting keys;
+      3. then shred the local wrapped key files (root.key alone decrypts
+         nothing). Until this step completes, crypto-shred of a migrated
+         namespace does NOT cover its local copy - rerun to finish.
+    Rerunning after a crash at any point converges to the same end state."""
+    from memd.storage.crypto import (LocalKeyEnvelope, ObjectStoreKeyEnvelope, legacy_key_path,
+                                     provider_from_config, read_custody,
+                                     resolve_key_provider_name, wrapped_key_object)
+
+    store, local_dir = _keys_store(args.data)
+    keys_dir = os.path.join(local_dir, "keys")
+    if args.sub == "status":
+        custody = read_custody(store)
+        out: dict = {"custody": custody or {"provider": "local"}, "namespaces": {}}
+        local_env = (LocalKeyEnvelope(keys_dir)
+                     if os.path.exists(os.path.join(keys_dir, "root.key")) else None)
+        nss = set(n for n in (local_env.namespaces() if local_env else []))
+        for k in store.list("keys/"):
+            if k.endswith(".dek"):
+                nss.add(k[len("keys/"):-len(".dek")])
+        for ns in sorted(nss):
+            row: dict = {"local_key": bool(local_env and os.path.exists(legacy_key_path(keys_dir, ns)))}
+            raw = store.get(wrapped_key_object(ns))
+            if raw:
+                rec = json.loads(raw)
+                row["wrapped"] = {k: rec.get(k) for k in ("provider", "key_id", "key_version", "created_ms")}
+            out["namespaces"][ns] = row
+        print(json.dumps(out, indent=1, sort_keys=True))
+        return 0
+
+    target = args.to if args.sub == "migrate" else resolve_key_provider_name({})
+    if target == "local":
+        print("the target must be a remote provider (aws-kms or vault-transit); moving keys back "
+              "to local files is not supported", file=sys.stderr)
+        return 2
+    provider = provider_from_config(target, {})
+    remote = ObjectStoreKeyEnvelope(provider, store)
+
+    if args.sub == "rotate":
+        done = []
+        for k in store.list("keys/"):
+            if k.endswith(".dek"):
+                done.append(remote.rewrap(k[len("keys/"):-len(".dek")]))
+        print(json.dumps({"rotated": len(done), "namespaces": done}, indent=1))
+        return 0
+
+    # ---- migrate
+    if not os.path.exists(os.path.join(keys_dir, "root.key")):
+        print(f"no local key directory at {keys_dir} (MEMD_LOCAL_DIR / --data)", file=sys.stderr)
+        return 1
+    custody = read_custody(store)
+    if custody and custody.get("provider") not in (target,):
+        print(f"refused: this store's keys are already held by {custody.get('provider')!r}",
+              file=sys.stderr)
+        return 1
+    local = LocalKeyEnvelope(keys_dir)
+    report: dict = {"to": target, "migrated": [], "already": [], "errors": {}}
+    # Hold every namespace's single-writer lock for the whole migration: a
+    # node still running on the `local` provider would otherwise MINT a new
+    # local key for a namespace it opens after step 3 removed the old one -
+    # and write data no key can read. Busy namespaces refuse the migration.
+    held, busy = _hold_namespaces(store, local.namespaces())
+    try:
+        if busy:
+            print(json.dumps({"to": target, "busy": busy}, indent=1))
+            print("refused: these namespaces are open in a running memd - stop it first",
+                  file=sys.stderr)
+            return 1
+        return _migrate_keys(args, store, keys_dir, local, provider, remote, target, report)
+    finally:
+        _release_namespaces(store, held)
+
+
+def _hold_namespaces(store, names: list[str]) -> tuple[list, list[str]]:
+    from memd.storage.engine import _acquire_owner, NamespaceBusyError
+
+    held: list = []
+    busy: list[str] = []
+    for ns in names:
+        leaser = getattr(store, "try_acquire_owner", None)
+        try:
+            if callable(leaser):
+                if leaser(ns, f"memd-keys-migrate@{os.getpid()}"):
+                    held.append(("lease", ns))
+                else:
+                    busy.append(ns)
+            else:
+                path = os.path.join(store.root, "ns", ns.replace("/", "__"), ".owner")
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                _acquire_owner(path)
+                held.append(("flock", path))
+        except NamespaceBusyError:
+            busy.append(ns)
+    return held, busy
+
+
+def _release_namespaces(store, held: list) -> None:
+    from memd.storage.engine import _release_owner
+
+    for kind, what in held:
+        try:
+            if kind == "lease":
+                store.release_owner(what)
+            else:
+                _release_owner(what)
+        except Exception:  # noqa: BLE001 - leases expire; flocks die with us
+            pass
+
+
+def _migrate_keys(args, store, keys_dir, local, provider, remote, target, report) -> int:
+    from memd.storage.crypto import (KeyCustodyError, WrappedKey, _overwrite_unlink,
+                                     legacy_key_path, wrapped_key_object, write_custody)
+
+    for ns in local.namespaces():
+        try:
+            dk = local.peek_data_key(ns)
+            if dk is None:
+                continue
+            rec = remote.read_record(ns)
+            if rec is None:
+                wk = provider.wrap(ns, dk)
+                body = json.dumps(wk.to_record(ns), sort_keys=True).encode()
+                store.put_if_absent(wrapped_key_object(ns), body)
+                rec = remote.read_record(ns)
+                bucket = report["migrated"]
+            else:
+                bucket = report["already"]
+            if rec is None or rec.get("provider") != target:
+                raise KeyCustodyError(f"wrapped key for {ns!r} is missing or under another provider")
+            if provider.unwrap(ns, WrappedKey.from_record(rec)) != dk:
+                # someone minted a DIFFERENT key for this namespace remotely:
+                # never paper over that - both copies are kept for an operator
+                raise KeyCustodyError(f"the remote key for {ns!r} differs from the local one")
+            bucket.append(ns)
+        except Exception as ex:  # noqa: BLE001 - report every namespace
+            report["errors"][ns] = f"{type(ex).__name__}: {ex}"
+    if report["errors"]:
+        report["swapped"] = False
+        print(json.dumps(report, indent=1, sort_keys=True))
+        print("not swapped: fix the errors above and rerun (nothing local was removed)", file=sys.stderr)
+        return 1
+    write_custody(store, provider)           # the swap point
+    report["swapped"] = True
+    removed = []
+    if not args.keep_local:
+        for ns in report["migrated"] + report["already"]:
+            p = legacy_key_path(keys_dir, ns)
+            if os.path.exists(p):
+                _overwrite_unlink(p)
+                removed.append(ns)
+    report["local_keys_removed"] = removed
+    print(json.dumps(report, indent=1, sort_keys=True))
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="memd", description="memd - agent memory engine")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -468,6 +653,19 @@ def main(argv=None) -> int:
 
     mt = sub.add_parser("metrics", help="dump in-process metrics snapshot (JSON)")
     mt.set_defaults(fn=_cmd_metrics)
+
+    ks = sub.add_parser("keys", help="data-key custody: status, migrate to a KMS, rotate (ADR-12)")
+    kssub = ks.add_subparsers(dest="sub", required=True)
+    kst = kssub.add_parser("status", help="custody marker + where each namespace's key is wrapped")
+    ksm = kssub.add_parser("migrate", help="re-wrap local data keys under a remote provider")
+    ksm.add_argument("--to", required=True, choices=["aws-kms", "vault-transit"])
+    ksm.add_argument("--keep-local", action="store_true",
+                     help="keep the local wrapped key files (crypto-shred will NOT cover them)")
+    ksr = kssub.add_parser("rotate", help="re-wrap every data key under the provider's current key version")
+    for x in (kst, ksm, ksr):
+        x.add_argument("--data", default=os.environ.get("MEMD_DATA", "./memd-data"),
+                       help="data root: a local path or s3://bucket/prefix (then MEMD_LOCAL_DIR)")
+    ks.set_defaults(fn=_cmd_keys)
 
     mg = sub.add_parser("migrate", help="store-format upgrade: report what it did or would do")
     mg.add_argument("--report", metavar="DATA", required=True,
