@@ -132,8 +132,11 @@ durability*, not *any node serves any namespace*. Crypto-shred still works — t
 key is local, destroy it and the ciphertext is inert — but a second node cannot
 decrypt. A KMS key provider is the missing piece and is not built. Back the keys
 directory up with the data and restore them together: a namespace opened with a
-key its data was not written with (or without one) raises `KeyCustodyError` and
-nothing is changed — it is never read as empty, and never compacted away.
+key its data was not written with (or without one, or with encryption off)
+raises `KeyCustodyError` and nothing is changed — it is never read as empty, and
+never compacted away. A complete log frame that does not read is never cut off
+as a torn tail either; [SECURITY.md](SECURITY.md) has the recovery procedure for
+one that is damaged.
 
 Single-writer is still enforced, by a **lease** rather than a file lock (`flock`
 cannot see another machine): the first writer claims `ns/<ns>/.owner` with a
