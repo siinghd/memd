@@ -163,7 +163,7 @@ class NodeRegistry:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
-        self._seen: dict[str, dict] = {}      # every node ever listed: id -> info
+        self._urls: dict[str, str] = {}       # node id -> advertised URL (cached)
         self._live_at = 0.0
         self._live: dict[str, dict] = {}
         self._ver: str | None = None      # our entry's version, as last read or written
@@ -176,11 +176,11 @@ class NodeRegistry:
         from memd.storage.objectstore import PreconditionFailed
 
         body = {"node": self.cfg.node_id, "url": self.cfg.advertise_url,
-                "incarnation": self.cfg.incarnation, "beat": 0.0 if stopped else time.time()}
-        if stopped:
-            body["stopped"] = True
+                "incarnation": self.cfg.incarnation, "beat": time.time()}
+        # a stopped node's entry is EMPTY: visible as such in a LIST (live())
+        data = b"" if stopped else json.dumps(body).encode()
         try:
-            self._ver = self.store.put_if_match(self.key, json.dumps(body).encode(), self._ver)
+            self._ver = self.store.put_if_match(self.key, data, self._ver)
         except PreconditionFailed:
             METRICS.inc("memd_cluster_registry_conflicts_total",
                         help="registry entries changed by another process (duplicate node id?)")
@@ -200,7 +200,7 @@ class NodeRegistry:
             try:
                 got = self.store.get_versioned(self.key)
                 self._ver = got[1] if got else None
-                cur = json.loads(got[0]) if got else {}
+                cur = json.loads(got[0]) if got and got[0] else {}
             except Exception:
                 cur = {}
             age = time.time() - float(cur.get("beat", 0) or 0)
@@ -245,35 +245,47 @@ class NodeRegistry:
             pass
 
     def live(self) -> dict[str, dict]:
+        """Nodes whose registry entry was written within the TTL - judged
+        from ONE LIST: LastModified against the server's own Date, so
+        neither node clocks nor a peer frozen mid-write (which can hold an
+        object's lock on MinIO) can stall or skew it. A stopped node's entry
+        is empty. Cached for CACHE_S."""
         now = time.monotonic()
         with self._lock:
             if now - self._live_at < self.CACHE_S:
                 return dict(self._live)
         out: dict[str, dict] = {}
-        seen: dict[str, dict] = {}
-        for k in self.store.list(f"{NODE_PREFIX}/"):
-            try:
-                info = json.loads(self.store.get(k) or b"{}")
-                nid = str(info["node"])
-            except Exception:
-                continue
-            seen[nid] = info
-            if info.get("stopped"):
-                continue
-            age = time.time() - float(info.get("beat", 0))
-            if -self.cfg.lease_ttl_s <= age <= self.cfg.lease_ttl_s:
-                out[nid] = info
+        for o in self.store.list_meta(f"{NODE_PREFIX}/"):
+            name = o["key"].rsplit("/", 1)[-1]
+            if not name.endswith(".json") or o["size"] == 0:
+                continue                   # a stopped node (see _beat)
+            nid = name[:-len(".json")]
+            if o["age_s"] <= self.cfg.lease_ttl_s:
+                out[nid] = {"node": nid, "age_s": o["age_s"]}
         with self._lock:
-            self._seen.update(seen)
             self._live, self._live_at = out, time.monotonic()
         return dict(out)
 
     def url_of(self, node_id: str) -> str | None:
-        info = self.live().get(node_id)
-        if info is None:
+        """The URL a node advertises: read from its entry once and cached
+        (it is fixed per process; forget_url drops it after a failed proxy)."""
+        with self._lock:
+            url = self._urls.get(node_id)
+        if url:
+            return url
+        try:
+            got = self.store.get_versioned(f"{NODE_PREFIX}/{node_id}.json")
+            url = json.loads(got[0]).get("url") if got and got[0] else None
+        except Exception:  # noqa: BLE001 - unknown for now; routing waits
+            url = None
+        if url:
             with self._lock:
-                info = self._seen.get(node_id)
-        return info.get("url") if info else None
+                self._urls[node_id] = url
+        return url
+
+    def forget_url(self, node_id: str) -> None:
+        with self._lock:
+            self._urls.pop(node_id, None)
 
 
 # ----------------------------------------------------------------- router
@@ -327,7 +339,7 @@ class Router:
         return not (info and info["fresh"] and node_of(info["holder"]) != node)
 
     def resolve(self, ns: str, exclude: frozenset = frozenset()) -> Decision:
-        if self.store.holds_lease(ns):
+        if self.store.holds_lease(ns, fresh=True):
             return Decision("local", self.cfg.node_id, reason="held")
         with self._lock:
             hit = self._cache.get(ns)
@@ -504,11 +516,14 @@ class ClusterMiddleware:
         from starlette.concurrency import run_in_threadpool
 
         while True:
+            t_r = time.monotonic()
             try:
                 d = await run_in_threadpool(self.router.resolve, ns, frozenset(exclude))
             except Exception as ex:  # noqa: BLE001 - the object store is unreachable
                 d = Decision("wait", reason=f"routing lookup failed: {type(ex).__name__}")
             last = d.reason
+            _log.debug("route %s %s: %s %s (%s) resolved in %.0f ms", scope["method"], ns, d.kind,
+                       d.node, d.reason, (time.monotonic() - t_r) * 1000)
             if d.kind == "local":
                 if await self._local(scope, body, receive, send):
                     METRICS.inc("memd_router_requests_total", decision="local")
@@ -524,6 +539,7 @@ class ClusterMiddleware:
                 self.router.forget(ns)
                 if outcome == "unreachable":
                     exclude.add(d.node)
+                    self.router.registry.forget_url(d.node)   # it may have moved
             if time.monotonic() >= deadline:
                 break
             await asyncio.sleep(min(0.4, 0.05 * (2 ** attempt)))

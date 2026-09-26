@@ -128,6 +128,24 @@ class S3ObjectStore(ObjectStore):
                           # concurrent GETs serialize on connections instead
                           max_pool_connections=max(10, int(fetch_concurrency) + 4)),
         )
+        # Control-plane client: lease objects and the cluster registry, with
+        # SHORT timeouts and few retries. On MinIO a conditional PUT holds the
+        # object's lock until its body arrives, so a peer frozen mid-renewal
+        # (SIGSTOP, a VM pause) blocks every reader of that object for
+        # MinIO's ~30 s lock timeout. With the data-plane client's 60 s read
+        # timeout and 5 retries a router thread waited that out - per request,
+        # until the pool was exhausted. A control-plane call instead fails in
+        # seconds and is treated as "busy, retry" (AWS S3 does not lock).
+        self._ctl = client or boto3.client(
+            "s3",
+            endpoint_url=endpoint_url,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name=region,
+            config=Config(retries={"total_max_attempts": 2, "mode": "standard"},
+                          signature_version="s3v4", connect_timeout=2, read_timeout=4,
+                          max_pool_connections=10),
+        )
         # Next part number per logical key. Single-writer per data root (see
         # try_acquire_owner), so an in-process counter is authoritative once
         # seeded; seeding costs one LIST on the first append to a key, not one
@@ -219,18 +237,18 @@ class S3ObjectStore(ObjectStore):
     def _raw_get(self, full: str) -> bytes | None:
         _count_op("get_object")   # the per-part fan-out was invisible before
         try:
-            return self._client.get_object(Bucket=self.bucket, Key=full)["Body"].read()
+            return self._client_for(full).get_object(Bucket=self.bucket, Key=full)["Body"].read()
         except Exception as ex:
             if self._is_missing(ex):
                 return None
             raise
 
     def _raw_put(self, full: str, data: bytes) -> None:
-        self._client.put_object(Bucket=self.bucket, Key=full, Body=data)
+        self._client_for(full).put_object(Bucket=self.bucket, Key=full, Body=data)
 
     def _raw_delete(self, full: str) -> None:
         try:
-            self._client.delete_object(Bucket=self.bucket, Key=full)
+            self._client_for(full).delete_object(Bucket=self.bucket, Key=full)
         except Exception as ex:
             if not self._is_missing(ex):
                 raise
@@ -247,10 +265,16 @@ class S3ObjectStore(ObjectStore):
         _count_op("delete_batch")
         self._client.delete_objects(Bucket=self.bucket, Delete={"Objects": batch})
 
+    def _client_for(self, full: str):
+        """The control-plane client for lease and registry objects."""
+        if full.endswith("/.owner") or f"/{_REGISTRY_DIR}/" in f"/{full}":
+            return self._ctl
+        return self._client
+
     def _raw_head(self, full: str) -> int | None:
         """Object size, or None when absent."""
         try:
-            return int(self._client.head_object(Bucket=self.bucket, Key=full)["ContentLength"])
+            return int(self._client_for(full).head_object(Bucket=self.bucket, Key=full)["ContentLength"])
         except Exception as ex:
             if self._is_missing(ex):
                 return None
@@ -297,6 +321,14 @@ class S3ObjectStore(ObjectStore):
                 hint_seq, hint_bytes = 0, 0
         if not hint_seq:
             return self._seed_seq_full(key)
+        if hint_bytes and self._raw_head(
+                f"{self._full(key)}{_PART_SEP}{hint_seq - 1:0{_PART_WIDTH}d}") is None:
+            # The part the hint counts up to is gone: the prefix it sums was
+            # deleted after it was written (a writer that lost its lease and
+            # resumed wrote it late, ADR-12). Rescan - but never let the
+            # numbering go back below the hint's.
+            seq, size = self._seed_seq_full(key)
+            return max(seq, hint_seq), size
 
         # Resume from the hint. The hint carries BOTH the next sequence number
         # and the logical size AT that point, because knowing only the sequence
@@ -481,6 +513,30 @@ class S3ObjectStore(ObjectStore):
                 f"{key!r} was changed by another writer since this process last wrote it; "
                 + (f"namespace {ns!r} is fenced" if fence and ns else "not overwritten"))
         return etag
+
+    def list_meta(self, prefix: str) -> list[dict]:
+        """Objects under `prefix` with {key, size, etag, age_s} - `age_s`
+        on the SERVER's clock (its Date header minus LastModified), so no
+        node's clock skew enters it. One LIST, no per-object reads: LIST is
+        never blocked by an object a frozen peer holds locked (see _ctl)."""
+        from email.utils import parsedate_to_datetime
+
+        _count_op("list")
+        out: list[dict] = []
+        kw = {"Bucket": self.bucket, "Prefix": self._full(prefix)}
+        while True:
+            r = self._ctl.list_objects_v2(**kw)
+            date = (r.get("ResponseMetadata", {}).get("HTTPHeaders", {}) or {}).get("date")
+            now = parsedate_to_datetime(date).timestamp() if date else time.time()
+            for o in r.get("Contents", []) or []:
+                out.append({"key": self._rel(o["Key"]), "size": int(o["Size"]),
+                            "etag": o.get("ETag", ""),
+                            # Date is truncated to the second, so this never
+                            # reports a write as older than it is
+                            "age_s": max(0.0, now - o["LastModified"].timestamp())})
+            if not r.get("IsTruncated"):
+                return out
+            kw["ContinuationToken"] = r["NextContinuationToken"]
 
     def log_bound(self, key: str) -> int | None:
         with self._seq_lock:
@@ -849,7 +905,7 @@ class S3ObjectStore(ObjectStore):
         """(body, ETag) or None when absent."""
         _count_op("get_object")
         try:
-            r = self._client.get_object(Bucket=self.bucket, Key=full)
+            r = self._client_for(full).get_object(Bucket=self.bucket, Key=full)
             return r["Body"].read(), r.get("ETag", "")
         except Exception as ex:
             if self._is_missing(ex):
@@ -867,7 +923,7 @@ class S3ObjectStore(ObjectStore):
         if if_none_match:
             kw["IfNoneMatch"] = "*"
         try:
-            r = self._client.put_object(Bucket=self.bucket, Key=full, Body=data, **kw)
+            r = self._client_for(full).put_object(Bucket=self.bucket, Key=full, Body=data, **kw)
             return r.get("ETag", "") or ""
         except Exception as ex:
             code = self._code(ex)
@@ -1003,6 +1059,22 @@ class S3ObjectStore(ObjectStore):
         self._lease_thread.start()
 
     def try_acquire_owner(self, namespace: str, holder: str) -> bool:
+        """See _try_acquire_owner. A control-plane TIMEOUT (the lease object
+        is locked by a frozen peer's in-flight write, the endpoint is slow)
+        answers "not acquired" - the caller's busy/retry path - instead of an
+        opaque transport error."""
+        try:
+            return self._try_acquire_owner(namespace, holder)
+        except Exception as ex:
+            from botocore.exceptions import BotoCoreError
+
+            if isinstance(ex, BotoCoreError):
+                METRICS.inc("memd_s3_owner_lease_acquire_timeouts_total",
+                            help="lease acquisitions that timed out on the control plane")
+                return False
+            raise
+
+    def _try_acquire_owner(self, namespace: str, holder: str) -> bool:
         """Claim single-writer ownership of a namespace.
 
         The local backend uses `flock`, which cannot see another machine. Here
@@ -1112,8 +1184,19 @@ class S3ObjectStore(ObjectStore):
         fresh = -max(5.0, self.lease_ttl_s) <= age <= self.lease_ttl_s
         return {"holder": who, "stamp": stamp, "age_s": age, "fresh": fresh}
 
-    def holds_lease(self, namespace: str) -> bool:
-        return namespace in self._leases and namespace not in self._fenced
+    def holds_lease(self, namespace: str, fresh: bool = False) -> bool:
+        """We hold `namespace`'s lease (and have not been fenced). `fresh`:
+        also prove it - a holder whose heartbeat is stale (a process that
+        was paused) renews synchronously first, so a router never serves a
+        READ locally from a lease another node may have taken meanwhile."""
+        holder = self._leases.get(namespace)
+        if holder is None or namespace in self._fenced:
+            return False
+        if fresh and time.monotonic() - self._last_beat.get(namespace, 0.0) > self._beat_period():
+            self._renew_one(namespace, holder)
+            return (namespace in self._leases and namespace not in self._fenced
+                    and time.monotonic() - self._last_beat.get(namespace, 0.0) <= self._valid_for())
+        return True
 
     def release_owner(self, namespace: str) -> None:
         """Drop our lease - but only if it is still OURS.
@@ -1153,6 +1236,8 @@ class S3ObjectStore(ObjectStore):
 
 # the body of a lease its holder released (see release_owner)
 _RELEASED = b"\n0"
+# the cluster node registry's directory (memd.server.cluster.NODE_PREFIX)
+_REGISTRY_DIR = "_cluster"
 
 
 class _NoConditional(Exception):

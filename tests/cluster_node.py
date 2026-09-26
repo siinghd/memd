@@ -14,10 +14,19 @@ rotation is reachable from a few HTTP writes.
 
 Test-only: nothing here ships; the hooks are monkeypatches.
 """
+import faulthandler
 import os
 import signal
 import sys
 import threading
+
+# SIGUSR1 dumps every thread's stack into the node's log (hang diagnosis)
+faulthandler.register(signal.SIGUSR1, all_threads=True)
+if os.environ.get("MEMD_TEST_ROUTER_DEBUG"):
+    import logging
+
+    logging.basicConfig(format="%(asctime)s %(name)s %(message)s")
+    logging.getLogger("memd.cluster").setLevel(logging.DEBUG)
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 

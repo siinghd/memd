@@ -49,6 +49,13 @@ NODE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cluster_node.py
 TTL = 4.0
 ADMIN = "memd-admin-" + uuid.uuid4().hex
 EPSILON = 3.0      # routing retry cadence + reclaim + cold open from the bucket
+# A SIGSTOPped process can be frozen in the middle of a conditional PUT (its
+# lease renewal, its registry beat), and MinIO holds that object's lock until
+# the body arrives - up to its ~30 s lock timeout - so the takeover of a
+# FROZEN holder may wait that out (a KILLED one closes its connection and
+# releases the lock at once; AWS S3 does not lock). Waits after a SIGSTOP
+# allow for it.
+MINIO_LOCK_S = 35.0
 
 
 def _free_port() -> int:
@@ -177,8 +184,8 @@ class Fleet:
         holder = body.decode().split("\n", 1)[0]
         return holder.split("@", 1)[0] if "@" in holder else holder
 
-    def log_tail(self) -> str:
-        return "\n".join(f"--- {n}\n{open(p).read()[-2500:]}" for n, p in self.logs.items())
+    def log_tail(self, n: int = 2500) -> str:
+        return "\n".join(f"--- {nid}\n{open(p).read()[-n:]}" for nid, p in self.logs.items())
 
 
 @pytest.fixture()
@@ -326,16 +333,32 @@ def test_a_forged_route_header_is_ignored(fleet_factory):
 # ---------------------------------------------------------------- failover
 
 
-def _takeover_after(writer: Writer, t0: float, timeout: float) -> float:
+def _takeover_after(writer: Writer, t0: float, timeout: float, fleet: "Fleet | None" = None) -> float:
     """Seconds from t0 to the first ack of a request SENT after t0 (a
     request already in flight at t0 may still be answered by the old owner)."""
     deadline = time.monotonic() + timeout
+    next_dump = t0 + TTL + 3
     while time.monotonic() < deadline:
         after = [t for rid, _c, t in list(writer.acked) if writer.sent_at.get(rid, 0) > t0]
         if after:
             return after[0] - t0
+        if fleet is not None and os.environ.get("MEMD_TEST_ROUTER_DEBUG") and time.monotonic() > next_dump:
+            next_dump += 4
+            for p in fleet.procs.values():
+                if p.poll() is None:
+                    p.send_signal(signal.SIGUSR1)
         time.sleep(0.05)
-    raise AssertionError("no write was acknowledged after the leaseholder went away")
+    fails = [(c, round(t - t0, 2)) for c, t in writer.failed if t > t0][-15:]
+    if fleet is not None:
+        for p in fleet.procs.values():            # stacks of every live node, into its log
+            if p.poll() is None:
+                try:
+                    p.send_signal(signal.SIGUSR1)
+                except Exception:
+                    pass
+        time.sleep(1.0)
+    raise AssertionError(f"no write was acknowledged after the leaseholder went away; "
+                         f"failures since: {fails}\n{fleet.log_tail(20000) if fleet else ''}")
 
 
 def test_kill_the_leaseholder_another_node_takes_over_within_ttl(fleet_factory):
@@ -353,7 +376,7 @@ def test_kill_the_leaseholder_another_node_takes_over_within_ttl(fleet_factory):
     assert w.acked, f"no steady-state acks through the router: {w.failed[:5]}\n{f.log_tail()}"
     t_kill = time.monotonic()
     f.stop(owner, signal.SIGKILL)
-    took = _takeover_after(w, t_kill, TTL + 20)
+    took = _takeover_after(w, t_kill, TTL + 20, f)
     time.sleep(1.5)
     w.stop.set()
     w.join(timeout=60)
@@ -386,7 +409,7 @@ def test_graceful_shutdown_hands_off_without_waiting_for_the_ttl(fleet_factory):
     time.sleep(1.5)
     t_stop = time.monotonic()
     f.stop(owner, signal.SIGTERM, wait=False)
-    took = _takeover_after(w, t_stop, TTL + 20)
+    took = _takeover_after(w, t_stop, TTL + 20, f)
     f.procs[owner].wait(timeout=60)
     time.sleep(1.0)
     w.stop.set()
@@ -397,9 +420,8 @@ def test_graceful_shutdown_hands_off_without_waiting_for_the_ttl(fleet_factory):
     assert f.procs[owner].returncode in (0, -signal.SIGTERM), f.log_tail()
     assert "Application shutdown complete" in open(f.logs[owner]).read()
     assert took < TTL, f"graceful handoff took {took:.2f}s - the lease was not released"
-    reg = json.loads(f.s3.get_object(Bucket=BUCKET, Key=f"{f.prefix}/_cluster/nodes/{owner}.json")
-                     ["Body"].read())
-    assert reg.get("stopped") is True, f"a gracefully stopped node stayed registered: {reg}"
+    reg = f.s3.get_object(Bucket=BUCKET, Key=f"{f.prefix}/_cluster/nodes/{owner}.json")["Body"].read()
+    assert reg == b"", f"a gracefully stopped node stayed registered: {reg!r}"
     _assert_all_acked_readable(f, ns, w.acked, [n for n in nodes if n != owner])
 
 
@@ -424,7 +446,7 @@ def test_a_frozen_leaseholder_cannot_split_brain(fleet_factory, kms):
     t_stop = time.monotonic()
     wb = Writer(f.urls[b], ns, "from-b")
     wb.start()
-    took = _takeover_after(wb, t_stop, TTL + 20)
+    took = _takeover_after(wb, t_stop, TTL + MINIO_LOCK_S, f)
     time.sleep(1.5)                                      # B writes while A is frozen
     f.send(a, signal.SIGCONT)
     time.sleep(3.0)                                      # A resumes, is fenced, routes to B
@@ -549,7 +571,7 @@ def test_a_commit_paused_past_the_takeover_fails_instead_of_clobbering(fleet_fac
     # another node takes over (after the TTL) and writes
     w = Writer(f.urls["n2"], ns, "after-takeover")
     w.start()
-    took = _takeover_after(w, t_stop, TTL + 20)
+    took = _takeover_after(w, t_stop, TTL + MINIO_LOCK_S, f)
     time.sleep(1.5)
     new_owner = f.owner(ns)
     assert new_owner in ("n2", "n3"), new_owner
