@@ -502,3 +502,151 @@ def test_end_to_end_checkout_webhook_entitlement_usage_push(tmp_path, stripe_moc
     finally:
         app.state.engine.close()
         h.store.close()
+
+
+# ------------------------------- stale usage: never auto-pushed, reconciled
+
+
+class _Sim:
+    """A simulated clock shared by the ledger, the pusher and FakeStripe
+    (whose idempotency keys expire after 24 h, as Stripe's do)."""
+
+    def __init__(self, tmp_path, fake: FakeStripe):
+        self.fake = fake
+        fake.key_ttl_s = 24 * 3600
+        fake.clock = lambda: self.now
+        self.base = (int(time.time()) // 3600 - 40) * 3600  # 40 h ago, hour-aligned
+        self.now = self.base
+        self.store = AdminStore.for_data_root(str(tmp_path / "data"))
+        self.plans = Plans()
+        self.org = self.store.create_org("acme", plan="scale")
+        self.store.update_org(self.org, stripe_customer_id="cus_acme")
+        self.billing = Billing(self.store, self.plans, BillingConfig.from_env(
+            _env(fake.url, MEMD_STRIPE_MAX_NETWORK_RETRIES="0")))
+        self.hours_recorded = 0
+
+    def usage_through(self, hour: int) -> None:
+        """One search per simulated hour, a minute past the hour."""
+        while self.hours_recorded <= hour:
+            self.store.record_usage(self.org, "acme", {"searches": 1}, self.plans.get("scale"),
+                                    ts=self.base + self.hours_recorded * 3600 + 60)
+            self.hours_recorded += 1
+
+    def tick(self, hour: float) -> dict:
+        """The billing job's hourly tick at base + hour."""
+        self.now = int(self.base + hour * 3600)
+        return {"push": self.billing.push_usage(now=self.now),
+                "reconcile": self.billing.reconcile_pending(now=self.now)}
+
+    def ledger_units(self) -> float:
+        return sum(e["billable"] for e in self.store.events(self.org) if e["meter"] == "searches")
+
+
+def test_30h_outage_never_double_counts(tmp_path):
+    """Hour 0's batch reaches Stripe but its response is lost; then Stripe is
+    unreachable for 30 h while the job keeps ticking. Retrying that batch
+    after recovery under its key would bill it twice (Stripe forgot the key
+    after 24 h), so nothing older than 20 h is auto-pushed: those events are
+    settled against Stripe's meter summary, which already holds hour 0 -
+    only the verified missing quantity is sent, under a fresh key."""
+    fake = FakeStripe({"searches": "memd_searches"})
+    try:
+        sim = _Sim(tmp_path, fake)
+        sim.usage_through(0)
+        fake.fail_after_accept = True  # Stripe bills hour 0, the pusher never hears back
+        assert sim.tick(1)["push"]["failed"] == 1
+        [batch_a] = sim.store.pending_pushes()
+        fake.fail_after_accept, fake.down = False, True
+        for h in range(1, 31):  # the 30 h outage; every tick fails or defers
+            sim.usage_through(h)
+            t = sim.tick(h + 1)
+            assert t["push"]["sent"] == 0 and t["reconcile"]["reconciled"] == 0
+        assert sim.store.needs_reconcile_count() > 0
+        assert any(b["id"] == batch_a["id"] and b["abandoned_at"] for b in sim.store.batches())
+
+        fake.down = False  # recovery
+        sim.usage_through(31)
+        seen_before_send = []
+
+        def check_recorded(params):  # the fresh key is persisted BEFORE the send
+            row = [b for b in sim.store.batches() if b["id"] == params["idempotency_key"]]
+            seen_before_send.append(bool(row) and row[0]["pushed_at"] is None)
+
+        fake.on_meter_event = check_recorded
+        first = sim.tick(32)
+        second = sim.tick(34)  # a deferred window settles on a later tick
+        fake.on_meter_event = None
+        assert first["push"]["failed"] == 0 and second["push"]["failed"] == 0
+        assert all(seen_before_send)
+
+        assert fake.total("memd_searches") == sim.ledger_units() == 32  # nothing lost, nothing doubled
+        assert fake.expired_key_reuse == 0  # no key was re-sent after Stripe forgot it
+        a_sends = [r for r in fake.requests if r["idempotency_key"] == batch_a["id"]]
+        assert len(a_sends) == 1  # batch A was never retried after the outage
+        [rec] = [b for b in sim.store.batches() if b["kind"] == "reconcile"]
+        assert rec["credited"] == 1  # hour 0: verified already in Stripe, not re-sent
+        # hours 1-11 (older than 20 h at the recovery tick, 32 h): sent once
+        assert rec["value"] == 11 and rec["pushed_at"] is not None
+        assert sim.store.needs_reconcile_count() == 0 and sim.store.unpushed_count() == 0
+        assert {e["push_status"] for e in sim.store.events(sim.org)} <= {"sent", "reconciled"}
+        # the drift report over the quota period to date is clean
+        rep = sim.billing.reconcile(min(e["ts"] for e in sim.store.events()) // 3600 * 3600, sim.now)
+        assert rep["alerts"] == 0 and rep["pairs"][0]["drift"] == 0
+    finally:
+        fake.close()
+
+
+def test_stale_batch_that_already_landed_is_not_resent(tmp_path):
+    fake = FakeStripe({"searches": "memd_searches"})
+    try:
+        sim = _Sim(tmp_path, fake)
+        sim.usage_through(2)
+        fake.fail_after_accept = True  # all three hours land; every response is lost
+        assert sim.tick(3)["push"]["failed"] == 3
+        fake.fail_after_accept = False
+        # the pusher only comes back 22 h later: too late to retry the keys
+        out = sim.tick(25)
+        assert out["push"]["abandoned"] == 3 and out["push"]["sent"] == 0
+        assert out["reconcile"]["reconciled"] == 1 and out["reconcile"]["pushed_units"] == 0
+        assert out["reconcile"]["credited_units"] == 3
+        assert fake.total() == sim.ledger_units() == 3 and len(fake.requests) == 3
+        assert {e["push_status"] for e in sim.store.events(sim.org)} == {"reconciled"}
+    finally:
+        fake.close()
+
+
+def test_reconcile_that_cannot_decide_alerts_and_sends_nothing(tmp_path):
+    fake = FakeStripe({"searches": "memd_searches"})
+    try:
+        sim = _Sim(tmp_path, fake)
+        sim.usage_through(4)
+        # Stripe holds usage for this customer the ledger cannot account for
+        # (a manual adjustment, another system): more than the ledger expects
+        fake.events.append({"event_name": "memd_searches", "identifier": "manual", "customer": "cus_acme",
+                            "value": "7", "timestamp": sim.base + 120, "idempotency_key": None, "_at": 0})
+        out = sim.tick(26)  # 5 hours of usage, all older than 20 h
+        assert out["push"]["needs_reconcile"] == 5 and out["push"]["sent"] == 0
+        assert out["reconcile"]["undecidable"] == 1 and out["reconcile"]["reconciled"] == 0
+        assert len(fake.requests) == 0  # nothing was pushed
+        assert sim.store.needs_reconcile_count() == 5  # left for a human, still alerting
+        [alert] = sim.store.log_entries(sim.org, "drift_alert")
+        assert json.loads(alert["detail"])["reason"] == "stripe_differs"
+        assert "memd_billing_drift_alerts_total" in METRICS.render_prometheus()
+    finally:
+        fake.close()
+
+
+def test_usage_older_than_20h_is_never_auto_pushed(tmp_path):
+    fake = FakeStripe({"searches": "memd_searches"})
+    try:
+        sim = _Sim(tmp_path, fake)
+        sim.usage_through(0)
+        sim.now = sim.base + 20 * 3600 + 61  # the event is 20 h and 1 s old
+        out = sim.billing.push_usage(now=sim.now)
+        assert out["needs_reconcile"] == 1 and out["batches"] == 0 and fake.requests == []
+        # younger usage in the same run still goes out normally
+        sim.store.record_usage(sim.org, "acme", {"searches": 1}, sim.plans.get("scale"), ts=sim.now - 60)
+        out = sim.billing.push_usage(now=sim.now)
+        assert out["sent"] == 1 and fake.total() == 1
+    finally:
+        fake.close()

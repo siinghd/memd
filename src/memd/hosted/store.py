@@ -73,7 +73,9 @@ CREATE TABLE IF NOT EXISTS usage_event (
   period TEXT NOT NULL,              -- quota period, 'YYYY-MM' UTC
   push_id TEXT,                      -- the meter_push batch that carries it
   pushed_at INTEGER,
-  push_status TEXT                   -- sent | not_billable | no_customer | expired
+  -- NULL (pending) | sent | reconciling | reconciled | needs_reconcile |
+  -- not_billable | no_customer | unmapped | expired
+  push_status TEXT
 );
 CREATE INDEX IF NOT EXISTS usage_unpushed ON usage_event(push_id) WHERE pushed_at IS NULL;
 CREATE INDEX IF NOT EXISTS usage_org_period ON usage_event(org_id, period, meter);
@@ -85,22 +87,41 @@ CREATE TABLE IF NOT EXISTS usage_rollup (
   billable REAL NOT NULL DEFAULT 0,
   PRIMARY KEY (org_id, meter, period)
 );
+-- in-flight quota reservations: admission reserves under BEGIN IMMEDIATE,
+-- the usage commit (or a failure) releases; rows older than the TTL are a
+-- crashed request's and stop counting
+CREATE TABLE IF NOT EXISTS usage_reservation (
+  id TEXT NOT NULL,
+  org_id TEXT NOT NULL,
+  meter TEXT NOT NULL,
+  period TEXT NOT NULL,
+  quantity REAL NOT NULL,
+  created REAL NOT NULL,
+  PRIMARY KEY (id, meter)
+);
+CREATE INDEX IF NOT EXISTS usage_reservation_org ON usage_reservation(org_id, meter, period);
 -- one Stripe meter event per batch; the batch id is the Stripe identifier
 -- AND idempotency key, persisted before the first send so every retry
--- (after a crash, a timeout, a 5xx) re-sends the same key
+-- (after a crash, a timeout, a 5xx) re-sends the same key - but only while
+-- Stripe still remembers it (see MAX_AUTO_PUSH_AGE_S)
 CREATE TABLE IF NOT EXISTS meter_push (
   id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL DEFAULT 'regular',  -- regular | reconcile
   org_id TEXT NOT NULL,
   meter TEXT NOT NULL,
   customer TEXT NOT NULL,
-  value INTEGER NOT NULL,            -- whole Stripe units (see STRIPE_UNIT_SCALE)
-  ts INTEGER NOT NULL,
-  created INTEGER NOT NULL,
+  value INTEGER NOT NULL,            -- whole Stripe units sent (see STRIPE_UNIT_SCALE)
+  credited INTEGER NOT NULL DEFAULT 0,  -- reconcile: units verified already in Stripe, not re-sent
+  ts INTEGER NOT NULL,               -- the meter event timestamp (newest member event)
+  first_ts INTEGER NOT NULL,         -- the oldest member event
+  created INTEGER NOT NULL,          -- claimed; the first send follows
   pushed_at INTEGER,
+  abandoned_at INTEGER,              -- too old to retry under its key: handed to reconciliation
   attempts INTEGER NOT NULL DEFAULT 0,
   last_error TEXT
 );
 CREATE INDEX IF NOT EXISTS meter_push_pending ON meter_push(created) WHERE pushed_at IS NULL;
+CREATE INDEX IF NOT EXISTS meter_push_org ON meter_push(org_id, meter, customer, ts);
 CREATE TABLE IF NOT EXISTS processed_events (
   id TEXT PRIMARY KEY,               -- Stripe event id: webhook idempotency
   type TEXT NOT NULL,
@@ -124,10 +145,26 @@ _USAGE_NS = uuid.UUID("6f1b0c5e-2a7d-4c1e-9a53-8d0f4e2b7c11")
 SCOPES = frozenset({"memory", "billing", "override"})
 # Stripe accepts meter events up to 35 days old; leave a day of margin
 STRIPE_MAX_EVENT_AGE_S = 34 * 86400
+# Stripe remembers an idempotency key (and a meter event identifier) for
+# ~24 h. A usage event older than this is never pushed automatically - a
+# retry could land after Stripe forgot the key and bill it twice - it goes
+# to reconciliation, which pushes only what Stripe verifiably lacks.
+MAX_AUTO_PUSH_AGE_S = 20 * 3600
+
+
+def stripe_units(quantity: float, scale: int = 1) -> int:
+    """Whole Stripe units, rounded up (a fraction is never given away)."""
+    return int(-(-round(quantity * scale, 6) // 1))
 
 
 class OwnershipError(Exception):
     """A namespace already belongs to another org."""
+
+
+class _Denied(Exception):
+    def __init__(self, info: dict):
+        super().__init__(info.get("meter", ""))
+        self.info = info
 
 
 def period_of(ts: float) -> str:
@@ -326,7 +363,7 @@ class AdminStore:
     # ----------------------------------------------------------------- usage
 
     def record_usage(self, org_id: str, ns: str | None, usage: dict[str, float], plan: Plan,
-                     ts: float | None = None) -> list[str]:
+                     ts: float | None = None, reservation: str | None = None) -> list[str]:
         """Append counter usage to the ledger and bump the rollups - ONE
         transaction, so the quota rollup and the billing ledger can never
         disagree. The billable part of each event is fixed here, against the
@@ -356,7 +393,56 @@ class AdminStore:
                             " quantity = quantity + excluded.quantity, billable = billable + excluded.billable",
                             (org_id, meter, period, float(qty), billable))
                 ids.append(eid)
+            if reservation is not None:
+                # same transaction: the rollup grows as the reservation goes
+                con.execute("DELETE FROM usage_reservation WHERE id = ?", (reservation,))
         return ids
+
+    # ------------------------------------------------------------ reservations
+
+    def try_reserve(self, org_id: str, period: str, checks: list[tuple[str, float, float, float | None]],
+                    *, now: float, ttl_s: float) -> tuple[str | None, dict | None]:
+        """Atomic check-and-reserve for hard caps. `checks` holds (meter,
+        quantity, limit, live_base): the used amount is `live_base` (the
+        memories gauge, counted outside SQLite) or the period rollup, plus
+        every live reservation. Under BEGIN IMMEDIATE no other request can
+        check or reserve in between, so concurrent requests at the boundary
+        cannot all pass. Returns (reservation id, None) or (None, denial)."""
+        rid = str(uuid.uuid4())
+        try:
+            self._reserve(rid, org_id, period, checks, now=now, ttl_s=ttl_s)
+        except _Denied as d:
+            return None, d.info
+        return rid, None
+
+    def _reserve(self, rid: str, org_id: str, period: str, checks, *, now: float, ttl_s: float) -> None:
+        with self.txn() as con:
+            con.execute("DELETE FROM usage_reservation WHERE created < ?", (now - ttl_s,))
+            for meter, qty, limit, live_base in checks:
+                rperiod = "live" if live_base is not None else period
+                if live_base is not None:
+                    used = float(live_base)
+                else:
+                    row = con.execute("SELECT quantity FROM usage_rollup WHERE org_id = ? AND meter = ?"
+                                      " AND period = ?", (org_id, meter, period)).fetchone()
+                    used = float(row["quantity"]) if row else 0.0
+                held = con.execute("SELECT COALESCE(SUM(quantity), 0) FROM usage_reservation"
+                                   " WHERE org_id = ? AND meter = ? AND period = ?",
+                                   (org_id, meter, rperiod)).fetchone()[0]
+                if used + float(held) + qty > limit:
+                    # raising rolls back the reservations made so far
+                    raise _Denied({"meter": meter, "limit": limit, "used": used + float(held)})
+                con.execute("INSERT INTO usage_reservation (id, org_id, meter, period, quantity, created)"
+                            " VALUES (?, ?, ?, ?, ?, ?)", (rid, org_id, meter, rperiod, float(qty), now))
+
+    def release(self, reservation: str) -> None:
+        with self.txn() as con:
+            con.execute("DELETE FROM usage_reservation WHERE id = ?", (reservation,))
+
+    def reservations(self, org_id: str | None = None) -> list[dict]:
+        if org_id is None:
+            return self._all("SELECT * FROM usage_reservation")
+        return self._all("SELECT * FROM usage_reservation WHERE org_id = ?", (org_id,))
 
     def record_gauge(self, org_id: str, meter: str, value: float, plan: Plan, day: str,
                      ts: float | None = None) -> str | None:
@@ -403,7 +489,8 @@ class AdminStore:
     # ------------------------------------------------------------- meter push
 
     def claim_push_batches(self, event_name_for, *, now: float | None = None,
-                           unit_scale: dict[str, int] | None = None, limit: int = 50_000) -> dict:
+                           unit_scale: dict[str, int] | None = None, limit: int = 50_000,
+                           max_age_s: int = MAX_AUTO_PUSH_AGE_S) -> dict:
         """Move unpushed ledger rows into push batches, in one transaction.
 
         Billable rows of orgs with a Stripe customer are grouped per (org,
@@ -411,16 +498,17 @@ class AdminStore:
         lands it in the right billing period. Each batch's id is a UUIDv5 of
         its member event UUIDs; it is persisted here, BEFORE any send, and
         becomes the Stripe identifier and idempotency key. Rows that owe
-        Stripe nothing are closed out with the reason."""
+        Stripe nothing are closed out with the reason; billable rows older
+        than `max_age_s` go to reconciliation instead (needs_reconcile)."""
         now_i = int(time.time() if now is None else now)
         scale = unit_scale or {}
-        counts = {"batches": 0, "not_billable": 0, "no_customer": 0, "expired": 0, "unmapped": 0}
+        counts = {"batches": 0, "not_billable": 0, "no_customer": 0, "unmapped": 0, "needs_reconcile": 0}
         with self.txn() as con:
             rows = con.execute(
                 "SELECT e.id, e.org_id, e.meter, e.billable, e.ts, o.stripe_customer_id AS customer"
                 " FROM usage_event e LEFT JOIN org o ON o.id = e.org_id"
-                " WHERE e.pushed_at IS NULL AND e.push_id IS NULL ORDER BY e.ts, e.id LIMIT ?",
-                (limit,)).fetchall()
+                " WHERE e.pushed_at IS NULL AND e.push_id IS NULL AND e.push_status IS NULL"
+                " ORDER BY e.ts, e.id LIMIT ?", (limit,)).fetchall()
             groups: dict[tuple, list] = {}
             for r in rows:
                 reason = None
@@ -428,14 +516,17 @@ class AdminStore:
                     reason = "not_billable"
                 elif not r["customer"]:
                     reason = "no_customer"
-                elif now_i - r["ts"] > STRIPE_MAX_EVENT_AGE_S:
-                    reason = "expired"
                 elif not event_name_for(r["meter"]):
                     reason = "unmapped"
                 if reason is not None:
                     counts[reason] += 1
                     con.execute("UPDATE usage_event SET pushed_at = ?, push_status = ? WHERE id = ?",
                                 (now_i, reason, r["id"]))
+                    continue
+                if now_i - r["ts"] > max_age_s:
+                    counts["needs_reconcile"] += 1
+                    con.execute("UPDATE usage_event SET push_status = 'needs_reconcile' WHERE id = ?",
+                                (r["id"],))
                     continue
                 if r["meter"] in GAUGES:
                     key = (r["org_id"], r["meter"], r["customer"], "gauge", r["id"])  # never summed
@@ -446,25 +537,88 @@ class AdminStore:
                 ids = sorted(m["id"] for m in members)
                 bid = str(uuid.uuid5(_USAGE_NS, "push|" + ",".join(ids)))
                 qty = sum(m["billable"] for m in members)
-                value = int(-(-round(qty * scale.get(meter, 1), 6) // 1))  # ceil, whole units
+                value = stripe_units(qty, scale.get(meter, 1))
                 ts = max(m["ts"] for m in members)
-                con.execute("INSERT OR IGNORE INTO meter_push (id, org_id, meter, customer, value, ts, created)"
-                            " VALUES (?, ?, ?, ?, ?, ?, ?)", (bid, org_id, meter, customer, value, ts, now_i))
+                first = min(m["ts"] for m in members)
+                con.execute("INSERT OR IGNORE INTO meter_push (id, org_id, meter, customer, value, ts, first_ts,"
+                            " created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            (bid, org_id, meter, customer, value, ts, first, now_i))
                 con.executemany("UPDATE usage_event SET push_id = ? WHERE id = ?", [(bid, i) for i in ids])
                 counts["batches"] += 1
         return counts
 
     def pending_pushes(self, limit: int = 1000) -> list[dict]:
-        return self._all("SELECT * FROM meter_push WHERE pushed_at IS NULL ORDER BY created, id LIMIT ?",
-                         (limit,))
+        return self._all("SELECT * FROM meter_push WHERE pushed_at IS NULL AND abandoned_at IS NULL"
+                         " ORDER BY created, id LIMIT ?", (limit,))
 
-    def mark_pushed(self, batch_id: str, now: float | None = None) -> None:
+    def mark_pushed(self, batch_id: str, now: float | None = None, status: str = "sent") -> None:
         now_i = int(time.time() if now is None else now)
         with self.txn() as con:
             con.execute("UPDATE meter_push SET pushed_at = ?, attempts = attempts + 1, last_error = NULL"
                         " WHERE id = ?", (now_i, batch_id))
-            con.execute("UPDATE usage_event SET pushed_at = ?, push_status = 'sent' WHERE push_id = ?",
+            con.execute("UPDATE usage_event SET pushed_at = ?, push_status = ? WHERE push_id = ?",
+                        (now_i, status, batch_id))
+
+    def abandon_batch(self, batch_id: str, now: float | None = None) -> None:
+        """A pending batch too old to retry under its key (Stripe may have
+        forgotten it, and may or may not hold the first attempt): its events
+        go to reconciliation, which asks Stripe what it actually has."""
+        now_i = int(time.time() if now is None else now)
+        with self.txn() as con:
+            con.execute("UPDATE meter_push SET abandoned_at = ? WHERE id = ? AND pushed_at IS NULL",
                         (now_i, batch_id))
+            con.execute("UPDATE usage_event SET push_id = NULL, push_status = 'needs_reconcile'"
+                        " WHERE push_id = ? AND pushed_at IS NULL", (batch_id,))
+
+    def needs_reconcile_groups(self) -> list[dict]:
+        """needs_reconcile rows per (org, meter, customer, period) - per
+        event for gauges, which Stripe aggregates as 'last', not 'sum'."""
+        rows = self._all(
+            "SELECT e.id, e.org_id, e.meter, e.billable, e.ts, e.period, o.stripe_customer_id AS customer"
+            " FROM usage_event e LEFT JOIN org o ON o.id = e.org_id"
+            " WHERE e.push_status = 'needs_reconcile' ORDER BY e.ts, e.id")
+        groups: dict[tuple, dict] = {}
+        for r in rows:
+            key = (r["org_id"], r["meter"], r["customer"], r["period"],
+                   r["id"] if r["meter"] in GAUGES else "")
+            g = groups.setdefault(key, {"org_id": r["org_id"], "meter": r["meter"], "customer": r["customer"],
+                                        "period": r["period"], "ids": [], "billable": 0.0,
+                                        "min_ts": r["ts"], "max_ts": r["ts"]})
+            g["ids"].append(r["id"])
+            g["billable"] += r["billable"]
+            g["min_ts"] = min(g["min_ts"], r["ts"])
+            g["max_ts"] = max(g["max_ts"], r["ts"])
+        return list(groups.values())
+
+    def close_events(self, ids: list[str], status: str, now: float | None = None) -> None:
+        now_i = int(time.time() if now is None else now)
+        with self.txn() as con:
+            con.executemany("UPDATE usage_event SET pushed_at = ?, push_status = ? WHERE id = ?",
+                            [(now_i, status, i) for i in ids])
+
+    def create_reconcile_batch(self, org_id: str, meter: str, customer: str, *, value: int, credited: int,
+                               ts: int, first_ts: int, ids: list[str], now: float | None = None) -> str:
+        """Persist a reconciliation push BEFORE it is sent, under a FRESH id
+        (the old keys may be forgotten by Stripe): `value` units to send,
+        `credited` units verified as already in Stripe."""
+        now_i = int(time.time() if now is None else now)
+        bid = str(uuid.uuid4())
+        with self.txn() as con:
+            con.execute("INSERT INTO meter_push (id, kind, org_id, meter, customer, value, credited, ts, first_ts,"
+                        " created) VALUES (?, 'reconcile', ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (bid, org_id, meter, customer, int(value), int(credited), int(ts), int(first_ts), now_i))
+            con.executemany("UPDATE usage_event SET push_id = ?, push_status = 'reconciling' WHERE id = ?"
+                            " AND push_status = 'needs_reconcile'", [(bid, i) for i in ids])
+        return bid
+
+    def unsettled(self, org_id: str, meter: str, customer: str, start: int, end: int, settled_before: int) -> bool:
+        """A batch in [start, end) that Stripe may not reflect yet: still
+        pending, or sent after `settled_before` (meter summaries lag)."""
+        row = self._one("SELECT 1 AS x FROM meter_push WHERE org_id = ? AND meter = ? AND customer = ?"
+                        " AND ts >= ? AND ts < ? AND abandoned_at IS NULL AND (pushed_at IS NULL"
+                        " OR (pushed_at > ? AND value > 0)) LIMIT 1",
+                        (org_id, meter, customer, start, end, settled_before))
+        return row is not None
 
     def mark_push_failed(self, batch_id: str, error: str) -> None:
         with self.txn() as con:
@@ -475,24 +629,35 @@ class AdminStore:
         row = self._one("SELECT COUNT(*) AS n FROM usage_event WHERE pushed_at IS NULL")
         return int(row["n"]) if row else 0
 
-    def pushed_totals(self, org_id: str, meter: str, start: int, end: int) -> tuple[float, int]:
-        """(sum of the ledger's billable quantity, sum of Stripe units sent)
-        over the batches Stripe acknowledged with a timestamp in [start, end)."""
-        row = self._one("SELECT COALESCE(SUM(value), 0) AS units FROM meter_push WHERE org_id = ? AND meter = ?"
-                        " AND pushed_at IS NOT NULL AND ts >= ? AND ts < ?", (org_id, meter, start, end))
-        led = self._one("SELECT COALESCE(SUM(e.billable), 0) AS q FROM usage_event e JOIN meter_push p"
-                        " ON p.id = e.push_id WHERE p.org_id = ? AND p.meter = ? AND p.pushed_at IS NOT NULL"
-                        " AND p.ts >= ? AND p.ts < ?", (org_id, meter, start, end))
-        return float(led["q"] if led else 0.0), int(row["units"] if row else 0)
+    def needs_reconcile_count(self) -> int:
+        row = self._one("SELECT COUNT(*) AS n FROM usage_event WHERE push_status = 'needs_reconcile'")
+        return int(row["n"]) if row else 0
 
-    def last_pushed_gauge(self, org_id: str, meter: str, start: int, end: int) -> int | None:
-        row = self._one("SELECT value FROM meter_push WHERE org_id = ? AND meter = ? AND pushed_at IS NOT NULL"
-                        " AND ts >= ? AND ts < ? ORDER BY ts DESC, id DESC LIMIT 1", (org_id, meter, start, end))
-        return int(row["value"]) if row else None
+    def settled_units(self, org_id: str, meter: str, customer: str, start: int, end: int) -> int:
+        """What Stripe should hold from us for [start, end): every settled
+        batch's sent units plus the units reconciliation verified were
+        already there. Abandoned batches do not count (reconciliation
+        accounts for whatever of them landed)."""
+        row = self._one("SELECT COALESCE(SUM(value + credited), 0) AS u FROM meter_push WHERE org_id = ?"
+                        " AND meter = ? AND customer = ? AND pushed_at IS NOT NULL AND abandoned_at IS NULL"
+                        " AND ts >= ? AND ts < ?", (org_id, meter, customer, start, end))
+        return int(row["u"]) if row else 0
 
-    def pushed_pairs(self, start: int, end: int) -> list[dict]:
+    def last_settled_gauge(self, org_id: str, meter: str, customer: str, start: int, end: int) -> int | None:
+        row = self._one("SELECT value + credited AS u FROM meter_push WHERE org_id = ? AND meter = ?"
+                        " AND customer = ? AND pushed_at IS NOT NULL AND abandoned_at IS NULL"
+                        " AND ts >= ? AND ts < ? ORDER BY ts DESC, created DESC LIMIT 1",
+                        (org_id, meter, customer, start, end))
+        return int(row["u"]) if row else None
+
+    def settled_pairs(self, start: int, end: int) -> list[dict]:
         return self._all("SELECT DISTINCT org_id, meter, customer FROM meter_push WHERE pushed_at IS NOT NULL"
-                         " AND ts >= ? AND ts < ?", (start, end))
+                         " AND abandoned_at IS NULL AND ts >= ? AND ts < ?", (start, end))
+
+    def batches(self, org_id: str | None = None) -> list[dict]:
+        if org_id is None:
+            return self._all("SELECT * FROM meter_push ORDER BY created, id")
+        return self._all("SELECT * FROM meter_push WHERE org_id = ? ORDER BY created, id", (org_id,))
 
     # --------------------------------------------------------- stripe events
 

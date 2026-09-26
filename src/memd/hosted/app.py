@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 from memd.hosted.billing import Billing, BillingConfig, BillingError
 from memd.hosted.metering import Forbidden, Metering, QuotaDenied
 from memd.hosted.plans import Plans
-from memd.hosted.store import AdminStore, parse_scopes
+from memd.hosted.store import AdminStore, parse_scopes, period_bounds, period_of
 from memd.metrics import METRICS
 from memd.server.auth import Principal, hash_secret
 
@@ -97,9 +97,9 @@ class HostedKeyStore:
 
 
 class BillingJobs:
-    """Background loop: the daily gauge snapshot, the hourly meter push and
-    the daily reconciliation. Every step is idempotent, so several workers
-    (or a restart mid-step) are safe."""
+    """Background loop: the daily gauge snapshot, the hourly meter push, the
+    settling of usage too old to push on its own, and the daily drift
+    report. Every step is idempotent, so a restart mid-step is safe."""
 
     def __init__(self, hosted: "Hosted"):
         self.hosted = hosted
@@ -119,9 +119,13 @@ class BillingJobs:
             self._snapshot_day = day
         if h.billing.cfg.configured:
             out["push"] = h.billing.push_usage(now=now)
+            # every tick: usage too old to push on its own is settled against
+            # what Stripe verifiably holds (a no-op when there is none)
+            out["reconcile_pending"] = h.billing.reconcile_pending(now=now)
             today = int(now // 86400) * 86400
             if self._reconciled_day != today:
-                out["reconcile"] = h.billing.reconcile(today - 86400, today)
+                # the drift report covers yesterday's quota period to date
+                out["reconcile"] = h.billing.reconcile(period_bounds(period_of(today - 1))[0], today)
                 self._reconciled_day = today
         return out
 

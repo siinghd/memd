@@ -48,13 +48,22 @@ def free_port() -> int:
 
 class FakeStripe:
     """POST /v1/billing/meter_events, GET /v1/billing/meters and
-    GET /v1/billing/meters/{id}/event_summaries, idempotent like Stripe."""
+    GET /v1/billing/meters/{id}/event_summaries, idempotent like Stripe -
+    including Stripe's LIMIT: a key is remembered for `key_ttl_s` (Stripe:
+    ~24 h) on the fake's own `clock`, after which the same key is a new
+    event."""
 
     def __init__(self, event_names: dict[str, str] | None = None):
         self.lock = threading.Lock()
-        self.by_key: dict[str, dict] = {}   # idempotency key -> accepted event
+        self.by_key: dict[str, dict] = {}   # idempotency key -> accepted event (latest)
+        self.events: list[dict] = []        # every accepted (billed) event
         self.requests: list[dict] = []      # every request, replays included
         self.replays = 0
+        self.expired_key_reuse = 0          # a key re-sent after Stripe forgot it: billed twice
+        self.clock = time.time
+        self.key_ttl_s: float | None = None
+        self.down = False                    # outage: every request answers 503
+        self.fail_after_accept = False       # accept, then answer 500 (the response is lost)
         self.drop: set[str] = set()          # identifiers to "lose" (drift tests)
         self.on_meter_event = None           # hook(params) -> "kill_before" | None; runs pre-response
         self.after_accept = None             # hook(params) after the event is stored, pre-response
@@ -76,6 +85,8 @@ class FakeStripe:
             def do_POST(self):
                 n = int(self.headers.get("Content-Length") or 0)
                 form = {k: v[0] for k, v in parse_qs(self.rfile.read(n).decode()).items()}
+                if fake.down:
+                    return self._send(503, {"error": {"message": "outage", "type": "api_error"}})
                 if urlparse(self.path).path != "/v1/billing/meter_events":
                     return self._send(404, {"error": {"message": "unknown path"}})
                 key = self.headers.get("Idempotency-Key")
@@ -87,21 +98,31 @@ class FakeStripe:
                     return  # the pusher dies before Stripe accepted anything
                 with fake.lock:
                     fake.requests.append(params)
-                    if key and key in fake.by_key:
+                    now = fake.clock()
+                    known = fake.by_key.get(key) if key else None
+                    if known is not None and fake.key_ttl_s is not None and now - known["_at"] > fake.key_ttl_s:
+                        fake.expired_key_reuse += 1
+                        known = None
+                    if known is not None:
                         fake.replays += 1
-                        stored = fake.by_key[key]
+                        stored = known
                     else:
-                        stored = dict(params)
+                        stored = dict(params, _at=now)
+                        fake.events.append(stored)
                         if key:
                             fake.by_key[key] = stored
                 if fake.after_accept is not None:
                     fake.after_accept(params)
+                if fake.fail_after_accept:
+                    return self._send(500, {"error": {"message": "lost response", "type": "api_error"}})
                 self._send(200, {"object": "billing.meter_event", "event_name": stored["event_name"],
                                  "identifier": stored["identifier"], "livemode": False,
                                  "payload": {"stripe_customer_id": stored["customer"], "value": stored["value"]},
                                  "timestamp": stored["timestamp"], "created": int(time.time())})
 
             def do_GET(self):
+                if fake.down:
+                    return self._send(503, {"error": {"message": "outage", "type": "api_error"}})
                 u = urlparse(self.path)
                 q = {k: v[0] for k, v in parse_qs(u.query).items()}
                 parts = u.path.strip("/").split("/")
@@ -113,7 +134,7 @@ class FakeStripe:
                     name = fake.meters.get(parts[3])
                     start, end = int(q.get("start_time", 0)), int(q.get("end_time", 0))
                     with fake.lock:
-                        vals = [e for e in fake.by_key.values()
+                        vals = [e for e in fake.events
                                 if e["event_name"] == name and e["customer"] == q.get("customer")
                                 and start <= e["timestamp"] < end and e["identifier"] not in fake.drop]
                     total = sum(float(e["value"]) for e in vals)
@@ -129,7 +150,11 @@ class FakeStripe:
 
     def accepted(self) -> list[dict]:
         with self.lock:
-            return list(self.by_key.values())
+            return list(self.events)
+
+    def total(self, event_name: str | None = None) -> float:
+        return sum(float(e["value"]) for e in self.accepted()
+                   if event_name is None or e["event_name"] == event_name)
 
     def close(self) -> None:
         self.server.shutdown()

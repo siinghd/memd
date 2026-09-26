@@ -17,7 +17,8 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from memd.hosted.plans import GAUGES, METERS, STRIPE_UNIT_SCALE, Plans
-from memd.hosted.store import AdminStore
+from memd.hosted.store import (MAX_AUTO_PUSH_AGE_S, STRIPE_MAX_EVENT_AGE_S, AdminStore, period_bounds,
+                               stripe_units)
 from memd.metrics import METRICS
 
 _log = logging.getLogger("memd.billing")
@@ -59,6 +60,9 @@ class BillingConfig:
     webhook_secret: str = ""
     api_base: str = ""
     webhook_tolerance_s: int = 300
+    max_push_age_s: int = MAX_AUTO_PUSH_AGE_S
+    settle_s: int = 3600
+    max_network_retries: int = 2
     grace_days: float = 7.0
     drift_tolerance: float = 0.01
     public_url: str = "http://localhost:8700"
@@ -75,6 +79,11 @@ class BillingConfig:
             webhook_secret=env.get("MEMD_STRIPE_WEBHOOK_SECRET", ""),
             api_base=env.get("MEMD_STRIPE_API_BASE", ""),
             webhook_tolerance_s=int(env.get("MEMD_STRIPE_WEBHOOK_TOLERANCE_S", "300")),
+            # capped below Stripe's ~24 h idempotency-key memory
+            max_push_age_s=min(int(env.get("MEMD_BILLING_MAX_PUSH_AGE_S", str(MAX_AUTO_PUSH_AGE_S))),
+                               MAX_AUTO_PUSH_AGE_S),
+            settle_s=int(env.get("MEMD_BILLING_SETTLE_S", "3600")),
+            max_network_retries=int(env.get("MEMD_STRIPE_MAX_NETWORK_RETRIES", "2")),
             grace_days=float(env.get("MEMD_BILLING_GRACE_DAYS", "7")),
             drift_tolerance=float(env.get("MEMD_BILLING_DRIFT_TOLERANCE", "0.01")),
             public_url=env.get("MEMD_PUBLIC_URL", "http://localhost:8700").rstrip("/"),
@@ -170,7 +179,7 @@ class Billing:
                 raise BillingError(503, "billing_not_configured", "Stripe is not configured on this instance")
             import stripe  # memd[billing]
 
-            kw: dict[str, Any] = {"max_network_retries": 2}
+            kw: dict[str, Any] = {"max_network_retries": self.cfg.max_network_retries}
             if self.cfg.api_base:
                 kw["base_addresses"] = {"api": self.cfg.api_base}
             self._client = stripe.StripeClient(self.cfg.secret_key, **kw)
@@ -431,43 +440,69 @@ class Billing:
 
     # ------------------------------------------------------------ meter push
 
+    def _send(self, b: Mapping[str, Any]) -> bool:
+        try:
+            self.svc.billing.meter_events.create(
+                params={"event_name": self.cfg.event_name(b["meter"]),
+                        "payload": {"stripe_customer_id": b["customer"], "value": str(b["value"])},
+                        "identifier": b["id"], "timestamp": int(b["ts"])},
+                options={"idempotency_key": b["id"]})
+        except BillingError:
+            raise
+        except Exception as ex:
+            self.store.mark_push_failed(b["id"], f"{type(ex).__name__}: {ex}")
+            METRICS.inc("memd_billing_push_failures_total", meter=b["meter"], **_OPS)
+            _log.warning("memd billing: meter push %s failed: %s", b["id"], ex)
+            return False
+        METRICS.inc("memd_billing_meter_events_pushed_total", meter=b["meter"], **_OPS)
+        return True
+
+    def _retry_safe(self, b: Mapping[str, Any], now: int) -> bool:
+        """Re-sending a batch is safe only while Stripe still remembers its
+        key: its first send (created) and, for a regular batch, its oldest
+        usage event are younger than max_push_age_s (20 h, inside Stripe's
+        ~24 h window with margin)."""
+        age = self.cfg.max_push_age_s
+        if now - int(b["created"]) > age:
+            return False
+        return b.get("kind") == "reconcile" or now - int(b["first_ts"]) <= age
+
     def push_usage(self, now: float | None = None) -> dict:
         """Claim unpushed ledger rows into batches, then send every pending
         batch as a Stripe meter event (identifier = idempotency key = batch
         id). At-least-once: a crash anywhere re-sends the same key, which
-        Stripe deduplicates. Batches that fail stay pending for the next
-        run."""
+        Stripe deduplicates. Batches that fail stay pending for the next run
+        - but never past max_push_age_s: an older usage event is never
+        pushed automatically (Stripe may have forgotten the key, so a retry
+        could bill twice); it goes to reconcile_pending() instead."""
+        now_i = int(time.time() if now is None else now)
         claimed: dict[str, int] = {}
         for _ in range(100):  # bounded: at most 100 x 50K rows per run
-            got = self.store.claim_push_batches(self.cfg.event_name, now=now, unit_scale=STRIPE_UNIT_SCALE)
+            got = self.store.claim_push_batches(self.cfg.event_name, now=now_i, unit_scale=STRIPE_UNIT_SCALE,
+                                                max_age_s=self.cfg.max_push_age_s)
             for k, v in got.items():
                 claimed[k] = claimed.get(k, 0) + v
             if not any(got.values()):
                 break
-        sent = failed = 0
+        sent = failed = abandoned = 0
         for b in self.store.pending_pushes():
-            try:
-                self.svc.billing.meter_events.create(
-                    params={"event_name": self.cfg.event_name(b["meter"]),
-                            "payload": {"stripe_customer_id": b["customer"], "value": str(b["value"])},
-                            "identifier": b["id"], "timestamp": int(b["ts"])},
-                    options={"idempotency_key": b["id"]})
-            except BillingError:
-                raise
-            except Exception as ex:
-                failed += 1
-                self.store.mark_push_failed(b["id"], f"{type(ex).__name__}: {ex}")
-                METRICS.inc("memd_billing_push_failures_total", meter=b["meter"], **_OPS)
-                _log.warning("memd billing: meter push %s failed: %s", b["id"], ex)
+            if not self._retry_safe(b, now_i):
+                self.store.abandon_batch(b["id"], now=now_i)
+                abandoned += 1
+                METRICS.inc("memd_billing_batches_abandoned_total", meter=b["meter"], **_OPS)
                 continue
-            self.store.mark_pushed(b["id"], now=now)
-            sent += 1
-            METRICS.inc("memd_billing_meter_events_pushed_total", meter=b["meter"], **_OPS)
-        for reason in ("no_customer", "expired", "unmapped"):
+            if self._send(b):
+                self.store.mark_pushed(b["id"], now=now_i,
+                                       status="reconciled" if b.get("kind") == "reconcile" else "sent")
+                sent += 1
+            else:
+                failed += 1
+        for reason in ("no_customer", "unmapped"):
             if claimed.get(reason):
                 METRICS.inc("memd_billing_unbillable_events_total", claimed[reason], reason=reason, **_OPS)
         METRICS.set_gauge("memd_billing_unpushed_events", self.store.unpushed_count(), **_OPS)
-        return {**claimed, "sent": sent, "failed": failed}
+        METRICS.set_gauge("memd_billing_needs_reconcile_events", self.store.needs_reconcile_count(), **_OPS)
+        return {**claimed, "sent": sent, "failed": failed, "abandoned": abandoned}
 
     # -------------------------------------------------------- reconciliation
 
@@ -482,31 +517,121 @@ class Billing:
                 return m.id
         return ""
 
+    def _stripe_total(self, meter: str, customer: str, start: int, end: int) -> float:
+        mid = self._meter_id_for(meter)
+        if not mid:
+            raise LookupError(f"no Stripe meter found for {meter!r} (set MEMD_STRIPE_METER_ID_{meter.upper()})")
+        summ = self.svc.billing.meters.event_summaries.list(
+            mid, params={"customer": customer, "start_time": int(start), "end_time": int(end)})
+        return float(sum(float(s.aggregated_value) for s in summ.data))
+
+    def _undecidable(self, g: Mapping[str, Any], reason: str, **detail: Any) -> None:
+        METRICS.inc("memd_billing_drift_alerts_total", meter=g["meter"], **_OPS)
+        _log.warning("memd billing: DRIFT (reconcile undecidable, %s) org=%s meter=%s %s", reason,
+                     g["org_id"], g["meter"], detail)
+        self.store.append_log(g["org_id"], "drift_alert", {"meter": g["meter"], "reason": reason,
+                                                           "events": len(g["ids"]), **detail})
+
+    def reconcile_pending(self, now: float | None = None) -> dict:
+        """Settle needs_reconcile usage (events too old to push on their own,
+        and batches abandoned for the same reason) against what Stripe
+        actually holds.
+
+        Per (org, meter, customer, quota period): Stripe's meter summary for
+        [period start, the group's last hour) is compared with what it should
+        hold - every settled batch in that window plus these events. The
+        difference is the verified missing quantity: 0 means the earlier
+        attempts landed (nothing is sent), up to the group's own units is
+        pushed under a FRESH idempotency key recorded before the send.
+        Anything else (Stripe holds more than the ledger, or lacks more than
+        these events) cannot be decided safely: drift alert, nothing sent,
+        the events stay needs_reconcile. A window with a batch still pending
+        or sent within settle_s (summaries lag) is deferred to the next run.
+        Gauges are settled per event over its hour (Stripe aggregates them
+        as 'last')."""
+        now_i = int(time.time() if now is None else now)
+        out = {"groups": 0, "reconciled": 0, "pushed_units": 0, "credited_units": 0, "deferred": 0,
+               "undecidable": 0, "expired": 0, "failed": 0}
+        for g in self.store.needs_reconcile_groups():
+            out["groups"] += 1
+            meter, customer = g["meter"], g["customer"]
+            units = stripe_units(g["billable"], STRIPE_UNIT_SCALE.get(meter, 1))
+            if not customer:
+                self.store.close_events(g["ids"], "no_customer", now=now_i)
+                continue
+            if now_i - g["max_ts"] > STRIPE_MAX_EVENT_AGE_S:
+                # Stripe refuses events this old: nothing can bill them now
+                self.store.close_events(g["ids"], "expired", now=now_i)
+                self._undecidable(g, "expired", units=units)
+                out["expired"] += 1
+                continue
+            if meter in GAUGES:
+                start = g["max_ts"] // 3600 * 3600
+                end = start + 3600
+            else:
+                start = period_bounds(g["period"])[0]
+                end = min(period_bounds(g["period"])[1], g["max_ts"] // 3600 * 3600 + 3600)
+            if self.store.unsettled(g["org_id"], meter, customer, start, end, now_i - self.cfg.settle_s):
+                out["deferred"] += 1
+                continue
+            try:
+                in_stripe = self._stripe_total(meter, customer, start, end)
+            except Exception as ex:
+                METRICS.inc("memd_billing_stripe_errors_total", op="reconcile", **_OPS)
+                _log.warning("memd billing: reconcile deferred for %s/%s: %s", g["org_id"], meter, ex)
+                out["deferred"] += 1
+                continue
+            settled = 0 if meter in GAUGES else self.store.settled_units(g["org_id"], meter, customer, start, end)
+            missing = settled + units - in_stripe
+            whole = round(missing)
+            ok = abs(missing - whole) < 1e-6 and 0 <= whole <= units
+            if meter in GAUGES:
+                ok = ok and whole in (0, units)  # 'last': all there or not there at all
+            if not ok:
+                self._undecidable(g, "stripe_differs", expected=settled + units, stripe=in_stripe,
+                                  settled=settled, units=units)
+                out["undecidable"] += 1
+                continue
+            bid = self.store.create_reconcile_batch(g["org_id"], meter, customer, value=int(whole),
+                                                    credited=units - int(whole), ts=g["max_ts"],
+                                                    first_ts=g["min_ts"], ids=g["ids"], now=now_i)
+            if whole == 0:
+                self.store.mark_pushed(bid, now=now_i, status="reconciled")  # nothing to send
+            else:
+                batch = {"id": bid, "meter": meter, "customer": customer, "value": int(whole), "ts": g["max_ts"]}
+                if not self._send(batch):
+                    out["failed"] += 1  # stays pending: retried under the SAME fresh key
+                    continue
+                self.store.mark_pushed(bid, now=now_i, status="reconciled")
+            out["reconciled"] += 1
+            out["pushed_units"] += int(whole)
+            out["credited_units"] += units - int(whole)
+            self.store.append_log(g["org_id"], "reconciled", {"meter": meter, "units": units,
+                                                              "pushed": int(whole), "batch": bid})
+        METRICS.set_gauge("memd_billing_needs_reconcile_events", self.store.needs_reconcile_count(), **_OPS)
+        return out
+
     def reconcile(self, start: int, end: int) -> dict:
-        """Compare what the ledger pushed for [start, end) with Stripe's
-        meter event summaries, per (org, meter). |drift| above the tolerance
-        raises memd_billing_drift_alerts_total and a billing_log entry.
-        Counters compare sums; gauges (Stripe aggregation 'last') compare
-        the last value."""
+        """The drift report: compare what the ledger settled for [start, end)
+        with Stripe's meter event summaries, per (org, meter). |drift| above
+        the tolerance raises memd_billing_drift_alerts_total and a
+        billing_log entry. Counters compare sums; gauges (Stripe aggregation
+        'last') compare the last value. The daily job reports the quota
+        period to date, so a reconciliation push timestamped later in the
+        period than the attempt it completes cannot show up as drift."""
         rows, alerts = [], 0
-        for pair in self.store.pushed_pairs(start, end):
+        for pair in self.store.settled_pairs(start, end):
             org_id, meter, customer = pair["org_id"], pair["meter"], pair["customer"]
             try:
-                mid = self._meter_id_for(meter)
-                if not mid:
-                    rows.append({"org_id": org_id, "meter": meter, "error": "no_meter_id"})
-                    continue
-                summ = self.svc.billing.meters.event_summaries.list(
-                    mid, params={"customer": customer, "start_time": start, "end_time": end})
-                stripe_val = float(sum(float(s.aggregated_value) for s in summ.data))
+                stripe_val = self._stripe_total(meter, customer, start, end)
             except Exception as ex:
                 METRICS.inc("memd_billing_stripe_errors_total", op="reconcile", **_OPS)
                 rows.append({"org_id": org_id, "meter": meter, "error": f"{type(ex).__name__}: {ex}"})
                 continue
             if meter in GAUGES:
-                ledger_val = float(self.store.last_pushed_gauge(org_id, meter, start, end) or 0)
+                ledger_val = float(self.store.last_settled_gauge(org_id, meter, customer, start, end) or 0)
             else:
-                ledger_val = float(self.store.pushed_totals(org_id, meter, start, end)[1])
+                ledger_val = float(self.store.settled_units(org_id, meter, customer, start, end))
             drift = stripe_val - ledger_val
             rel = abs(drift) / max(ledger_val, 1.0)
             METRICS.set_gauge("memd_billing_drift_ratio", rel, meter=meter, **_OPS)

@@ -130,13 +130,19 @@ def _error(status: int, detail: Any, code: str | None = None,
 class _Unmetered:
     """Hosted mode off (the default): no org checks, no quotas, no ledger."""
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        return None
+
     def authorize(self, p, ns) -> None:
         pass
 
-    def admit(self, p, ns, **kw) -> None:
-        pass
+    def admit(self, p, ns, **kw) -> "_Unmetered":
+        return self
 
-    def record(self, p, ns, **kw) -> None:
+    def record(self, **kw) -> None:
         pass
 
     def stored_delta(self, ns, delta) -> None:
@@ -385,7 +391,6 @@ def create_app(
 
     @app.post("/v1/ns/{ns}/events", status_code=202)
     def post_events(ns: str, body: EventsIn, p: Principal = Depends(auth)):
-        bill.admit(p, ns, writes=len(body.events))
         events = []
         downgraded = 0
         for e in body.events:
@@ -412,14 +417,14 @@ def create_app(
             })
         if downgraded:
             METRICS.inc("memd_source_downgrades_total", ns=ns, amount=downgraded)
-        ids = engine.add_events(events, namespace=ns)
-        bill.record(p, ns, writes=len(ids))  # durable before the ack
+        with bill.admit(p, ns, writes=len(events)) as meter:  # hosted: check + reserve
+            ids = engine.add_events(events, namespace=ns)
+            meter.record(writes=len(ids))  # durable before the ack
         return {"ids": ids, "accepted": len(ids)}
 
     @app.post("/v1/ns/{ns}/memories", status_code=201)
     def post_memory(ns: str, body: MemoryIn, p: Principal = Depends(auth)):
         user, _ = apply_scope(p, body.user_id, body.session_id)
-        bill.admit(p, ns, writes=1)
         # Trust-tier spoofing guard (D7 #1/#2): API keys are agent
         # credentials - they cannot mint USER-tier facts by assertion.
         # Only scope_override-capable principals claim human tier.
@@ -427,40 +432,41 @@ def create_app(
         if source == "user" and not p.scope_override:
             source = "agent"
             METRICS.inc("memd_source_downgrades_total", ns=ns)
-        rid = engine.remember(
-            body.content,
-            kind=body.kind,
-            entity_keys=body.entity_keys,
-            session_id=body.session_id,
-            user_id=user,
-            agent_id=body.agent_id,
-            org_id=body.org_id,
-            source=source,
-            actor_id=body.actor_id or f"key:{p.key_id}",
-            t_event=body.t_event,
-            valid_from=body.valid_from,
-            namespace=ns,
-        )
-        bill.record(p, ns, writes=1)
+        with bill.admit(p, ns, writes=1) as meter:
+            rid = engine.remember(
+                body.content,
+                kind=body.kind,
+                entity_keys=body.entity_keys,
+                session_id=body.session_id,
+                user_id=user,
+                agent_id=body.agent_id,
+                org_id=body.org_id,
+                source=source,
+                actor_id=body.actor_id or f"key:{p.key_id}",
+                t_event=body.t_event,
+                valid_from=body.valid_from,
+                namespace=ns,
+            )
+            meter.record(writes=1)
         return {"id": rid}
 
     @app.post("/v1/ns/{ns}/search")
     def search(ns: str, body: SearchIn, p: Principal = Depends(auth)):
         user, _ = apply_scope(p, body.user_id, body.session_id)
-        bill.admit(p, ns, searches=1)
-        res = engine.search(
-            body.query,
-            user_id=user,
-            session_id=body.session_id,
-            agent_id=body.agent_id,
-            org_id=body.org_id,
-            budget_tokens=body.budget_tokens,
-            as_of=body.as_of,
-            kinds=body.kinds,
-            include_quarantined=body.include_quarantined,
-            namespace=ns,
-        )
-        bill.record(p, ns, searches=1, reranked=res.reranked)
+        with bill.admit(p, ns, searches=1) as meter:
+            res = engine.search(
+                body.query,
+                user_id=user,
+                session_id=body.session_id,
+                agent_id=body.agent_id,
+                org_id=body.org_id,
+                budget_tokens=body.budget_tokens,
+                as_of=body.as_of,
+                kinds=body.kinds,
+                include_quarantined=body.include_quarantined,
+                namespace=ns,
+            )
+            meter.record(searches=1, reranked=res.reranked)
         return {
             "packed_context": res.packed_context,
             "items": [i.__dict__ for i in res.items],
@@ -540,9 +546,9 @@ def create_app(
         # pinned keys constrain extraction to their user (blocks cross-user
         # session-id injection into the fact lane); override keys may target any
         heavy(ns, "close_session", p)
-        bill.admit(p, ns, extract=True)
-        res = engine.close_session(session_id, user_id=p.pinned_user, namespace=ns)
-        bill.record(p, ns, extraction=res)
+        with bill.admit(p, ns, extract=True) as meter:
+            res = engine.close_session(session_id, user_id=p.pinned_user, namespace=ns)
+            meter.record(extraction=res)
         return res
 
     @app.post("/v1/ns/{ns}/compact")

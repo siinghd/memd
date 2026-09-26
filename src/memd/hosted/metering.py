@@ -1,22 +1,33 @@
 """Entitlement enforcement and usage recording on the request path.
 
-Two calls per metered request, both no-ops for principals without an org
+One admission per metered request, a no-op for principals without an org
 (the operator key) and absent entirely when hosted mode is off:
 
+    with metering.admit(p, ns, searches=1) as meter:   # check + reserve
+        res = engine.search(...)                        # the operation
+        meter.record(searches=1, reranked=res.reranked) # commit usage
+
   admit()   BEFORE the operation: read-only (grace expired) and hard caps
-            -> QuotaDenied (402). Deletes never call it: they are always
-            allowed, whatever the plan or payment state.
+            -> QuotaDenied (402). The check and a RESERVATION of the
+            requested quantity happen in one BEGIN IMMEDIATE transaction
+            against the rollup plus every in-flight reservation, so
+            concurrent requests at the cap boundary cannot all pass: exactly
+            the remaining quantity is admitted. Deletes never call it: they
+            are always allowed, whatever the plan or payment state.
   record()  AFTER the operation succeeded, BEFORE the response: the usage
-            event is committed (fsynced) to the admin ledger, so every
-            acknowledged operation is billed. A crash between the operation
-            and this commit loses the event of an operation the client never
-            saw acknowledged (its retry is the one billed); a crash after it
-            bills an operation whose ack was lost - the at-least-once side,
-            which the idempotent push turns into exactly one Stripe event per
-            ledger row.
+            event, the rollup and the release of the reservation commit
+            (fsynced) in one transaction, so every acknowledged operation is
+            billed. A failed operation releases its reservation instead. A
+            crash between the operation and this commit loses the event of an
+            operation the client never saw acknowledged (its retry is the one
+            billed); a crash after it bills an operation whose ack was lost -
+            the at-least-once side, which the idempotent push turns into
+            exactly one Stripe event per ledger row. A crashed request's
+            reservation stops counting after RESERVATION_TTL_S.
 """
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 from typing import Any, Callable
@@ -27,6 +38,7 @@ from memd.hosted.store import AdminStore, period_bounds, period_of
 from memd.metrics import METRICS
 
 _OPS = {"ns": "_billing"}  # operator-only series (see billing._OPS)
+_NULL_LOCK = contextlib.nullcontext()
 
 
 class QuotaDenied(Exception):
@@ -47,10 +59,50 @@ class Forbidden(Exception):
         self.detail = detail
 
 
+class _NoAdmission:
+    """An org-less principal (the operator key): nothing reserved or billed."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        return None
+
+    def record(self, **usage) -> list[str]:
+        return []
+
+
+NO_ADMISSION = _NoAdmission()
+
+
+class Admission:
+    def __init__(self, metering: "Metering", p: Any, ns: str, reservation: str | None):
+        self.metering, self.p, self.ns, self.reservation = metering, p, ns, reservation
+        self.recorded = False
+
+    def __enter__(self) -> "Admission":
+        return self
+
+    def record(self, *, writes: int = 0, searches: int = 0, reranked: bool | int = 0,
+               extraction: dict | None = None) -> list[str]:
+        ids = self.metering._record(self.p, self.ns, reservation=self.reservation, writes=writes,
+                                    searches=searches, reranked=reranked, extraction=extraction)
+        self.recorded = True
+        return ids
+
+    def __exit__(self, *exc) -> None:
+        # the operation failed (or never recorded): give the quota back
+        if not self.recorded and self.reservation is not None:
+            self.metering.store.release(self.reservation)
+        return None
+
+
 class Metering:
     # a namespace's live record count is re-read from the engine at most
     # this often; between reads it moves by the writes/deletes seen here
     ANCHOR_TTL_S = 300.0
+    # a reservation outliving this belongs to a crashed request
+    RESERVATION_TTL_S = 600.0
 
     def __init__(self, store: AdminStore, plans: Plans, engine: Any,
                  clock: Callable[[], float] = time.time):
@@ -59,6 +111,9 @@ class Metering:
         self.engine = engine
         self.clock = clock
         self._lock = threading.Lock()
+        # orders "read the live memories count + reserve" against "move the
+        # count + release the reservation", so the two never interleave
+        self._stored_lock = threading.Lock()
         self._counts: dict[str, list[float]] = {}  # ns -> [records, anchored_at (monotonic)]
         self._owners: dict[str, str] = {}  # ns -> org (ownership never moves)
 
@@ -96,10 +151,11 @@ class Metering:
         key (the dominant COGS line); the local heuristic costs nothing."""
         return bool(getattr(getattr(self.engine, "extractor", None), "api_key", None))
 
-    def admit(self, p: Any, ns: str, *, writes: int = 0, searches: int = 0, extract: bool = False) -> None:
+    def admit(self, p: Any, ns: str, *, writes: int = 0, searches: int = 0,
+              extract: bool = False) -> "Admission | _NoAdmission":
         org_id = getattr(p, "org_id", None)
         if org_id is None:
-            return
+            return NO_ADMISSION
         org = self.store.get_org(org_id)
         if org is None:
             raise Forbidden("the key's org no longer exists")
@@ -121,26 +177,34 @@ class Metering:
         if extract and self.our_key_extraction():
             checks.append((EXTRACTIONS_OUR_KEY, 1))
         period = period_of(now)
-        for meter, qty in checks:
-            ent = plan.entitlement(meter)
-            if not ent.hard or ent.limit is None:
-                continue
-            used = (self.stored_records(org_id, ns) if meter == MEMORIES_STORED
-                    else self.store.rollup(org_id, meter, period))
-            if used + qty > ent.limit:
-                METRICS.inc("memd_quota_denials_total", meter=meter, **_OPS)
-                raise QuotaDenied("quota_exceeded", f"{plan.name} plan limit reached for {meter}",
-                                  meter=meter, limit=ent.limit, used=used, plan=plan.name)
+        hard = [(m, q, plan.entitlement(m).limit) for m, q in checks
+                if plan.entitlement(m).hard and plan.entitlement(m).limit is not None]
+        if not hard:
+            return Admission(self, p, ns, None)
+        live = any(m == MEMORIES_STORED for m, _, _ in hard)
+        if live:
+            self.stored_records(org_id, ns)  # refresh a stale anchor outside the lock
+        with self._stored_lock if live else _NULL_LOCK:
+            base = self.stored_records(org_id, ns) if live else None
+            rid, denied = self.store.try_reserve(
+                org_id, period, [(m, q, lim, base if m == MEMORIES_STORED else None) for m, q, lim in hard],
+                now=now, ttl_s=self.RESERVATION_TTL_S)
+        if denied is not None:
+            METRICS.inc("memd_quota_denials_total", meter=denied["meter"], **_OPS)
+            raise QuotaDenied("quota_exceeded", f"{plan.name} plan limit reached for {denied['meter']}",
+                              meter=denied["meter"], limit=denied["limit"], used=denied["used"],
+                              plan=plan.name)
+        return Admission(self, p, ns, rid)
 
     # -------------------------------------------------------------- usage
 
-    def record(self, p: Any, ns: str, *, writes: int = 0, searches: int = 0, reranked: bool | int = 0,
-               extraction: dict | None = None) -> list[str]:
+    def _record(self, p: Any, ns: str, *, reservation: str | None, writes: int = 0, searches: int = 0,
+                reranked: bool | int = 0, extraction: dict | None = None) -> list[str]:
         org_id = getattr(p, "org_id", None)
-        if org_id is None:
-            return []
-        org = self.store.get_org(org_id)
+        org = self.store.get_org(org_id) if org_id is not None else None
         if org is None:
+            if reservation is not None:
+                self.store.release(reservation)
             return []
         usage = {WRITES: writes, SEARCHES: searches, RERANKED_SEARCHES: int(reranked)}
         stored = writes
@@ -148,12 +212,16 @@ class Metering:
             if self.our_key_extraction():
                 usage[EXTRACTIONS_OUR_KEY] = int(extraction.get("raw_considered") or 0)
             stored += int(extraction.get("facts_written") or 0)
-        ids = self.store.record_usage(org_id, ns, usage, self.plans.get(org["plan"]), ts=self.clock())
+        with self._stored_lock if stored else _NULL_LOCK:
+            # the live count moves BEFORE the reservation is released: an
+            # admission in between sees one or the other, never neither
+            if stored:
+                self.stored_delta(ns, stored)
+            ids = self.store.record_usage(org_id, ns, usage, self.plans.get(org["plan"]), ts=self.clock(),
+                                          reservation=reservation)
         for m, q in usage.items():
             if q:
                 METRICS.inc("memd_billing_usage_total", q, meter=m, **_OPS)
-        if stored:
-            self.stored_delta(ns, stored)
         return ids
 
     # --------------------------------------------------- memories_stored gauge

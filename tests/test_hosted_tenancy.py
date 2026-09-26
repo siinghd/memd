@@ -462,3 +462,110 @@ def test_usage_ledger_survives_sigkill_between_op_and_ack(tmp_path, kill_after_a
     ids = [r[0] for r in con.execute("SELECT id FROM usage_event")]
     assert len(ids) == len(set(ids))
     con.close()
+
+
+# ------------------------------- quotas under concurrency: check + reserve
+
+
+def _serve(app):
+    import uvicorn
+
+    from tests.hosted_helpers import free_port
+
+    port = free_port()
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning",
+                                           lifespan="off"))
+    t = threading.Thread(target=server.run, daemon=True)
+    t.start()
+    deadline = time.time() + 30
+    while not server.started and time.time() < deadline:
+        time.sleep(0.05)
+    assert server.started
+    return server, t, f"http://127.0.0.1:{port}"
+
+
+def _slow(fn, delay=0.05):
+    def wrapped(*a, **kw):
+        time.sleep(delay)  # widen the window between admission and commit
+        return fn(*a, **kw)
+    return wrapped
+
+
+def _burst(url: str, key: str, path: str, bodies: list[dict]) -> list[int]:
+    barrier = threading.Barrier(len(bodies))
+    codes: list[int] = [0] * len(bodies)
+
+    def one(i):
+        with httpx.Client(base_url=url, headers={"Authorization": f"Bearer {key}"}, timeout=60) as c:
+            barrier.wait()
+            codes[i] = c.post(path, json=bodies[i]).status_code
+
+    threads = [threading.Thread(target=one, args=(i,)) for i in range(len(bodies))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=120)
+    return codes
+
+
+@pytest.mark.parametrize("meter", ["searches", "memories_stored"])
+def test_50_concurrent_requests_at_the_cap_admit_exactly_the_limit(tmp_path, meter):
+    limit = 20
+    plans = {"free": {"meters": {"searches": {"limit": limit, "hard": True},
+                                 "memories_stored": {"limit": limit, "hard": True}}}}
+    h = Hosted(tmp_path, plans=plans)
+    server = None
+    try:
+        org = h.org("acme")
+        key, _ = h.h.keystore.create("acme", org_id=org, scopes="memory")
+        if meter == "searches":
+            h.engine.search = _slow(h.engine.search)
+            path, bodies = "/v1/ns/acme/search", [{"query": f"burst query {i}"} for i in range(50)]
+        else:
+            h.engine.remember = _slow(h.engine.remember)
+            path, bodies = "/v1/ns/acme/memories", [{"content": f"burst fact {i}"} for i in range(50)]
+        server, _t, url = _serve(h.app)
+        codes = _burst(url, key, path, bodies)
+        ok = [c for c in codes if c in (200, 201)]
+        assert len(ok) == limit, codes
+        assert codes.count(402) == 50 - limit, codes
+        if meter == "searches":
+            assert h.store.rollup(org, "searches", period_of(time.time())) == limit
+        else:
+            assert h.engine.stats(namespace="acme")["records"] == limit
+        assert h.store.reservations() == []  # every reservation committed or released
+    finally:
+        if server is not None:
+            server.should_exit = True
+            _t.join(timeout=30)
+        h.close()
+
+
+def test_a_failed_operation_releases_its_reservation(hosted):
+    org = hosted.org("acme")
+    c = hosted.client(org, "acme")
+    real = hosted.engine.search
+
+    def boom(*a, **kw):
+        raise RuntimeError("engine exploded")
+
+    hosted.engine.search = boom
+    for i in range(5):
+        assert _search(c, "acme", f"q{i}").status_code == 500
+    assert hosted.store.reservations() == []
+    assert hosted.store.rollup(org, "searches", period_of(time.time())) == 0  # failures are not billed
+    hosted.engine.search = real
+    for i in range(3):  # the full quota is still there
+        assert _search(c, "acme", f"ok {i}").status_code == 200
+    assert _search(c, "acme", "over").status_code == 402
+
+
+def test_a_crashed_requests_reservation_expires(hosted):
+    org = hosted.org("acme")
+    c = hosted.client(org, "acme")
+    now = time.time()
+    rid, denied = hosted.store.try_reserve(org, period_of(now), [("searches", 3, 3, None)], now=now, ttl_s=600)
+    assert rid and denied is None
+    assert _search(c, "acme", "held by a live reservation").status_code == 402
+    hosted.h.metering.clock = lambda: now + 601  # the owning request died long ago
+    assert _search(c, "acme", "the stale hold no longer counts").status_code == 200
