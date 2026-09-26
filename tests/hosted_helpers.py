@@ -1,0 +1,196 @@
+"""Shared helpers for the hosted-mode / billing tests. Fully offline:
+
+- FakeStripe: a tiny in-process HTTP server speaking the three Stripe
+  endpoints the meter push and reconciliation use, WITH Stripe's
+  idempotency-key semantics (a replayed key returns the first response and
+  is not counted twice). The real `stripe` SDK talks to it over HTTP.
+- stripe_mock_url(): stripe/stripe-mock in docker for the full API surface
+  (stateless fixtures; no idempotency), or MEMD_TEST_STRIPE_MOCK=<url>.
+- sign(): a Stripe-Signature header for a payload, as Stripe computes it.
+"""
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import os
+import shutil
+import socket
+import subprocess
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+WEBHOOK_SECRET = "whsec_memd_test_only"
+
+
+def sign(payload: str | bytes, secret: str = WEBHOOK_SECRET, t: int | None = None) -> str:
+    body = payload.decode() if isinstance(payload, bytes) else payload
+    t = int(time.time()) if t is None else t
+    mac = hmac.new(secret.encode(), f"{t}.{body}".encode(), hashlib.sha256).hexdigest()
+    return f"t={t},v1={mac}"
+
+
+def event(etype: str, obj: dict, *, eid: str | None = None, created: int | None = None) -> dict:
+    return {"id": eid or f"evt_{os.urandom(6).hex()}", "object": "event", "type": etype,
+            "created": int(time.time()) if created is None else created, "api_version": "2025-01-01",
+            "livemode": False, "data": {"object": obj}}
+
+
+def free_port() -> int:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+class FakeStripe:
+    """POST /v1/billing/meter_events, GET /v1/billing/meters and
+    GET /v1/billing/meters/{id}/event_summaries, idempotent like Stripe."""
+
+    def __init__(self, event_names: dict[str, str] | None = None):
+        self.lock = threading.Lock()
+        self.by_key: dict[str, dict] = {}   # idempotency key -> accepted event
+        self.requests: list[dict] = []      # every request, replays included
+        self.replays = 0
+        self.drop: set[str] = set()          # identifiers to "lose" (drift tests)
+        self.on_meter_event = None           # hook(params) -> "kill_before" | None; runs pre-response
+        self.after_accept = None             # hook(params) after the event is stored, pre-response
+        self.meters = {f"mtr_{i}": name for i, name in enumerate(sorted((event_names or {}).values()))}
+        fake = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _send(self, code: int, body: dict):
+                raw = json.dumps(body).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                form = {k: v[0] for k, v in parse_qs(self.rfile.read(n).decode()).items()}
+                if urlparse(self.path).path != "/v1/billing/meter_events":
+                    return self._send(404, {"error": {"message": "unknown path"}})
+                key = self.headers.get("Idempotency-Key")
+                params = {"event_name": form.get("event_name"), "identifier": form.get("identifier"),
+                          "customer": form.get("payload[stripe_customer_id]"),
+                          "value": form.get("payload[value]"), "timestamp": int(form.get("timestamp") or 0),
+                          "idempotency_key": key}
+                if fake.on_meter_event is not None and fake.on_meter_event(params) == "kill_before":
+                    return  # the pusher dies before Stripe accepted anything
+                with fake.lock:
+                    fake.requests.append(params)
+                    if key and key in fake.by_key:
+                        fake.replays += 1
+                        stored = fake.by_key[key]
+                    else:
+                        stored = dict(params)
+                        if key:
+                            fake.by_key[key] = stored
+                if fake.after_accept is not None:
+                    fake.after_accept(params)
+                self._send(200, {"object": "billing.meter_event", "event_name": stored["event_name"],
+                                 "identifier": stored["identifier"], "livemode": False,
+                                 "payload": {"stripe_customer_id": stored["customer"], "value": stored["value"]},
+                                 "timestamp": stored["timestamp"], "created": int(time.time())})
+
+            def do_GET(self):
+                u = urlparse(self.path)
+                q = {k: v[0] for k, v in parse_qs(u.query).items()}
+                parts = u.path.strip("/").split("/")
+                if u.path == "/v1/billing/meters":
+                    return self._send(200, {"object": "list", "has_more": False, "url": u.path, "data": [
+                        {"object": "billing.meter", "id": mid, "event_name": name, "status": "active"}
+                        for mid, name in fake.meters.items()]})
+                if len(parts) == 5 and parts[:3] == ["v1", "billing", "meters"] and parts[4] == "event_summaries":
+                    name = fake.meters.get(parts[3])
+                    start, end = int(q.get("start_time", 0)), int(q.get("end_time", 0))
+                    with fake.lock:
+                        vals = [e for e in fake.by_key.values()
+                                if e["event_name"] == name and e["customer"] == q.get("customer")
+                                and start <= e["timestamp"] < end and e["identifier"] not in fake.drop]
+                    total = sum(float(e["value"]) for e in vals)
+                    return self._send(200, {"object": "list", "has_more": False, "url": u.path, "data": [
+                        {"object": "billing.meter_event_summary", "id": "mtrusg_1", "meter": parts[3],
+                         "aggregated_value": total, "start_time": start, "end_time": end, "livemode": False}]})
+                return self._send(404, {"error": {"message": "unknown path"}})
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def accepted(self) -> list[dict]:
+        with self.lock:
+            return list(self.by_key.values())
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def _docker_ok() -> bool:
+    if not shutil.which("docker"):
+        return False
+    try:
+        return subprocess.run(["docker", "info"], capture_output=True, timeout=20).returncode == 0
+    except Exception:
+        return False
+
+
+class StripeMock:
+    """stripe/stripe-mock: MEMD_TEST_STRIPE_MOCK=<url> reuses a running one,
+    =off skips; otherwise a container is started on a free port (and
+    removed by stop())."""
+
+    def __init__(self):
+        self.url: str | None = None
+        self.container: str | None = None
+        self.skip_reason: str | None = None
+
+    def start(self) -> "StripeMock":
+        pre = os.environ.get("MEMD_TEST_STRIPE_MOCK", "")
+        if pre == "off":
+            self.skip_reason = "MEMD_TEST_STRIPE_MOCK=off"
+            return self
+        if pre:
+            self.url = pre.rstrip("/")
+            return self
+        if not _docker_ok():
+            self.skip_reason = "docker unavailable: stripe-mock end-to-end skipped"
+            return self
+        port = free_port()
+        name = f"memd-test-stripe-mock-{os.getpid()}-{port}"
+        r = subprocess.run(["docker", "run", "-d", "--rm", "--name", name, "-p", f"127.0.0.1:{port}:12111",
+                            "stripe/stripe-mock:latest"], capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            self.skip_reason = f"could not start stripe-mock: {r.stderr.strip()[:200]}"
+            return self
+        self.container = name
+        url = f"http://127.0.0.1:{port}"
+        import httpx
+
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            try:
+                if httpx.get(f"{url}/v1/billing/meters", auth=("sk_test_123", ""), timeout=2).status_code == 200:
+                    self.url = url
+                    return self
+            except Exception:
+                pass
+            time.sleep(0.5)
+        self.stop()
+        self.skip_reason = "stripe-mock did not become ready"
+        return self
+
+    def stop(self) -> None:
+        if self.container:
+            subprocess.run(["docker", "rm", "-f", self.container], capture_output=True, timeout=60)
+            self.container = None
