@@ -399,7 +399,17 @@ def create_app(
         return _error(503, "namespace is held by another node; retry", "not_owner",
                       headers={"Retry-After": "1", "X-Memd-Not-Owner": "1"})
 
-    from memd.storage.s3store import LeaseLostError
+    from memd.storage.crypto import KeyCustodyError
+    from memd.storage.objectstore import LeaseLostError
+
+    @app.exception_handler(KeyCustodyError)
+    async def key_custody_handler(request: Request, exc: KeyCustodyError):
+        # data under a key this node does not hold: not retryable here, and
+        # never "repaired" - an operator must restore the key
+        METRICS.inc("memd_http_key_custody_errors_total",
+                    help="requests refused: the namespace's data key is not available")
+        return _error(500, "the namespace's data key is not available on this node "
+                           "(key custody); see the server log", "key_custody")
 
     @app.exception_handler(LeaseLostError)
     async def lease_lost_handler(request: Request, exc: LeaseLostError):

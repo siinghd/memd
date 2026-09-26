@@ -488,10 +488,12 @@ class LocalKeyEnvelope(KeyEnvelope):
             if (self._guard_store is not None and not self._allow_mint_existing
                     and self._guard_store.exists(f"ns/{namespace}/manifest.json")):
                 raise KeyCustodyError(
-                    f"namespace {namespace!r} has data in the object store but this node has no "
-                    f"local key for it ({p}): with the `local` key provider only the node that "
-                    "created a namespace can decrypt it. Serve it from that node, or move the "
-                    "keys to a KMS (`memd keys migrate`) so every node can")
+                    f"namespace {namespace!r} has data but no data key here ({p}): its key is "
+                    "lost or held elsewhere (with the `local` provider only the node - or the "
+                    "keys directory - that created a namespace can decrypt it). Restore the "
+                    "keys directory, or serve it where the key is; minting a new key would "
+                    "make the existing data unreadable (MEMD_KEYS_ALLOW_MINT_EXISTING=1 only "
+                    "for a namespace that was never encrypted)")
             dk, wk = self.provider.generate(namespace)
             try:
                 self._write_secret(p, wk.ciphertext)
@@ -820,17 +822,28 @@ def provider_from_config(name: str, cfg: dict | None = None) -> KeyProvider:
 
 def read_custody(store: Any) -> dict | None:
     """The store's key-custody marker: which provider wraps its data keys.
-    Absent for a store that has only ever used `local` keys."""
+    None only when it is ABSENT (a store that has only ever used `local`
+    keys). Fails CLOSED: a marker that cannot be read or parsed - garbage,
+    a truncated write, an outage - raises KeyCustodyError instead of reading
+    as "absent", which would let a node on the wrong provider mint fresh
+    keys over data it cannot decrypt."""
     try:
         raw = store.get(CUSTODY_KEY)
-    except Exception:  # noqa: BLE001 - unreadable marker: treat as absent
-        return None
-    if not raw:
+    except Exception as ex:  # noqa: BLE001
+        raise KeyCustodyError(f"cannot read the key-custody marker {CUSTODY_KEY!r}: "
+                              f"{type(ex).__name__}; refusing to open") from ex
+    if raw is None:
         return None
     try:
-        return json.loads(raw.decode())
-    except ValueError:
-        return None
+        cur = json.loads(raw.decode())
+    except (ValueError, UnicodeDecodeError):
+        cur = None
+    if not isinstance(cur, dict) or not isinstance(cur.get("provider"), str):
+        raise KeyCustodyError(
+            f"the key-custody marker {CUSTODY_KEY!r} is present but unreadable ({raw[:40]!r}); "
+            "refusing to open: which provider holds this store's keys is unknown. Restore it "
+            "(`memd keys status` on a node that knows) - never delete it to get past this")
+    return cur
 
 
 def write_custody(store: Any, provider: KeyProvider) -> None:
@@ -882,10 +895,13 @@ def envelope_from_config(cfg: dict | None, local_dir: str, store: Any, *,
                 f"this store's data keys are held by {custody.get('provider')!r} "
                 f"(key {custody.get('key_id')!r}); set MEMD_KEY_PROVIDER={custody.get('provider')} "
                 "and its settings - the local provider cannot read them")
-        remote = store is not None and not hasattr(store, "root")   # s3://, not a local dir
+        # The mint guard applies to EVERY root: a namespace that has data but
+        # no key file here (keys lost or moved, a restore without the keys
+        # directory, another node's namespace on a shared bucket) is refused
+        # instead of silently re-keyed - new data under a new key, the old
+        # frames unreadable and cut off by the torn-tail repair.
         allow = str(_opt(cfg, "keys_allow_mint_existing", "MEMD_KEYS_ALLOW_MINT_EXISTING", "")) in ("1", "true")
-        return LocalKeyEnvelope(keys_dir, guard_store=store if remote else None,
-                                allow_mint_existing=allow)
+        return LocalKeyEnvelope(keys_dir, guard_store=store, allow_mint_existing=allow)
     if custody and custody.get("provider") != name:
         raise KeyCustodyError(
             f"this store's data keys are held by {custody.get('provider')!r}, not {name!r}")
