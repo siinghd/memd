@@ -283,8 +283,21 @@ def create_app(
 
         # the facade's own namespace is per node (every node pins its facade
         # namespace, so a shared "default" would be leased by one node forever)
+        from memd.storage.crypto import resolve_key_provider_name
+
+        if resolve_key_provider_name({}) == "local":
+            raise ValueError(
+                "cluster mode needs a remote key provider (MEMD_KEY_PROVIDER=aws-kms or "
+                "vault-transit): with `local` keys only the node that created a namespace can "
+                "decrypt it. Existing stores: `memd keys migrate --to ...` first")
+        # node-local state (derived index cache) is per NODE, even when every
+        # node on a host was given the same MEMD_LOCAL_DIR: two nodes sharing
+        # one namespace's SQLite cache across a handoff would corrupt it
+        local_dir = os.path.join(os.environ.get("MEMD_LOCAL_DIR") or ".memd-local",
+                                 f"node-{cluster.node_id}")
         engine = Memory(data_dir, namespace=cluster.node_namespace,
-                        config={"lease_holder": cluster.holder, "lease_ttl_s": cluster.lease_ttl_s})
+                        config={"lease_holder": cluster.holder, "lease_ttl_s": cluster.lease_ttl_s,
+                                "local_dir": local_dir})
         node = Cluster(cluster, engine.engine.store)
     bill: Any = _Unmetered()
     if is_hosted:

@@ -24,6 +24,7 @@ multi-node serving. See ObjectStoreKeyEnvelope.
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
 import logging
@@ -425,8 +426,17 @@ class LocalKeyEnvelope(KeyEnvelope):
 
     provider_name = "local"
 
-    def __init__(self, dir_path: str, root_key: bytes | None = None):
+    def __init__(self, dir_path: str, root_key: bytes | None = None, *,
+                 guard_store: Any = None, allow_mint_existing: bool = False):
         self.dir = dir_path
+        # a REMOTE store (s3://) this node shares with others: a namespace
+        # there may have been created - and keyed - on another node, and
+        # minting a local key for it would orphan its data (see
+        # ObjectStoreKeyEnvelope._guard_mint). Local roots keep the old
+        # behaviour.
+        self._guard_store = guard_store
+        self._allow_mint_existing = allow_mint_existing
+        self.prefetch_at_open = guard_store is not None
         os.makedirs(dir_path, exist_ok=True)
         # unwrapped per-namespace data keys, LRU-bounded. Caching is sound:
         # every encrypt/decrypt needs the raw key in process memory anyway.
@@ -475,6 +485,13 @@ class LocalKeyEnvelope(KeyEnvelope):
         if os.path.exists(p):
             dk = self._unwrap_file(namespace, p)
         else:
+            if (self._guard_store is not None and not self._allow_mint_existing
+                    and self._guard_store.exists(f"ns/{namespace}/manifest.json")):
+                raise KeyCustodyError(
+                    f"namespace {namespace!r} has data in the object store but this node has no "
+                    f"local key for it ({p}): with the `local` key provider only the node that "
+                    "created a namespace can decrypt it. Serve it from that node, or move the "
+                    "keys to a KMS (`memd keys migrate`) so every node can")
             dk, wk = self.provider.generate(namespace)
             try:
                 self._write_secret(p, wk.ciphertext)
@@ -497,8 +514,10 @@ class LocalKeyEnvelope(KeyEnvelope):
         """Namespaces with a wrapped key file here."""
         out = []
         for fn in sorted(os.listdir(self.dir)):
+            # names are taken verbatim: a namespace never contains "/", but
+            # may contain "__" (a legal name), which must not be rewritten
             if fn.startswith("ns-") and fn.endswith(".key"):
-                out.append(fn[3:-4].replace("__", "/"))
+                out.append(fn[3:-4])
         return out
 
     def has_key(self, namespace: str) -> bool:
@@ -566,7 +585,10 @@ class ObjectStoreKeyEnvelope(KeyEnvelope):
         self.allow_mint_existing = allow_mint_existing
         self._cache: "OrderedDict[str, bytes]" = OrderedDict()
         self.CACHE_MAX = 1024
-        self._mint_lock = threading.Lock()
+        # one lock per namespace being resolved: a KMS round trip for one
+        # namespace must not serialize every other namespace's open
+        self._locks_guard = threading.Lock()
+        self._ns_locks: dict[str, list] = {}
         self._custody_written = False
 
     # the plaintext DEK cache is as in LocalKeyEnvelope: a DEK has to be in
@@ -603,7 +625,7 @@ class ObjectStoreKeyEnvelope(KeyEnvelope):
         if cached is not None:
             self._cache.move_to_end(namespace)
             return cached
-        with self._mint_lock:
+        with self._ns_lock(namespace):
             cached = self._cache.get(namespace)
             if cached is not None:
                 return cached
@@ -621,6 +643,20 @@ class ObjectStoreKeyEnvelope(KeyEnvelope):
                 dk = self._unwrap_record(namespace, rec)
             self._mark_custody()
             return self._remember(namespace, dk)
+
+    @contextlib.contextmanager
+    def _ns_lock(self, namespace: str):
+        with self._locks_guard:
+            ent = self._ns_locks.setdefault(namespace, [threading.Lock(), 0])
+            ent[1] += 1
+        try:
+            with ent[0]:
+                yield
+        finally:
+            with self._locks_guard:
+                ent[1] -= 1
+                if ent[1] == 0:
+                    self._ns_locks.pop(namespace, None)
 
     def _guard_mint(self, namespace: str) -> None:
         if self.legacy_dir and os.path.exists(legacy_key_path(self.legacy_dir, namespace)):
@@ -817,7 +853,10 @@ def envelope_from_config(cfg: dict | None, local_dir: str, store: Any, *,
                 f"this store's data keys are held by {custody.get('provider')!r} "
                 f"(key {custody.get('key_id')!r}); set MEMD_KEY_PROVIDER={custody.get('provider')} "
                 "and its settings - the local provider cannot read them")
-        return LocalKeyEnvelope(keys_dir)
+        remote = store is not None and not hasattr(store, "root")   # s3://, not a local dir
+        allow = str(_opt(cfg, "keys_allow_mint_existing", "MEMD_KEYS_ALLOW_MINT_EXISTING", "")) in ("1", "true")
+        return LocalKeyEnvelope(keys_dir, guard_store=store if remote else None,
+                                allow_mint_existing=allow)
     if custody and custody.get("provider") != name:
         raise KeyCustodyError(
             f"this store's data keys are held by {custody.get('provider')!r}, not {name!r}")

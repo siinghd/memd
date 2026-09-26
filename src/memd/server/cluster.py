@@ -173,6 +173,25 @@ class NodeRegistry:
         self.store.put(self.key, json.dumps(body).encode())
 
     def start(self) -> None:
+        """Register. A registration of the same node id that is still
+        heartbeating belongs to another live process (a twin started with the
+        same id - refused) or to this node's crashed predecessor (waited out:
+        its leases are only reclaimable after the TTL anyway)."""
+        deadline = time.time() + self.cfg.lease_ttl_s + 2
+        while True:
+            try:
+                cur = json.loads(self.store.get(self.key) or b"{}")
+            except Exception:
+                cur = {}
+            age = time.time() - float(cur.get("beat", 0) or 0)
+            if not cur or cur.get("incarnation") == self.cfg.incarnation or age > self.cfg.lease_ttl_s:
+                break
+            if time.time() > deadline:
+                raise RuntimeError(f"node id {self.cfg.node_id!r} is registered by another live "
+                                   f"process ({cur.get('incarnation')}); node ids must be unique")
+            _log.warning("memd cluster: node id %s still registered by %s; waiting for it to expire",
+                         self.cfg.node_id, cur.get("incarnation"))
+            time.sleep(min(1.0, self.cfg.lease_ttl_s / 3))
         self._beat()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="memd-cluster-registry")
         self._thread.start()

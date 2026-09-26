@@ -224,3 +224,25 @@ def test_router_resolves_against_real_leases_and_registry(tmp_path):
         assert r1.resolve(free).kind == "local", "a deregistered node still gets namespaces"
     finally:
         NodeRegistry.CACHE_S = 1.0
+
+
+@pytest.mark.s3
+def test_a_second_node_with_local_keys_refuses_instead_of_rekeying(tmp_path):
+    """`local` keys on a shared bucket: the node that did not create a
+    namespace has no key for it. It used to MINT one - new writes under a
+    key the old data was never under, and the replay skipping the frames it
+    could not decrypt. Now the open is refused."""
+    from memd.engine.memory import Memory
+    from memd.storage.crypto import KeyCustodyError
+
+    store = _s3()
+    cfg = {"s3_endpoint_url": ENDPOINT, "s3_access_key": KEY, "s3_secret_key": SECRET,
+           "s3_region": "us-east-1", "embedder": "hash"}
+    m = Memory(f"s3://{BUCKET}/{store.prefix}", config=dict(cfg, local_dir=str(tmp_path / "a")))
+    m.remember("only node A holds the key for this")
+    m.close()
+    with pytest.raises(KeyCustodyError, match="no local key"):
+        Memory(f"s3://{BUCKET}/{store.prefix}", config=dict(cfg, local_dir=str(tmp_path / "b")))
+    m = Memory(f"s3://{BUCKET}/{store.prefix}", config=dict(cfg, local_dir=str(tmp_path / "a")))
+    assert any("node A" in i.content for i in m.search("who holds the key").items)
+    m.close()

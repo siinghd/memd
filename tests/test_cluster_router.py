@@ -295,8 +295,9 @@ def test_any_node_serves_any_namespace(fleet_factory):
         rec = json.loads(f.s3.get_object(Bucket=BUCKET, Key=f"{f.prefix}/keys/{ns}.dek")["Body"].read())
         assert rec["provider"] == "aws-kms"
     for n in nodes:
-        kd = f.tmp / f"local-{n}" / "keys"
+        kd = f.tmp / f"local-{n}" / f"node-{n}" / "keys"
         assert not kd.exists() or not [p for p in os.listdir(kd) if p.startswith("ns-tenant")]
+        assert (f.tmp / f"local-{n}" / f"node-{n}" / "_cache").is_dir(), "node-local cache not per node" 
     # a node's own facade namespace is never served to a client
     assert httpx.get(f"{f.urls['n1']}/v1/ns/memd-node.n2/stats", headers=H).status_code == 404
     # registry objects exist for every node
