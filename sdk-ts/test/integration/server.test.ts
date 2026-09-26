@@ -15,8 +15,10 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   AuthenticationError,
+  ForgetPreviewMismatchError,
   MemdClient,
   PermissionDeniedError,
+  RateLimitError,
   ValidationError,
   type MemoryRecord,
 } from "../../src/index.js";
@@ -165,13 +167,23 @@ describe.skipIf(!AVAILABLE)("against a real memd server", () => {
     for await (const r of a.exportStream()) streamed.push(r.id);
     expect(streamed).toEqual(exported.map((r) => r.id));
 
-    // soft delete: gone from reads, still visible with history, not re-deletable
+    // soft delete: gone from every read, history included; only an admin
+    // read with include_deleted still sees it (a namespace key gets 403)
     expect(await a.delete(rawId!)).toBe(true);
     expect(await a.get(rawId!)).toBeNull();
-    expect((await a.get(rawId!, { history: true }))?.deleted).toBe(true);
-    expect(await a.delete(rawId!)).toBe(false);
+    expect(await a.get(rawId!, { history: true })).toBeNull();
+    const denied = await a.get(rawId!, { include_deleted: true }).catch((e: unknown) => e);
+    expect(denied).toBeInstanceOf(PermissionDeniedError);
+    expect((denied as PermissionDeniedError).code).toBe("forbidden");
+    expect((await admin.get(rawId!, { history: true, include_deleted: true }))?.deleted).toBe(true);
+    expect(await a.delete(rawId!)).toBe(false); // already soft-deleted
 
-    // hard delete: gone even from history
+    // a soft-deleted record can still be hard-deleted (purged), once
+    expect(await a.delete(rawId!, { hard: true })).toBe(true);
+    expect(await a.delete(rawId!, { hard: true })).toBe(false);
+    expect(await admin.get(rawId!, { include_deleted: true })).toBeNull();
+
+    // hard delete of a live record
     expect(await a.delete(factId, { hard: true })).toBe(true);
     expect(await a.get(factId, { history: true })).toBeNull();
 
@@ -237,18 +249,40 @@ describe.skipIf(!AVAILABLE)("against a real memd server", () => {
     expect(typeof closed.segment).toBe("string");
   });
 
-  it("forget previews, then deletes on confirm", async () => {
-    await a.add("The office wifi password is tangerine", { user_id: "u3" });
-    const preview = await a.forget("wifi password tangerine", { user_id: "u3" });
-    expect(preview.confirmed).toBe(false);
-    expect(preview.count).toBeGreaterThanOrEqual(1);
-    expect(preview.will_delete.some((w) => w.content.includes("tangerine"))).toBe(true);
-    expect(await a.findIds("wifi password tangerine", { user_id: "u3" })).toHaveLength(preview.count);
+  it("forget previews, then deletes exactly the preview on confirm", async () => {
+    const [raw] = await a.add("The office wifi password is tangerine", { user_id: "u3" });
+    const fact = await a.remember("office wifi password: tangerine", { user_id: "u3" });
+    const filters = { user_id: "u3", kinds: ["fact" as const] };
 
-    const deleted = await a.forget("wifi password tangerine", { user_id: "u3", confirm: true });
-    expect(deleted.length).toBe(preview.count);
-    const after = await a.search("wifi password", { user_id: "u3" });
-    expect(after.items.some((i) => i.content.includes("tangerine"))).toBe(false);
+    const preview = await a.forget("wifi password tangerine", filters);
+    expect(preview.confirmed).toBe(false);
+    expect(preview.will_delete.map((w) => w.id)).toEqual([fact]);
+    expect(preview.fingerprint).toMatch(/^[0-9a-f]+$/);
+    expect(await a.findIds("wifi password tangerine", filters)).toEqual([fact]);
+
+    // confirming with the preview sends its fingerprint and deletes that set only
+    const deleted = await a.forget("wifi password tangerine", { ...filters, confirm: preview });
+    expect(deleted).toEqual([fact]);
+    expect(await a.get(fact)).toBeNull();
+    expect((await a.get(raw!))?.content).toContain("tangerine"); // kinds excluded it
+  });
+
+  it("a confirm whose matches changed since the preview deletes nothing", async () => {
+    await a.add("The garage door code is 7781", { user_id: "u4" });
+    const q = "garage door code 7781";
+    const preview = await a.forget(q, { user_id: "u4" });
+    const [later] = await a.add("Reminder: garage door code 7781 changes soon", { user_id: "u4" });
+
+    const err = await a.forget(q, { user_id: "u4", confirm: preview }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ForgetPreviewMismatchError);
+    expect((err as ForgetPreviewMismatchError).status).toBe(409);
+    expect((err as ForgetPreviewMismatchError).code).toBe("preview_mismatch");
+    expect(await a.get(later!)).not.toBeNull();
+
+    const again = await a.forget(q, { user_id: "u4" });
+    const deleted = await a.forget(q, { user_id: "u4", confirm: again });
+    expect(deleted).toContain(later);
+    expect(deleted).toHaveLength(again.count);
   });
 
   it("stats, compact and reembed return their documented shapes", async () => {
@@ -272,15 +306,20 @@ describe.skipIf(!AVAILABLE)("against a real memd server", () => {
 
   it("maps real server errors to typed errors", async () => {
     const bad = new MemdClient({ apiKey: "memd_nope_00000000_ffff", baseUrl, namespace: nsA });
-    await expect(bad.stats()).rejects.toBeInstanceOf(AuthenticationError);
+    const unauth = await bad.stats().catch((e: unknown) => e);
+    expect(unauth).toBeInstanceOf(AuthenticationError);
+    expect((unauth as AuthenticationError).code).toBe("unauthorized");
 
     const err = (await a.search("q", { budget_tokens: 10 }).catch((e: unknown) => e)) as ValidationError;
     expect(err).toBeInstanceOf(ValidationError);
     expect(err.status).toBe(422);
+    expect(err.code).toBe("validation_error");
     expect(err.issues[0]?.loc).toEqual(["body", "budget_tokens"]);
 
     // crypto-shred needs an override-capable key
-    await expect(a.destroyNamespace()).rejects.toBeInstanceOf(PermissionDeniedError);
+    const shred = await a.destroyNamespace().catch((e: unknown) => e);
+    expect(shred).toBeInstanceOf(PermissionDeniedError);
+    expect((shred as PermissionDeniedError).code).toBe("forbidden");
   });
 
   it("an admin key reaches any namespace and can destroy one", async () => {
@@ -289,5 +328,24 @@ describe.skipIf(!AVAILABLE)("against a real memd server", () => {
     expect((await admin.export({ namespace: scratch })).length).toBe(1);
     expect(await admin.destroyNamespace(scratch)).toBe(true);
     expect(await admin.export({ namespace: scratch })).toEqual([]);
+    // a namespace that never existed is a 404: false, and it is not created
+    const ghost = `sdk-ghost-${randomBytes(3).toString("hex")}`;
+    expect(await admin.destroyNamespace(ghost)).toBe(false);
+    expect((await admin.status()).namespaces).not.toContain(ghost);
+  });
+
+  it("a real 429 carries Retry-After, and a read retries after it", async () => {
+    // a fresh key: the maintenance budget (10/min per key and route) is its own
+    const c = new MemdClient({ apiKey: mintKey(nsA), baseUrl, namespace: nsA, retries: 0 });
+    for (let i = 0; i < 10; i++) await c.findIds("budget probe");
+    const err = (await c.findIds("budget probe").catch((e: unknown) => e)) as RateLimitError;
+    expect(err).toBeInstanceOf(RateLimitError);
+    expect(err.code).toBe("rate_limited");
+    expect(err.retryAfter).toBeGreaterThanOrEqual(1);
+    expect(err.retryAfter).toBeLessThanOrEqual(60);
+
+    const t0 = Date.now();
+    expect(await c.findIds("budget probe", { retries: 1 })).toEqual([]);
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(err.retryAfter! * 1000 - 1500);
   });
 });
