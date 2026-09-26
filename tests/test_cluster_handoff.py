@@ -293,6 +293,78 @@ def test_a_reopen_no_other_tenure_came_between_keeps_its_warm_cache(tmp_path):
             e.close()
 
 
+def test_an_open_killed_between_its_lineage_commit_and_stamp_keeps_its_cache(tmp_path, monkeypatch):
+    """A process killed after its open committed the new lineage but before
+    it stamped the cache with it (a crash inside a usearch sidecar load on
+    the worker thread lands there often) wrote nothing else: its cache is
+    exactly current for that lineage, and the next open keeps it instead of
+    discarding it - the vectors in it are not durable anywhere else. Another
+    tenure in between still discards it."""
+    import sqlite3
+
+    from memd.core.schema import MemoryRecord
+    from memd.index.sqlite_index import NamespaceIndex
+    from memd.storage.engine import StorageEngine
+
+    class Killed(BaseException):
+        pass
+
+    root, cache = str(tmp_path / "store"), str(tmp_path / "cache")
+    e = StorageEngine(root, cache_dir=cache)
+    ns = e.namespace("t")
+    for i in range(5):
+        ns.append([MemoryRecord.create(namespace="t", kind="raw_event", content=f"r {i}")])
+    path = ns.index.path
+    e.close()
+    con = sqlite3.connect(path)   # a mark only this very cache file carries
+    con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('test_mark','this file')")
+    con.commit()
+    con.close()
+
+    def marked() -> bool:
+        con = sqlite3.connect(path)
+        try:
+            return con.execute("SELECT v FROM meta WHERE k='test_mark'").fetchone() is not None
+        finally:
+            con.close()
+
+    real = NamespaceIndex.set_meta
+
+    def killed_at_the_stamp(self, k, v):
+        if k == "lineage" and v:
+            raise Killed()
+        return real(self, k, v)
+
+    monkeypatch.setattr(NamespaceIndex, "set_meta", killed_at_the_stamp)
+    with pytest.raises(Killed):
+        StorageEngine(root, cache_dir=cache).namespace("t")
+    monkeypatch.setattr(NamespaceIndex, "set_meta", real)
+    mpath = os.path.join(root, "ns", "t", "manifest.json")
+    with open(mpath) as f:
+        committed = json.load(f)["lineage"]
+    e = StorageEngine(root, cache_dir=cache)
+    try:
+        ns = e.namespace("t")
+        assert not ns._replayed_at_open and ns.index.stats()["records"] == 5
+        assert ns.manifest.lineage != committed
+    finally:
+        e.close()
+    assert marked(), "the cache current for the committed lineage was discarded"
+    # control: another tenure committed since - discarded
+    with open(mpath) as f:
+        m = json.load(f)
+    m["lineage"] = "01OTHERTENURE0000000000000"
+    with open(mpath, "w") as f:
+        json.dump(m, f)
+    e = StorageEngine(root, cache_dir=cache)
+    try:
+        ns = e.namespace("t")
+        assert ns._replayed_at_open and ns.index.stats()["records"] == 5
+    finally:
+        e.close()
+    assert not marked(), "a cache of another lineage was kept"
+
+
 def test_a_discarded_cache_takes_the_ann_sidecar_with_it(tmp_path, monkeypatch):
     """The lineage check (ADR-12) with the usearch sidecar: a cache of
     another lineage is deleted and rebuilt - and so are the sidecar's files,

@@ -290,7 +290,10 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   `lineage` of the tenure that opened the namespace last; a cache is caught
   up only in its own lineage, and any other is deleted - file, WAL and
   tantivy copy and the usearch sidecar's files, so purged text and vectors
-  go with it (D7) - and rebuilt from the snapshot plus the tail. A clean release racing a heartbeat renewal no
+  go with it (D7) - and rebuilt from the snapshot plus the tail. An open
+  killed between committing its lineage and stamping its cache (a crash in a
+  usearch sidecar load lands there) keeps that cache: a pending stamp,
+  written once the replay is flushed, says it is current for that lineage. A clean release racing a heartbeat renewal no
   longer leaves the lease live (the next node waited out the TTL and took
   over); a local data key wrapped by another root key raises
   `KeyCustodyError`, not a raw `InvalidTag`.

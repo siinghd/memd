@@ -1188,9 +1188,10 @@ class NamespaceStore:
             os.replace(tmp, path)
             self.index = NamespaceIndex(path)
             self.index._ns_hint = self.namespace
-            # the image carries its publisher's lineage stamp: this open
+            # the image carries its publisher's lineage stamps: this open
             # stamps its own once it has caught the image up
             self.index.set_meta("lineage", "")
+            self.index.set_meta("lineage_pending", "")
             # the image carries the publisher's vector lineage: this node's
             # copy diverges from here, so it gets its own (a sidecar file of
             # another lineage at the same watermark must never match it). The
@@ -1328,9 +1329,17 @@ class NamespaceStore:
         self.index.flush()
         self.index.set_meta("applied_seq", str(self.manifest.seq))
         self.index.set_meta("store_format", str(STORE_FORMAT))
+        # The cache now holds everything this tenure's open replayed, and the
+        # tenure has written nothing yet (it writes only once the open
+        # returns). Say so BEFORE the commit below: a process killed between
+        # that commit and the stamp after it - a crash in a sidecar load on
+        # the worker thread, say - left a manifest of this lineage over a
+        # cache that is exactly current for it (see _stale_cache).
+        self.index.set_meta("lineage_pending", self.manifest.lineage)
         self._persist_manifest()
         # only now that this tenure's lineage is committed: the cache is up
-        # to date in it (a crash before this discards the cache next time)
+        # to date in it (a crash before the pending stamp above discards the
+        # cache next time)
         self.index.set_meta("lineage", self.manifest.lineage)
         self._scrub_caches()
         self._collect_garbage()
@@ -1605,10 +1614,14 @@ class NamespaceStore:
         tenure has written it since - and no fold retired ops above its
         watermark (see _snapshot_floor). Any other cache is rebuilt: from the
         snapshot, when one is published, plus the tail - what a node without
-        a cache pays anyway."""
+        a cache pays anyway. "Brought up to date in it" includes a cache
+        whose pending stamp names that lineage: the tenure's own open, on
+        this node, replayed into it and was killed after committing its
+        lineage but before stamping it - having written nothing else."""
         if not prior_lineage:
             return "the namespace has no lineage yet"   # new, or written by an older build
-        if self.index.get_meta("lineage") != prior_lineage:
+        if prior_lineage not in (self.index.get_meta("lineage"),
+                                 self.index.get_meta("lineage_pending")):
             return "another tenure wrote the namespace since"
         try:
             applied = int(self.index.get_meta("applied_seq") or 0)
