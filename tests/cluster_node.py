@@ -12,6 +12,9 @@ lets another node take the namespace over, then SIGCONTs it.
 MEMD_TEST_ROTATE_FRAMES=N: rotate the WAL every N frames (default 512), so a
 rotation is reachable from a few HTTP writes.
 
+MEMD_TEST_REPLICA_FAIL=1: this node's read replicas refuse every read
+(ReplicaUnavailableError), so an eventual read must fall back to the writer.
+
 Test-only: nothing here ships; the hooks are monkeypatches.
 """
 import faulthandler
@@ -68,6 +71,14 @@ if _frames:
         kw["wal_rotate_frames"] = int(_frames)
         return _init(self, *a, **kw)
     _engine.StorageEngine.__init__ = _small_rotation
+
+if os.environ.get("MEMD_TEST_REPLICA_FAIL"):
+    # this node's replicas never serve: every eventual read must fall back
+    from memd.storage import replica as _replica  # noqa: E402
+
+    def _refuse(self, max_staleness_s):
+        raise _replica.ReplicaUnavailableError("test: this node's replicas are down")
+    _replica.ReplicaStore.ensure_fresh = _refuse
 
 from memd.cli import main  # noqa: E402
 

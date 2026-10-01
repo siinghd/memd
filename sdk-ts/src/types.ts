@@ -122,6 +122,18 @@ export interface SearchHit {
   namespace: string;
 }
 
+/** Read consistency: `"strong"` reads the writer; `"eventual"` accepts a read replica. */
+export type ReadConsistency = "strong" | "eventual";
+
+/** Who served a read (the `X-Memd-Served-By` / `-Replica-Seq` / `-Replica-Age-Ms` headers). */
+export interface ReadInfo {
+  servedBy: "leader" | "replica";
+  /** The seq the replica had applied every event up to (`null` for the leader). */
+  appliedSeq: number | null;
+  /** How long ago the replica's last good refresh started, in ms (`null` for the leader). */
+  ageMs: number | null;
+}
+
 /** `POST /v1/ns/{ns}/search` (`memd.engine.memory.SearchResult`). */
 export interface SearchResult {
   /** Provenance-tagged context, ready to inject into a prompt. */

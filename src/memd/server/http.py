@@ -25,6 +25,51 @@ from memd.storage.engine import NamespaceBusyError
 
 _log = logging.getLogger("memd.http")
 
+# Read replicas: a read opts into eventual consistency with
+# this header (or ?consistency=eventual), optionally bounding how stale the
+# replica may be (ms); every search/get answers who served it.
+CONSISTENCY_HEADER = "X-Memd-Read-Consistency"
+MAX_STALENESS_HEADER = "X-Memd-Max-Staleness-Ms"
+SERVED_BY_HEADER = "X-Memd-Served-By"
+REPLICA_SEQ_HEADER = "X-Memd-Replica-Seq"
+REPLICA_AGE_HEADER = "X-Memd-Replica-Age-Ms"
+# a replica could not serve the read: the cluster router sends it to the
+# namespace's writer instead (never reaches a client through the router)
+REPLICA_UNAVAILABLE_HEADER = "X-Memd-Replica-Unavailable"
+
+
+def read_consistency(request: Request) -> tuple[str, int | None]:
+    """(consistency, max_staleness_ms) a read asked for. "eventual" is
+    honoured only where the cluster router marked the request for this
+    node's replica (it does when this node is not the namespace's writer):
+    everywhere else the writer serves it, which satisfies any bound."""
+    raw = (request.headers.get(CONSISTENCY_HEADER) or request.query_params.get("consistency")
+           or "strong").strip().lower()
+    if raw not in ("strong", "eventual"):
+        raise HTTPException(400, f"{CONSISTENCY_HEADER} must be 'strong' or 'eventual'")
+    ms_raw = request.headers.get(MAX_STALENESS_HEADER) or request.query_params.get("max_staleness_ms")
+    ms = None
+    if ms_raw not in (None, ""):
+        try:
+            ms = int(ms_raw)
+        except ValueError:
+            ms = -1
+        if ms < 0 or ms > 86_400_000:
+            raise HTTPException(400, f"{MAX_STALENESS_HEADER} must be milliseconds (0..86400000)")
+    if raw == "eventual" and not getattr(request.state, "memd_replica_ok", False):
+        raw = "strong"
+    return raw, ms
+
+
+def _served_headers(response: Response, info: dict | None) -> None:
+    info = info or {}
+    if info.get("served_by") == "replica":
+        response.headers[SERVED_BY_HEADER] = "replica"
+        response.headers[REPLICA_SEQ_HEADER] = str(int(info.get("applied_seq") or 0))
+        response.headers[REPLICA_AGE_HEADER] = str(int(info.get("age_ms") or 0))
+    else:
+        response.headers[SERVED_BY_HEADER] = "leader"
+
 
 class EventIn(BaseModel):
     content: str = Field(min_length=1, max_length=1_000_000)
@@ -404,7 +449,24 @@ def create_app(
                       headers={"Retry-After": "1", "X-Memd-Not-Owner": "1"})
 
     from memd.storage.crypto import KeyCustodyError
-    from memd.storage.objectstore import LeaseLostError
+    from memd.storage.objectstore import LeaseLostError, ReadOnlyError
+    from memd.storage.replica import ReplicaUnavailableError
+
+    @app.exception_handler(ReplicaUnavailableError)
+    async def replica_unavailable_handler(request: Request, exc: ReplicaUnavailableError):
+        # this node's replica cannot serve the read within the staleness the
+        # caller accepts: the cluster router intercepts the header and sends
+        # the request to the namespace's writer (a client sees this only
+        # when it bypassed the router's retry)
+        METRICS.inc("memd_http_replica_unavailable_total",
+                    help="eventual reads a replica could not serve (sent to the writer)")
+        _log.info("replica read refused on %s: %s", _route_label(request.url.path), exc)
+        return _error(503, "no replica of the namespace can serve this read; retry", "replica_unavailable",
+                      headers={"Retry-After": "1", REPLICA_UNAVAILABLE_HEADER: "1"})
+
+    @app.exception_handler(ReadOnlyError)
+    async def read_only_handler(request: Request, exc: ReadOnlyError):
+        return _error(409, "this namespace is open read-only here", "read_only")
 
     @app.exception_handler(KeyCustodyError)
     async def key_custody_handler(request: Request, exc: KeyCustodyError):
@@ -611,8 +673,10 @@ def create_app(
         return {"id": rid}
 
     @app.post("/v1/ns/{ns}/search")
-    def search(ns: str, body: SearchIn, p: Principal = Depends(auth)):
+    def search(ns: str, body: SearchIn, request: Request, response: Response,
+               p: Principal = Depends(auth)):
         user, _ = apply_scope(p, body.user_id, body.session_id)
+        consistency, max_staleness_ms = read_consistency(request)
         with bill.admit(p, ns, searches=1) as meter:
             res = engine.search(
                 body.query,
@@ -626,8 +690,12 @@ def create_app(
                 include_quarantined=body.include_quarantined,
                 namespace=ns,
                 rerank=meter.allow_rerank,  # hosted: False once the reranked quota is spent
+                consistency=consistency,
+                max_staleness_ms=max_staleness_ms,
             )
             meter.record(searches=1, reranked=res.reranked)
+        _served_headers(response, {"served_by": res.served_by, "applied_seq": res.replica_seq,
+                                   "age_ms": res.replica_age_ms})
         return {
             "packed_context": res.packed_context,
             "items": [i.__dict__ for i in res.items],
@@ -639,16 +707,22 @@ def create_app(
         }
 
     @app.get("/v1/ns/{ns}/memories/{record_id}")
-    def get_memory(ns: str, record_id: str, history: bool = False, include_deleted: bool = False,
+    def get_memory(ns: str, record_id: str, request: Request, response: Response,
+                   history: bool = False, include_deleted: bool = False,
                    p: Principal = Depends(auth)):
         # a deleted record - or deleted version in its history - is served only
         # to an administrative read; `history` alone used to serve soft-deleted
         # content until a compaction purged it
         if include_deleted and not p.scope_override:
             raise HTTPException(403, "include_deleted requires an override-capable key")
-        got = engine.get(record_id, history=history, include_deleted=include_deleted, namespace=ns)
+        consistency, max_staleness_ms = read_consistency(request)
+        info: dict = {}
+        got = engine.get(record_id, history=history, include_deleted=include_deleted, namespace=ns,
+                         consistency=consistency, max_staleness_ms=max_staleness_ms, read_info=info)
+        _served_headers(response, info)
         if got is None:
-            raise HTTPException(404, "not found")
+            raise HTTPException(404, "not found", headers={
+                k: v for k, v in response.headers.items() if k.lower().startswith("x-memd-")})
         # user-pinned keys must not read other users' records by id;
         # 404 rather than 403 so existence isn't revealed
         rec_scope = got.get("scope") or {}

@@ -31,6 +31,8 @@ import type {
   MemoryRecord,
   NamespaceStats,
   PackedContextMessage,
+  ReadConsistency,
+  ReadInfo,
   ReembedResult,
   ScopeFields,
   SearchIn,
@@ -64,6 +66,21 @@ export interface MemdClientOptions {
   fetch?: FetchLike;
   /** Extra headers sent with every request (for a gateway in front of memd, say). */
   headers?: Record<string, string>;
+  /**
+   * Read consistency for `search`, `pack` and `get` (overridable per call).
+   * `"strong"` (the server's default) reads the namespace's writer;
+   * `"eventual"` lets a read replica serve them, no staler
+   * than `maxStalenessMs`. `lastRead` says who served the last one.
+   */
+  consistency?: ReadConsistency;
+  /** The staleness an eventual read accepts, in ms (the server's default bound when unset). */
+  maxStalenessMs?: number;
+}
+
+/** Read-consistency options of `search`, `pack` and `get`. */
+export interface ReadOptions {
+  consistency?: ReadConsistency;
+  maxStalenessMs?: number;
 }
 
 /** Per-call options every method accepts. */
@@ -78,7 +95,7 @@ export interface RequestOptions {
 
 export type AddOptions = Omit<EventIn, "content"> & RequestOptions;
 export type RememberOptions = Omit<MemoryIn, "content"> & RequestOptions;
-export type SearchOptions = Omit<SearchIn, "query"> & RequestOptions;
+export type SearchOptions = Omit<SearchIn, "query"> & RequestOptions & ReadOptions;
 export type FindOptions = Omit<FindIn, "query" | "confirm" | "fingerprint"> & RequestOptions;
 export type ForgetOptions = FindOptions & {
   /**
@@ -91,7 +108,7 @@ export type ForgetOptions = FindOptions & {
   fingerprint?: string;
 };
 export type ObserveOptions = ScopeFields & RequestOptions;
-export interface GetOptions extends RequestOptions {
+export interface GetOptions extends RequestOptions, ReadOptions {
   /** Include the supersedence chain (superseded versions; deleted ones only with `include_deleted`). */
   history?: boolean;
   /** Serve a deleted record, or deleted versions in its history. Override-capable (admin) keys only: 403 otherwise. */
@@ -117,6 +134,8 @@ interface CallSpec {
   accept?: string;
   /** Called with a successful response's headers, before its body is read. */
   onHeaders?: (headers: Headers) => void;
+  /** Extra headers for this call. */
+  headers?: Record<string, string>;
 }
 
 type Attempt<T> = { ok: true; value: T } | { ok: false; error: MemdError; retryable: boolean };
@@ -124,6 +143,12 @@ type Attempt<T> = { ok: true; value: T } | { ok: false; error: MemdError; retrya
 const DEFAULT_BASE_URL = "http://localhost:8700";
 /** How many unreadable WAL frames the server left out of an export. */
 const EXPORT_SKIPPED_HEADER = "x-memd-export-skipped-frames";
+/** Read replicas: what a read accepts, and who served it. */
+const CONSISTENCY_HEADER = "x-memd-read-consistency";
+const MAX_STALENESS_HEADER = "x-memd-max-staleness-ms";
+const SERVED_BY_HEADER = "x-memd-served-by";
+const REPLICA_SEQ_HEADER = "x-memd-replica-seq";
+const REPLICA_AGE_HEADER = "x-memd-replica-age-ms";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_RETRIES = 2;
 /** A server asking for a longer pause than this gets the error back instead. */
@@ -200,6 +225,14 @@ export class MemdClient {
    * client overwrite it: read it right after the export it belongs to.
    */
   lastExportSkippedFrames = 0;
+  /**
+   * Who served the last successful `search` / `pack` / `get`: the namespace's
+   * writer (`"leader"`) or a read replica, with the seq it had applied and
+   * its age in ms. `null` before the first one.
+   */
+  lastRead: ReadInfo | null = null;
+  readonly consistency: ReadConsistency | undefined;
+  readonly maxStalenessMs: number | undefined;
 
   constructor(options: MemdClientOptions) {
     if (!options || typeof options.apiKey !== "string" || options.apiKey === "") {
@@ -213,6 +246,11 @@ export class MemdClient {
     this.retryBaseDelayMs = options.retryBaseDelayMs ?? 250;
     this.retryMaxDelayMs = options.retryMaxDelayMs ?? 8_000;
     this.extraHeaders = { ...(options.headers ?? {}) };
+    if (options.consistency !== undefined && options.consistency !== "strong" && options.consistency !== "eventual") {
+      throw new TypeError('MemdClient: consistency must be "strong" or "eventual"');
+    }
+    this.consistency = options.consistency;
+    this.maxStalenessMs = options.maxStalenessMs;
     const injected = options.fetch;
     // Never store the global fetch unbound: calling it as a method of another
     // object throws "Illegal invocation" on Workers and in browsers.
@@ -267,7 +305,7 @@ export class MemdClient {
   async search(query: string, options: SearchOptions = {}): Promise<SearchResult> {
     const body = { ...pick(options, SEARCH_KEYS), query };
     return this.json<SearchResult>(
-      { method: "POST", path: this.nsPath(options, "/search"), body, idempotent: true },
+      { method: "POST", path: this.nsPath(options, "/search"), body, idempotent: true, ...this.readSpec(options) },
       options,
     );
   }
@@ -297,6 +335,7 @@ export class MemdClient {
           path: this.nsPath(options, `/memories/${encodeURIComponent(recordId)}`),
           query: { history: options.history, include_deleted: options.include_deleted },
           idempotent: true,
+          ...this.readSpec(options),
         },
         options,
       );
@@ -511,6 +550,35 @@ export class MemdClient {
 
   // -- transport ---------------------------------------------------------
 
+  /** The headers a read sends, and the callback that records who served it. */
+  private readSpec(options: ReadOptions): Pick<CallSpec, "headers" | "onHeaders"> {
+    const consistency = options.consistency ?? this.consistency;
+    if (consistency !== undefined && consistency !== "strong" && consistency !== "eventual") {
+      throw new TypeError('consistency must be "strong" or "eventual"');
+    }
+    const headers: Record<string, string> = {};
+    if (consistency !== undefined) headers[CONSISTENCY_HEADER] = consistency;
+    const ms = options.maxStalenessMs ?? this.maxStalenessMs;
+    if (ms !== undefined) headers[MAX_STALENESS_HEADER] = String(Math.max(0, Math.floor(ms)));
+    return {
+      headers,
+      onHeaders: (h) => {
+        const num = (name: string): number | null => {
+          const v = h.get(name);
+          if (v === null) return null;
+          const n = Number.parseInt(v, 10);
+          return Number.isFinite(n) ? n : null;
+        };
+        const servedBy = h.get(SERVED_BY_HEADER) === "replica" ? "replica" : "leader";
+        this.lastRead = {
+          servedBy,
+          appliedSeq: servedBy === "replica" ? num(REPLICA_SEQ_HEADER) : null,
+          ageMs: servedBy === "replica" ? num(REPLICA_AGE_HEADER) : null,
+        };
+      },
+    };
+  }
+
   private nsPath(options: RequestOptions, suffix: string): string {
     const ns = options.namespace ?? this.namespace;
     return `/v1/ns/${encodeURIComponent(ns)}${suffix}`;
@@ -550,6 +618,7 @@ export class MemdClient {
     // the wire (Headers would join them into one comma-separated value)
     const headers: Record<string, string> = {};
     for (const [k, v] of Object.entries(this.extraHeaders)) headers[k.toLowerCase()] = v;
+    for (const [k, v] of Object.entries(spec.headers ?? {})) headers[k.toLowerCase()] = v;
     headers["authorization"] = `Bearer ${this.apiKey}`;
     headers["accept"] = spec.accept ?? "application/json";
     let body: string | undefined;

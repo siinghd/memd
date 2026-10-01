@@ -18,14 +18,34 @@ class HostedError(RuntimeError):
 
 # how many unreadable WAL frames the server left out of an export
 EXPORT_SKIPPED_HEADER = "X-Memd-Export-Skipped-Frames"
+# read replicas: what a read accepts, and who served it
+CONSISTENCY_HEADER = "X-Memd-Read-Consistency"
+MAX_STALENESS_HEADER = "X-Memd-Max-Staleness-Ms"
+SERVED_BY_HEADER = "X-Memd-Served-By"
+REPLICA_SEQ_HEADER = "X-Memd-Replica-Seq"
+REPLICA_AGE_HEADER = "X-Memd-Replica-Age-Ms"
 
 
 class HostedMemory:
     # the last export_jsonl()'s count of WAL frames left out (0: complete)
     last_export_skipped_frames = 0
+    # who served the last search/get: {"served_by": "leader"|"replica",
+    # "applied_seq", "age_ms"} (the replica's seq and age; None for the leader)
+    last_read: dict | None = None
+    consistency: str | None = None
+    max_staleness_ms: int | None = None
 
     def __init__(self, api_key: str, base_url: str = "http://localhost:8700", namespace: str = "default",
-                 transport: httpx.BaseTransport | None = None):
+                 transport: httpx.BaseTransport | None = None, *, consistency: str | None = None,
+                 max_staleness_ms: int | None = None):
+        """`consistency="eventual"` lets searches and gets be served by a read
+        replica no staler than `max_staleness_ms` (the
+        server's default bound when None); the default, "strong", reads the
+        namespace's writer. Both can be given per call too."""
+        if consistency not in (None, "strong", "eventual"):
+            raise ValueError("consistency must be 'strong' or 'eventual'")
+        self.consistency = consistency
+        self.max_staleness_ms = max_staleness_ms
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.namespace = namespace
@@ -87,8 +107,9 @@ class HostedMemory:
                   "include_quarantined"):
             if kw.get(k) is not None:
                 body[k] = kw[k]
-        r = self._client.post(f"/v1/ns/{self._ns(kw)}/search", json=body)
+        r = self._client.post(f"/v1/ns/{self._ns(kw)}/search", json=body, **self._read_headers(kw))
         self._raise(r)
+        info = self._note_read(r)
         d = r.json()
         return SearchResult(
             packed_context=d["packed_context"],
@@ -98,6 +119,9 @@ class HostedMemory:
             truncated=d["truncated"],
             query_class=d["query_class"],
             latency_ms=d["latency_ms"],
+            served_by=info["served_by"],
+            replica_seq=info["applied_seq"],
+            replica_age_ms=info["age_ms"],
         )
 
     def pack(self, messages: list[dict], **kw) -> list[dict]:
@@ -123,10 +147,13 @@ class HostedMemory:
         params = {"history": str(history).lower()}
         if include_deleted:  # admin keys only (403 otherwise)
             params["include_deleted"] = "true"
-        r = self._client.get(f"/v1/ns/{ns}/memories/{record_id}", params=params)
+        r = self._client.get(f"/v1/ns/{ns}/memories/{record_id}", params=params,
+                             **self._read_headers(kw))
         if r.status_code == 404:
+            self._note_read(r)
             return None
         self._raise(r)
+        self._note_read(r)
         return r.json()
 
     # -- lifecycle ----------------------------------------------------
@@ -216,6 +243,36 @@ class HostedMemory:
         from memd.core.schema import Source
 
         return v.name.lower() if isinstance(v, Source) else v
+
+    def _read_headers(self, kw: dict) -> dict:
+        """{"headers": ...} for a read's request, or {} when it asks nothing
+        (a strong read with no bound sends no header)."""
+        consistency = kw.get("consistency") or self.consistency
+        if consistency not in (None, "strong", "eventual"):
+            raise ValueError("consistency must be 'strong' or 'eventual'")
+        out = {}
+        if consistency:
+            out[CONSISTENCY_HEADER] = consistency
+        ms = kw.get("max_staleness_ms")
+        ms = self.max_staleness_ms if ms is None else ms
+        if ms is not None:
+            out[MAX_STALENESS_HEADER] = str(int(ms))
+        return {"headers": out} if out else {}
+
+    def _note_read(self, r: httpx.Response) -> dict:
+        def num(h):
+            v = r.headers.get(h)
+            try:
+                return int(v) if v is not None else None
+            except ValueError:
+                return None
+
+        served = r.headers.get(SERVED_BY_HEADER) or "leader"
+        info = {"served_by": served,
+                "applied_seq": num(REPLICA_SEQ_HEADER) if served == "replica" else None,
+                "age_ms": num(REPLICA_AGE_HEADER) if served == "replica" else None}
+        self.last_read = info
+        return info
 
     def _ns(self, kw: dict) -> str:
         return kw.get("namespace") or self.namespace
