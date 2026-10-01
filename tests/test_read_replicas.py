@@ -1061,6 +1061,90 @@ def test_a_replicas_store_calls_have_short_timeouts(tmp_path):
         lead.close()
 
 
+def test_a_failed_replica_open_is_not_retried_by_every_read(be, monkeypatch):
+    """A replica that cannot open (the key provider unreachable: every open
+    spent 12-20 s on KMS retries before the read fell back) is remembered
+    per namespace: eventual reads fail over at once for a backoff (5 s,
+    doubling to 60 s), then one open is tried again; success forgets it."""
+    from memd.storage.crypto import KeyUnavailableError
+    from memd.storage.engine import StorageEngine
+    from memd.storage.replica import ReplicaStore, ReplicaUnavailableError
+
+    monkeypatch.setattr(StorageEngine, "REPLICA_OPEN_BACKOFF_S", (0.4, 1.6), raising=False)
+    writer = be.leader(namespace="elsewhere")
+    reader = be.leader(namespace="here")         # an eventual read of "elsewhere" is a replica read
+    opens = []
+    real = ReplicaStore._open
+
+    def unreachable(self):
+        opens.append(time.monotonic())
+        if fail[0]:
+            raise KeyUnavailableError("aws-kms Decrypt failed (test: unreachable)")
+        return real(self)
+
+    fail = [True]
+    monkeypatch.setattr(ReplicaStore, "_open", unreachable)
+    try:
+        writer.add("followed once the key is back victor")
+        for _ in range(5):
+            with pytest.raises(ReplicaUnavailableError):
+                reader.search("victor", namespace="elsewhere", consistency="eventual")
+        assert len(opens) == 1, f"{len(opens)} opens: every read retried the bootstrap"
+        time.sleep(0.5)                          # the backoff (0.4 s) passed: one more try
+        for _ in range(3):
+            with pytest.raises(ReplicaUnavailableError):
+                reader.search("victor", namespace="elsewhere", consistency="eventual")
+        assert len(opens) == 2
+        time.sleep(0.5)                          # the backoff doubled (0.8 s): not yet
+        with pytest.raises(ReplicaUnavailableError):
+            reader.search("victor", namespace="elsewhere", consistency="eventual")
+        assert len(opens) == 2
+        fail[0] = False
+        time.sleep(0.5)
+        res = reader.search("victor", namespace="elsewhere", consistency="eventual")
+        assert res.served_by == "replica" and len(opens) == 3
+        assert {i.content for i in res.items} == {"followed once the key is back victor"}
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_a_replicas_key_provider_calls_have_short_timeouts(tmp_path, kms_server, monkeypatch):
+    """A replica unwraps data keys through a KMS client of its own with the
+    replica timeouts: a KMS that hangs fails the open in seconds (it used
+    to hold it for botocore's 60 s x 5 attempts)."""
+    url, arn = kms_server
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", KEY)
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", SECRET)
+    keys = {"key_provider": "aws-kms", "kms_region": "us-east-1", "kms_key_id": arn}
+    be = Backend("local", tmp_path)
+    proxy = _Blackhole(url)
+    lead = be.leader(kms_endpoint_url=url, **keys)
+    rep = be.replica(kms_endpoint_url=proxy.url, replica_refresh_s=3600, replica_connect_timeout_s=1,
+                     replica_read_timeout_s=1, replica_max_attempts=1, **keys)
+    try:
+        lead.add("behind a hung key provider whiskey", namespace="sealed")
+        proxy.hang = True
+        done = threading.Event()
+        err = []
+
+        def run():
+            try:
+                rep.search("whiskey", namespace="sealed")
+            except Exception as ex:  # noqa: BLE001
+                err.append(ex)
+            done.set()
+
+        threading.Thread(target=run, daemon=True).start()
+        assert done.wait(10), "a replica open against a hung KMS did not time out"
+        assert err, "served without the key?"
+    finally:
+        proxy.hang = False
+        proxy.close()
+        rep.close()
+        lead.close()
+
+
 def test_concurrent_reads_during_refreshes_and_rebuilds(be):
     lead = be.leader()
     rep = be.replica(replica_refresh_s=0.05)

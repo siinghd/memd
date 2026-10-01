@@ -4349,6 +4349,9 @@ class StorageEngine:
                                        else _env("MEMD_REPLICA_MAX_ATTEMPTS", 2))),
         }
         self._replica_backend_: tuple | None = None
+        # ns -> (retry at (monotonic), backoff s, the error): replica opens
+        # that failed (see replica(backoff=True))
+        self._replica_failed: "OrderedDict[str, tuple]" = OrderedDict()
         self._replicas: "OrderedDict[str, object]" = OrderedDict()
         self._replica_opening: dict[str, list] = {}
         self._replica_path: str | None = None
@@ -4897,9 +4900,49 @@ class StorageEngine:
                 self._replica_backend_ = (store, env)
             return self._replica_backend_
 
-    def replica(self, ns: str):
+    # a replica that failed to open is not opened again by an eventual read
+    # for this long - doubling with each failure in a row, up to the second
+    # value - and those reads fail over at once (see replica(backoff=True))
+    REPLICA_OPEN_BACKOFF_S = (5.0, 60.0)
+    REPLICA_FAILED_MAX = 4096
+
+    def _replica_backoff(self, ns: str) -> None:
+        """(Under self._lock.) ReplicaUnavailableError while `ns`'s last
+        replica open failed less than its backoff ago."""
+        from memd.storage.replica import ReplicaUnavailableError
+
+        got = self._replica_failed.get(ns)
+        if got is None:
+            return
+        retry_at, _backoff, ex = got
+        left = retry_at - time.monotonic()
+        if left > 0:
+            METRICS.inc("memd_replica_open_backoffs_total",
+                        help="eventual reads failed over at once: the replica failed to open recently")
+            raise ReplicaUnavailableError(
+                f"namespace {ns!r}: its replica failed to open ({type(ex).__name__}: {ex}); "
+                f"not tried again for {left:.1f} s") from ex
+
+    def _replica_open_failed(self, ns: str, ex: BaseException) -> None:
+        lo, hi = self.REPLICA_OPEN_BACKOFF_S
+        with self._lock:
+            prev = self._replica_failed.pop(ns, None)
+            backoff = lo if prev is None else min(hi, prev[1] * 2)
+            self._replica_failed[ns] = (time.monotonic() + backoff, backoff, ex)
+            while len(self._replica_failed) > self.REPLICA_FAILED_MAX:
+                self._replica_failed.popitem(last=False)
+        METRICS.inc("memd_replica_open_failures_total", help="read replicas that failed to open",
+                    detail=type(ex).__name__)
+
+    def replica(self, ns: str, *, backoff: bool = False):
         """The read replica of `ns` (memd.storage.replica.ReplicaStore),
-        opened - bootstrapped from the bucket - if this engine has none."""
+        opened - bootstrapped from the bucket - if this engine has none.
+
+        `backoff` (a read that can fail over to the writer): an open that
+        failed is remembered per namespace, and for REPLICA_OPEN_BACKOFF_S
+        (5 s, doubling to 60 s while it keeps failing) such reads get
+        ReplicaUnavailableError at once instead of each paying for another
+        open - with the key provider unreachable, that was 12-20 s apiece."""
         from memd.storage.replica import ReplicaStore
 
         ns = _validate_ns(ns)
@@ -4909,6 +4952,8 @@ class StorageEngine:
                 self._replicas.move_to_end(ns)
                 rep.touch()
                 return rep
+            if backoff:
+                self._replica_backoff(ns)
         with self._replica_open_lock(ns):
             with self._lock:
                 rep = self._replicas.get(ns)
@@ -4918,16 +4963,23 @@ class StorageEngine:
                     return rep
                 if self._replica_stop.is_set():
                     raise RuntimeError("the storage engine is closed")
+                if backoff:
+                    # (an open this read waited for may just have failed)
+                    self._replica_backoff(ns)
             d = self._replica_dir()
             store, env = self._replica_backend()
             try:
                 rep = ReplicaStore(ns, store, d, env, lexical=self.lexical,
                                    vector_index=self.vector_index, on_applied=self._replica_applied,
                                    refresh_wait_s=self.replica_refresh_wait_s)
-            except BaseException:
+            except BaseException as ex:
                 with contextlib.suppress(Exception):
                     _drop_cache_files(d, ns)
+                if isinstance(ex, Exception):
+                    self._replica_open_failed(ns, ex)
                 raise
+            with self._lock:
+                self._replica_failed.pop(ns, None)
             with self._lock:
                 self._replicas[ns] = rep
                 victims = []
@@ -4987,7 +5039,10 @@ class StorageEngine:
                 return nstore, {"served_by": "leader", "applied_seq": nstore.manifest.seq, "age_ms": 0}
         bound = self.replica_max_staleness_s if max_staleness_s is None else max(0.0, max_staleness_s)
         try:
-            rep = self.replica(ns)
+            # a read with a writer to fall back to does not retry an open that
+            # just failed (an embedded read-only engine's reads have none:
+            # each tries, and sees the error itself)
+            rep = self.replica(ns, backoff=wrap_errors)
             rep.ensure_fresh(bound)
         except ReplicaUnavailableError:
             raise
