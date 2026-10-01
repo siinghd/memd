@@ -1228,6 +1228,81 @@ def test_a_failed_replica_open_is_not_retried_by_every_read(be, monkeypatch):
         writer.close()
 
 
+def test_a_slow_replica_open_holds_an_eventual_read_no_longer_than_its_wait(be, monkeypatch):
+    """An eventual read that can go to the writer waits for the replica's
+    open at most replica_refresh_wait_s - as for a refresh - and never past
+    that into an open already running: the read goes to the writer, and the
+    open goes on in the background; once it completes, the replica serves.
+    The read used to wait out the whole open (a KMS that hangs: 10-11 s)."""
+    from memd.storage.replica import ReplicaStore, ReplicaUnavailableError
+
+    writer = be.leader(namespace="elsewhere")
+    reader = be.leader(namespace="here")         # an eventual read of "elsewhere" is a replica read
+    release = threading.Event()
+    real = ReplicaStore._open
+
+    def slow(self):
+        release.wait(10)
+        return real(self)
+
+    monkeypatch.setattr(ReplicaStore, "_open", slow)
+    try:
+        writer.add("served once the open completes xray")
+        t0 = time.monotonic()
+        with pytest.raises(ReplicaUnavailableError):
+            reader.search("xray", namespace="elsewhere", consistency="eventual")
+        assert time.monotonic() - t0 < 2.0, "the read waited out the replica's open"
+        t0 = time.monotonic()
+        with pytest.raises(ReplicaUnavailableError):
+            reader.get("whatever", namespace="elsewhere", consistency="eventual")
+        assert time.monotonic() - t0 < 0.5, "the open in flight is past the wait: fail over at once"
+        release.set()
+        assert _wait(lambda: reader.engine.peek_replica("elsewhere") is not None)
+        res = reader.search("xray", namespace="elsewhere", consistency="eventual")
+        assert res.served_by == "replica"
+        assert {i.content for i in res.items} == {"served once the open completes xray"}
+    finally:
+        release.set()
+        reader.close()
+        writer.close()
+
+
+def test_a_hung_key_provider_holds_an_eventual_read_no_longer_than_its_wait(tmp_path, kms_server,
+                                                                          monkeypatch):
+    """A KMS that accepts connections and never answers: the replica's open
+    times out on its key unwrap (replica_read_timeout_s per attempt), and
+    the first eventual read of the namespace used to wait for all of it. It
+    goes to the writer after replica_refresh_wait_s (1 s), the next one at
+    once while the open is still in flight."""
+    from memd.storage.replica import ReplicaUnavailableError
+
+    url, arn = kms_server
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", KEY)
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", SECRET)
+    keys = {"key_provider": "aws-kms", "kms_region": "us-east-1", "kms_key_id": arn}
+    be = Backend("local", tmp_path)
+    proxy = _Blackhole(url)
+    writer = be.leader(namespace="elsewhere", kms_endpoint_url=url, **keys)
+    reader = be.leader(namespace="here", kms_endpoint_url=proxy.url, replica_read_timeout_s=4,
+                       replica_max_attempts=1, **keys)
+    try:
+        writer.add("behind a hung key provider yankee")
+        proxy.hang = True
+        t0 = time.monotonic()
+        with pytest.raises(ReplicaUnavailableError):
+            reader.search("yankee", namespace="elsewhere", consistency="eventual")
+        assert time.monotonic() - t0 < 2.5, "the read waited out the key provider's timeouts"
+        t0 = time.monotonic()
+        with pytest.raises(ReplicaUnavailableError):
+            reader.search("yankee", namespace="elsewhere", consistency="eventual")
+        assert time.monotonic() - t0 < 0.5
+    finally:
+        proxy.hang = False
+        proxy.close()
+        reader.close()
+        writer.close()
+
+
 def test_a_replicas_key_provider_calls_have_short_timeouts(tmp_path, kms_server, monkeypatch):
     """A replica unwraps data keys through a KMS client of its own with the
     replica timeouts: a KMS that hangs fails the open in seconds (it used

@@ -4232,6 +4232,19 @@ class _MigrationPreview(NamespaceStore):
         return self._plan_legacy(self._read_ops())["report"]
 
 
+class _ReplicaOpen:
+    """A replica open running in the background (StorageEngine.
+    _replica_within_wait)."""
+
+    __slots__ = ("started", "done", "rep", "error")
+
+    def __init__(self):
+        self.started = time.monotonic()
+        self.done = threading.Event()
+        self.rep = None
+        self.error: BaseException | None = None
+
+
 class StorageEngine:
     """Manages namespaces over an ObjectStore. Stateless compute: any process
     can open any namespace by replaying the object-store log."""
@@ -4333,7 +4346,8 @@ class StorageEngine:
         self.replica_max_staleness_s = float(replica_max_staleness_s)
         # a stale replica's read waits at most this long for a refresh (the
         # one in flight, or one it starts) - never on a refresh stuck longer
-        # than that - then fails over (see ReplicaStore.ensure_fresh)
+        # than that - then fails over (see ReplicaStore.ensure_fresh); and so
+        # long for the replica's open (see replica(backoff=True))
         if replica_refresh_wait_s is None:
             ms = _env("MEMD_REPLICA_REFRESH_WAIT_MS", None)
             replica_refresh_wait_s = ms / 1000.0 if ms is not None else 1.0
@@ -4354,6 +4368,9 @@ class StorageEngine:
         self._replica_failed: "OrderedDict[str, tuple]" = OrderedDict()
         self._replicas: "OrderedDict[str, object]" = OrderedDict()
         self._replica_opening: dict[str, list] = {}
+        # ns -> _ReplicaOpen: opens running in the background for reads that
+        # stopped waiting for them (see _replica_within_wait)
+        self._replica_bg: dict[str, _ReplicaOpen] = {}
         self._replica_path: str | None = None
         self._replica_lock_fd: int | None = None
         self._replica_lock_path: str | None = None
@@ -4942,9 +4959,11 @@ class StorageEngine:
         failed is remembered per namespace, and for REPLICA_OPEN_BACKOFF_S
         (5 s, doubling to 60 s while it keeps failing) such reads get
         ReplicaUnavailableError at once instead of each paying for another
-        open - with the key provider unreachable, that was 12-20 s apiece."""
-        from memd.storage.replica import ReplicaStore
-
+        open - with the key provider unreachable, that was 12-20 s apiece.
+        Such a read also waits for an open at most replica_refresh_wait_s,
+        as for a refresh, and the open goes on in the background (see
+        _replica_within_wait): a key provider that hangs held the first
+        read of every namespace for its timeouts - 10-11 s."""
         ns = _validate_ns(ns)
         with self._lock:
             rep = self._replicas.get(ns)
@@ -4954,6 +4973,54 @@ class StorageEngine:
                 return rep
             if backoff:
                 self._replica_backoff(ns)
+        if backoff:
+            return self._replica_within_wait(ns)
+        return self._open_replica(ns, backoff=False)
+
+    def _replica_within_wait(self, ns: str):
+        """`ns`'s replica opened in the background and waited for at most
+        replica_refresh_wait_s - never past that into an open already
+        running, like a read waiting for a refresh (ReplicaStore.
+        ensure_fresh). ReplicaUnavailableError when it fails or does not
+        complete in time; then it goes on, and a later read finds the
+        replica open - or its failure remembered for the backoff."""
+        from memd.storage.replica import ReplicaUnavailableError
+
+        with self._lock:
+            job = self._replica_bg.get(ns)
+            if job is None:
+                job = self._replica_bg[ns] = _ReplicaOpen()
+                threading.Thread(target=self._open_replica_job, args=(ns, job),
+                                 name=f"memd-replica-open-{ns}", daemon=True).start()
+        now = time.monotonic()
+        wait = self.replica_refresh_wait_s
+        if not job.done.wait(max(0.0, min(now + wait, job.started + wait) - now)):
+            METRICS.inc("memd_replica_open_waits_total",
+                        help="eventual reads that went to the writer: the replica was still opening")
+            raise ReplicaUnavailableError(
+                f"namespace {ns!r}: its replica is still opening "
+                f"({int((time.monotonic() - job.started) * 1000)} ms so far)")
+        ex = job.error
+        if ex is not None:
+            why = str(ex) if isinstance(ex, ReplicaUnavailableError) else (
+                f"namespace {ns!r}: no replica ({type(ex).__name__}: {ex})")
+            raise ReplicaUnavailableError(why) from ex
+        return job.rep
+
+    def _open_replica_job(self, ns: str, job: "_ReplicaOpen") -> None:
+        try:
+            job.rep = self._open_replica(ns, backoff=True)
+        except BaseException as ex:  # noqa: BLE001 - handed to the reads waiting for it
+            job.error = ex
+        finally:
+            with self._lock:
+                if self._replica_bg.get(ns) is job:
+                    del self._replica_bg[ns]
+            job.done.set()
+
+    def _open_replica(self, ns: str, *, backoff: bool):
+        from memd.storage.replica import ReplicaStore
+
         with self._replica_open_lock(ns):
             with self._lock:
                 rep = self._replicas.get(ns)
@@ -4981,13 +5048,18 @@ class StorageEngine:
             with self._lock:
                 self._replica_failed.pop(ns, None)
             with self._lock:
-                self._replicas[ns] = rep
+                stopped = self._replica_stop.is_set()   # (closed while it opened)
                 victims = []
-                while len(self._replicas) > self.max_replicas:
+                if not stopped:
+                    self._replicas[ns] = rep
+                while not stopped and len(self._replicas) > self.max_replicas:
                     name = next((n for n in self._replicas if n not in self._pinned and n != ns), None)
                     if name is None:
                         break
                     victims.append(self._replicas.pop(name))
+            if stopped:
+                self._close_replica(rep)
+                raise RuntimeError("the storage engine is closed")
             for v in victims:
                 METRICS.inc("memd_replica_evictions_total",
                             help="replicas closed (their caches deleted) by the LRU cap or idleness",
