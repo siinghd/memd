@@ -6,6 +6,8 @@ wrong, how it showed, and the numbers before and after where it has them.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-01
+
 ### Added
 - **Read replicas.** A namespace can be opened READ-ONLY
   (`Memory(path, read_only=True)`; `ReplicaStore`): no lease, no object
