@@ -3041,6 +3041,15 @@ class NamespaceStore:
             elif kind == "quarantine":
                 self.index.mark_quarantined(op["id"], bool(op.get("flag", True)))
             elif kind == "set_vector":
+                # Applied when a log carries one, but nothing in memd writes
+                # it: vectors are derived state (ADR-5, ADR-8). The embed
+                # worker and reembed() put them straight into the index and
+                # never log them, and no fold keeps this op (a record holds
+                # no vector). Its vector then lives only in the index cache
+                # and its snapshot; an open without them - or with a vector
+                # of another model than the embedder's - re-derives it from
+                # the record's raw text (the vector-lane self-heal,
+                # Memory._report_vector_health). See test_pass47.
                 import numpy as np
 
                 vec = np.frombuffer(bytes.fromhex(op["vec_hex"]), dtype=np.float32)

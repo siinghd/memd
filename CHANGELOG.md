@@ -6,6 +6,17 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
 
 ## [Unreleased]
 
+### Changed
+- **Documented: a logged `set_vector` op is derived state, like every
+  vector.** A probe that appended one (an arbitrary vector) found it gone
+  after close + reopen. Nothing in memd writes that op: the embed worker and
+  `reembed()` put vectors straight into the index and never log them, and no
+  fold keeps the op (a record holds no vector). A vector lives in the index
+  cache and its snapshot; an open without them, or with a vector of another
+  model than the embedder's (the probe's model name was not the embedder's),
+  re-derives it from the record's raw text (the vector-lane self-heal). The
+  contract is now pinned by tests; nothing changed in behaviour.
+
 ## [0.3.1] - 2026-10-01
 
 ### Fixed - data integrity / security
