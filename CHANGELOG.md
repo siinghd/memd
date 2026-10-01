@@ -20,21 +20,18 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   exclusively, taken without waiting - a namespace in use is left to the
   next sweep - and a destroy takes it too. The lock file goes with the
   caches it guarded.
-- **A key file a crash left empty is reported, then replaced.** On a
-  filesystem without hard links the `local` key provider creates a key file
-  in place (create, then write); a crash in between left it EMPTY. An empty
-  wrapped data key then failed as a bare `ValueError` ("Nonce must be
-  between 8 and 128 bytes"), and an empty `root.key` ("local root key must
-  be 32 bytes") made every later key creation fail for good. A key file
-  still empty or short after the read retry window is now a
-  `KeyCustodyError` naming the file. An EMPTY one older than the stale
-  threshold (300 s) is what such a crash left - it holds no key: a key is
-  used only once its file is written - and the next creation of that key
-  replaces it (one process at a time, under a lock on the keys directory);
-  a file with any bytes in it is never replaced. An in-place write that
-  fails removes the file it created, and a creator stalled past the
-  threshold before its write landed - its file taken for a crashed one and
-  replaced - uses the key that replaced it, never its own.
+- **A key file a crash left empty is reported clearly.** On a filesystem
+  without hard links the `local` key provider creates a key file in place
+  (create, then write); a crash in between left it EMPTY. An empty wrapped
+  data key then failed as a bare `ValueError` ("Nonce must be between 8 and
+  128 bytes"), and an empty `root.key` as "local root key must be 32
+  bytes". A key file still empty or short after the read retry window is
+  now a `KeyCustodyError` naming the file and the recovery: restore it from
+  a backup, or delete it only when no data was ever written under it.
+  memd never replaces a key file itself: it cannot tell a crashed creation
+  from a truncated key, and replacing an empty `root.key` automatically
+  would orphan every namespace key wrapped under the real one. An in-place
+  write that fails removes the file it created.
 - **An S3 or KMS error without a parsed reply is raised as itself.** Every
   place the S3 store and the `aws-kms` key provider read an error code did
   `getattr(ex, "response", {}).get(...)`; a transport error (botocore's

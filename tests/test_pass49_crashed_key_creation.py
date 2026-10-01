@@ -79,33 +79,36 @@ def _size(path: str) -> int:
 
 
 @pytest.mark.parametrize("which", ["root", "wrapped"])
-def test_a_crash_after_creating_a_key_file_is_reported_then_recovered(tmp_path, which):
+def test_a_crash_after_creating_a_key_file_is_reported_never_replaced(tmp_path, which):
     d = str(tmp_path / "keys")
     if which == "wrapped":
         LocalKeyEnvelope(d).data_key("warmup")          # the root key exists
     _crash_creating(d, "alpha")
     path = os.path.join(d, "root.key" if which == "root" else "ns-alpha.key")
     assert os.path.exists(path) and _size(path) == 0, "precondition: the crash left it empty"
-    # young: it may be a creation in progress - reported, never replaced
-    with pytest.raises(KeyCustodyError, match=path.replace(".", r"\.")):
-        LocalKeyEnvelope(d).data_key("alpha")
-    assert _size(path) == 0
-    # stale: what a crash left - it holds no key, and is replaced
-    _age(path)
+    # young or old, an empty key file is reported and never replaced: memd
+    # cannot tell a crashed creation from a truncated key (a verifier showed
+    # an automatic replacement of an empty root.key orphaning every
+    # namespace's key)
+    for age in (0, 3600):
+        _age(path, age)
+        with pytest.raises(KeyCustodyError, match=path.replace(".", r"\.")):
+            LocalKeyEnvelope(d).data_key("alpha")
+        assert _size(path) == 0
+    if which == "wrapped":
+        assert len(LocalKeyEnvelope(d).data_key("warmup")) == KEY_LEN, "the other key is untouched"
+    # the operator, who knows no data was written under it, deletes it
+    os.unlink(path)
     dk = LocalKeyEnvelope(d).data_key("alpha")
     assert len(dk) == KEY_LEN
-    assert _size(path) == (KEY_LEN if which == "root" else crypto._WRAPPED_KEY_LEN)
     fresh = LocalKeyEnvelope(d)
     assert fresh.data_key("alpha") == dk
     assert fresh.decrypt("alpha", LocalKeyEnvelope(d).encrypt("alpha", b"payload")) == b"payload"
-    if which == "wrapped":
-        assert len(fresh.data_key("warmup")) == KEY_LEN, "the other namespace's key is untouched"
     for f in os.listdir(d):
         if ".tmp-" in f:
             _age(os.path.join(d, f))                   # the crash's temporary file: swept
     LocalKeyEnvelope(d)
     assert not [f for f in os.listdir(d) if ".tmp-" in f or ".shred-" in f]
-    assert LocalKeyEnvelope(d).data_key("alpha") == dk
 
 
 @pytest.mark.parametrize("which", ["root", "wrapped"])
@@ -167,65 +170,19 @@ def test_a_failed_in_place_write_leaves_no_empty_key_file(tmp_path, monkeypatch,
     assert len(LocalKeyEnvelope(d).data_key("alpha")) == KEY_LEN
 
 
-@pytest.mark.parametrize("which", ["root", "wrapped"])
-def test_concurrent_creators_replace_a_crashed_key_file_once(tmp_path, monkeypatch, which):
+def test_an_empty_root_key_is_never_replaced_while_wrapped_keys_exist(tmp_path):
+    # the verifier's case: a truncated root.key, aged, then a NEW namespace
     d = str(tmp_path / "keys")
-    if which == "wrapped":
-        LocalKeyEnvelope(d).data_key("warmup")
-    path = os.path.join(d, "root.key" if which == "root" else "ns-alpha.key")
-    os.makedirs(d, exist_ok=True)
-    with open(path, "wb"):
-        pass                                           # what a crash left: created, never written
-    _age(path)
-    _no_hard_links(monkeypatch)
-    n = 8
-    gate = threading.Barrier(n)
-    out: list = [None] * n
-
-    def body(i):
-        env = LocalKeyEnvelope(d)
-        gate.wait(10)
-        try:
-            out[i] = env.encrypt("alpha", f"from {i}".encode())
-        except Exception as ex:  # noqa: BLE001 - reported below
-            out[i] = ex
-
-    threads = [threading.Thread(target=body, args=(i,)) for i in range(n)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(30)
-    errors = [o for o in out if isinstance(o, Exception)]
-    assert not errors, errors
-    fresh = LocalKeyEnvelope(d)
-    for i, blob in enumerate(out):
-        assert fresh.decrypt("alpha", blob) == f"from {i}".encode(), "creators disagree on the key"
-
-
-@pytest.mark.parametrize("which", ["root", "wrapped"])
-def test_a_creator_stalled_past_the_threshold_uses_the_key_that_replaced_its_file(
-        tmp_path, monkeypatch, which):
-    """A creator paused between creating the file and writing it for longer
-    than the stale threshold: its empty file is taken for a crashed creation
-    and replaced. Its own key must then not be used - nothing could read it."""
-    d = str(tmp_path / "keys")
-    if which == "wrapped":
-        LocalKeyEnvelope(d).data_key("warmup")
-    path = os.path.join(d, "root.key" if which == "root" else "ns-alpha.key")
-    _no_hard_links(monkeypatch)
-    real_write = os.write
-    other: dict = {}
-
-    def write(fd, data):
-        if not other and os.path.realpath(f"/proc/self/fd/{fd}") == os.path.realpath(path):
-            other["stalled"] = True
-            _age(path)                                 # the stall, past the threshold
-            other["dk"] = LocalKeyEnvelope(d).data_key("alpha")   # replaces the empty file
-        return real_write(fd, data)
-
-    monkeypatch.setattr(crypto.os, "write", write)
-    stalled = LocalKeyEnvelope(d).data_key("alpha")
-    monkeypatch.setattr(crypto.os, "write", real_write)
-    assert "dk" in other, "precondition: the stalled creator's file was replaced"
-    assert stalled == other["dk"] == LocalKeyEnvelope(d).data_key("alpha"), \
-        "the stalled creator used a key no file holds"
+    env = LocalKeyEnvelope(d)
+    blob = env.encrypt("old", b"precious")
+    rk = os.path.join(d, "root.key")
+    saved = open(rk, "rb").read()
+    with open(rk, "r+b") as f:
+        f.truncate(0)
+    _age(rk)
+    with pytest.raises(KeyCustodyError, match="root"):
+        LocalKeyEnvelope(d).data_key("new")
+    assert _size(rk) == 0 and not os.path.exists(os.path.join(d, "ns-new.key"))
+    with open(rk, "wb") as f:                          # restored from a backup
+        f.write(saved)
+    assert LocalKeyEnvelope(d).decrypt("old", blob) == b"precious"

@@ -37,7 +37,7 @@ class TestSigkillDurability:
     def test_sigkilled_writer_loses_no_acked_record(self, tmp_path, delay_s):
         root = str(tmp_path / "data")
         ack_path = str(tmp_path / "acks.log")
-        src = "/home/deploy/agent-memory/src"
+        src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
         child = subprocess.Popen(
             [sys.executable, "-c", CHILD.format(src=src), root, ack_path],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
@@ -81,7 +81,7 @@ class TestSigkillDurability:
         (tail-only), and the second cycle inherits all prior acks."""
         root = str(tmp_path / "data")
         ack_path = str(tmp_path / "acks.log")
-        src = "/home/deploy/agent-memory/src"
+        src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
         all_acked: list[str] = []
         for round_no, delay in enumerate((0.5, 0.5)):
             child = subprocess.Popen(
