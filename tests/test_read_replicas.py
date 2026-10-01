@@ -880,6 +880,81 @@ def test_no_read_is_served_from_a_rebuild_that_failed(be, monkeypatch):
         lead.close()
 
 
+@pytest.mark.parametrize("tail_in_time", [True, False], ids=["tail-in-time", "tail-late"])
+def test_a_read_that_waited_for_a_rebuild_never_sees_it_before_its_tail(be, monkeypatch, tail_in_time):
+    """A rebuild builds the index again from durable data; the refresh that
+    ran it applies the log tail after it - and the tail may hold a hard
+    delete this replica already applied and served. A read that passed its
+    freshness check just before the rebuild began waits for it on the serve
+    lock: it must not then read the rebuilt index before the tail is applied
+    (the deleted record served again, older than what the replica already
+    served). It waits for that refresh, at most refresh_wait_s, and is
+    refused when it does not complete in time; what it reports (applied_seq,
+    age_ms) is the state it was served from."""
+    from memd.storage.replica import ReplicaStore, ReplicaUnavailableError
+
+    lead = be.leader()
+    rep = be.replica(replica_refresh_s=3600,
+                     replica_refresh_wait_ms=5000 if tail_in_time else 1000)
+    release = threading.Event()
+    try:
+        x = lead.add("erased before the takeover yankee")[0]
+        lead.add("kept across the takeover zulu")
+        lead.ns.rotate()                         # x is in a segment; its delete will be in the tail
+        rep.ns.refresh()
+        assert rep.get(x)
+        lead.delete(x, hard=True)
+        rep.ns.refresh()
+        assert rep.get(x, include_deleted=True) is None     # served: the delete
+        lead.close()
+        lead = be.leader()                       # a new tenure: the next refresh rebuilds
+
+        rebuilt = threading.Event()
+        real_rebuild, real_tail = ReplicaStore._rebuild, ReplicaStore._read_tail
+
+        def rebuild(self, *a, **kw):
+            real_rebuild(self, *a, **kw)
+            rebuilt.set()
+
+        def tail(self):
+            if rebuilt.is_set():
+                release.wait(10)                 # the tail read after the rebuild is slow
+            return real_tail(self)
+
+        monkeypatch.setattr(ReplicaStore, "_rebuild", rebuild)
+        monkeypatch.setattr(ReplicaStore, "_read_tail", tail)
+        refresh = threading.Thread(target=rep.ns.refresh, daemon=True)
+        refresh.start()
+        assert rebuilt.wait(10)
+        # (as if the freshness check had passed just before the rebuild began)
+        monkeypatch.setattr(ReplicaStore, "ensure_fresh", lambda self, *a, **kw: None)
+        info = {}
+        t0 = time.monotonic()
+        if tail_in_time:
+            threading.Timer(0.4, release.set).start()
+            assert rep.get(x, include_deleted=True, read_info=info) is None
+            waited = time.monotonic() - t0
+            assert waited >= 0.4, "served before the tail was applied"
+            refresh.join(10)
+            assert info["served_by"] == "replica" and info["applied_seq"] == rep.ns.applied_seq
+            assert info["age_ms"] >= 400, info    # its refresh started before the rebuild
+        else:
+            with pytest.raises(ReplicaUnavailableError):
+                rep.get(x, include_deleted=True)
+            assert time.monotonic() - t0 < 3.0
+            with pytest.raises(ReplicaUnavailableError):
+                rep.search("erased before the takeover yankee")
+            release.set()
+            refresh.join(10)
+            assert rep.get(x, include_deleted=True, read_info=info) is None
+            assert info["applied_seq"] == rep.ns.applied_seq
+        assert _texts(rep, "takeover") == {"kept across the takeover zulu"}
+    finally:
+        release.set()
+        rep.close()
+        lead.close()
+
+
 # -------------------------------------------------------------- bounds
 
 

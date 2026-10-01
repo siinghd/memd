@@ -5054,9 +5054,9 @@ class StorageEngine:
                 raise
             raise ReplicaUnavailableError(
                 f"namespace {ns!r}: no replica ({type(ex).__name__}: {ex})") from ex
-        age = rep.age_s()
-        return rep, {"served_by": "replica", "applied_seq": rep.applied_seq,
-                     "age_ms": int((age or 0.0) * 1000)}
+        # (as of the freshness check: a read brings it up to the state it is
+        # admitted to - ReplicaStore.reading, Memory._serving)
+        return rep, rep.serving_info()
 
     def _replica_applied(self, ns: str, rep, records) -> None:
         hook = self.replica_hook

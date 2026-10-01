@@ -297,20 +297,44 @@ class ReplicaStore(NamespaceStore):
                                    "cache; re-resolve it via the engine")
             yield self
 
+    def serving_info(self) -> dict:
+        """What a read served now is served from: {"served_by", "applied_seq",
+        "age_ms"} (age_ms None: no refresh has completed since the last
+        rebuild began - reading() serves nothing then)."""
+        age = self.age_s()
+        return {"served_by": "replica", "applied_seq": self.applied_seq,
+                "age_ms": None if age is None else int(age * 1000)}
+
     @contextlib.contextmanager
     def reading(self):
         """Hold while reading the index to serve a read: a rebuild waits for
         it. A rebuild that failed part-way (it discarded the index first)
         leaves nothing to serve: ReplicaUnavailableError until one completes -
         also for a read that passed its freshness check before the rebuild
-        began."""
+        began.
+
+        A rebuild that completed is not served either until the refresh that
+        ran it has applied the log tail too (refreshed_at is None until
+        then): the index built from durable data alone can be older than
+        what this replica served before it - a hard delete the tail holds,
+        applied and served already, not applied yet. A read that waited for
+        the rebuild waits for that refresh (at most refresh_wait_s, as in
+        ensure_fresh) and is refused if it does not complete in time. Any
+        refresh that completes after a rebuild began is newer than the one a
+        read checked its freshness against."""
         self.touch()
-        with self.holding():
-            if self.exists and not self._synced:
-                raise ReplicaUnavailableError(
-                    f"namespace {self.namespace!r}: the replica's rebuild did not complete "
-                    f"({self.last_error or 'in progress'})")
-            yield self
+        while True:
+            with self.holding():
+                if self.exists and not self._synced:
+                    raise ReplicaUnavailableError(
+                        f"namespace {self.namespace!r}: the replica's rebuild did not complete "
+                        f"({self.last_error or 'in progress'})")
+                if self.refreshed_at is not None:
+                    yield self
+                    return
+            # (the serve lock released: the refresh may rebuild again)
+            self._await_refresh(float("-inf"), time.monotonic(), self.refresh_wait_s,
+                                "the replica was rebuilt and has not applied the log tail yet")
 
     def ensure_fresh(self, max_staleness_s: float, wait_s: float | None = None) -> None:
         """Make sure every write the writer acknowledged more than
@@ -330,6 +354,16 @@ class ReplicaStore(NamespaceStore):
         if at is not None and at >= floor:
             return
         wait = self.refresh_wait_s if wait_s is None else max(0.0, float(wait_s))
+        self._await_refresh(floor, t_req, wait,
+                            f"the replica is staler than {int(max_staleness_s * 1000)} ms")
+
+    def _await_refresh(self, floor: float, t_req: float, wait: float, stale: str) -> None:
+        """Wait until a refresh that started at or after `floor` has
+        completed (refreshed_at >= floor): the one in flight if it did, else
+        one queued in the background - until t_req + wait, and never past
+        `wait` into a refresh that is running already.
+        ReplicaUnavailableError (`stale` says why the read waited) when
+        none completes in time, or one it could have used failed."""
         with self._fresh_cv:
             done = self._done
             while True:
@@ -356,9 +390,7 @@ class ReplicaStore(NamespaceStore):
                     why = (f"a refresh has been running for {int((now - running) * 1000)} ms"
                            if running is not None and now - running >= wait
                            else f"no refresh completed within {int(wait * 1000)} ms")
-                    raise ReplicaUnavailableError(
-                        f"namespace {self.namespace!r}: the replica is staler than "
-                        f"{int(max_staleness_s * 1000)} ms ({why})")
+                    raise ReplicaUnavailableError(f"namespace {self.namespace!r}: {stale} ({why})")
                 self._fresh_cv.wait(deadline - now)
 
     def _kick(self) -> None:
@@ -615,8 +647,9 @@ class ReplicaStore(NamespaceStore):
         bootstrap = not self._synced
         with self._serve.write():
             # under the serve lock: a read that waited for the rebuild sees
-            # either its result or that it failed (reading()), never the
-            # discarded index
+            # its result once the refresh running it has applied the tail
+            # too, or that it failed (reading()) - never the discarded index,
+            # nor the rebuilt one short of the tail
             self.refreshed_at = None     # nothing is served from it until a refresh completes
             self._synced = False
             self.applied_seq = 0

@@ -1182,7 +1182,7 @@ class Memory:
                                max_staleness_ms=max_staleness_ms)
         t0 = time.monotonic()
         ns_idx, info = self._reader(namespace, consistency, max_staleness_ms)
-        with self._serving(ns_idx):
+        with self._serving(ns_idx, info):
             return self._search(ns_idx, info, t0, query, user_id=user_id, session_id=session_id,
                                 agent_id=agent_id, org_id=org_id, budget_tokens=budget_tokens,
                                 as_of=as_of, kinds=kinds,
@@ -1484,9 +1484,9 @@ class Memory:
                 read_info.update(impl.last_read or {"served_by": "leader"})
             return got
         ns, info = self._reader(namespace, consistency, max_staleness_ms)
-        if read_info is not None:
-            read_info.update(info or {"served_by": "leader"})
-        with self._serving(ns):
+        with self._serving(ns, info):
+            if read_info is not None:
+                read_info.update(info or {"served_by": "leader"})
             rec = ns.index.get_by_id(record_id, include_deleted=True)
             if rec is None or (rec.deleted and not include_deleted):
                 return None
@@ -1513,11 +1513,22 @@ class Memory:
                                   wrap_errors=not self.read_only)
 
     @staticmethod
-    def _serving(store):
+    @contextlib.contextmanager
+    def _serving(store, info: dict | None = None):
         """Hold while reading a store's index to SERVE a read: a replica's
-        rebuild swaps it, and one that failed leaves nothing to serve."""
+        rebuild swaps it, one that failed leaves nothing to serve, and one
+        whose refresh has not applied the log tail yet is waited for (see
+        ReplicaStore.reading). `info` (a replica read's) is brought up to
+        the state the read was admitted to: a rebuild and a refresh may have
+        run since its freshness check."""
         reading = getattr(store, "reading", None)
-        return reading() if callable(reading) else contextlib.nullcontext()
+        if not callable(reading):
+            yield
+            return
+        with reading():
+            if info is not None and info.get("served_by") == "replica":
+                info.update(store.serving_info())
+            yield
 
     @staticmethod
     def _holding(store):
