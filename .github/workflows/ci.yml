@@ -17,19 +17,19 @@ jobs:
   test:
     name: tests (py${{ matrix.python }}, ${{ matrix.lexical }})
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
           # 3.11 is the declared floor: the core install, bm25 lane on FTS5
           - python: "3.11"
-            extras: "dev,mcp"
+            extras: "dev,mcp,s3"
             lexical: fts5
           # 3.12 matches the Dockerfile, with memd[fast]: without it every
           # tantivy test skips and the accelerator ships untested
           - python: "3.12"
-            extras: "dev,mcp,fast"
+            extras: "dev,mcp,fast,s3"
             lexical: tantivy
     steps:
       - uses: actions/checkout@v4
@@ -40,11 +40,27 @@ jobs:
           cache-dependency-path: pyproject.toml
       - name: Install
         run: pip install -e ".[${{ matrix.extras }}]"
+      # The whole suite runs against an S3 API too: the s3-marked tests
+      # outside the s3 job's files (key custody, cache sweeps, cluster
+      # handoff, the S3 example) skip without an endpoint. A service
+      # container cannot take a command, and MinIO needs one (see the s3 job).
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+          for _ in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:9000/minio/health/live
       - name: Assert the lexical backend under test
         run: |
           python -c "from memd.index.tantivy_lexical import resolve_lexical_backend as r; \
           got = r({}); assert got == '${{ matrix.lexical }}', got; print('lexical backend:', got)"
-      - name: Unit + regression suite
+      - name: Unit + regression suite (examples included)
+        env:
+          MEMD_TEST_S3_ENDPOINT: http://127.0.0.1:9000
         run: python -m pytest tests/ -q --timeout=600
       - name: Assert the tantivy tests actually ran
         if: matrix.lexical == 'tantivy'
@@ -73,6 +89,9 @@ jobs:
           path: harness-results/
           if-no-files-found: ignore
           retention-days: 14
+      - name: MinIO logs on failure
+        if: failure()
+        run: docker logs minio || true
 
   s3:
     name: engine on a real S3 API (MinIO)
@@ -93,8 +112,9 @@ jobs:
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
             minio/minio:latest server /data
-          for i in $(seq 1 60); do
-            curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null && break || sleep 1
+          for _ in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null; then break; fi
+            sleep 1
           done
           curl -sf http://127.0.0.1:9000/minio/health/live
       # The s3 half skips per-test when the endpoint is unset, so the step can
@@ -220,8 +240,9 @@ jobs:
           docker run -d --name memd-ci -p 8700:8700 \
             -e MEMD_ADMIN_KEY=ci-admin-key -v memd-ci-data:/data \
             memd/memd:ci serve --http
-          for i in $(seq 1 30); do
-            curl -sf http://127.0.0.1:8700/health >/dev/null && break || sleep 1
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8700/health >/dev/null; then break; fi
+            sleep 1
           done
           curl -sf http://127.0.0.1:8700/health
           H='Authorization: Bearer ci-admin-key'
@@ -238,3 +259,28 @@ jobs:
       - name: Cleanup
         if: always()
         run: docker rm -f memd-ci || true
+
+  # The TypeScript SDK: typecheck, unit tests, build, the packaged tarball,
+  # every runtime, the integration suite and the TS example against a real
+  # server. Defined in sdk-ts.yml (also runnable on its own).
+  sdk-ts:
+    name: sdk-ts
+    uses: ./.github/workflows/sdk-ts.yml
+
+  docs:
+    name: docs build (mkdocs --strict)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      # memd itself is installed too: the HTTP reference is rendered from the
+      # server's own OpenAPI schema at build time
+      - run: pip install -e ".[docs]"
+      # strict: a broken link or anchor, or an include whose heading moved,
+      # fails the build
+      - run: mkdocs build --strict

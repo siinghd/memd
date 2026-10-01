@@ -1,0 +1,69 @@
+name: Release (npm)
+
+# On a version tag: run the sdk-ts checks, then publish @memd/client with
+# npm provenance. The SDK is versioned on its own (sdk-ts/package.json), so
+# a tag publishes it only when that version is not on npm yet; bump it in
+# package.json to release a new one (RELEASING.md). Needs the NPM_TOKEN
+# secret (an npm automation or granular token with publish rights on the
+# @memd scope); without it the publish is skipped with a warning, so a tag
+# never fails on it and never publishes by accident.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: sdk-ts checks
+    uses: ./.github/workflows/sdk-ts.yml
+
+  publish-npm:
+    name: publish @memd/client
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write   # npm provenance: a signed link from the tarball to this run
+    defaults:
+      run:
+        working-directory: sdk-ts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: sdk-ts/package-lock.json
+      - run: npm ci
+      - name: Decide whether to publish
+        id: plan
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          if [ -z "$NPM_TOKEN" ]; then
+            echo "::warning::NPM_TOKEN is not set: not publishing $name@$version"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          elif npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "$name@$version is already on npm: nothing to publish (bump sdk-ts/package.json to release)"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publishing $name@$version"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+      # prepack runs the build; check:dist verifies what the tarball holds
+      - if: steps.plan.outputs.publish == 'true'
+        run: npm run build && npm run check:dist
+      - if: steps.plan.outputs.publish == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public

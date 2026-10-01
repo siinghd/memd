@@ -1,24 +1,10 @@
 name: sdk-ts
 
+# Called by ci.yml on every push and pull request (its concurrency group
+# applies), and by release-npm.yml before a publish; runnable on its own too.
 on:
-  push:
-    branches: ["**"]
-    paths:
-      - "sdk-ts/**"
-      - "src/**"
-      - "pyproject.toml"
-      - ".github/workflows/sdk-ts.yml"
-  pull_request:
-    paths:
-      - "sdk-ts/**"
-      - "src/**"
-      - "pyproject.toml"
-      - ".github/workflows/sdk-ts.yml"
+  workflow_call:
   workflow_dispatch:
-
-concurrency:
-  group: sdk-ts-${{ github.ref }}
-  cancel-in-progress: true
 
 defaults:
   run:
@@ -102,3 +88,12 @@ jobs:
           MEMD_PYTHON: python
           MEMD_REQUIRE_INTEGRATION: "1"
         run: npm run test:integration
+      # examples/05_ts installs the SDK from ../../sdk-ts, so it needs the build
+      - run: npm run build
+      - name: TypeScript example against a real server
+        working-directory: examples/05_ts
+        env:
+          MEMD_EMBEDDER: hash
+        run: |
+          npm install --no-audit --no-fund
+          python ../local_server.py -- node quickstart.mjs
