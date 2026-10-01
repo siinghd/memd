@@ -18,7 +18,10 @@ following the writer's durable state:
   - a new lineage (another tenure) or a fold that retired ops above the
     replica's horizon (compact_seq / scrub_seq: the _snapshot_floor rule)
     REBUILDS it - the cache files are deleted, the bootstrap runs again; a
-    rotation is caught up by loading its segment (the warm-open catch-up);
+    rotation is caught up by loading its segment (the warm-open catch-up).
+    A rebuild across a lineage resolves the data key again (the namespace
+    may have been destroyed and created again under its name, with a new
+    key), and a rebuild that failed part-way runs again on the next refresh;
   - a namespace whose manifest is gone (crypto-shred) drops its cache.
 
 It never writes or deletes an object: it is handed a ReadOnlyObjectStore and
@@ -208,6 +211,8 @@ class ReplicaStore(NamespaceStore):
 
     read_only = True
     REFRESH_ATTEMPTS = 6
+    # a custody refusal mid-refresh resolves the key again at most this often
+    KEY_RETRY_S = 30.0
 
     def __init__(self, namespace: str, store: ObjectStore, cache_dir: str,
                  envelope: KeyEnvelope | None = None, *, lexical: dict | None = None,
@@ -222,6 +227,8 @@ class ReplicaStore(NamespaceStore):
         self.applied_seq = 0
         self._synced = False      # built from a manifest (and not dropped since)
         self._lineage = ""        # the tenure it was built in (a pre-lineage build's: "")
+        self._key_lineage: str | None = None   # the tenure its data key was proven in
+        self._key_retry_at: float | None = None
         self._fresh_index = True  # the index file holds nothing yet
         self.exists = False       # the namespace has a manifest
         self._cursors: dict = {"wal": None, "ops": None}
@@ -270,13 +277,28 @@ class ReplicaStore(NamespaceStore):
         self.last_read = time.monotonic()
 
     @contextlib.contextmanager
-    def reading(self):
-        """Hold while reading the index: a rebuild waits for it."""
-        self.touch()
+    def holding(self):
+        """Hold the index (a rebuild waits for it) - for maintenance: a flush,
+        derived vectors. Reads use reading()."""
         with self._serve.read():
             if self._closed:
                 raise RuntimeError(f"namespace {self.namespace!r} replica was evicted from the open "
                                    "cache; re-resolve it via the engine")
+            yield self
+
+    @contextlib.contextmanager
+    def reading(self):
+        """Hold while reading the index to serve a read: a rebuild waits for
+        it. A rebuild that failed part-way (it discarded the index first)
+        leaves nothing to serve: ReplicaUnavailableError until one completes -
+        also for a read that passed its freshness check before the rebuild
+        began."""
+        self.touch()
+        with self.holding():
+            if self.exists and not self._synced:
+                raise ReplicaUnavailableError(
+                    f"namespace {self.namespace!r}: the replica's rebuild did not complete "
+                    f"({self.last_error or 'in progress'})")
             yield self
 
     def ensure_fresh(self, max_staleness_s: float) -> None:
@@ -328,7 +350,12 @@ class ReplicaStore(NamespaceStore):
             t0 = time.monotonic()
             epoch = self.data_epoch
             try:
-                self._sync()
+                try:
+                    self._sync()
+                except KeyCustodyError:
+                    if not self._resolve_key_again():
+                        raise
+                    self._sync()
             except BaseException as ex:
                 self.failures += 1
                 self.last_error = f"{type(ex).__name__}: {ex}"[:300]
@@ -344,6 +371,27 @@ class ReplicaStore(NamespaceStore):
                             help="replica refresh duration (ms)", ns=self.namespace)
             return self.data_epoch != epoch
 
+    def _resolve_key_again(self) -> bool:
+        """A custody refusal mid-refresh: drop the key in hand and rebuild from
+        durable data with the key resolved again from its record - once, and
+        at most every KEY_RETRY_S. A stale copy (the namespace destroyed and
+        created again under its name) is replaced; a wrong key is refused
+        again by the rebuild's _verify_key - never served, never skipped past
+        as damage."""
+        now = time.monotonic()
+        if self._key_retry_at is not None and now - self._key_retry_at < self.KEY_RETRY_S:
+            return False
+        self._key_retry_at = now
+        self._forget_key()
+        self._synced = False
+        return True
+
+    def _forget_key(self) -> None:
+        forget = getattr(self.envelope, "forget", None)
+        if callable(forget):
+            forget(self.namespace)
+        self._key_lineage = None
+
     def _sync(self) -> None:
         for _attempt in range(self.REFRESH_ATTEMPTS):
             got = self.store.get_versioned(self.manifest_key)
@@ -352,7 +400,9 @@ class ReplicaStore(NamespaceStore):
                 return
             raw, ver = got
             try:
-                if ver != self._manifest_ver:
+                # not synced: never built, or a rebuild failed part-way (the
+                # index was discarded) - it runs again, never a tail on top
+                if ver != self._manifest_ver or not self._synced:
                     self._adopt(Manifest.from_dict(json.loads(raw)), ver)
                 tail = self._read_tail()
             except _Moved:
@@ -472,9 +522,7 @@ class ReplicaStore(NamespaceStore):
             with self._serve.write():
                 self._discard_index("the namespace is gone")
                 self._fresh_index = True
-            forget = getattr(self.envelope, "forget", None)
-            if callable(forget):
-                forget(self.namespace)
+            self._forget_key()
             self.data_epoch += 1
             METRICS.inc("memd_replica_dropped_total",
                         help="replica caches dropped: the namespace was destroyed", ns=self.namespace)
@@ -497,22 +545,36 @@ class ReplicaStore(NamespaceStore):
         """Delete the cache files and build them again from durable data:
         snapshot (if it covers the floor) + segments; the tail follows."""
         bootstrap = not self._synced
-        self.refreshed_at = None     # nothing is served from it until a refresh completes
-        self._synced = False
-        self.applied_seq = 0
-        self.exists = True
-        self._reset_follow(0)
         with self._serve.write():
+            # under the serve lock: a read that waited for the rebuild sees
+            # either its result or that it failed (reading()), never the
+            # discarded index
+            self.refreshed_at = None     # nothing is served from it until a refresh completes
+            self._synced = False
+            self.applied_seq = 0
+            self.exists = True
+            self._reset_follow(0)
             if not self._fresh_index:
                 self._discard_index(why)
                 self._fresh_index = True
             self.manifest = m
             self._manifest_ver = ver
+            if self._key_lineage is not None and self._key_lineage != m.lineage:
+                # another tenure: the namespace may have been destroyed and
+                # created again under its name, with a new data key
+                self._forget_key()
             self._key_ok = self._key_proven = False
             try:
                 self._verify_key()          # KeyCustodyError: refused, never served empty
+            except BaseException:
+                # a key that failed verification (or could not be resolved)
+                # is never kept: the next attempt resolves it again from its
+                # record - a key restored meanwhile is picked up at once
+                self._forget_key()
+                raise
             finally:
                 self._open_blobs = {}
+            self._key_lineage = m.lineage
             applied = 0
             self.installed_snapshot = False
             self._fresh_index = False
@@ -538,13 +600,13 @@ class ReplicaStore(NamespaceStore):
             self.index.set_meta("scrubbed_seq", str(m.scrub_seq))
             if self._opened and self.index.lexical is None:
                 self._attach_lexical(self._lexical_cfg)
-        self.applied_seq = horizon
+            self.applied_seq = horizon
+            self._synced = True
+            self._lineage = m.lineage
+            self.data_epoch += 1
         self.scrubbed_through = max(self.scrubbed_through, horizon)
-        self._synced = True
-        self._lineage = m.lineage
         self._reset_follow(horizon)
         self._skip_floor = max(horizon, m.wal_base_seq)
-        self.data_epoch += 1
         if not bootstrap:
             self.rebuilds += 1
             METRICS.inc("memd_replica_rebuilds_total",
@@ -801,7 +863,7 @@ class ReplicaStore(NamespaceStore):
                                           "changing during the export")
 
     def stats(self) -> dict:
-        with self.reading():
+        with self.holding():   # (a failed rebuild's state is reported, not refused)
             st = super().stats()
         st["replica"] = self.status()
         return st

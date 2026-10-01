@@ -1508,9 +1508,17 @@ class Memory:
 
     @staticmethod
     def _serving(store):
-        """Hold while reading a store's index: a replica's rebuild swaps it."""
+        """Hold while reading a store's index to SERVE a read: a replica's
+        rebuild swaps it, and one that failed leaves nothing to serve."""
         reading = getattr(store, "reading", None)
         return reading() if callable(reading) else contextlib.nullcontext()
+
+    @staticmethod
+    def _holding(store):
+        """Hold a store's index for maintenance (flush, derived vectors): a
+        replica's rebuild swaps it, but there is no read to refuse."""
+        holding = getattr(store, "holding", None)
+        return holding() if callable(holding) else contextlib.nullcontext()
 
     @staticmethod
     def _info_fields(info: dict | None) -> dict:
@@ -2283,7 +2291,7 @@ class Memory:
                         help="embeddings dropped because the target namespace is gone")
             return
         # one batch: one index lock hold and one ANN sidecar change
-        with self._serving(ns):
+        with self._holding(ns):
             ns.index.set_vectors(list(ids), [vecs[i] for i in range(len(ids))], self.embedder.name)
 
     def reembed(self, *, namespace: str | None = None, batch_size: int = 256) -> dict:
@@ -2298,7 +2306,7 @@ class Memory:
         return self._reembed_store(self._ns_for(namespace))
 
     def _reembed_store(self, ns, batch_size: int = 256) -> dict:
-        with self._serving(ns):
+        with self._holding(ns):
             return self._reembed_locked(ns, batch_size)
 
     def _reembed_locked(self, ns, batch_size: int) -> dict:
@@ -2354,7 +2362,7 @@ class Memory:
                          "the vector lane is incomplete until the embed worker catches up",
                          left, budget)
         self._maint.drain(timeout_s=60)
-        with self._serving(self.ns):
+        with self._holding(self.ns):
             self.ns.index.flush()
         lex = self.ns.index.lexical
         if lex is not None:
@@ -2383,7 +2391,7 @@ class Memory:
         self._maint.stop(drain_timeout_s=float(self._embed_close_drain_s))
         if self.rerank is not None:
             self.rerank.close()
-        with self._serving(self.ns):
+        with self._holding(self.ns):
             self.ns.index.flush()
         self._flush_all_audits()
         self.ns.close()

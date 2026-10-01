@@ -675,9 +675,11 @@ class LocalKeyEnvelope(KeyEnvelope):
             self._cache.popitem(last=False)
         return dk
 
-    def peek_data_key(self, namespace: str) -> bytes | None:
-        """The namespace's key if it has one - never mints (key migration)."""
-        if namespace in self._cache:
+    def peek_data_key(self, namespace: str, *, fresh: bool = False) -> bytes | None:
+        """The namespace's key if it has one - never mints (key migration,
+        read replicas). `fresh`: from its key file, never this envelope's
+        cache (a read replica: the cached copy may be a key since shredded)."""
+        if not fresh and namespace in self._cache:
             return self._cache[namespace]
         p = self._key_path(namespace)
         return self._unwrap_file(namespace, p) if os.path.exists(p) else None
@@ -943,8 +945,10 @@ class ObjectStoreKeyEnvelope(KeyEnvelope):
             _log.warning("memd: could not write the key-custody marker", exc_info=True)
         self._custody_written = True
 
-    def peek_data_key(self, namespace: str) -> bytes | None:
-        if namespace in self._cache:
+    def peek_data_key(self, namespace: str, *, fresh: bool = False) -> bytes | None:
+        """The namespace's key if it has one - never mints. `fresh`: from its
+        wrapped key object, never this envelope's cache (as LocalKeyEnvelope)."""
+        if not fresh and namespace in self._cache:
             return self._cache[namespace]
         rec = self.read_record(namespace)
         return None if rec is None else self._unwrap_record(namespace, rec)
@@ -1010,7 +1014,11 @@ class ReadOnlyKeyEnvelope(KeyEnvelope):
     not create the key object (or local key file) the writer will own.
 
     It resolves through the wrapped envelope's peek_data_key (no minting,
-    no custody marker) and keeps its own LRU of the keys it resolved."""
+    no custody marker) - from the key's durable record, never the wrapped
+    envelope's cache: a copy this process kept from an earlier tenure of the
+    namespace may be a key since shredded - and keeps its own LRU of the
+    keys it resolved. forget() drops one: the namespace was destroyed, or
+    another tenure began (it may have been created again, with a new key)."""
 
     prefetch_at_open = False
     CACHE_MAX = 1024
@@ -1042,7 +1050,7 @@ class ReadOnlyKeyEnvelope(KeyEnvelope):
         if not self.enabled:
             return self._inner.data_key(namespace)   # (NullKeyEnvelope: no key, nothing written)
         peek = getattr(self._inner, "peek_data_key", None)
-        dk = peek(namespace) if callable(peek) else None
+        dk = peek(namespace, fresh=True) if callable(peek) else None
         if dk is None:
             raise KeyCustodyError(
                 f"namespace {namespace!r} has no data key here (a read replica resolves an "
@@ -1055,7 +1063,9 @@ class ReadOnlyKeyEnvelope(KeyEnvelope):
         return dk
 
     def forget(self, namespace: str) -> None:
-        """Drop the key from this view (the namespace is gone: crypto-shred)."""
+        """Drop the key from this view: the next use resolves it again from
+        its record (the namespace is gone - crypto-shred - or may have been
+        created again under its name with a new key)."""
         with self._mu:
             self._cache.pop(namespace, None)
 

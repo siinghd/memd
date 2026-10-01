@@ -578,6 +578,71 @@ def test_a_destroyed_namespace_drops_the_replica_cache(be):
         rep.close()
 
 
+@pytest.fixture(scope="module")
+def kms_server():
+    """A moto KMS server (aws-kms keys: the wrapped data key is an object in
+    the store, so a re-created namespace's new key is a new object)."""
+    pytest.importorskip("moto")
+    boto3 = pytest.importorskip("boto3")
+    import socket
+
+    from moto.server import ThreadedMotoServer
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    srv = ThreadedMotoServer(ip_address="127.0.0.1", port=port, verbose=False)
+    srv.start()
+    url = f"http://127.0.0.1:{port}"
+    arn = boto3.client("kms", endpoint_url=url, region_name="us-east-1", aws_access_key_id=KEY,
+                       aws_secret_access_key=SECRET).create_key()["KeyMetadata"]["Arn"]
+    yield url, arn
+    srv.stop()
+
+
+@pytest.fixture(params=["local", "kms"])
+def keys(request, monkeypatch):
+    """Config for the key provider under test."""
+    if request.param == "local":
+        return {}
+    url, arn = request.getfixturevalue("kms_server")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", KEY)
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", SECRET)
+    return {"key_provider": "aws-kms", "kms_endpoint_url": url, "kms_region": "us-east-1",
+            "kms_key_id": arn}
+
+
+@pytest.mark.parametrize("which", ["default", "other"])
+def test_a_namespace_destroyed_and_created_again_between_refreshes_is_followed(be, which, keys):
+    """Crypto-shredded and created again under the same name (a new data key,
+    a new lineage) before the replica's next refresh saw it gone: the replica
+    resolves the key again and follows the new namespace. It used to keep the
+    shredded key: every refresh KeyCustodyError, every read unavailable, for
+    good. Memory.destroy_namespace() on the facade's own namespace always
+    does this - the facade creates it again at once."""
+    ns = "default" if which == "default" else "reborn"
+    lead = be.leader(**keys)
+    rep = be.replica(namespace=ns, replica_refresh_s=3600, **keys)
+    try:
+        lead.add("the old secret alpha kilo", namespace=ns)
+        rep.ns.refresh()
+        assert _texts(rep, "secret") == {"the old secret alpha kilo"}
+        lead.destroy_namespace(ns)
+        lead.add("the new secret bravo lima", namespace=ns)
+        rep.ns.refresh()
+        assert _texts(rep, "secret") == {"the new secret bravo lima"}
+        assert rep.ns._key_retry_at is None, "the new tenure's key was resolved only after a refusal"
+        assert b"the old secret alpha kilo" not in _cache_bytes(rep)
+        rid = lead.add("written after the rebirth charlie", namespace=ns)[0]
+        rep.ns.refresh()
+        assert rep.get(rid)["content"] == "written after the rebirth charlie"
+        assert rep.ns.failures == 0
+    finally:
+        rep.close()
+        lead.close()
+
+
 def test_a_replicas_cache_is_deleted_when_it_closes(be):
     lead = be.leader()
     lead.add("transient yankee")
@@ -625,6 +690,189 @@ def test_a_replica_with_the_wrong_key_refuses_and_writes_nothing(be, tmp_path):
         with pytest.raises(KeyCustodyError):
             be.replica()
     assert be.objects() == before
+
+
+def _key_file(be, ns):
+    keys = os.path.join(be.local if be.kind == "s3" else be.path, "keys")
+    return os.path.join(keys, f"ns-{ns}.key")
+
+
+@pytest.mark.parametrize("wrong", ["another namespace's", "the shredded incarnation's"])
+def test_a_wrong_key_for_a_namespace_created_again_is_still_refused(be, wrong):
+    """Resolving the key again after a rebirth must not open the door to the
+    wrong one: a key that does not match the new namespace's data is
+    refused, and nothing - old or new - is served. The shredded
+    incarnation's key (an old backup of the keys directory) even unwraps
+    fine; it must not stay in hand once refused: when the right key is
+    restored, the next refresh resolves it."""
+    from memd.storage.replica import ReplicaUnavailableError
+
+    lead = be.leader()
+    rep = be.replica(namespace="reborn", replica_refresh_s=3600)
+    try:
+        lead.add("the old secret delta", namespace="reborn")
+        lead.add("another namespace's echo", namespace="bystander")
+        rep.ns.refresh()
+        with open(_key_file(be, "reborn"), "rb") as f:
+            shredded = f.read()
+        lead.destroy_namespace("reborn")
+        lead.add("the new secret foxtrot", namespace="reborn")
+        # the replica's node holds a key for it that is not the data's (the
+        # writer keeps the right one in memory)
+        with open(_key_file(be, "reborn"), "rb") as f:
+            right = f.read()
+        if wrong == "another namespace's":
+            shutil.copyfile(_key_file(be, "bystander"), _key_file(be, "reborn"))
+        else:
+            with open(_key_file(be, "reborn"), "wb") as f:
+                f.write(shredded)
+        for _ in range(2):
+            with pytest.raises(KeyCustodyError):
+                rep.ns.refresh()
+            with pytest.raises(ReplicaUnavailableError):
+                rep.search("secret", max_staleness_ms=0)
+        assert b"the old secret delta" not in _cache_bytes(rep)
+        assert b"the new secret foxtrot" not in _cache_bytes(rep)
+        # the right key restored: the next refresh resolves it (a refused key
+        # is never kept - not even for the KEY_RETRY_S window)
+        with open(_key_file(be, "reborn"), "wb") as f:
+            f.write(right)
+        rep.ns.refresh()
+        assert _texts(rep, "secret") == {"the new secret foxtrot"}
+    finally:
+        rep.close()
+        lead.close()
+
+
+def test_a_custody_refusal_mid_refresh_resolves_the_key_again_once(be):
+    """A key in hand that stopped matching within one lineage (it can only be
+    a stale copy) is dropped and resolved again once; the refresh goes on."""
+    lead = be.leader()
+    rep = be.replica(replica_refresh_s=3600)
+    try:
+        lead.add("before golf")
+        rep.ns.refresh()
+        env = rep.ns.envelope
+        if not env.enabled:
+            pytest.skip("encryption is off")
+        with env._mu:
+            env._cache["default"] = b"\x01" * 32       # a stale copy of the key
+        rid = lead.add("after hotel")[0]
+        rep.ns.refresh()
+        assert rep.get(rid)["content"] == "after hotel"
+        assert rep.ns.failures == 0
+    finally:
+        rep.close()
+        lead.close()
+
+
+def test_a_rebuild_that_failed_part_way_runs_again_on_the_next_refresh(be, monkeypatch):
+    """A rebuild discards the index before it reads durable data. One that
+    failed part-way (the bucket stalled, a custody refusal) must run again
+    on the next refresh: following only the log tail from there served an
+    index missing everything the segments hold."""
+    from memd.storage.replica import ReplicaStore
+
+    lead = be.leader()
+    rep = be.replica(replica_refresh_s=3600)
+    try:
+        a = lead.add("folded before the takeover india")[0]
+        rep.ns.refresh()
+        lead.close()
+        lead = be.leader()                 # a new tenure: the replica's next refresh rebuilds
+        b = lead.add("folded after the takeover juliet")[0]
+        lead.compact(force=True)           # both in a segment now
+        c = lead.add("in the tail kilo")[0]
+        real = ReplicaStore._load_from
+        calls = []
+
+        def flaky(self, *args, **kw):
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError("the bucket stalled mid-rebuild")
+            return real(self, *args, **kw)
+
+        monkeypatch.setattr(ReplicaStore, "_load_from", flaky)
+        with pytest.raises(OSError):
+            rep.ns.refresh()
+        rep.ns.refresh()
+        assert len(calls) >= 2, "the failed rebuild was not run again"
+        for rid in (a, b, c):
+            assert rep.get(rid), f"{rid} missing after the rebuild was retried"
+    finally:
+        rep.close()
+        lead.close()
+
+
+def test_a_custody_failure_in_a_rebuild_is_retried_on_the_next_refresh(be, keys, monkeypatch):
+    """The key cannot be resolved while a rebuild runs (the provider is
+    unreachable): that refresh fails and no read is served; the next one
+    resolves the key again - it is not latched on the failure - and rebuilds
+    from durable data."""
+    from memd.storage.replica import ReplicaUnavailableError
+
+    lead = be.leader(**keys)
+    rep = be.replica(replica_refresh_s=3600, **keys)
+    try:
+        a = lead.add("before the takeover oscar")[0]
+        rep.ns.refresh()
+        lead.close()
+        lead = be.leader(**keys)                 # a new tenure: the next refresh rebuilds
+        lead.compact(force=True)
+        b = lead.add("after the takeover papa")[0]
+        env = rep.ns.envelope
+        real = env.data_key
+        broken = [True]
+
+        def flaky(ns):
+            if broken[0]:
+                raise KeyCustodyError("the key provider is unreachable (test)")
+            return real(ns)
+
+        monkeypatch.setattr(env, "data_key", flaky)
+        with pytest.raises(KeyCustodyError):
+            rep.ns.refresh()
+        with pytest.raises(ReplicaUnavailableError):
+            rep.get(a, max_staleness_ms=60_000)
+        broken[0] = False
+        rep.ns.refresh()
+        assert rep.get(a) and rep.get(b), "the retried refresh did not rebuild from durable data"
+        assert rep.ns.status()["failures"] == 0
+    finally:
+        rep.close()
+        lead.close()
+
+
+def test_no_read_is_served_from_a_rebuild_that_failed(be, monkeypatch):
+    """A rebuild discards the index first. A read that passed its freshness
+    check before the rebuild began waits for it on the serve lock - and must
+    not then read the empty (or half-built) index the failed rebuild left:
+    the replica is unavailable until a rebuild completes."""
+    from memd.storage.replica import ReplicaStore, ReplicaUnavailableError
+
+    lead = be.leader()
+    rep = be.replica(replica_refresh_s=3600)
+    try:
+        a = lead.add("served only when whole lima")[0]
+        rep.ns.refresh()
+        lead.close()
+        lead = be.leader()                       # a new tenure: the next refresh rebuilds
+
+        def stalled(self, *args, **kw):
+            raise OSError("the bucket stalled mid-rebuild")
+
+        monkeypatch.setattr(ReplicaStore, "_load_from", stalled)
+        with pytest.raises(OSError):
+            rep.ns.refresh()
+        # (as if the freshness check had passed just before the rebuild began)
+        monkeypatch.setattr(ReplicaStore, "ensure_fresh", lambda self, *a, **kw: None)
+        with pytest.raises(ReplicaUnavailableError):
+            rep.search("whole lima")
+        with pytest.raises(ReplicaUnavailableError):
+            rep.get(a)
+    finally:
+        rep.close()
+        lead.close()
 
 
 # -------------------------------------------------------------- bounds
