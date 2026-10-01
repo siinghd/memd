@@ -398,6 +398,15 @@ class RateLimiter:
             tokens = min(limit_per_min, b[0] + (now - b[1]) * rate)
         return max(0.0, (1 - tokens) / rate)
 
+    def refund(self, key_id: str, limit_per_min: int) -> None:
+        """Give back a token allow() took for a request that is run again
+        elsewhere (a replica read the router sends to the writer): one
+        request is charged once."""
+        with self._lock:
+            b = self._buckets.get(key_id)
+            if b is not None:
+                b[0] = min(limit_per_min, b[0] + 1)
+
     def forget(self, key_id: str) -> None:
         """Drop state for a revoked/deleted principal (bounded-memory hook)."""
         with self._lock:

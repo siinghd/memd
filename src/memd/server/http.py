@@ -461,6 +461,12 @@ def create_app(
         METRICS.inc("memd_http_replica_unavailable_total",
                     help="eventual reads a replica could not serve (sent to the writer)")
         _log.info("replica read refused on %s: %s", _route_label(request.url.path), exc)
+        if getattr(request.state, "memd_replica_ok", False):
+            # the router runs the request again on the writer's route, where
+            # auth charges the rate budgets again: this attempt's charge is
+            # given back - one request, charged once
+            for lim, bucket, limit in getattr(request.state, "memd_rate_charged", None) or ():
+                lim.refund(bucket, limit)
         return _error(503, "no replica of the namespace can serve this read; retry", "replica_unavailable",
                       headers={"Retry-After": "1", REPLICA_UNAVAILABLE_HEADER: "1"})
 
@@ -569,10 +575,10 @@ def create_app(
             _charge_rate(p, ns)
             raise HTTPException(403, f"key not valid for namespace {ns!r}")
         bill.authorize(p, ns)  # hosted: the namespace belongs to the key's org
-        _charge_rate(p, ns)
+        request.state.memd_rate_charged = _charge_rate(p, ns)
         return p
 
-    def _charge_rate(p: Principal, ns: str | None) -> None:
+    def _charge_rate(p: Principal, ns: str | None) -> list:
         """Charge the request against BOTH the key's budget and the owning
         namespace's budget.
 
@@ -580,7 +586,9 @@ def create_app(
         many keys it minted: ten keys, ten times the budget, and the
         noisy-neighbour containment it exists for evaporates. The namespace
         bucket is the tenancy-level ceiling; the key bucket still contains a
-        single runaway client inside a tenant."""
+        single runaway client inside a tenant. Returns what it charged, as
+        (limiter, bucket, limit): a replica attempt the router sends on to
+        the writer gives it back (replica_unavailable_handler)."""
         # labelled with the key's AUTHORIZED namespace, never the path's: this
         # runs for requests being denied too, and a path namespace would let
         # any key mint unbounded series (and show its strings to operators)
@@ -588,11 +596,15 @@ def create_app(
             METRICS.inc("memd_rate_limited_total", ns=p.namespace, scope="key")
             raise _rate_limited("rate limit exceeded",
                                 limiter.retry_after(p.key_id, p.rate_limit_per_min))
+        charged = [(limiter, p.key_id, p.rate_limit_per_min)]
         owner = p.namespace if p.namespace != "*" else (ns or "*")
-        if owner != "*" and not ns_limiter.allow(f"ns:{owner}", ns_rate_limit_per_min):
-            METRICS.inc("memd_rate_limited_total", ns=p.namespace, scope="namespace")
-            raise _rate_limited("namespace rate limit exceeded",
-                                ns_limiter.retry_after(f"ns:{owner}", ns_rate_limit_per_min))
+        if owner != "*":
+            if not ns_limiter.allow(f"ns:{owner}", ns_rate_limit_per_min):
+                METRICS.inc("memd_rate_limited_total", ns=p.namespace, scope="namespace")
+                raise _rate_limited("namespace rate limit exceeded",
+                                    ns_limiter.retry_after(f"ns:{owner}", ns_rate_limit_per_min))
+            charged.append((ns_limiter, f"ns:{owner}", ns_rate_limit_per_min))
+        return charged
 
     def heavy(ns: str, route: str, p: Principal) -> None:
         """Separate small token budget for O(namespace) maintenance calls."""

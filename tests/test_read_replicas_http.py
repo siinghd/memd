@@ -269,3 +269,38 @@ def test_the_python_sdk_sends_nothing_by_default():
                transport=httpx.MockTransport(handler))
     m.search("q", consistency="eventual", max_staleness_ms=10)
     assert seen[1]["x-memd-read-consistency"] == "eventual"
+
+
+# ------------------------------------------------------- auth and metering
+
+
+def test_a_replica_fallback_is_charged_once_against_the_rate_limits(tmp_path, monkeypatch):
+    """A replica that cannot serve the read answers 503 and the router runs
+    the request again as a strong read: auth (and with it the key's and the
+    namespace's rate budgets) runs on both attempts. The replica attempt's
+    charge is refunded - a fallback costs one request, not two. (Hosted
+    usage is recorded only by an operation that succeeded, and a failed
+    one releases its reservation: never counted twice.)"""
+    from memd.storage.engine import StorageEngine
+    from memd.storage.replica import ReplicaUnavailableError
+
+    monkeypatch.setenv("MEMD_EMBEDDER", "hash")
+    monkeypatch.setenv("MEMD_RERANKER", "none")
+    monkeypatch.setenv("MEMD_NS_RATE_LIMIT_PER_MIN", "4")
+    app = create_app(data_dir=str(tmp_path / "data"), keys_path=str(tmp_path / "keys.json"))
+    key, _ = app.state.keystore.create("acme", name="tenant")
+
+    def no_replica(self, ns, max_staleness_s=None, *, wrap_errors=True):
+        raise ReplicaUnavailableError("the replica cannot serve (test)")
+
+    monkeypatch.setattr(StorageEngine, "reader", no_replica)
+    mw = ClusterMiddleware(app, _Router(False, Decision("local", "n1")), CFG_N1)
+    hdr = {"Authorization": f"Bearer {key}", "X-Memd-Read-Consistency": "eventual"}
+    try:
+        with TestClient(mw) as t:
+            got = [t.post("/v1/ns/acme/search", json={"query": "x"}, headers=hdr) for _ in range(5)]
+        assert [r.status_code for r in got[:4]] == [200] * 4, [r.text for r in got]
+        assert all(r.headers["X-Memd-Served-By"] == "leader" for r in got[:4])
+        assert got[4].status_code == 429, "the namespace budget (4/min) was not charged at all"
+    finally:
+        app.state.engine.close()
