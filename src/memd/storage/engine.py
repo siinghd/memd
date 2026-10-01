@@ -758,6 +758,14 @@ class NamespaceStore:
         # the seq of the first durable event the index failed to apply (None:
         # it has applied every one) - see _apply_durable / _index_mark
         self._index_owed: int | None = None
+        # automatic maintenance (maintain_rotate / maintain_compact) that
+        # raised and has not succeeded since - surfaced by stats(), status()
+        # and /health - and when it may run again (monotonic; see
+        # _maintenance_failed)
+        self._maint_failure: dict | None = None
+        self._maint_retry_at = 0.0
+        # the WAL frames the last export skipped as unreadable (_visible_records)
+        self.last_export_skipped: list[dict] = []
         self._replayed_at_open = False
         self._installed_vec: tuple | None = None  # (index snapshot, its vec_uid, vec_wm) installed at open
         self._migrated_t0: float | None = None  # set by a migrating open (progress log)
@@ -2559,12 +2567,20 @@ class NamespaceStore:
             good_end, n = end, i + 1
         return out, good_end, n, last_seq
 
-    def _wal_events(self, where: str) -> list[tuple[int, list[MemoryRecord]]]:
+    def _wal_events(self, where: str, skipped: list[dict] | None = None
+                    ) -> list[tuple[int, list[MemoryRecord]]]:
         """Every WAL frame past wal_base_seq as (seq, records) (fold paths,
         not the torn-tail repair). A complete frame that does not read -
         does not decrypt, or does not parse - raises KeyCustodyError: every
         fold deletes the log it read, and skipping such a frame destroyed it
-        (see _frame_fault)."""
+        (see _frame_fault).
+
+        `skipped` - export, which deletes nothing - leaves a damaged frame
+        out instead (one a single damaged frame made the recovery path
+        refuse), warns with its byte offset and collects it there as
+        {"log", "at", "fault"}. A frame under a key this process may not
+        hold ("key") is still refused: every frame would read that way, and
+        the export would come out empty."""
         base = self.manifest.wal_base_seq
         out: list[tuple[int, list[MemoryRecord]]] = []
         data = self.store.get(self.wal_key) or b""
@@ -2574,14 +2590,26 @@ class NamespaceStore:
             try:
                 payload = self._decrypt_frame(fr)
                 recs = records_from_jsonl(payload)
-            except KeyCustodyError as ex:
-                # every fold deletes the log it read: never past a frame
-                # under another key
-                raise self._frame_refusal("WAL", at=at) from ex
-            except Exception as ex:  # noqa: BLE001 - it does not parse
-                METRICS.inc("memd_storage_parse_errors_total", where=where, ns=self.namespace)
-                raise self._frame_refusal("WAL", self._frame_fault(fr, "WAL") or "damaged",
-                                          at=at) from ex
+            except Exception as ex:  # noqa: BLE001 - classified below
+                if isinstance(ex, KeyCustodyError):
+                    fault = "damaged" if self._key_proven else "key"
+                else:  # it does not parse
+                    METRICS.inc("memd_storage_parse_errors_total", where=where, ns=self.namespace)
+                    fault = self._frame_fault(fr, "WAL") or "damaged"
+                if skipped is None or at is None or fault == "key":
+                    # every fold deletes the log it read: never past a frame
+                    # that does not read
+                    raise self._frame_refusal("WAL", fault, at=at) from ex
+                skipped.append({"log": self.wal_key, "at": at, "fault": fault})
+                METRICS.inc("memd_export_frames_skipped_total",
+                            help="unreadable WAL frames an export left out (nothing deleted)",
+                            ns=self.namespace)
+                _log.warning("namespace %s: export skipped a complete WAL frame (at byte %d of "
+                             "%s) that does not read (%s): the records it holds are not in this "
+                             "export. Nothing was truncated or deleted; see \"Recovering from an "
+                             "unreadable log frame\" in SECURITY.md",
+                             self.namespace, at, self.wal_key, fault)
+                continue
             s = _frame_seq(payload)
             if s > base:
                 out.append((s, recs))
@@ -2949,7 +2977,7 @@ class NamespaceStore:
                         self.manifest.wal_size >= self.wal_rotate_bytes
                         or (not self._has_log_writer()
                             and self._wal_frames >= self.wal_rotate_frames)):
-                    self.rotate("frames" if frames_over else "size")
+                    self.maintain_rotate("frames" if frames_over else "size")
                 size = self.manifest.wal_size
         return size
 
@@ -3113,7 +3141,7 @@ class NamespaceStore:
             # re-entering would fold mid-replay state. The outer fold re-reads
             # everything we just appended.
             if size >= self.wal_rotate_bytes and not self._rotating:
-                self.rotate("ops-size")
+                self.maintain_rotate("ops-size")
 
     def _apply_durable(self, seq: int, records: list[MemoryRecord], ops: list[dict]) -> None:
         """(ns lock held) Apply events already durable in a log - a WAL frame
@@ -3187,9 +3215,98 @@ class NamespaceStore:
             self._seal_wal_writer_locked()
             self._rotating = True
             try:
-                return self._rotate_locked(reason)
+                name = self._rotate_locked(reason)
             finally:
                 self._rotating = False
+            self._maintenance_ok()
+            return name
+
+    # automatic maintenance after a failure: the next try waits this long,
+    # doubling per consecutive failure up to the cap (a try reads every log)
+    MAINT_RETRY_S = 30.0
+    MAINT_RETRY_MAX_S = 600.0
+
+    def maintain_rotate(self, reason: str) -> str:
+        """rotate() as maintenance - the size-triggered fold after a write, a
+        session close's - run once what triggered it is durable and applied.
+        One that raises does not fail that write. It used to: once a damaged
+        WAL frame made every fold refuse, every write and delete past the
+        rotate threshold raised AFTER it was durable, so callers saw errors
+        for writes that had landed - and retried them. The failure is now
+        logged, metered and surfaced (_maintenance_failed), and no write
+        tries again before its backoff has passed; the fold itself still
+        refuses until the frame is repaired. Returns the new segment's name,
+        or "" when nothing was folded. A closed store and a lost lease still
+        raise: those are not maintenance failures."""
+        with self._lock:
+            self._ensure_open()
+            if time.monotonic() < self._maint_retry_at:
+                return ""
+            try:
+                return self.rotate(reason)
+            except LeaseLostError:
+                raise
+            except Exception as ex:  # noqa: BLE001 - the write stands; surfaced instead
+                if self._closed:
+                    raise
+                self._maintenance_failed("rotate", ex)
+                return ""
+
+    def maintain_compact(self) -> CompactionReport | None:
+        """compact() as maintenance (a hard delete's purge deadline, off the
+        request path): None while a failed fold's backoff runs; one that
+        raises is surfaced (_maintenance_failed) and re-raised."""
+        with self._lock:
+            if time.monotonic() < self._maint_retry_at:
+                return None
+        try:
+            return self.compact(force=False)
+        except LeaseLostError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - surfaced, then the caller's
+            if not self._closed:
+                self._maintenance_failed("compact", ex)
+            raise
+
+    def _maintenance_failed(self, op: str, ex: BaseException) -> None:
+        """Automatic maintenance raised: log and meter it, keep it for
+        stats(), status() and /health until a fold succeeds, and hold the
+        next automatic try off for a backoff that doubles per consecutive
+        failure."""
+        with self._lock:
+            prev = self._maint_failure or {}
+            n = int(prev.get("failures", 0)) + 1
+            delay = min(self.MAINT_RETRY_MAX_S, self.MAINT_RETRY_S * 2 ** min(n - 1, 16))
+            self._maint_retry_at = time.monotonic() + delay
+            t = now_ms()
+            self._maint_failure = {
+                "op": op, "error": f"{type(ex).__name__}: {ex}", "failures": n,
+                "since_ms": int(prev.get("since_ms", t)), "last_ms": t,
+                "retry_at_ms": t + int(delay * 1000)}
+        METRICS.inc("memd_ns_maintenance_failures_total",
+                    help="automatic rotates/compactions that raised (the writes that triggered "
+                         "them stand)", ns=self.namespace, op=op)
+        METRICS.set_gauge("memd_ns_maintenance_failing", 1,
+                          help="1 while an open namespace's automatic maintenance is failing",
+                          ns=self.namespace)
+        _log.warning("namespace %s: automatic %s failed (%d in a row); the writes that triggered "
+                     "it are durable and stay acknowledged; next try in %d s: %s: %s",
+                     self.namespace, op, n, int(delay), type(ex).__name__, ex)
+
+    def _maintenance_ok(self) -> None:
+        """(ns lock held) A fold succeeded: maintenance is healthy again."""
+        if self._maint_failure is not None:
+            _log.info("namespace %s: maintenance recovered after %d failure(s)",
+                      self.namespace, self._maint_failure.get("failures", 0))
+            METRICS.set_gauge("memd_ns_maintenance_failing", 0, ns=self.namespace)
+        self._maint_failure = None
+        self._maint_retry_at = 0.0
+
+    def maintenance_status(self) -> dict | None:
+        """The failing automatic maintenance - op, error, failures (in a
+        row), since_ms, last_ms, retry_at_ms - or None while it is healthy."""
+        f = self._maint_failure
+        return dict(f) if f else None
 
     def _reset_wal_frames(self) -> None:
         self._wal_frames = 0
@@ -3439,6 +3556,7 @@ class NamespaceStore:
             for rid in held_hard:
                 self._track_pending_hard(rid, _HELD_FOR_QUARANTINE)
             self._persist_manifest()
+            self._maintenance_ok()
             # the text is gone from durable data; now from this cache (the
             # scrub waits out - aborts - a snapshot copy's pinned image, and
             # one cut short by a close is redone by the next open)
@@ -3565,7 +3683,11 @@ class NamespaceStore:
         Exports what a read can see (_visible_records). It used to dump the
         raw stored copies with no op applied: records deleted - soft or hard,
         acked - came back out of every export until a compaction purged them,
-        and superseded facts lost their supersedence."""
+        and superseded facts lost their supersedence.
+
+        A WAL frame that does not read is left out, not refused (it used to
+        make the recovery path itself refuse): last_export_skipped says
+        where it is (see _wal_events)."""
         with self._lock:
             recs = self._visible_records()
         recs.sort(key=lambda r: (r.time.t_ingested, r.id))
@@ -3579,7 +3701,9 @@ class NamespaceStore:
         bytes still sit in a segment. Superseded and quarantined records stay
         (history; the flags travel with them)."""
         versions, carried, _ = self._load_checkpoints(where="export-segment")
-        frames = self._wal_events("export-wal")
+        skipped: list[dict] = []
+        frames = self._wal_events("export-wal", skipped=skipped)
+        self.last_export_skipped = skipped
         kept, _pending, _unq, _folded, deferred = _fold_events(
             versions, _merge_events(carried + self._read_ops(), frames), now_ms(), force=False)
         return [r for r in kept if r.id not in deferred]
@@ -3598,6 +3722,9 @@ class NamespaceStore:
         )
         st["segments_collected"] = self.segments_collected
         st["snapshots_collected"] = self.snapshots_collected
+        # failing automatic maintenance (None while healthy): writes succeed
+        # meanwhile, and the logs grow until a fold succeeds
+        st["maintenance"] = self.maintenance_status()
         return st
 
     def close(self) -> None:
@@ -3629,6 +3756,9 @@ class NamespaceStore:
             except Exception:
                 pass
             self._wal_writer = None
+        if self._maint_failure is not None:
+            # the gauge counts OPEN namespaces failing maintenance
+            METRICS.set_gauge("memd_ns_maintenance_failing", 0, ns=self.namespace)
         # fold the index watermark so the next open only replays the tail
         # (and an event the index failed to apply: _index_mark)
         try:
@@ -3971,6 +4101,18 @@ class StorageEngine:
         the ones whose writer lease it holds)."""
         with self._lock:
             return list(self._namespaces)
+
+    def maintenance_failing(self) -> dict[str, dict]:
+        """Open namespaces whose automatic maintenance is failing -> its
+        status (NamespaceStore.maintenance_status). Touches no LRU order."""
+        with self._lock:
+            stores = list(self._namespaces.items())
+        out = {}
+        for name, nstore in stores:
+            st = nstore.maintenance_status()
+            if st:
+                out[name] = st
+        return out
 
     def has_namespace(self, ns: str) -> bool:
         """True if `ns` is open here or has a manifest; never materializes it."""

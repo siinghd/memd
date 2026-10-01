@@ -21,6 +21,27 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   a compaction tombstones or removes any record it dropped that the index
   still serves (`memd_index_settled_total`), which also heals caches an
   older build left in that state.
+- **One damaged WAL frame no longer blocks export or fails writes.**
+  Export - the recovery path - read the WAL with the reader every fold
+  uses, which refuses a complete frame that does not read, so a single
+  damaged frame made `export()` raise and nothing could be exported. It now
+  leaves that frame out and exports everything readable: a warning names
+  the frame's byte offset, `memd_export_frames_skipped_total` counts it,
+  and the export's audit entry lists it (`skipped_frames`: log, byte,
+  fault); nothing is cut or deleted. A frame under a key this process may
+  not hold still refuses the export (every frame would read that way). And
+  once the WAL or ops log passed its rotate threshold, every write and
+  delete ran the size-triggered rotate after it was durable and raised its
+  refusal - callers saw errors for writes that had landed, and retried
+  them; `close_session()` raised after its facts were written. Automatic
+  maintenance (that rotate, a session close's fold, a hard delete's
+  background purge compaction) that raises no longer fails the write: it
+  is logged, metered (`memd_ns_maintenance_failures_total{op}`,
+  `memd_ns_maintenance_failing`), surfaced as `maintenance` in `stats()`
+  and `status()` and as a count in `/health` (`maintenance_failing`), and
+  retried after a backoff (30 s, doubling to 10 min) instead of on every
+  write; `close_session()` returns `"segment": ""`. Rotate and compaction
+  themselves keep refusing until the frame is repaired.
 
 ## [0.3.0] - 2026-09-26
 
