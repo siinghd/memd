@@ -542,7 +542,12 @@ def create_app(
 
     @app.get("/health")
     def health():
-        return {"ok": True, "version": __import__("memd").__version__}
+        # how many open namespaces' automatic maintenance (rotate/compaction)
+        # is failing - writes succeed meanwhile. A count only: /health is
+        # unauthenticated, and namespace names are tenant data
+        failing = getattr(getattr(engine, "engine", None), "maintenance_failing", None)
+        return {"ok": True, "version": __import__("memd").__version__,
+                "maintenance_failing": len(failing()) if callable(failing) else 0}
 
     @app.get("/metrics")
     def metrics_endpoint(request: Request, creds: HTTPAuthorizationCredentials | None = Depends(bearer)):
