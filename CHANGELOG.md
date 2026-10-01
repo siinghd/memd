@@ -6,6 +6,15 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
 
 ## [Unreleased]
 
+### Fixed
+- **An S3 or KMS error without a parsed reply is raised as itself.** Every
+  place the S3 store and the `aws-kms` key provider read an error code did
+  `getattr(ex, "response", {}).get(...)`; a transport error (botocore's
+  `ReadTimeoutError`, a connection reset) whose `response` is None made
+  that raise `AttributeError`, which replaced the real error - and the
+  `aws-kms` provider raised it instead of `KeyUnavailableError`. An error
+  without a reply now reads as having no code.
+
 ### Changed
 - **Documented: a logged `set_vector` op is derived state, like every
   vector.** A probe that appended one (an arbitrary vector) found it gone

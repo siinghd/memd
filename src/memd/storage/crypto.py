@@ -236,7 +236,10 @@ class AwsKmsProvider(KeyProvider):
         try:
             return fn(**kw)
         except Exception as ex:
-            code = getattr(ex, "response", {}).get("Error", {}).get("Code", "")
+            # a transport error (a timeout) has no parsed reply: `response`
+            # is missing or None, and must not mask the error itself
+            reply = getattr(ex, "response", None)
+            code = ((reply.get("Error") or {}).get("Code", "") if isinstance(reply, dict) else "")
             raise KeyUnavailableError(f"aws-kms {what} failed ({code or type(ex).__name__}): {ex}") from ex
 
     def generate(self, namespace: str) -> tuple[bytes, WrappedKey]:

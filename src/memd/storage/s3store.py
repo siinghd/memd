@@ -85,6 +85,15 @@ def _validate_key(key: str) -> str:
     return key
 
 
+def _err_response(ex: BaseException) -> dict:
+    """The parsed reply a botocore ClientError carries, or {}. A transport
+    error (ReadTimeoutError, a connection reset) has none - no `response`,
+    or one that is None - and reading a code off that raised
+    AttributeError, which replaced the real error."""
+    r = getattr(ex, "response", None)
+    return r if isinstance(r, dict) else {}
+
+
 class S3ObjectStore(ObjectStore):
     """Object store over the S3 API.
 
@@ -208,8 +217,8 @@ class S3ObjectStore(ObjectStore):
         return full
 
     def _is_missing(self, ex: Exception) -> bool:
-        code = getattr(ex, "response", {}).get("Error", {}).get("Code", "")
-        status = getattr(ex, "response", {}).get("ResponseMetadata", {}).get("HTTPStatusCode")
+        code = self._code(ex)
+        status = (_err_response(ex).get("ResponseMetadata") or {}).get("HTTPStatusCode")
         return code in ("NoSuchKey", "404", "NotFound") or status == 404
 
     def _fetch_parts(self, segs: list) -> list[bytes]:
@@ -471,7 +480,7 @@ class S3ObjectStore(ObjectStore):
                                     IfNoneMatch="*")
             return True
         except Exception as ex:
-            code = getattr(ex, "response", {}).get("Error", {}).get("Code", "")
+            code = self._code(ex)
             if code in ("PreconditionFailed", "412", "ConditionalRequestConflict"):
                 return False
             if code in ("NotImplemented", "InvalidRequest", "InvalidArgument"):
@@ -615,7 +624,7 @@ class S3ObjectStore(ObjectStore):
             for i in range(0, len(batch), 1000):
                 self._delete_batch(batch[i:i + 1000])
         except Exception as ex:
-            code = getattr(ex, "response", {}).get("Error", {}).get("Code", "")
+            code = self._code(ex)
             if code not in ("NotImplemented", "AccessDenied", "MethodNotAllowed"):
                 raise
             try:
@@ -706,7 +715,7 @@ class S3ObjectStore(ObjectStore):
             self._client.put_object(Bucket=self.bucket, Key=full, Body=data,
                                     IfNoneMatch="*")
         except Exception as ex:
-            code = getattr(ex, "response", {}).get("Error", {}).get("Code", "")
+            code = self._code(ex)
             if code in ("PreconditionFailed", "412"):
                 METRICS.inc("memd_s3_append_conflicts_total",
                             help="append part already existed: another writer holds this log")
@@ -915,7 +924,9 @@ class S3ObjectStore(ObjectStore):
 
     @staticmethod
     def _code(ex: Exception) -> str:
-        return getattr(ex, "response", {}).get("Error", {}).get("Code", "")
+        """The S3 error code of `ex` - "" for an error without a parsed
+        reply (see _err_response)."""
+        return str((_err_response(ex).get("Error") or {}).get("Code", "") or "")
 
     def _raw_get_meta(self, full: str) -> tuple[bytes, str] | None:
         """(body, ETag) or None when absent."""
