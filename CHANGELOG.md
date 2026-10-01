@@ -7,6 +7,19 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
 ## [Unreleased]
 
 ### Fixed
+- **A cache sweep never deletes files another process serves from.**
+  Processes sharing one local cache directory each serve their namespaces
+  from it. The stale-cache sweep checked that no process had a
+  namespace's index open and deleted its caches after: a process that
+  opened the namespace in between lost its live files (index, tantivy copy,
+  ANN sidecar). And with the `.sqlite` briefly missing - an open rebuilding
+  it - the tantivy copy and the sidecar were deleted as "orphaned" with no
+  check at all. Every process now holds a per-namespace cache lock
+  (`<ns>.lock` in the cache directory, `flock`) shared while it has the
+  namespace's caches open; the sweep decides and deletes only under it held
+  exclusively, taken without waiting - a namespace in use is left to the
+  next sweep - and a destroy takes it too. The lock file goes with the
+  caches it guarded.
 - **A key file a crash left empty is reported, then replaced.** On a
   filesystem without hard links the `local` key provider creates a key file
   in place (create, then write); a crash in between left it EMPTY. An empty

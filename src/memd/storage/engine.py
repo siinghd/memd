@@ -660,6 +660,65 @@ DEFAULT_CACHE_SWEEP_S = 300.0
 _CACHE_SUFFIXES = (".sqlite", ".tantivy", ".usearch")
 
 
+def _cache_lock_path(cache_dir: str, ns: str) -> str:
+    """The namespace's cache lock file (see _lock_cache), beside its caches."""
+    return os.path.join(cache_dir, f"{ns.replace('/', '__')}.lock")
+
+
+def _lock_cache(path: str, *, exclusive: bool) -> int | None:
+    """Take a namespace's cache lock: SHARED - waiting for it - by every
+    process (or engine) for as long as it has the namespace's caches open
+    (NamespaceStore), EXCLUSIVE - never waiting - by whatever decides to
+    delete them (_drop_if_superseded, a destroy). Several processes may share
+    one cache directory: a sweep that checked the caches were unused and
+    then deleted them raced a process opening them in between, which lost
+    its live files. Under the exclusive lock nothing opens them meanwhile.
+
+    Returns the fd holding the lock (closing it releases it); None when the
+    exclusive lock is held elsewhere; -1 when there is no flock here (non-
+    POSIX, or a filesystem without it) - the caller goes on unguarded."""
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - non-POSIX
+        return -1
+    mode = fcntl.LOCK_EX | fcntl.LOCK_NB if exclusive else fcntl.LOCK_SH
+    while True:
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError:
+            return -1
+        try:
+            fcntl.flock(fd, mode)
+        except BlockingIOError:
+            os.close(fd)
+            return None
+        except OSError:
+            os.close(fd)
+            return -1
+        # the holder before us may have dropped the caches and this file
+        # with them: a lock on a deleted file guards nothing - take the new one
+        try:
+            st, cur = os.fstat(fd), os.stat(path)
+            if (st.st_dev, st.st_ino) == (cur.st_dev, cur.st_ino):
+                return fd
+        except FileNotFoundError:
+            pass
+        os.close(fd)
+
+
+def _unlock_cache(fd: int | None, path: str | None = None) -> None:
+    """Release a lock _lock_cache took; `path`: delete the lock file first
+    (the caches it guarded are gone - only while holding it exclusively)."""
+    if fd is None or fd < 0:
+        return
+    try:
+        if path is not None:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(path)
+    finally:
+        os.close(fd)
+
+
 def _drop_cache_files(cache_dir: str, ns: str, *, if_unused: bool = False) -> bool:
     """Delete namespace `ns`'s local derived caches - the SQLite index with
     its -wal/-shm (and the image of a snapshot install a crash interrupted),
@@ -667,7 +726,10 @@ def _drop_cache_files(cache_dir: str, ns: str, *, if_unused: bool = False) -> bo
     save is cancelled (a write in flight waited for) first. Nothing of the
     namespace may be open in this process. `if_unused`: keep them all while
     another process has the index open (a cache directory shared by
-    several processes - each serving from the same files). True if
+    several processes - each serving from the same files): the caller holds
+    the namespace's cache lock exclusively (_lock_cache), which every
+    process holds shared while it has them open, and this SQLite check
+    also catches a process that does not take it (an older build). True if
     anything was deleted."""
     from memd.index import ann_usearch
 
@@ -688,6 +750,12 @@ def _drop_cache_files(cache_dir: str, ns: str, *, if_unused: bool = False) -> bo
             found = True
             shutil.rmtree(d, ignore_errors=True)
     return found
+
+
+def _cache_left(cache_dir: str, ns: str) -> bool:
+    """Any of namespace `ns`'s cache files or directories is still there."""
+    base = os.path.join(cache_dir, ns.replace("/", "__"))
+    return any(os.path.exists(base + suffix) for suffix in _CACHE_SUFFIXES)
 
 
 def _existing_db_uri(path: str) -> str:
@@ -815,7 +883,15 @@ class NamespaceStore:
                         self._owner_path = lock_path
         os.makedirs(cache_dir, exist_ok=True)
         safe = namespace.replace("/", "__")
-        self.index = NamespaceIndex(os.path.join(cache_dir, f"{safe}.sqlite"))
+        # held shared until the index is closed (_close_index): a sweep -
+        # this process's or another's sharing the cache directory - deletes
+        # the caches only under it exclusively (see _lock_cache)
+        self._cache_lock = _lock_cache(_cache_lock_path(cache_dir, namespace), exclusive=False)
+        try:
+            self.index = NamespaceIndex(os.path.join(cache_dir, f"{safe}.sqlite"))
+        except BaseException:
+            self._release_cache_lock()
+            raise
         self.index._ns_hint = namespace
         self._lock = threading.RLock()
         self._wlock = threading.Lock()      # serializes WAL writes
@@ -896,6 +972,7 @@ class NamespaceStore:
                 self.index.close()
             except Exception:
                 pass
+            self._release_cache_lock()
             if self._took_over and not self._takeover_done:
                 self._release_ownership(clean=False)
             else:
@@ -4000,7 +4077,8 @@ class NamespaceStore:
 
     def _close_index(self, quiet: bool = True) -> None:
         """Close the index - which interrupts a purge scrub waiting for its
-        readers - and let an open's background scrub thread end with it."""
+        readers - and let an open's background scrub thread end with it;
+        then release the cache lock."""
         try:
             self.index.close()
         except Exception:
@@ -4010,6 +4088,11 @@ class NamespaceStore:
             t = self._scrub_thread
             if t is not None and t is not threading.current_thread():
                 t.join(timeout=5.0)
+            self._release_cache_lock()
+
+    def _release_cache_lock(self) -> None:
+        fd, self._cache_lock = getattr(self, "_cache_lock", None), None
+        _unlock_cache(fd)
 
     def _release_ownership(self, *, clean: bool = True, discard: bool = False) -> None:
         if self._owner_path:
@@ -4260,20 +4343,39 @@ class StorageEngine:
         """(ns open lock held, ns not open here) Delete this node's local
         copy of `ns` (_drop_cache_files) if another tenure superseded it
         (_cache_superseded) and no other process serves from it. `reason`
-        (a metric label) defaults to why it is stale."""
+        (a metric label) defaults to why it is stale.
+
+        Decided and done under the namespace's cache lock held exclusively,
+        taken without waiting (_lock_cache): a process sharing the cache
+        directory that has the caches open - or is opening them - holds it
+        shared, and the copy is then left to the next sweep. Checking that
+        no process had the index open and deleting after let one open it in
+        between and lose its live files; and with the .sqlite missing (an
+        open rebuilding it) the tantivy copy and the sidecar were deleted as
+        orphaned with no check at all."""
+        lock_path = _cache_lock_path(self.cache_dir, ns)
+        lock = _lock_cache(lock_path, exclusive=True)
+        if lock is None:
+            return False   # in use by another process (or engine) sharing the directory
+        dropped = False
         try:
-            why = self._cache_superseded(ns)
-        except Exception as ex:  # noqa: BLE001 - the next sweep retries
-            METRICS.inc("memd_index_cache_sweep_failures_total",
-                        help="local cache sweeps that failed", detail=type(ex).__name__)
-            return False
-        if why is None:
-            return False
-        try:
-            dropped = _drop_cache_files(self.cache_dir, ns, if_unused=True)
-        except Exception as ex:  # noqa: BLE001 - the next sweep or open retries
-            _log.warning("namespace %s: could not drop the local index cache (%s)", ns, ex)
-            return False
+            try:
+                why = self._cache_superseded(ns)
+            except Exception as ex:  # noqa: BLE001 - the next sweep retries
+                METRICS.inc("memd_index_cache_sweep_failures_total",
+                            help="local cache sweeps that failed", detail=type(ex).__name__)
+                return False
+            if why is None:
+                return False
+            try:
+                dropped = _drop_cache_files(self.cache_dir, ns, if_unused=True)
+            except Exception as ex:  # noqa: BLE001 - the next sweep or open retries
+                _log.warning("namespace %s: could not drop the local index cache (%s)", ns, ex)
+                return False
+        finally:
+            # the lock file goes with the caches it guarded (an opener
+            # waiting on it then takes a new one - see _lock_cache)
+            _unlock_cache(lock, lock_path if dropped and not _cache_left(self.cache_dir, ns) else None)
         if dropped:
             METRICS.inc("memd_index_cache_drops_total",
                         help="local index caches dropped: another node took the namespace over",
@@ -4550,8 +4652,14 @@ class StorageEngine:
         n = self.store.remove_prefix(f"ns/{ns}")
         # purge the derived caches (rebuildable data tied to the shredded ns):
         # the index, the tantivy copy (the same text, tokenized) and the ANN
-        # sidecar (its vectors)
-        _drop_cache_files(self.cache_dir, ns)
+        # sidecar (its vectors) - whoever else has them open; their lock
+        # file too, unless someone does (see _lock_cache)
+        lock_path = _cache_lock_path(self.cache_dir, ns)
+        lock = _lock_cache(lock_path, exclusive=True)
+        try:
+            _drop_cache_files(self.cache_dir, ns)
+        finally:
+            _unlock_cache(lock, lock_path)
         if self.envelope is not None:
             self.envelope.destroy(ns)
         return existed or n > 0
