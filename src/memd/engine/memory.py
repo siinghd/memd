@@ -2179,6 +2179,10 @@ class Memory:
         # bounded drain before stopping: a clean close should not silently
         # discard the vector lane it was asked to persist
         self._embed_worker.stop(drain_timeout_s=float(self._embed_close_drain_s))
+        # a purge's scrub waiting for a reader of the index (one memd does
+        # not control may hold on indefinitely) would hold the drain below:
+        # it stops waiting, and the next open finishes it
+        self.engine.stop_waiting()
         self._maint.stop(drain_timeout_s=float(self._embed_close_drain_s))
         if self.rerank is not None:
             self.rerank.close()

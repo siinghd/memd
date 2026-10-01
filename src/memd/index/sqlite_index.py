@@ -180,6 +180,9 @@ class NamespaceIndex:
         self._pins: set[ImagePin] = set()
         self._pins_cv = threading.Condition()
         self._scrubbing = 0
+        # set once a close begins (or is announced: stop_waiting): a scrub
+        # stops waiting for readers and leaves the rest to the next open
+        self._closing = threading.Event()
         self._pending = False  # writes committed lazily, not yet visible cross-connection
         self._lazy_commits = 0
         self._commit_threshold = 64
@@ -407,14 +410,25 @@ class NamespaceIndex:
     def _wait_unpinned(self) -> bool:
         """(scrub, index lock NOT held: a copy never needs it to let go)
         Abort every pinned image and wait until each is closed. False when
-        the index was closed first."""
+        a close came first."""
         self._abort_pins()
         with self._pins_cv:
             while self._pins:
-                if self._closed:
+                if self.closing:
                     return False
                 self._pins_cv.wait(0.1)
-        return not self._closed
+        return not self.closing
+
+    @property
+    def closing(self) -> bool:
+        """A close began or is announced (stop_waiting)."""
+        return self._closed or self._closing.is_set()
+
+    def stop_waiting(self) -> None:
+        """A close is coming: a scrub waiting for readers to let go of the
+        WAL gives up now (unfinished - the next open scrubs again), and none
+        starts waiting from here on."""
+        self._closing.set()
 
     def set_vector_limits(self, flat_max: int, exact_max: int) -> None:
         """A sidecar is configured: while it is not serving, a namespace over
@@ -424,6 +438,7 @@ class NamespaceIndex:
         self.exact_max_vectors = int(exact_max)
 
     def close(self) -> None:
+        self._closing.set()   # a scrub waiting for readers lets go first
         lex, self.lexical = self.lexical, None
         if lex is not None:
             # its final batch reads this index, so it goes first
@@ -879,6 +894,14 @@ class NamespaceIndex:
         self._ann_apply(queued)
         return cur.rowcount > 0
 
+    # the scrub's WAL truncation, one attempt at a time: each holds the index
+    # lock for at most this busy timeout (ms); between attempts the lock is
+    # released for a pause that doubles up to the cap (s)
+    SCRUB_ATTEMPT_BUSY_MS = 50
+    SCRUB_RETRY_S = 0.05
+    SCRUB_RETRY_MAX_S = 1.0
+    SCRUB_WARN_EVERY_S = 60.0
+
     def scrub(self) -> bool:
         """Remove what deleted rows left behind in the FILE (D7).
 
@@ -899,16 +922,24 @@ class NamespaceIndex:
         search or a write never waits for the copy), and checkpoints again
         until the WAL is truncated. It used to give up after the busy
         timeout, leaving the erased bytes in the file until the next open.
-        False only when the index was closed first: the next open scrubs."""
+
+        A reader memd does not control - another process's connection
+        holding an old snapshot - can hold on indefinitely; the scrub never
+        gives up on it (D10) and warns every SCRUB_WARN_EVERY_S. Each attempt
+        used to wait out the full 5 s busy timeout holding the index lock,
+        so every search and index write behind it waited too: now an attempt
+        waits SCRUB_ATTEMPT_BUSY_MS, and the lock is released between
+        attempts. False when a close came first (it interrupts the wait):
+        the next open scrubs."""
         with self._lock:
-            if self._closed:
+            if self.closing:
                 return False
             self._scrubbing += 1
         done = False
         try:
             self._abort_pins()  # their copies stop while the file is vacuumed
             with self._lock:
-                if self._closed:
+                if self.closing:
                     return False
                 self.flush()
                 c = self._con
@@ -921,24 +952,27 @@ class NamespaceIndex:
                     c.execute("PRAGMA incremental_vacuum").fetchall()
                 self._invalidate_stats()
             t0 = warned = time.monotonic()
+            pause = self.SCRUB_RETRY_S
             while True:
                 if not self._wait_unpinned():
                     return False
                 with self._lock:
-                    if self._closed:
+                    if self.closing:
                         return False
                     self.flush()  # a write since the vacuum may have left its transaction open
-                    done = not self._con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+                    done = self._truncate_wal()
                 if done:
                     break
-                # another reader (a search, a streamed scan) still holds an
-                # older snapshot; each attempt already waited the busy timeout
+                # another reader (a search, a streamed scan, another
+                # process) still holds an older snapshot
                 now = time.monotonic()
-                if now - warned >= 60.0:
+                if now - warned >= self.SCRUB_WARN_EVERY_S:
                     warned = now
                     _log.warning("memd: scrubbing %s of purged content: a reader has kept its WAL "
                                  "from being truncated for %d s; still retrying", self.path, int(now - t0))
-                time.sleep(0.05)
+                if self._closing.wait(pause):
+                    return False
+                pause = min(pause * 2, self.SCRUB_RETRY_MAX_S)
         finally:
             with self._lock:
                 self._scrubbing -= 1
@@ -948,6 +982,17 @@ class NamespaceIndex:
         if self.lexical is not None:
             self.lexical.reset()
         return True
+
+    def _truncate_wal(self) -> bool:
+        """(index lock held) One TRUNCATE checkpoint under a short busy
+        timeout: True once the WAL is truncated, False while a reader holds
+        an older snapshot (the caller retries, the lock released)."""
+        c = self._con
+        c.execute(f"PRAGMA busy_timeout={int(self.SCRUB_ATTEMPT_BUSY_MS)}")
+        try:
+            return not c.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+        finally:
+            c.execute("PRAGMA busy_timeout=5000")
 
     def hard_delete(self, record_id: str) -> bool:
         """Physical removal inside the index (compaction deadline path)."""

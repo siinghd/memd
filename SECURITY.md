@@ -183,6 +183,13 @@ any probe fails the build.
   its cache directory is removed. It never serves that copy, but it is on
   its disk: when a hard delete must reach every disk, clear the local cache
   directory (`local_dir`) of the nodes that no longer own the namespace.
+  On the owning node the purge's scrub waits until no reader holds a
+  snapshot of the index older than it: a process outside memd that keeps a
+  read transaction open on the SQLite file (a backup tool, an ad-hoc
+  `sqlite3` shell) keeps the erased text in the file's WAL for as long as
+  it holds on - memd keeps retrying and logs a warning every 60 s while
+  serving normally. A close in the meantime leaves the scrub to the next
+  open. Do not attach long-lived readers to the cache files.
 
 - **Hosted mode & billing (`--hosted`, off by default).**
   - *The Stripe webhook is authenticated by its signature only.*

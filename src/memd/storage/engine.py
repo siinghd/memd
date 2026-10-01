@@ -3557,20 +3557,35 @@ class NamespaceStore:
                 self._track_pending_hard(rid, _HELD_FOR_QUARANTINE)
             self._persist_manifest()
             self._maintenance_ok()
-            # the text is gone from durable data; now from this cache (the
-            # scrub waits out - aborts - a snapshot copy's pinned image, and
-            # one cut short by a close is redone by the next open)
-            if purged and self.index.scrub():
-                self.index.set_meta("scrubbed_seq", str(self.manifest.scrub_seq))
-            # ...and from the ANN sidecar: its files go now (usearch removal
-            # only marked the purged vectors), and it is rebuilt from SQLite
-            ann_ticket = (self.index.ann.purged(self.manifest.scrub_seq)
-                          if purged and self.index.ann is not None else 0)
+            scrub_seq = self.manifest.scrub_seq if purged else 0
             METRICS.set_gauge("memd_pending_purges", len(self._pending_hard), ns=self.namespace)
             rep.segments_out = len(self.manifest.segments)
             rep.records_folded = len(kept)
             rep.bytes_after = self.store.size(f"{self.prefix}/{name}") if kept or header_ops else 0
             self.index.invalidate_vec_cache()  # fold dead rows out of the scan matrix
+        ann_ticket = 0
+        if scrub_seq:
+            # The text is gone from durable data; now from this cache - OUTSIDE
+            # the namespace lock. The scrub waits until no reader holds a
+            # snapshot older than it: a snapshot copy's pinned image (aborted),
+            # or a reader memd does not control, for as long as that one holds
+            # on (D10: it never gives up). Under the lock, every append and
+            # close() waited with it - for that reader's whole lifetime. A
+            # close interrupts it; the next open scrubs again.
+            if self.index.scrub():
+                self.index.set_meta("scrubbed_seq", str(scrub_seq))
+            # ...and from the ANN sidecar: its files go now (usearch removal
+            # only marked the purged vectors), and it is rebuilt from SQLite -
+            # after the scrub, whose full VACUUM may renumber rowids
+            with self._lock:
+                ann = self.index.ann
+                if ann is not None and not self.index.closing:
+                    ann_ticket = ann.purged(scrub_seq)
+        if self.index.closing:
+            # a close cut the scrub short: no snapshot of this index now (the
+            # next open finishes the scrub; close() collects orphans)
+            rep.duration_ms = int((time.monotonic() - t0) * 1000)
+            return rep
         # Compaction is the natural snapshot point: the index has just been
         # folded and stamped with this manifest.seq, and compaction already
         # costs O(live) and runs off the request path (pass 17), so the
@@ -4101,6 +4116,15 @@ class StorageEngine:
         the ones whose writer lease it holds)."""
         with self._lock:
             return list(self._namespaces)
+
+    def stop_waiting(self) -> None:
+        """A close is coming: every open namespace's purge scrub stops
+        waiting for readers of its index (NamespaceIndex.stop_waiting), so
+        maintenance in flight can finish before the close."""
+        with self._lock:
+            stores = list(self._namespaces.values())
+        for nstore in stores:
+            nstore.index.stop_waiting()
 
     def maintenance_failing(self) -> dict[str, dict]:
         """Open namespaces whose automatic maintenance is failing -> its

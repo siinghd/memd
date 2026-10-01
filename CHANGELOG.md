@@ -42,6 +42,20 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   retried after a backoff (30 s, doubling to 10 min) instead of on every
   write; `close_session()` returns `"segment": ""`. Rotate and compaction
   themselves keep refusing until the frame is repaired.
+- **A reader outside memd no longer stalls a namespace during a purge.**
+  The scrub after a hard-delete purge retries until the index's WAL is
+  truncated, and a reader memd does not control (another connection
+  holding an old snapshot of the SQLite file) keeps that from happening
+  for as long as it holds on. Each attempt waited out the 5 s busy timeout
+  holding the index lock, and the compaction ran the scrub holding the
+  namespace lock: searches and index writes waited ~5 s at p99, and
+  appends and `close()` for the reader's whole lifetime (a 75 s reader:
+  append p99 75.7 s). An attempt now waits 50 ms, the index lock is
+  released between attempts (backoff 50 ms doubling to 1 s), and the
+  compaction scrubs outside the namespace lock. The scrub still never gives
+  up and warns every 60 s; a close interrupts it (`Memory.close()` stops
+  it before draining background maintenance) and the next open finishes
+  it.
 
 ## [0.3.0] - 2026-09-26
 
