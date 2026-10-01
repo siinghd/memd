@@ -371,13 +371,12 @@ class ReplicaStore(NamespaceStore):
                          daemon=True).start()
 
     def _kicked_refresh(self) -> None:
+        # (refresh() clears _kicked once it holds the lock: a read arriving
+        # after that may queue the next one)
         try:
             self.refresh(_kicked=True)
         except Exception:  # noqa: BLE001 - recorded on the replica; the waiting reads see it
             pass
-        finally:
-            with self._fresh_cv:
-                self._kicked = False
 
     # ------------------------------------------------------------ open
 
