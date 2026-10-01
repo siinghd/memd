@@ -63,6 +63,12 @@ class PreconditionFailed(LeaseLostError):
     lost ownership. Never retried blindly - the caller fences."""
 
 
+class ReadOnlyError(RuntimeError):
+    """A mutation was attempted through a read-only namespace - a read
+    replica, which takes no lease and never writes or
+    deletes any object. Nothing was changed."""
+
+
 def content_version(data: bytes) -> str:
     """Version token of an object for stores without native ETags: its
     content hash. Content-identical rewrites compare equal, which is safe -
@@ -246,6 +252,36 @@ class ObjectStore(ABC):
         noncurrent version too - a delete marker over a wrapped data key is
         not a crypto-shred."""
         self.delete(key)
+
+    # ------------------------------------------------ following a log
+    #
+    # A read replica follows a namespace's append logs: it
+    # reads what was appended since it last looked, never the whole log
+    # again. A cursor is opaque to it, except that it may move one back
+    # over bytes it could not parse yet (a frame still being written).
+
+    # True when a cursor stays valid across a fold deleting the log and new
+    # appends recreating it (S3: part numbers are never reused). Otherwise a
+    # follower restarts from the beginning after every fold.
+    log_cursors_survive_folds = False
+
+    def log_tail(self, key: str, cursor=None) -> tuple[list[tuple[object, bytes]], object, bool]:
+        """What was appended to log `key` after `cursor` (None: all of it):
+        (chunks, end, reset). `chunks` are (cursor past the chunk, its bytes)
+        in log order; `end` is the cursor past everything (also when nothing
+        is new); `reset` says the log was replaced or cut back since
+        `cursor` - the chunks then start at its beginning and may repeat
+        what was read before. Read-only: it never touches this store's write
+        bookkeeping. The default reads the whole log (cursor = byte offset)."""
+        data = self.get(key) or b""
+        off = int(cursor or 0)
+        if len(data) < off:
+            return ([(len(data), data)] if data else []), len(data), True
+        return ([(len(data), data[off:])] if len(data) > off else []), len(data), False
+
+    def log_cursor_back(self, cursor, nbytes: int):
+        """`cursor` (the end of a chunk) moved back over its last `nbytes`."""
+        return int(cursor) - int(nbytes)
 
 
 class LogWriter(ABC):
@@ -507,6 +543,35 @@ class LocalObjectStore(ObjectStore):
 
     def open_log(self, key: str) -> LocalLogWriter:
         return LocalLogWriter(self._path(key))
+
+    def log_tail(self, key: str, cursor=None) -> tuple[list[tuple[object, bytes]], object, bool]:
+        """A log is one file here; a cursor is (st_dev, st_ino, offset). A
+        fold deletes the file and the next append creates a new one: another
+        identity (or a shorter file) reads from its beginning, `reset`. An
+        inode number the filesystem reuses for the new file is not caught
+        here - a follower restarts after every fold anyway (the manifest
+        tells it: log_cursors_survive_folds is False). A missing file reads
+        as empty with no cursor: whatever is created next is new."""
+        _count_op("log_tail")
+        try:
+            f = open(self._path(key), "rb")
+        except FileNotFoundError:
+            return [], None, False
+        with f:
+            st = os.fstat(f.fileno())
+            off, reset = 0, False
+            if cursor is not None:
+                if (cursor[0], cursor[1]) == (st.st_dev, st.st_ino) and cursor[2] <= st.st_size:
+                    off = cursor[2]
+                else:
+                    reset = True
+            f.seek(off)
+            data = f.read()
+        end = (st.st_dev, st.st_ino, off + len(data))
+        return ([(end, data)] if data else []), end, reset
+
+    def log_cursor_back(self, cursor, nbytes: int):
+        return (cursor[0], cursor[1], cursor[2] - int(nbytes))
 
     def remove_prefix(self, prefix: str) -> int:
         # A prefix that names neither a directory nor a file has nothing under

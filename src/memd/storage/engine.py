@@ -30,6 +30,7 @@ import itertools
 import json
 import logging
 import os
+import secrets
 import shutil
 import socket
 import threading
@@ -42,8 +43,8 @@ from memd.core.schema import (MemoryRecord, now_ms, records_from_jsonl, records_
 from memd.metrics import METRICS
 from memd.index.sqlite_index import ImageAborted, NamespaceIndex
 from memd.storage.crypto import KeyCustodyError, KeyEnvelope, NullKeyEnvelope
-from memd.storage.objectstore import (LeaseLostError, LocalObjectStore, ObjectStore,
-                                      PreconditionFailed, tmp_is_foreign)
+from memd.storage.objectstore import (LeaseLostError, LocalObjectStore, ObjectStore,  # noqa: F401
+                                      PreconditionFailed, ReadOnlyError, tmp_is_foreign)
 
 _log = logging.getLogger(__name__)
 
@@ -800,6 +801,32 @@ def _cache_lineages(path: str) -> tuple[str, str] | None:
     return str(meta.get("lineage") or ""), str(meta.get("lineage_pending") or "")
 
 
+def _sweep_dead_replica_dirs(root: str) -> list[str]:
+    """Delete the replica caches (see memd.storage.replica) of engines that
+    are gone: each engine holds `<root>/<incarnation>.lock` exclusively for
+    as long as it lives, so a lock that can be taken is a dead one - its
+    directory (plaintext record text) goes, then the lock file. A
+    directory without a lock file is residue too. Returns what was deleted."""
+    gone = []
+    try:
+        names = os.listdir(root)
+    except FileNotFoundError:
+        return gone
+    for fn in names:
+        path = os.path.join(root, fn)
+        if fn.endswith(".lock"):
+            fd = _lock_cache(path, exclusive=True)
+            if fd is None or fd < 0:
+                continue          # alive (or no flock here: never guess)
+            shutil.rmtree(path[:-len(".lock")], ignore_errors=True)
+            _unlock_cache(fd, path)
+            gone.append(fn[:-len(".lock")])
+        elif os.path.isdir(path) and not os.path.exists(path + ".lock"):
+            shutil.rmtree(path, ignore_errors=True)
+            gone.append(fn)
+    return gone
+
+
 class NamespaceStore:
     """One namespace: WAL + segments + ops + derived index.
 
@@ -807,6 +834,11 @@ class NamespaceStore:
     """
 
     _PREVIEW = False  # a _MigrationPreview: plans, never writes, stays quiet
+    # a read replica (memd.storage.replica.ReplicaStore): no
+    # lease, no lineage, and every path below that writes or deletes an
+    # object refuses (_refuse_if_read_only) - beside the read-only store and
+    # key envelope a replica is handed, which refuse the same at the bottom
+    read_only = False
     # key custody (see _verify_key); class defaults for _MigrationPreview,
     # which never runs _open
     _key_ok = False
@@ -858,7 +890,7 @@ class NamespaceStore:
         self._took_over = False   # this open reclaimed a stale lease
         self._takeover_done = False  # ...and completed its fence + manifest claim
         self._lost = False        # a conditional write failed: ownership lost
-        if not os.environ.get("MEMD_ALLOW_MULTI_PROCESS"):
+        if not os.environ.get("MEMD_ALLOW_MULTI_PROCESS") and not self.read_only:
             leaser = getattr(store, "try_acquire_owner", None)
             if callable(leaser):
                 holder = (getattr(store, "lease_holder", None)
@@ -947,7 +979,8 @@ class NamespaceStore:
         # the logs as this open first read them (_open_blob)
         self._open_blobs: dict[str, bytes] = {}
         try:
-            if self.envelope.enabled and getattr(self.envelope, "prefetch_at_open", False):
+            if (self.envelope.enabled and getattr(self.envelope, "prefetch_at_open", False)
+                    and not self.read_only):
                 # a remote key provider resolves the data key BEFORE the
                 # manifest is touched: a namespace whose key is held elsewhere
                 # then fails here, cleanly, instead of mid-replay (and a new
@@ -1005,6 +1038,7 @@ class NamespaceStore:
         # holder's next number. Retried a bounded number of times; a holder
         # that keeps appending past its lease is refused (NamespaceBusyError),
         # and the aborted takeover is released as NOT clean (see __init__).
+        self._refuse_if_read_only("a takeover fence")
         for key in self._log_keys().values():
             for attempt in range(16):
                 try:
@@ -1020,6 +1054,13 @@ class NamespaceStore:
 
     def _log_keys(self) -> dict[str, str]:
         return {"wal": self.wal_key, "ops": self.ops_key, "audit": f"{self.prefix}/audit"}
+
+    def _refuse_if_read_only(self, what: str) -> None:
+        if self.read_only:
+            raise ReadOnlyError(
+                f"namespace {self.namespace!r} is open read-only (a read replica): {what} is "
+                "refused - a replica takes no lease and never writes or deletes an object. "
+                "Write through the namespace's writer")
 
     def _apply_log_floors(self) -> None:
         setf = getattr(self.store, "set_log_floor", None)
@@ -1156,6 +1197,7 @@ class NamespaceStore:
         import sqlite3 as _sq
         import tempfile as _tf
 
+        self._refuse_if_read_only("publishing an index snapshot")
         try:
             if self._closed:
                 return False
@@ -1537,6 +1579,7 @@ class NamespaceStore:
             self._manifest_ver = None
 
     def _claim_manifest(self) -> None:
+        self._refuse_if_read_only("a manifest claim")
         for attempt in range(5):
             try:
                 self._persist_manifest(fence=False)
@@ -1578,6 +1621,7 @@ class NamespaceStore:
         return lb(self.wal_key), lb(self.ops_key)
 
     def _drop_log(self, key: str, bound: int | None) -> None:
+        self._refuse_if_read_only("deleting a log")
         dl = getattr(self.store, "delete_log", None)
         if callable(dl):
             dl(key, bound)
@@ -1947,6 +1991,7 @@ class NamespaceStore:
     def _drop_snapshot(self, reason: str) -> None:
         """Unreference and delete the index snapshot (a replay replaces it),
         and the sidecar image published with it."""
+        self._refuse_if_read_only("dropping the index snapshot")
         with self._lock:
             name = self.manifest.snapshot_name
             vname = (self.manifest.vector_snapshot or {}).get("name", "")
@@ -1998,6 +2043,7 @@ class NamespaceStore:
         namespace's lock or lease holder collects (not with
         MEMD_ALLOW_MULTI_PROCESS). Each deletion is counted, logged and
         audited (temp files: counted and logged)."""
+        self._refuse_if_read_only("garbage collection")
         m = self.manifest
         if m.checkpoint_gen <= 0 or not (self._owner_path or self._owner_lease):
             return
@@ -2109,6 +2155,7 @@ class NamespaceStore:
         and deletes, and possibly the format-1 index, which open rebuilds
         because no format-2 open stamped it (see _open). The local index is
         rebuilt from the result, so every node serves the same state."""
+        self._refuse_if_read_only("a format migration")
         t0 = time.monotonic()
         m = self.manifest
         # a crashed earlier attempt may have left its report: this attempt
@@ -2581,6 +2628,7 @@ class NamespaceStore:
         return f"ns/{namespace}/migration-report.json"
 
     def _write_migration_report(self, report: dict) -> None:
+        self._refuse_if_read_only("writing a migration report")
         data = json.dumps(report, sort_keys=True).encode()
         if self.envelope.enabled:
             data = self.envelope.encrypt(self.namespace, data)
@@ -2702,7 +2750,9 @@ class NamespaceStore:
 
     def _load_checkpoints(self, applied: int = 0, where: str = "segment-load",
                           holders: dict[str, list[dict]] | None = None,
-                          unreadable: list[dict] | None = None
+                          unreadable: list[dict] | None = None,
+                          segments: list[dict] | None = None,
+                          missing: list[dict] | None = None,
                           ) -> tuple[dict[str, tuple[MemoryRecord, int]], list[dict], int]:
         """Segment state for a fold -> (versions, carried ops, max fold_seq).
 
@@ -2718,15 +2768,23 @@ class NamespaceStore:
         (quarantined in place) instead of replacing - deleting - it. That
         includes one that does not authenticate once the key in hand is
         proven to be this data's (see _verify_key): damage, or an object that
-        is not ours. Before that - a preview, which proves nothing - it
-        raises KeyCustodyError instead."""
+        before that - a preview, which proves nothing - it
+        raises KeyCustodyError instead.
+
+        `segments` replaces the manifest's list (a read replica loads the
+        ones it has not caught up on); `missing`, if given, collects a
+        referenced segment the store does not have - for the namespace's
+        writer that is damage (skipped), for a replica the sign that a fold
+        committed and deleted it meanwhile."""
         versions: dict[str, tuple[MemoryRecord, int]] = {}
         src_fold: dict[str, int] = {}  # newest segment wins, by fold_seq
         carried: list[dict] = []
         max_fold = 0
-        for seg in self.manifest.segments:
+        for seg in self.manifest.segments if segments is None else segments:
             data = self.store.get(f"{self.prefix}/{seg['name']}")
             if data is None:
+                if missing is not None:
+                    missing.append(seg)
                 continue
             fold = int(seg.get("fold_seq", 0))
             max_fold = max(max_fold, fold)
@@ -2909,6 +2967,7 @@ class NamespaceStore:
 
     def _write_segment(self, name: str, kept: list[MemoryRecord], fold_seq: int,
                        carried: list[dict] = (), before: dict[str, int] | None = None) -> bytes:
+        self._refuse_if_read_only("writing a segment")
         # stamped with the manifest generation it was written under: older
         # than the checkpoint that replaces it, never older than one a
         # writer committed before writing it (see _collect_segments)
@@ -3141,6 +3200,7 @@ class NamespaceStore:
 
         Stamps the data key's fingerprint (key_check) once the key in hand
         is proven to be this data's (see _verify_key)."""
+        self._refuse_if_read_only("a manifest commit")
         if self._lost:
             raise LeaseLostError(f"namespace {self.namespace!r}: ownership was lost")
         lb = getattr(self.store, "log_bound", None)
@@ -3200,6 +3260,7 @@ class NamespaceStore:
         rebuildable, so a crash between the index upsert and the fsync loses
         only bytes that were never acked.
         """
+        self._refuse_if_read_only("an append")
         if not records:
             return self.manifest.wal_size
         payload = records_to_jsonl(records)
@@ -3350,6 +3411,7 @@ class NamespaceStore:
         fsync'd append AND a separate index commit PER OP - O(n) round trips
         on the forget/destructive-sweep request path. Frame format is
         unchanged (one op per frame), so replay is identical."""
+        self._refuse_if_read_only("appending an op")
         if not ops:
             return
         # hygiene: a self-supersede is inert everywhere - refuse to persist it
@@ -3431,6 +3493,8 @@ class NamespaceStore:
     def _cut_ops_back(self, size: int) -> None:
         """Best effort: truncate the ops log to `size` if a failed append
         grew it (open repairs whatever this cannot)."""
+        if self.read_only:
+            return
         try:
             if self.store.size(self.ops_key) > size:
                 self.store.truncate(self.ops_key, size)
@@ -3456,6 +3520,7 @@ class NamespaceStore:
         persisted BEFORE the wal/ops logs are deleted. A crash between the
         two leaves stale logs (replayed idempotently on open) instead of an
         orphaned segment and lost data."""
+        self._refuse_if_read_only("a rotate")
         with self._lock:
             self._ensure_open()
             self._seal_wal_writer_locked()
@@ -3484,6 +3549,7 @@ class NamespaceStore:
         refuses until the frame is repaired. Returns the new segment's name,
         or "" when nothing was folded. A closed store and a lost lease still
         raise: those are not maintenance failures."""
+        self._refuse_if_read_only("a rotate")
         with self._lock:
             self._ensure_open()
             if time.monotonic() < self._maint_retry_at:
@@ -3502,6 +3568,7 @@ class NamespaceStore:
         """compact() as maintenance (a hard delete's purge deadline, off the
         request path): None while a failed fold's backoff runs; one that
         raises is surfaced (_maintenance_failed) and re-raised."""
+        self._refuse_if_read_only("a compaction")
         with self._lock:
             if time.monotonic() < self._maint_retry_at:
                 return None
@@ -3669,6 +3736,7 @@ class NamespaceStore:
         leaves the old segments in place (harmless: replay is idempotent and
         the next compaction reclaims them) instead of a manifest that points
         at deleted files."""
+        self._refuse_if_read_only("a compaction")
         t0 = time.monotonic()
         rep = CompactionReport(duration_ms=0)
         with self._lock:
@@ -3940,6 +4008,9 @@ class NamespaceStore:
         return True
 
     def rebuild_index(self) -> int:
+        # a replica rebuilds itself from durable data whenever it must (see
+        # memd.storage.replica): it is not rebuilt in place on request
+        self._refuse_if_read_only("rebuild_index")
         # lock: same completeness requirement as export - a concurrent
         # rotate/compact must not delete segments mid-replay, and concurrent
         # searches must never observe a wiped (partial) index
@@ -4177,6 +4248,11 @@ class StorageEngine:
         lexical: dict | None = None,
         vector_index: dict | None = None,
         cache_sweep_s: float | None = None,
+        read_only: bool = False,
+        replica_refresh_s: float | None = None,
+        max_replicas: int | None = None,
+        replica_idle_s: float | None = None,
+        replica_max_staleness_s: float | None = None,
     ):
         self.root = root
         # {"backend": "fts5"|"tantivy", "commit_ms", "commit_docs"}
@@ -4229,7 +4305,41 @@ class StorageEngine:
         self.cache_sweep_s = float(cache_sweep_s)
         self._sweep_stop = threading.Event()
         self._sweeper: threading.Thread | None = None
-        if self.cache_sweep_s > 0 and callable(getattr(self.store, "try_acquire_owner", None)):
+        # Read replicas (memd.storage.replica): namespaces this
+        # engine follows WITHOUT their lease, in a table of their own (LRU,
+        # max_replicas), refreshed every replica_refresh_s by one thread, and
+        # closed - their caches deleted - once unread for replica_idle_s. A
+        # read-only engine (Memory(read_only=True)) opens EVERY namespace
+        # that way and writes nothing at all.
+        self.read_only = bool(read_only)
+
+        def _env(name, default):
+            v = os.environ.get(name)
+            return float(v) if v not in (None, "") else default
+
+        self.replica_refresh_s = float(replica_refresh_s if replica_refresh_s is not None
+                                       else _env("MEMD_REPLICA_REFRESH_S", 2.0))
+        self.max_replicas = max(1, int(max_replicas if max_replicas is not None
+                                       else _env("MEMD_MAX_REPLICAS", 64)))
+        self.replica_idle_s = float(replica_idle_s if replica_idle_s is not None
+                                    else _env("MEMD_REPLICA_IDLE_S", 300.0))
+        if replica_max_staleness_s is None:
+            ms = _env("MEMD_REPLICA_MAX_STALENESS_MS", None)
+            replica_max_staleness_s = ms / 1000.0 if ms is not None else 3 * max(self.replica_refresh_s, 0.5)
+        self.replica_max_staleness_s = float(replica_max_staleness_s)
+        self._replicas: "OrderedDict[str, object]" = OrderedDict()
+        self._replica_opening: dict[str, list] = {}
+        self._replica_path: str | None = None
+        self._replica_lock_fd: int | None = None
+        self._replica_lock_path: str | None = None
+        self._replica_stop = threading.Event()
+        self._refresher: threading.Thread | None = None
+        self.replica_refresh_workers = 8
+        # replica_hook(ns, store, records): a replica was opened (records
+        # None) or applied records (the Memory facade derives their vectors)
+        self.replica_hook = None
+        if (self.cache_sweep_s > 0 and not self.read_only
+                and callable(getattr(self.store, "try_acquire_owner", None))):
             self._sweeper = threading.Thread(target=self._sweep_loop, name="memd-cache-sweep",
                                              daemon=True)
             self._sweeper.start()
@@ -4401,6 +4511,8 @@ class StorageEngine:
 
     def namespace(self, ns: str) -> NamespaceStore:
         ns = _validate_ns(ns)
+        if self.read_only:
+            return self.replica(ns)
         evicted: list[tuple[str, NamespaceStore, list]] = []
         opened = False
         stale = None
@@ -4460,6 +4572,13 @@ class StorageEngine:
         # outside the engine lock: the hook takes its own
         for name, ev in notes + [(ns, ev) for ev in collected]:
             self._audit(name, ev["action"], ev["target"], ev)
+        if opened:
+            # this node now writes the namespace: its replica of it (if any)
+            # is redundant - and the leader serves every read better
+            with self._lock:
+                rep = self._replicas.pop(ns, None)
+            if rep is not None:
+                self._close_replica(rep)
         if opened and self.open_hook is not None:
             try:
                 self.open_hook(ns, nstore)
@@ -4490,6 +4609,8 @@ class StorageEngine:
         the work is dropped - the vector lane heals via reembed(), records
         were shredded on purpose."""
         ns = _validate_ns(ns)
+        if self.read_only:
+            return self.peek_replica(ns)
         with self._lock:
             nstore = self._namespaces.get(ns)
             if nstore is not None:
@@ -4498,16 +4619,17 @@ class StorageEngine:
 
     def open_namespaces(self) -> list[str]:
         """Namespaces open in this process right now (for a cluster node:
-        the ones whose writer lease it holds)."""
+        the ones whose writer lease it holds; for a read-only engine: its
+        replicas)."""
         with self._lock:
-            return list(self._namespaces)
+            return list(self._replicas if self.read_only else self._namespaces)
 
     def stop_waiting(self) -> None:
         """A close is coming: every open namespace's purge scrub stops
         waiting for readers of its index (NamespaceIndex.stop_waiting), so
         maintenance in flight can finish before the close."""
         with self._lock:
-            stores = list(self._namespaces.values())
+            stores = list(self._namespaces.values()) + list(self._replicas.values())
         for nstore in stores:
             nstore.index.stop_waiting()
 
@@ -4625,6 +4747,8 @@ class StorageEngine:
         shredded data). The namespace is marked closed FIRST so in-flight
         operations fail cleanly instead of hitting torn state."""
         ns = _validate_ns(ns)
+        if self.read_only:
+            raise ReadOnlyError(f"namespace {ns!r}: a read-only engine never destroys a namespace")
         with self._ns_open_lock(ns):  # an open in flight completes first
             return self._destroy_namespace(ns)
 
@@ -4668,6 +4792,7 @@ class StorageEngine:
         self._sweep_stop.set()
         if self._sweeper is not None and self._sweeper is not threading.current_thread():
             self._sweeper.join(timeout=10.0)
+        self._close_replicas()
         # opens in flight finish (and land in the table) before it is closed
         with self._lock:
             opening = [ent[0] for ent in self._opening.values()]
@@ -4698,6 +4823,227 @@ class StorageEngine:
         ann_usearch.settle_all()
         for name, d in notes:  # outside the engine lock, as at open
             self._audit(name, d["action"], d["target"], d)
+
+    # ------------------------------------------------------------ read replicas
+
+    @contextlib.contextmanager
+    def _replica_open_lock(self, ns: str):
+        with self._lock:
+            ent = self._replica_opening.setdefault(ns, [threading.Lock(), 0])
+            ent[1] += 1
+        try:
+            with ent[0]:
+                yield
+        finally:
+            with self._lock:
+                ent[1] -= 1
+                if ent[1] == 0 and self._replica_opening.get(ns) is ent:
+                    del self._replica_opening[ns]
+
+    def _replica_dir(self) -> str:
+        """This engine's replica cache directory, created (and dead engines'
+        swept) on first use: `<cache_dir>/replicas/<pid>-<token>/`, held by
+        an exclusive flock on `<...>.lock` for the engine's life."""
+        with self._lock:
+            if self._replica_path is not None:
+                return self._replica_path
+            root = os.path.join(self.cache_dir, "replicas")
+            os.makedirs(root, exist_ok=True)
+            for dead in _sweep_dead_replica_dirs(root):
+                _log.info("deleted the replica caches %s left by an engine that is gone", dead)
+            inc = f"{os.getpid()}-{secrets.token_hex(4)}"
+            lock_path = os.path.join(root, inc + ".lock")
+            fd = _lock_cache(lock_path, exclusive=True)
+            path = os.path.join(root, inc)
+            os.makedirs(path, exist_ok=True)
+            self._replica_path, self._replica_lock_fd, self._replica_lock_path = path, fd, lock_path
+            return path
+
+    def replica(self, ns: str):
+        """The read replica of `ns` (memd.storage.replica.ReplicaStore),
+        opened - bootstrapped from the bucket - if this engine has none."""
+        from memd.storage.replica import ReplicaStore
+
+        ns = _validate_ns(ns)
+        with self._lock:
+            rep = self._replicas.get(ns)
+            if rep is not None and not rep._closed:
+                self._replicas.move_to_end(ns)
+                rep.touch()
+                return rep
+        with self._replica_open_lock(ns):
+            with self._lock:
+                rep = self._replicas.get(ns)
+                if rep is not None and not rep._closed:
+                    self._replicas.move_to_end(ns)
+                    rep.touch()
+                    return rep
+                if self._replica_stop.is_set():
+                    raise RuntimeError("the storage engine is closed")
+            d = self._replica_dir()
+            try:
+                rep = ReplicaStore(ns, self.store, d, self.envelope, lexical=self.lexical,
+                                   vector_index=self.vector_index, on_applied=self._replica_applied)
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    _drop_cache_files(d, ns)
+                raise
+            with self._lock:
+                self._replicas[ns] = rep
+                victims = []
+                while len(self._replicas) > self.max_replicas:
+                    name = next((n for n in self._replicas if n not in self._pinned and n != ns), None)
+                    if name is None:
+                        break
+                    victims.append(self._replicas.pop(name))
+            for v in victims:
+                METRICS.inc("memd_replica_evictions_total",
+                            help="replicas closed (their caches deleted) by the LRU cap or idleness",
+                            reason="lru")
+                self._close_replica(v)
+            METRICS.set_gauge("memd_replicas_open", float(len(self._replicas)),
+                              help="read replicas open in this process")
+            self._start_refresher()
+        if self.replica_hook is not None:
+            try:
+                self.replica_hook(ns, rep, None)
+            except Exception:  # noqa: BLE001 - a hook never fails an open
+                METRICS.inc("memd_replica_hook_failures_total", ns=ns)
+        return rep
+
+    def peek_replica(self, ns: str):
+        """The open replica of `ns`, or None - never opens one."""
+        ns = _validate_ns(ns)
+        with self._lock:
+            rep = self._replicas.get(ns)
+            return rep if rep is not None and not rep._closed else None
+
+    def open_replicas(self) -> list[str]:
+        with self._lock:
+            return list(self._replicas)
+
+    def holds(self, ns: str) -> bool:
+        """`ns` is open here as its writer, with its lease (not fenced)."""
+        with self._lock:
+            nstore = self._namespaces.get(ns)
+        return (nstore is not None and not nstore._closed and not nstore._lost
+                and not nstore.lease_lost())
+
+    def reader(self, ns: str, max_staleness_s: float | None = None, *, wrap_errors: bool = True):
+        """Where an EVENTUALLY consistent read of `ns` is served -> (store,
+        info): the namespace's writer store when it is open here (always the
+        freshest), else this engine's replica of it, refreshed first if it
+        is staler than `max_staleness_s` (default replica_max_staleness_s).
+        info: {"served_by", "applied_seq", "age_ms"}. A replica that cannot
+        serve it raises ReplicaUnavailableError (`wrap_errors`: whatever
+        stopped it - key custody, a store error - is wrapped in one, so a
+        router can send the read to the writer instead)."""
+        from memd.storage.replica import ReplicaUnavailableError
+
+        ns = _validate_ns(ns)
+        if not self.read_only and self.holds(ns):
+            nstore = self.peek_namespace(ns)
+            if nstore is not None:
+                return nstore, {"served_by": "leader", "applied_seq": nstore.manifest.seq, "age_ms": 0}
+        bound = self.replica_max_staleness_s if max_staleness_s is None else max(0.0, max_staleness_s)
+        try:
+            rep = self.replica(ns)
+            rep.ensure_fresh(bound)
+        except ReplicaUnavailableError:
+            raise
+        except Exception as ex:
+            if not wrap_errors:
+                raise
+            raise ReplicaUnavailableError(
+                f"namespace {ns!r}: no replica ({type(ex).__name__}: {ex})") from ex
+        age = rep.age_s()
+        return rep, {"served_by": "replica", "applied_seq": rep.applied_seq,
+                     "age_ms": int((age or 0.0) * 1000)}
+
+    def _replica_applied(self, ns: str, rep, records) -> None:
+        hook = self.replica_hook
+        if hook is not None:
+            hook(ns, rep, records)
+
+    def _close_replica(self, rep) -> None:
+        try:
+            rep.close()
+        except Exception as ex:  # noqa: BLE001 - closing never fails the caller
+            METRICS.inc("memd_replica_close_errors_total", help="errors closing a read replica")
+            _log.warning("namespace %s: closing the replica failed (%s)", rep.namespace, ex)
+
+    def _start_refresher(self) -> None:
+        with self._lock:
+            if self._refresher is not None or self.replica_refresh_s <= 0 or self._replica_stop.is_set():
+                return
+            self._refresher = threading.Thread(target=self._refresh_loop, name="memd-replica-refresh",
+                                               daemon=True)
+            self._refresher.start()
+
+    def _refresh_loop(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        pool = ThreadPoolExecutor(max_workers=self.replica_refresh_workers,
+                                  thread_name_prefix="memd-replica")
+        try:
+            while not self._replica_stop.is_set():
+                t0 = time.monotonic()
+                try:
+                    self._refresh_round(pool)
+                except Exception as ex:  # noqa: BLE001 - the next round retries
+                    METRICS.inc("memd_replica_round_failures_total",
+                                help="replica refresh rounds that raised", detail=type(ex).__name__)
+                # every replica_refresh_s from round start to round start
+                # (the staleness bound); a round that overran starts the next
+                # one at once, but never busy-loops
+                left = self.replica_refresh_s - (time.monotonic() - t0)
+                if self._replica_stop.wait(max(left, 0.01)):
+                    return
+        finally:
+            pool.shutdown(wait=True)
+
+    def _refresh_round(self, pool) -> None:
+        now = time.monotonic()
+        idle = []
+        with self._lock:
+            reps = list(self._replicas.items())
+            for name, rep in reps:
+                if name not in self._pinned and now - rep.last_read > self.replica_idle_s:
+                    if self._replicas.get(name) is rep:
+                        del self._replicas[name]
+                    idle.append(rep)
+        for rep in idle:
+            METRICS.inc("memd_replica_evictions_total", reason="idle")
+            self._close_replica(rep)
+        live = [rep for _name, rep in reps if rep not in idle]
+        for fut in [pool.submit(self._refresh_replica, rep) for rep in live]:
+            fut.result()
+
+    def _refresh_replica(self, rep) -> None:
+        if rep._closed:
+            return
+        try:
+            rep.refresh()
+        except Exception as ex:  # noqa: BLE001 - recorded on the replica; reads see its age
+            if not rep._closed and (rep.failures in (1, 10, 100) or rep.failures % 1000 == 0):
+                _log.warning("namespace %s: replica refresh failed (%d in a row): %s",
+                             rep.namespace, rep.failures, ex)
+
+    def _close_replicas(self) -> None:
+        self._replica_stop.set()
+        t = self._refresher
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=30.0)
+        with self._lock:
+            reps = list(self._replicas.values())
+            self._replicas.clear()
+            path, fd, lock_path = self._replica_path, self._replica_lock_fd, self._replica_lock_path
+            self._replica_path = self._replica_lock_fd = self._replica_lock_path = None
+        for rep in reps:
+            self._close_replica(rep)
+        if path is not None:
+            shutil.rmtree(path, ignore_errors=True)
+            _unlock_cache(fd, lock_path)
 
     def migration_report(self) -> dict:
         """What the format-1 upgrade did - or, for a namespace not migrated

@@ -12,6 +12,7 @@ evidence packing as an experimental opt-in).
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -52,12 +53,20 @@ from memd.query.rerank import (
 from memd.storage.audit import AuditLog, BufferedAuditLog
 from memd.storage.crypto import envelope_from_config
 from memd.storage.engine import StorageEngine
-from memd.storage.objectstore import LocalObjectStore, count_io
+from memd.storage.objectstore import LocalObjectStore, ReadOnlyError, count_io
 
 _log = logging.getLogger(__name__)
 
 DEFAULT_BUDGET_TOKENS = 2000
 HARD_DELETE_PURGE_MS = 72 * 3600 * 1000  # default physical-purge window for hard deletes
+# the embed worker's / maintenance jobs' name for a namespace's READ REPLICA
+# in a writer process (a cluster node serves both): "#" is never in a name
+_REPLICA_TAG = "#replica"
+
+
+def _opt_float(cfg: dict, key: str) -> float | None:
+    v = cfg.get(key)
+    return None if v is None or v == "" else float(v)
 
 
 @dataclass
@@ -87,6 +96,11 @@ class SearchResult:
     # the reranker actually ran for THIS call (not a cache hit, not a
     # fallback): hosted mode meters reranked searches on it
     reranked: bool = False
+    # who served it: "leader" - the namespace's writer - or
+    # "replica", with the seq it had applied and its age (ms) at the read
+    served_by: str = "leader"
+    replica_seq: int | None = None
+    replica_age_ms: int | None = None
 
 
 @dataclass
@@ -594,7 +608,13 @@ class Memory:
         config: dict[str, Any] | None = None,
         encrypt: bool = True,
         transport: Any = None,
+        read_only: bool = False,
     ):
+        """`read_only` (or config `read_only`): open every namespace as a
+        READ REPLICA - no lease, nothing written or deleted
+        in the store or the keys, every mutating call refused with
+        ReadOnlyError; reads follow the namespace's writer within
+        `replica_refresh_s` (default 2 s)."""
         cfg = dict(config or {})
         if api_key:
             from memd.sdk.client import HostedMemory
@@ -634,6 +654,8 @@ class Memory:
             path = str(cfg.get("local_dir")
                        or os.environ.get("MEMD_LOCAL_DIR")
                        or os.path.join(".memd-local", bucket, s3_prefix or "_"))
+        read_only = bool(read_only or cfg.get("read_only"))
+        self.read_only = read_only
         os.makedirs(path, exist_ok=True)
         remote = store is not None
         if store is None:
@@ -645,7 +667,7 @@ class Memory:
         # encryption off, the keys directory - and the store's wrapped keys -
         # still tell an open that a namespace was written with it on: see
         # NamespaceStore._verify_key)
-        envelope = envelope_from_config(cfg, path, store, encrypt=encrypt)
+        envelope = envelope_from_config(cfg, path, store, encrypt=encrypt, read_only=read_only)
         # resolved before any namespace opens: the accelerators attach at open
         self.lexical_backend = resolve_lexical_backend(cfg)
         self.vector_index = resolve_vector_index(cfg)
@@ -658,7 +680,14 @@ class Memory:
                                         "commit_docs": int(cfg.get("lexical_commit_docs", DEFAULT_COMMIT_DOCS)),
                                     },
                                     vector_index=vector_index_config(cfg, self.vector_index),
-                                    cache_sweep_s=cfg.get("cache_sweep_s"))
+                                    cache_sweep_s=cfg.get("cache_sweep_s"),
+                                    read_only=read_only,
+                                    replica_refresh_s=_opt_float(cfg, "replica_refresh_s"),
+                                    max_replicas=cfg.get("max_replicas"),
+                                    replica_idle_s=_opt_float(cfg, "replica_idle_s"),
+                                    replica_max_staleness_s=(
+                                        None if cfg.get("replica_max_staleness_ms") is None
+                                        else float(cfg["replica_max_staleness_ms"]) / 1000.0))
         self.namespace_name = namespace
         # Audit ledgers are PER NAMESPACE. They are held in an LRU keyed by
         # namespace (mirroring the engine's namespace table) and routed by the
@@ -679,6 +708,7 @@ class Memory:
         self._shredded: "OrderedDict[str, None]" = OrderedDict()
         self.engine.audit_hook = self._audit_engine_event
         self.engine.close_hook = self._namespace_closing
+        self.engine.replica_hook = self._replica_event
         self.ns = self.engine.namespace(namespace)
         # the facade holds a direct reference to this store for its lifetime:
         # pin it so LRU churn of other namespaces can't close it underneath us
@@ -774,6 +804,7 @@ class Memory:
                             agent_id=agent_id, org_id=org_id, role=role, kind=kind,
                             source=source, actor_id=actor_id, t_event=t_event,
                             meta=meta, namespace=namespace)
+        self._writable("add")
         _guard_input(content, meta)
         _guard_kind(kind)
         ns = self._ns_for(namespace)
@@ -826,6 +857,7 @@ class Memory:
         impl = self._hosted()
         if impl is not None:
             return impl.add_events(events, namespace=namespace)
+        self._writable("add_events")
         ns = self._ns_for(namespace)
         if len(events) > MAX_BATCH_EVENTS:
             raise ValueError(f"batch exceeds {MAX_BATCH_EVENTS} events; split the call")
@@ -907,6 +939,7 @@ class Memory:
                                  agent_id=agent_id, org_id=org_id, source=source,
                                  actor_id=actor_id, t_event=t_event,
                                  valid_from=valid_from, namespace=namespace)
+        self._writable("remember")
         _guard_input(content, None)
         _guard_kind(kind)
         ns = self._ns_for(namespace)
@@ -994,6 +1027,7 @@ class Memory:
             return impl.observe(messages, response, user_id=user_id,
                                 session_id=session_id, agent_id=agent_id,
                                 org_id=org_id, namespace=namespace)
+        self._writable("observe")
         events = []
         for m in messages:
             if isinstance(m, dict) and m.get("content"):
@@ -1033,6 +1067,8 @@ class Memory:
         O(1) amortized; bounded by `audit_max_open` open ledgers (LRU, the
         facade default is pinned).
         """
+        if self.read_only:
+            return _NullAuditLog()   # a replica writes no object - the ledger is the writer's
         with self._audit_lock:
             if ns_name in self._shredded:
                 return _NullAuditLog()   # never resurrect a shredded namespace
@@ -1115,10 +1151,19 @@ class Memory:
         include_quarantined: bool = False,
         namespace: str | None = None,
         rerank: bool = True,
+        consistency: str | None = None,
+        max_staleness_ms: int | None = None,
     ) -> SearchResult:
         """`rerank=False` skips the reranker for this call (hosted mode: the
         org's reranked-search quota is spent); the result is the unreranked
-        order, counted as a fallback with reason "quota" and not cached."""
+        order, counted as a fallback with reason "quota" and not cached.
+
+        `consistency="eventual"` accepts a read replica: the
+        namespace's writer when it is open here, else this process's
+        replica of it, no staler than `max_staleness_ms` (default
+        replica_max_staleness_ms); the result says which (`served_by`,
+        `replica_seq`, `replica_age_ms`). "strong" (the default; a read-only
+        Memory is always eventual) reads the writer."""
         if len(query) > MAX_QUERY_CHARS:
             raise ValueError(f"query exceeds {MAX_QUERY_CHARS} char cap")
         impl = self._hosted()
@@ -1127,9 +1172,19 @@ class Memory:
                                agent_id=agent_id, org_id=org_id,
                                budget_tokens=budget_tokens, as_of=as_of,
                                kinds=kinds, include_quarantined=include_quarantined,
-                               namespace=namespace)
+                               namespace=namespace, consistency=consistency,
+                               max_staleness_ms=max_staleness_ms)
         t0 = time.monotonic()
-        ns_idx = self._ns_for(namespace)
+        ns_idx, info = self._reader(namespace, consistency, max_staleness_ms)
+        with self._serving(ns_idx):
+            return self._search(ns_idx, info, t0, query, user_id=user_id, session_id=session_id,
+                                agent_id=agent_id, org_id=org_id, budget_tokens=budget_tokens,
+                                as_of=as_of, kinds=kinds,
+                                include_quarantined=include_quarantined, rerank=rerank)
+
+    def _search(self, ns_idx, info: dict | None, t0: float, query: str, *, user_id, session_id,
+                agent_id, org_id, budget_tokens, as_of, kinds, include_quarantined,
+                rerank) -> SearchResult:
         ns_name = ns_idx.namespace
         cache_key = (
             ns_name, query,
@@ -1140,6 +1195,9 @@ class Memory:
             # must not outlive the load - nor one served while the lane skips
             # queries because the ANN sidecar is still loading or rebuilding
             self.embedder.ready(), ns_idx.index.vector_lane_degraded(),
+            # a replica's results never stand in for the writer's, and go
+            # stale with every refresh that changed what it serves
+            (info or {}).get("served_by", "leader"), getattr(ns_idx, "data_epoch", 0),
         )
         cached = self._qcache.get(cache_key)
         if cached is not None:
@@ -1153,7 +1211,8 @@ class Memory:
             # subsequent hit - so a caller (and bench/slo_bench.py, which
             # grades the retrieval SLO from this field) read a stale number
             # that described neither the hit nor a fresh query.
-            return _dc_replace(cached, latency_ms=round(hit_ms, 3), reranked=False)
+            return _dc_replace(cached, latency_ms=round(hit_ms, 3), reranked=False,
+                               **self._info_fields(info))
         METRICS.inc("memd_search_cache_misses_total")
         # entered/exited explicitly rather than via `with`, because the tally
         # must close AFTER the latency observation below. count_io()'s reset
@@ -1161,7 +1220,7 @@ class Memory:
         # exception leaves at most an orphan dict that the next search replaces.
         io_ctx = count_io()
         io_tally = io_ctx.__enter__()
-        ns = self._ns_for(namespace)
+        ns = ns_idx
         scope = Scope(org=org_id, agent=agent_id, user=user_id, session=session_id)
         _st0 = time.monotonic()
         plan = plan_query(query)
@@ -1270,8 +1329,18 @@ class Memory:
         for lane, hits in lane_hits.items():
             METRICS.observe("memd_lane_candidates", len(hits), help="candidates per lane per search",
                             buckets=(0, 1, 5, 10, 25, 50, 100), ns=ns.namespace, lane=lane)
-        self._audit_for(ns.namespace).append(actor="search", action="search",
-                          target=self._audit_target_for_query(query), detail={"hits": len(items)})
+        if info is not None and info.get("served_by") == "replica":
+            # a replica cannot append to the namespace's ledger (the writer's
+            # object): a writer process audits the read in its own ledger
+            # (a cluster node's memd-node.<id>), naming the namespace
+            if not self.read_only:
+                self.audit.append(actor="search", action="replica_search",
+                                  target=self._audit_target_for_query(query),
+                                  detail={"namespace": ns.namespace, "hits": len(items),
+                                          "applied_seq": info.get("applied_seq")})
+        else:
+            self._audit_for(ns.namespace).append(actor="search", action="search",
+                              target=self._audit_target_for_query(query), detail={"hits": len(items)})
         # measured LAST: the audit append is real per-request work and used to
         # sit outside the timer, so p99 under-reported every search
         latency = (time.monotonic() - t0) * 1000
@@ -1294,6 +1363,7 @@ class Memory:
             query_class=plan.qclass,
             latency_ms=round(latency, 3),
             reranked=rerank_order is not None,
+            **self._info_fields(info),
         )
         if not degraded:
             # a result served while the reranker was failing must not
@@ -1389,31 +1459,93 @@ class Memory:
         return out
 
     def get(self, record_id: str, *, history: bool = False, include_deleted: bool = False,
-            namespace: str | None = None) -> dict | None:
+            namespace: str | None = None, consistency: str | None = None,
+            max_staleness_ms: int | None = None, read_info: dict | None = None) -> dict | None:
         """One record, or None. history=True adds its supersedence chain.
         A deleted record - and a deleted version in a chain - is served only
         with include_deleted (an administrative read: `history` used to serve
-        soft-deleted content until compaction purged it)."""
+        soft-deleted content until compaction purged it).
+
+        `consistency` / `max_staleness_ms` as for search(); `read_info`, if
+        a dict, is filled with who served the read: {"served_by",
+        "applied_seq", "age_ms"}."""
         impl = self._hosted()
         if impl is not None:
-            return impl.get(record_id, history=history, include_deleted=include_deleted,
-                            namespace=namespace)
-        ns = self._ns_for(namespace)
-        rec = ns.index.get_by_id(record_id, include_deleted=True)
-        if rec is None or (rec.deleted and not include_deleted):
-            return None
-        d = rec.to_dict()
-        if history:
-            d["history"] = [h.to_dict() for h in ns.index.history(record_id)
-                            if include_deleted or not h.deleted]
-        return d
+            got = impl.get(record_id, history=history, include_deleted=include_deleted,
+                           namespace=namespace, consistency=consistency,
+                           max_staleness_ms=max_staleness_ms)
+            if read_info is not None:
+                read_info.update(impl.last_read or {"served_by": "leader"})
+            return got
+        ns, info = self._reader(namespace, consistency, max_staleness_ms)
+        if read_info is not None:
+            read_info.update(info or {"served_by": "leader"})
+        with self._serving(ns):
+            rec = ns.index.get_by_id(record_id, include_deleted=True)
+            if rec is None or (rec.deleted and not include_deleted):
+                return None
+            d = rec.to_dict()
+            if history:
+                d["history"] = [h.to_dict() for h in ns.index.history(record_id)
+                                if include_deleted or not h.deleted]
+            return d
+
+    # ------------------------------------------------------------ read replicas
+
+    def _reader(self, namespace: str | None, consistency: str | None,
+                max_staleness_ms: int | None):
+        """(store, info) a read is served from - see search()."""
+        c = consistency or ("eventual" if self.read_only else "strong")
+        if c not in ("strong", "eventual"):
+            raise ValueError(f"consistency must be 'strong' or 'eventual', got {c!r}")
+        if c == "strong":
+            if self.read_only:
+                raise ReadOnlyError("a read-only Memory (a read replica) serves eventual reads only")
+            return self._ns_for(namespace), None
+        bound = None if max_staleness_ms is None else max(0.0, float(max_staleness_ms) / 1000.0)
+        return self.engine.reader(namespace or self.namespace_name, bound,
+                                  wrap_errors=not self.read_only)
+
+    @staticmethod
+    def _serving(store):
+        """Hold while reading a store's index: a replica's rebuild swaps it."""
+        reading = getattr(store, "reading", None)
+        return reading() if callable(reading) else contextlib.nullcontext()
+
+    @staticmethod
+    def _info_fields(info: dict | None) -> dict:
+        if not info or info.get("served_by") != "replica":
+            return {"served_by": "leader", "replica_seq": None, "replica_age_ms": None}
+        return {"served_by": "replica", "replica_seq": info.get("applied_seq"),
+                "replica_age_ms": info.get("age_ms")}
+
+    def _writable(self, what: str) -> None:
+        if self.read_only:
+            raise ReadOnlyError(f"{what}: this Memory is read-only (a read replica) "
+                                "- write through the namespace's writer")
+
+    def _replica_event(self, ns_name: str, store, records) -> None:
+        """StorageEngine.replica_hook: a replica opened (records None) or
+        applied records - their vectors are derived here, locally (vectors
+        are derived state, never logged)."""
+        if not getattr(self, "fuse_vector", False) or getattr(self, "_embed_worker", None) is None:
+            return
+        tag = ns_name if self.read_only else ns_name + _REPLICA_TAG
+        if records is None:
+            self._report_vector_health(store)
+            return
+        for rec in records:
+            if not rec.deleted and not rec.meta.get("quarantined"):
+                self._embed_worker.submit(tag, rec.id, rec.content)
 
     # ------------------------------------------------------------------ lifecycle
 
     def session_raw_count(self, session_id: str, *, user_id: str | None = None,
                           namespace: str | None = None) -> int:
         """How many raw records close_session() would hand the extractor."""
-        return self._ns_for(namespace).index.count_session_raw(session_id, user_id=user_id)
+        ns = self._ns_for(namespace)
+        with self._serving(ns):
+            return ns.index.count_session_raw(session_id, user_id=user_id)
 
     def close_session(
         self,
@@ -1438,6 +1570,7 @@ class Memory:
         impl = self._hosted()
         if impl is not None:
             return impl.close_session(session_id, user_id=user_id, namespace=namespace)
+        self._writable("close_session")
         ns = self._ns_for(namespace)
         self._embed_worker.drain(timeout_s=60)
         # durable boundary: commit index + audit before folding the segment
@@ -1615,6 +1748,7 @@ class Memory:
         impl = self._hosted()
         if impl is not None:
             return impl.delete(record_id, hard=hard, namespace=namespace)
+        self._writable("delete")
         ns = self._ns_for(namespace)
         ns.append_op({"op": "tombstone", "id": record_id, "at": now_ms()})
         ok = ns.index.tombstone(record_id, now_ms())
@@ -1649,6 +1783,7 @@ class Memory:
             # hosted door has no batch endpoint yet: keep correctness, accept
             # the per-id cost server-side
             return sum(1 for rid in record_ids if impl.delete(rid, hard=hard, namespace=namespace))
+        self._writable("delete_many")
         ids = [rid for rid in record_ids if rid]
         if not ids:
             return 0
@@ -1686,6 +1821,12 @@ class Memory:
     def _run_maintenance(self, job: str) -> bool:
         if job.startswith("reembed:"):
             ns_name = job.split(":", 1)[1]
+            if ns_name.endswith(_REPLICA_TAG):
+                store = self.engine.peek_replica(ns_name[:-len(_REPLICA_TAG)])
+                if store is None:
+                    return False
+                self._reembed_store(store)
+                return True
             if self.engine.peek_namespace(ns_name) is None:
                 return False
             self.reembed(namespace=ns_name)
@@ -1712,7 +1853,8 @@ class Memory:
         if missing and self._vector_selfheal:
             # heal on the maintenance thread, never at open time on the
             # caller's path (that is the pass-17 lesson)
-            self._maint.submit(f"reembed:{ns.namespace}")
+            tag = _REPLICA_TAG if getattr(ns, "read_only", False) and not self.read_only else ""
+            self._maint.submit(f"reembed:{ns.namespace}{tag}")
         return missing
 
     def _run_due_purge(self, ns_name: str) -> bool:
@@ -1759,6 +1901,12 @@ class Memory:
         if len(query) > MAX_QUERY_CHARS:
             raise ValueError(f"query exceeds {MAX_QUERY_CHARS} char cap")
         ns = self._ns_for(namespace)
+        with self._serving(ns):
+            return self._find_ids(ns, query, user_id=user_id, session_id=session_id,
+                                  agent_id=agent_id, org_id=org_id, as_of=as_of, kinds=kinds)
+
+    def _find_ids(self, ns, query: str, *, user_id, session_id, agent_id, org_id, as_of,
+                  kinds) -> list[str]:
         scope = Scope(org=org_id, agent=agent_id, user=user_id, session=session_id)
         _st0 = time.monotonic()
         plan = plan_query(query)
@@ -1853,6 +2001,7 @@ class Memory:
                                session_id=session_id, agent_id=agent_id,
                                org_id=org_id, as_of=as_of, kinds=kinds,
                                fingerprint=expected, namespace=namespace)
+        self._writable("forget")
         ids = self.find_ids(
             query, user_id=user_id, session_id=session_id, agent_id=agent_id,
             org_id=org_id, as_of=as_of, kinds=kinds, namespace=namespace,
@@ -1886,6 +2035,7 @@ class Memory:
         impl = self._hosted()
         if impl is not None:
             return impl.destroy_namespace(namespace=namespace)
+        self._writable("destroy_namespace")
         name = namespace or self.namespace_name
         ns_store = self._ns_for(name)
         # block new ops + serialize against in-flight exports/reads before
@@ -1999,6 +2149,7 @@ class Memory:
         impl = self._hosted()
         if impl is not None:
             return impl.compact(force=force, namespace=namespace)
+        self._writable("compact")
         ns = self._ns_for(namespace)
         ns.index.flush()
         self._audit_for(ns.namespace).flush()
@@ -2085,6 +2236,10 @@ class Memory:
     # ------------------------------------------------------------------ internals
 
     def _ns_for(self, namespace: str | None):
+        if self.read_only:
+            # a replica, refreshed first if it is staler than the bound: a
+            # read never sees a replica mid-rebuild (or one that failed one)
+            return self.engine.reader(namespace or self.namespace_name, wrap_errors=False)[0]
         if namespace is None or namespace == self.namespace_name:
             return self.ns
         store = self.engine.namespace(namespace)
@@ -2119,13 +2274,17 @@ class Memory:
         # peek, never materialize: a namespace destroyed between submit and
         # apply must stay destroyed (re-materializing it by name raced the
         # teardown and resurrected shredded records into a ghost index).
-        ns = self.engine.peek_namespace(ns_name)
+        if ns_name.endswith(_REPLICA_TAG):
+            ns = self.engine.peek_replica(ns_name[:-len(_REPLICA_TAG)])
+        else:
+            ns = self.engine.peek_namespace(ns_name)
         if ns is None:
             METRICS.inc("memd_embed_target_missing_total",
                         help="embeddings dropped because the target namespace is gone")
             return
         # one batch: one index lock hold and one ANN sidecar change
-        ns.index.set_vectors(list(ids), [vecs[i] for i in range(len(ids))], self.embedder.name)
+        with self._serving(ns):
+            ns.index.set_vectors(list(ids), [vecs[i] for i in range(len(ids))], self.embedder.name)
 
     def reembed(self, *, namespace: str | None = None, batch_size: int = 256) -> dict:
         """Batch re-embedding job: rebuild the vector lane from raw.
@@ -2136,7 +2295,13 @@ class Memory:
         impl = self._hosted()
         if impl is not None:
             raise RuntimeError("reembed is embedded-only (no REST surface)")
-        ns = self._ns_for(namespace)
+        return self._reembed_store(self._ns_for(namespace))
+
+    def _reembed_store(self, ns, batch_size: int = 256) -> dict:
+        with self._serving(ns):
+            return self._reembed_locked(ns, batch_size)
+
+    def _reembed_locked(self, ns, batch_size: int) -> dict:
         stale = ns.index.records_missing_embedding(self.embedder.name)
         done = 0
         t0 = time.monotonic()
@@ -2161,8 +2326,10 @@ class Memory:
         METRICS.inc("memd_reembed_total", done, ns=ns.namespace)
         if done:
             self._bump_epoch(ns.namespace)  # vector lane changed -> cached contexts are stale
-        self._audit_for(ns.namespace).append(actor="maintenance", action="reembed", target=ns.namespace,
-                          detail={"embedded": done, "model": self.embedder.name})
+        if not getattr(ns, "read_only", False):
+            self._audit_for(ns.namespace).append(actor="maintenance", action="reembed",
+                                                 target=ns.namespace,
+                                                 detail={"embedded": done, "model": self.embedder.name})
         return {"namespace": ns.namespace, "missing": len(stale), "embedded": done,
                 "model": self.embedder.name}
 
@@ -2187,7 +2354,8 @@ class Memory:
                          "the vector lane is incomplete until the embed worker catches up",
                          left, budget)
         self._maint.drain(timeout_s=60)
-        self.ns.index.flush()
+        with self._serving(self.ns):
+            self.ns.index.flush()
         lex = self.ns.index.lexical
         if lex is not None:
             # the tantivy accelerator is derived and serves its tail from
@@ -2215,7 +2383,8 @@ class Memory:
         self._maint.stop(drain_timeout_s=float(self._embed_close_drain_s))
         if self.rerank is not None:
             self.rerank.close()
-        self.ns.index.flush()
+        with self._serving(self.ns):
+            self.ns.index.flush()
         self._flush_all_audits()
         self.ns.close()
         self.engine.close()
