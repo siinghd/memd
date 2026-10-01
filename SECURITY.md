@@ -60,7 +60,15 @@ any probe fails the build.
   claims `ns/<ns>/.owner` with a conditional PUT and a second gets
   `NamespaceBusyError`; a lease older than the TTL is reclaimable so a crashed
   node cannot wedge a namespace. It makes split-brain loud, not impossible.
-  Do not run two writers and rely on it.
+  Do not run two writers and rely on it. In particular, on the 0.2.x line a
+  writer that stalls past the lease TTL (a paused VM, a long GC pause, a
+  SIGSTOP) while a second process takes the namespace over can lose
+  acknowledged writes and deletes of either process when it resumes: it may
+  finish a write it had already fenced-checked, and a fold deletes the
+  whole log. Run one writer per namespace with an external guarantee (one
+  process, a supervisor that kills before restarting), or upgrade to 0.3.0,
+  whose per-lease log parts, bounded log deletes and takeover fencing close
+  this.
 - **Audit retention is bounded** (16 sealed segments, 64MB each by default).
   Past that the oldest is dropped and the hash chain is re-anchored, so
   `verify()` proves tamper-evidence over the *retained window*.
@@ -159,7 +167,7 @@ serving, and fails closed only where the frame would be lost:
   records it deleted, hard-deleted text included.
 - *Every acknowledged delete is applied at once* - to the index and, for a
   hard delete, to the purge schedule - so `get()` and search stop serving
-  the record whatever the rotate does. (Through 0.3.0 the refused rotate ran
+  the record whatever the rotate does. (Through 0.2.1 the refused rotate ran
   first and skipped both; a cache left that way is healed by the first
   compaction after recovery, which removes anything the log deleted that
   the index still serves - `memd_index_settled_total`.)
