@@ -203,6 +203,10 @@ def test_health_reports_failing_maintenance_without_naming_namespaces(tmp_path):
         body = t.get("/health").json()
         assert body["ok"] and body["maintenance_failing"] == 1
         assert "acme" not in json.dumps(body)
+        # a fold that succeeds clears it
+        ns.rotate("probe")
+        assert ns.maintenance_status() is None
+        assert t.get("/health").json()["maintenance_failing"] == 0
     finally:
         app.state.engine.close()
 
