@@ -6,6 +6,34 @@ wrong, how it showed, and the numbers before and after where it has them.
 
 ## [Unreleased]
 
+### Added
+- **Read replicas.** A namespace can be opened READ-ONLY
+  (`Memory(path, read_only=True)`; `ReplicaStore`): no lease, no object
+  written or deleted (a read-only view of the store and of the keys, and
+  every write path of the store refuses), every mutating call refused with
+  `ReadOnlyError`. A replica bootstraps from the index snapshot and the
+  segments and follows its writer every `MEMD_REPLICA_REFRESH_S` (2 s):
+  manifest, WAL and ops tails since its last read (S3: a LIST and a GET per
+  new part), manifest again - a fold in between makes it read again from
+  the new manifest - and applies events in the one seq order only up to the
+  seq every lower event is known to be durable below. A compaction above
+  what it applied, a takeover or a new tenure rebuilds it from the bucket
+  (its files deleted); a rotation is caught up. A hard delete stops being
+  served within the staleness bound and is scrubbed from the replica's
+  files when it is applied; a destroyed namespace's replica deletes its
+  files. In a cluster, a search or get with `X-Memd-Read-Consistency:
+  eventual` (optional `X-Memd-Max-Staleness-Ms`) reaching a node that does
+  not hold the namespace's lease is served by that node's replica, and
+  falls back to the writer when the replica is too stale or fails; replies
+  carry `X-Memd-Served-By` and, from a replica, `X-Memd-Replica-Seq` and
+  `X-Memd-Replica-Age-Ms`. Python SDK: `HostedMemory(consistency=...,
+  max_staleness_ms=...)` / per call, `last_read`; TypeScript SDK:
+  `consistency` / `maxStalenessMs`, `lastRead`; embedded `search` / `get`:
+  `consistency=`, `max_staleness_ms=`. Settings: `MEMD_REPLICA_REFRESH_S`,
+  `MEMD_REPLICA_MAX_STALENESS_MS`, `MEMD_MAX_REPLICAS` (64),
+  `MEMD_REPLICA_IDLE_S` (300). Behaviour and settings: README-engine.md,
+  "Read replicas".
+
 ## [0.3.2] - 2026-10-01
 
 ### Fixed

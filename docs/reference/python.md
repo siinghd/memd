@@ -9,7 +9,9 @@ from memd.sdk import HostedMemory, HostedError
 `s3://` root; `Memory(api_key=..., base_url=...)` is the same facade over
 the REST API (it delegates to `HostedMemory`), so code moves between the two
 without changes. Every method takes `namespace=` to act on a namespace other
-than the facade's default.
+than the facade's default. `Memory(path, read_only=True)` opens every
+namespace as a read replica that follows its writer (another process);
+`search` and `get` take `consistency="eventual"` and `max_staleness_ms`.
 
 This page is generated from the docstrings in `src/memd`.
 
@@ -77,5 +79,9 @@ This page is generated from the docstrings in `src/memd`.
 ::: memd.storage.engine.NamespaceBusyError
 
 ::: memd.storage.crypto.KeyCustodyError
+
+::: memd.storage.objectstore.ReadOnlyError
+
+::: memd.storage.replica.ReplicaUnavailableError
 
 ::: memd.engine.memory.ForgetPreviewMismatch

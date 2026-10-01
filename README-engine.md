@@ -230,8 +230,63 @@ SIGKILLed → next write acked after 3.6-3.8 s (bound: TTL + ε); SIGTERM →
 0.03-1.1 s; frozen past its TTL → 4.8-6.2 s, with no acked write lost in any
 case. On MinIO a node frozen in the middle of a lease write holds that
 object's lock for MinIO's ~30 s timeout, and its takeover waits for it
-(observed in 2 of 14 frozen runs; AWS S3 does not lock). Not built yet: read replicas (every read goes to the leaseholder) and
+(observed in 2 of 14 frozen runs; AWS S3 does not lock). Not built yet:
 multiple writers inside one namespace.
+
+### Read replicas (eventual reads)
+
+Reads are **strong by default**: the node holding the namespace's lease
+serves them, as above. A search or a get may opt into **eventual
+consistency**, and is then served by a **read replica** - on whichever node
+received it, with no hop - so a load balancer in front spreads a hot
+namespace's reads over every node:
+
+```bash
+curl -X POST "$NODE/v1/ns/acme/search" -H "Authorization: Bearer $KEY" \
+     -H "X-Memd-Read-Consistency: eventual" -H "X-Memd-Max-Staleness-Ms: 5000" \
+     -d '{"query": "how do we deploy?"}'
+# X-Memd-Served-By: replica   X-Memd-Replica-Seq: 4211   X-Memd-Replica-Age-Ms: 840
+```
+
+```python
+mem = HostedMemory(api_key=..., base_url=..., consistency="eventual")   # or per call
+mem.search("how do we deploy?"); mem.last_read   # {"served_by": "replica", "applied_seq": ..., "age_ms": ...}
+```
+
+- A replica takes **no lease and never writes or deletes an object** (no
+  manifest, part, fence, key, custody marker, audit entry or snapshot) - it
+  is opened over a read-only view of the store and the keys. It bootstraps
+  from the published index snapshot and the segments, then follows the
+  writer: every `MEMD_REPLICA_REFRESH_S` (2 s) it reads the manifest, the
+  WAL and ops tails since its last read (S3: one LIST and a GET per new
+  part), and the manifest again; a compaction, takeover or new tenure
+  rebuilds it from the bucket, a rotation is caught up.
+- **Staleness bound**: every write acknowledged before the replica's last
+  refresh started is served. A read accepts a replica no older than
+  `X-Memd-Max-Staleness-Ms` (default 3 x the refresh interval); an older
+  one refreshes inline once, and a read it still cannot serve - or one that
+  hits a key-custody or store error - goes to the writer instead,
+  invisibly. Every search and get answers `X-Memd-Served-By: leader|replica`
+  (a replica adds `X-Memd-Replica-Seq` and `X-Memd-Replica-Age-Ms`).
+- **Read-your-writes** holds for strong reads only: an eventual read may
+  miss a write acknowledged less than the bound ago, and may still serve a
+  record deleted that recently. A hard delete stops being served by every
+  replica within the bound, and is scrubbed from the replica's files when
+  it applies it (SECURITY.md).
+- Served by replicas: `search` and `get` (`GET .../memories/{id}`). Always
+  the writer: every write, `export` (audited in the namespace's ledger, which
+  only the writer appends to), `find_ids` / `forget` (a preview must match
+  what the confirm deletes), `stats`. A replica-served search is audited in
+  the serving node's own ledger (`memd-node.<id>`, `replica_search`).
+- A replica needs the namespace's data key like a writer (provider access
+  for `aws-kms` / `vault-transit`); it never mints one, and a key it cannot
+  use refuses (the read then goes to the writer).
+- Embedded: `Memory(path, read_only=True)` opens every namespace as a
+  replica - every mutating call raises `ReadOnlyError`, nothing is written
+  to the store or the keys directory, and reads follow the writer (another
+  process) within the bound. `search(..., consistency="eventual")` /
+  `get(...)` on a writer `Memory` reads its own store when the namespace is
+  open in it, else a replica.
 
 | setting | default | |
 |---|---|---|
@@ -244,6 +299,10 @@ multiple writers inside one namespace.
 | `MEMD_KEY_PROVIDER` | - | required: `aws-kms` or `vault-transit` (a `local` key file cannot be shared) |
 | `MEMD_LOCAL_DIR` | `.memd-local` | node-local cache, under `<dir>/node-<id>` |
 | `MEMD_CACHE_SWEEP_S` | 300 | how often a node drops its local copies of namespaces another node took over (also at startup; `0` = never) |
+| `MEMD_REPLICA_REFRESH_S` | 2 | how often a read replica follows its writer (the staleness bound's base; `replica_refresh_s` in `Memory(config=...)`) |
+| `MEMD_REPLICA_MAX_STALENESS_MS` | 3 x refresh | the default bound of an eventual read (`X-Memd-Max-Staleness-Ms` per request) |
+| `MEMD_MAX_REPLICAS` | 64 | replica namespaces per node (LRU; a closed replica's cache is deleted) |
+| `MEMD_REPLICA_IDLE_S` | 300 | a replica nobody read for this long is closed (each costs ~3 object-store requests per refresh) |
 | `MEMD_S3_ACCESS_KEY` / `MEMD_S3_SECRET_KEY` | boto3 chain | bucket credentials, separate from the `AWS_*` ones KMS uses |
 | `MEMD_SHUTDOWN_GRACE_S` | 30 | uvicorn graceful drain on SIGTERM |
 
