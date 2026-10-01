@@ -108,9 +108,12 @@ def _files_with(root, needle: bytes) -> list[str]:
     for dirpath, _dirs, files in os.walk(str(root)):
         for fn in files:
             path = os.path.join(dirpath, fn)
-            with open(path, "rb") as f:
-                if needle in f.read():
-                    out.append(os.path.relpath(path, str(root)))
+            try:
+                with open(path, "rb") as f:
+                    if needle in f.read():
+                        out.append(os.path.relpath(path, str(root)))
+            except FileNotFoundError:
+                continue   # deleted mid-walk (a sidecar rebuild, a scrub, a replica closing)
     return sorted(out)
 
 

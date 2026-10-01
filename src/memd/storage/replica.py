@@ -39,7 +39,7 @@ from memd.core.schema import MemoryRecord, records_from_jsonl
 from memd.metrics import METRICS
 from memd.storage.crypto import KeyCustodyError, KeyEnvelope, NullKeyEnvelope, ReadOnlyKeyEnvelope
 from memd.storage.engine import (STORE_FORMAT, Manifest, NamespaceStore, StoreFormatError,
-                                 _drop_cache_files, _frame_seq, _frame_start,
+                                 _cache_lock_path, _drop_cache_files, _frame_seq, _frame_start,
                                  _frames_with_offsets, _merge_events)
 from memd.storage.objectstore import ObjectStore, ReadOnlyError
 
@@ -814,6 +814,8 @@ class ReplicaStore(NamespaceStore):
     def close(self) -> None:
         """Close and DELETE the cache files: a replica's cache lives exactly
         as long as the replica (nothing it held outlives it)."""
+        if getattr(self, "_dropped", False):
+            return
         got = self._refresh_lock.acquire(timeout=30.0)
         try:
             self._closed = True
@@ -822,8 +824,13 @@ class ReplicaStore(NamespaceStore):
                 self._scrub_want = 0
             with self._serve.write():
                 self._close_index()
+            cache_dir = os.path.dirname(self.index.path)
             try:
-                _drop_cache_files(os.path.dirname(self.index.path), self.namespace)
+                _drop_cache_files(cache_dir, self.namespace)
+                # the directory is this engine's alone: its lock file goes too
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(_cache_lock_path(cache_dir, self.namespace))
+                self._dropped = True
             except Exception as ex:  # noqa: BLE001 - the engine's directory sweep retries
                 _log.warning("namespace %s: could not delete the replica cache (%s)",
                              self.namespace, ex)
