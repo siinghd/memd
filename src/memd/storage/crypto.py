@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import errno
 import hashlib
 import hmac
 import json
@@ -236,7 +237,10 @@ class AwsKmsProvider(KeyProvider):
         try:
             return fn(**kw)
         except Exception as ex:
-            code = getattr(ex, "response", {}).get("Error", {}).get("Code", "")
+            # a transport error (a timeout) has no parsed reply: `response`
+            # is missing or None, and must not mask the error itself
+            reply = getattr(ex, "response", None)
+            code = ((reply.get("Error") or {}).get("Code", "") if isinstance(reply, dict) else "")
             raise KeyUnavailableError(f"aws-kms {what} failed ({code or type(ex).__name__}): {ex}") from ex
 
     def generate(self, namespace: str) -> tuple[bytes, WrappedKey]:
@@ -524,7 +528,8 @@ class LocalKeyEnvelope(KeyEnvelope):
 
     def _root_or_mint(self) -> bytes:
         """The root key, minted if this keys directory has none yet (only
-        ever to wrap a data key being minted)."""
+        ever to wrap a data key being minted) - or has only the empty file a
+        crash left: that is reported (_read_secret), never replaced)."""
         if self._root_key is None and not os.path.exists(self._rk_path):
             fresh = secrets.token_bytes(KEY_LEN)
             try:
@@ -544,16 +549,29 @@ class LocalKeyEnvelope(KeyEnvelope):
 
     @staticmethod
     def _read_secret(path: str, size: int = _WRAPPED_KEY_LEN) -> bytes:
-        """A key file's bytes. One shorter than `size` - an older build
-        creates the file first and writes it after, so a concurrent reader
-        could catch it empty - is read again for up to _SECRET_SETTLE_S
-        before it is returned as it is (and refused by its user)."""
+        """A key file's bytes. One shorter than `size` - a key file created
+        in place (an older build, or _write_secret on a filesystem without
+        hard links) is created first and written after, so a concurrent
+        reader could catch it empty - is read again for up to
+        _SECRET_SETTLE_S. One still short then is a KeyCustodyError naming
+        it: it used to be returned as it was, and failed far from the cause
+        (an empty wrapped key as "Nonce must be between 8 and 128 bytes",
+        an empty root.key as "local root key must be 32 bytes")."""
         deadline = time.monotonic() + _SECRET_SETTLE_S
         while True:
             with open(path, "rb") as f:
                 data = f.read()
-            if len(data) >= size or time.monotonic() >= deadline:
+            if len(data) >= size:
                 return data
+            if time.monotonic() >= deadline:
+                what = "empty" if not data else f"short ({len(data)} of {size} bytes)"
+                raise KeyCustodyError(
+                    f"key file {path} is {what}: a crash interrupted its creation (a key "
+                    "file created in place, on a filesystem without hard links), or it was "
+                    "truncated or damaged. memd never replaces a key file, because it cannot "
+                    "tell those apart. Restore it from a backup of the keys directory; only "
+                    "if you know no data was ever written under it (a creation a crash cut "
+                    "short, and for root.key: no ns-*.key file exists), delete it and retry")
             time.sleep(0.01)
 
     @staticmethod
@@ -583,11 +601,30 @@ class LocalKeyEnvelope(KeyEnvelope):
                 raise   # a concurrent creator won (not the fallback below)
             except OSError:
                 # no hard links here: create it in place (a reader retries
-                # one it catches short - see _read_secret)
+                # one it catches short - see _read_secret). A crash before
+                # the write lands leaves it empty: reported as a
+                # KeyCustodyError naming it, never replaced. A write that
+                # FAILS removes it - it is this call's (O_EXCL), and nothing
+                # used the key it was to hold.
                 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 try:
-                    os.write(fd, data)
-                    os.fsync(fd)
+                    ours = os.fstat(fd)
+                    try:
+                        view = memoryview(data)
+                        while view:
+                            view = view[os.write(fd, view):]
+                        os.fsync(fd)
+                    except BaseException:
+                        if _is_file(path, ours):
+                            with contextlib.suppress(OSError):
+                                os.unlink(path)
+                        raise
+                    if not _is_file(path, ours):
+                        # this process stalled between the create and the
+                        # write for so long that the empty file was taken
+                        # for a crashed creation and replaced: the key now
+                        # in the file is the one
+                        raise FileExistsError(errno.EEXIST, "replaced while it was empty", path)
                 finally:
                     os.close(fd)
             _fsync_dir(d)
@@ -603,8 +640,9 @@ class LocalKeyEnvelope(KeyEnvelope):
 
     def _unwrap_file(self, namespace: str, path: str) -> bytes:
         provider = self.provider   # (no root key at all: KeyCustodyError, as it says)
+        wrapped = self._read_secret(path)   # (empty or short: KeyCustodyError naming it)
         try:
-            return provider.unwrap(namespace, WrappedKey("local", "", "1", self._read_secret(path)))
+            return provider.unwrap(namespace, WrappedKey("local", "", "1", wrapped))
         except KeyCustodyError as ex:
             raise KeyCustodyError(
                 f"{ex} (namespace {namespace!r}'s wrapped data key {path} does not unwrap under "
@@ -754,6 +792,15 @@ def _sweep_shreds(d: str) -> None:
                     _shred_file(p)
         except FileNotFoundError:
             pass  # a concurrent sweep (or its creator) finished it
+
+
+def _is_file(path: str, st: os.stat_result) -> bool:
+    """`path` names the file `st` was taken of."""
+    try:
+        cur = os.stat(path)
+    except FileNotFoundError:
+        return False
+    return (cur.st_dev, cur.st_ino) == (st.st_dev, st.st_ino)
 
 
 def wrapped_key_object(namespace: str) -> str:
