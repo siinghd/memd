@@ -258,10 +258,13 @@ class ReplicaStore(NamespaceStore):
         self.installed_snapshot = False
         # bumped whenever what the index serves changed (a search cache key)
         self.data_epoch = 0
+        # every hard delete this replica knows of at or below it is scrubbed
+        # from its files
         self.scrubbed_through = 0
         self._scrub_mu = threading.Lock()
         self._scrub_want = 0
         self._scrub_running = False
+        self._scrub_on_tail = False   # the first tail after a rebuild: see _apply_tail
         inner_env = envelope or NullKeyEnvelope()
         env = inner_env if isinstance(inner_env, ReadOnlyKeyEnvelope) else ReadOnlyKeyEnvelope(inner_env)
         ro = store if isinstance(store, ReadOnlyObjectStore) else ReadOnlyObjectStore(store)
@@ -658,6 +661,8 @@ class ReplicaStore(NamespaceStore):
             if not self._fresh_index:
                 self._discard_index(why)
                 self._fresh_index = True
+            with self._scrub_mu:
+                self._scrub_want = 0     # the files a scrub was asked for are gone
             self.manifest = m
             self._manifest_ver = ver
             if self._key_lineage is not None and self._key_lineage != m.lineage:
@@ -697,15 +702,24 @@ class ReplicaStore(NamespaceStore):
             horizon = max(applied, max_fold)
             self.index.flush()
             self.index.set_meta("applied_seq", str(horizon))
-            # a file built from durable data alone holds nothing purged
+            # durable data holds nothing the writer has purged (scrub_seq) -
+            # but the purges still pending are in it: a segment's copy of the
+            # record and the delete its header carries (or an installed
+            # image that reflects it). Building them in and deleting them
+            # again leaves their text in the files (the WAL's page images):
+            # scrubbed below, as for a delete applied from the tail.
             self.index.set_meta("scrubbed_seq", str(m.scrub_seq))
+            purges = [int(op.get("seq", 0)) for op in carried if op.get("op") == "hard_delete"]
+            self.scrubbed_through = min(purges) - 1 if purges else horizon
+            self._scrub_on_tail = True
             if self._opened and self.index.lexical is None:
                 self._attach_lexical(self._lexical_cfg)
             self.applied_seq = horizon
             self._synced = True
             self._lineage = m.lineage
             self.data_epoch += 1
-        self.scrubbed_through = max(self.scrubbed_through, horizon)
+        if purges:
+            self._request_scrub(horizon)
         self._reset_follow(horizon)
         self._skip_floor = max(horizon, m.wal_base_seq)
         if not bootstrap:
@@ -835,6 +849,17 @@ class ReplicaStore(NamespaceStore):
             self._rebuild(self.manifest, self._manifest_ver,
                           f"an event (seq {anomaly}) first read below the horizon ({H})")
             raise _Rebuilt()
+        reflected = []
+        if self._scrub_on_tail:
+            # the first tail after a rebuild reads the ops log from its start:
+            # a hard delete at or below the rebuild's horizon is one its
+            # durable data reflected (an installed image's file may hold the
+            # text) - scrubbed like one applied now
+            self._scrub_on_tail = False
+            reflected = [int(op.get("seq", 0)) for op in t.ops
+                         if op.get("op") == "hard_delete" and int(op.get("seq", 0)) <= H]
+            if reflected:
+                self.scrubbed_through = min(self.scrubbed_through, min(reflected) - 1)
         ready = [e for e in pending if e[0] <= t.horizon]
         rest = [e for e in pending if e[0] > t.horizon]
         new_h = max(H, t.horizon)
@@ -852,9 +877,9 @@ class ReplicaStore(NamespaceStore):
         self._cursors = t.cursors
         self._seen = t.seen
         self._covered = t.covered
+        if reflected or any(k == 1 and ev.get("op") == "hard_delete" for _s, k, ev in ready):
+            self._request_scrub(new_h)
         if ready:
-            if any(k == 1 and ev.get("op") == "hard_delete" for _s, k, ev in ready):
-                self._request_scrub(new_h)
             self._applied([r for _s, k, ev in ready if k == 0 for r in ev])
         METRICS.set_gauge("memd_replica_applied_seq", float(new_h),
                           help="the seq a replica has applied every event up to", ns=self.namespace)
@@ -891,23 +916,27 @@ class ReplicaStore(NamespaceStore):
         while True:
             with self._scrub_mu:
                 target = self._scrub_want
+            idx = self.index
             ok = False
             try:
-                ok = self._scrub_once(target)
+                ok = self._scrub_once(idx, target)
             except Exception as ex:  # noqa: BLE001 - the next applied delete scrubs again
                 if not self._closed:
                     _log.warning("namespace %s: the replica's purge scrub failed (%s)",
                                  self.namespace, ex)
             with self._scrub_mu:
-                if not ok or self._closed or self._scrub_want <= target:
+                # a rebuild that replaced the index meanwhile (deleting its
+                # files) may have asked for the new one to be scrubbed
+                again = self._scrub_want > 0 and (
+                    self.index is not idx or (ok and self._scrub_want > target))
+                if self._closed or not again:
                     self._scrub_running = False
                     return
 
-    def _scrub_once(self, target: int) -> bool:
-        """One scrub of the current index (not under the serve lock: a
+    def _scrub_once(self, idx, target: int) -> bool:
+        """One scrub of `idx`, the current index (not under the serve lock: a
         rebuild that swaps the index closes this one, which ends the scrub -
         and deletes the files, which is the stronger purge)."""
-        idx = self.index
         if self._closed or idx.closing:
             return False
         self._scrub_begin()
@@ -924,11 +953,11 @@ class ReplicaStore(NamespaceStore):
         if ticket and idx.ann is not None:
             idx.ann.wait_built(ticket, timeout_s=self.SCRUB_DRAIN_S)
         with idx._lock:
-            if idx._closed:
+            if idx._closed or self.index is not idx:
                 return False
             if int(idx.get_meta("scrubbed_seq") or 0) < target:
                 idx.set_meta("scrubbed_seq", str(target))
-        self.scrubbed_through = max(self.scrubbed_through, target)
+            self.scrubbed_through = max(self.scrubbed_through, target)
         METRICS.inc("memd_replica_scrubs_total",
                     help="replica caches scrubbed of hard-deleted text", ns=self.namespace)
         return True

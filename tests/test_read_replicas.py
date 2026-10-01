@@ -566,6 +566,50 @@ def test_a_hard_delete_leaves_the_replicas_local_files(be):
         lead.close()
 
 
+@pytest.mark.parametrize("how", ["takeover", "bootstrap"])
+def test_a_replica_built_from_durable_data_scrubs_the_hard_deletes_it_still_holds(be, how):
+    """A hard delete the writer has not purged yet (its deadline is days
+    away) is still in durable data: an older segment holds the record, and a
+    newer segment's header carries the delete. A replica built from that
+    data - rebuilt after a takeover, or bootstrapped - writes the record into
+    its index and deletes it again, which leaves its text in the cache files
+    (the SQLite WAL): it scrubs them, as it does for a delete it applies
+    from the tail - sooner than the writer's own purge. It used to stamp
+    such a build scrubbed and never scrub it."""
+    marker = "ERASE-ME-" + uuid.uuid4().hex
+    lead = be.leader()
+    rep = None
+    try:
+        for i in range(8):
+            lead.add(f"filler xray {i}")
+        rid = lead.add(f"secret {marker} yankee")[0]
+        lead.ns.rotate()                          # the record is in a segment
+        if how == "takeover":
+            rep = be.replica(replica_refresh_s=3600)
+            assert rep.get(rid) and marker.encode() in _cache_bytes(rep)
+        lead.delete(rid, hard=True)
+        deleted_at = lead.ns.manifest.seq
+        lead.ns.rotate()                          # the delete is folded: carried, its purge pending
+        assert lead.ns.manifest.scrub_seq < deleted_at and lead.ns.pending_hard_deletes == 1
+        if how == "takeover":
+            lead.close()
+            lead = be.leader()                    # a new tenure: the next refresh rebuilds
+            rebuilds = rep.ns.rebuilds
+            rep.ns.refresh()
+            assert rep.ns.rebuilds == rebuilds + 1
+        else:
+            rep = be.replica(replica_refresh_s=3600)
+        assert rep.get(rid) is None and rep.get(rid, include_deleted=True) is None
+        assert _wait(lambda: marker.encode() not in _cache_bytes(rep), timeout=20), \
+            "the hard-deleted text is still in the replica's files"
+        assert _wait(lambda: rep.ns.scrubbed_through >= deleted_at, timeout=20)
+        assert lead.ns.pending_hard_deletes == 1   # the writer has not purged it yet
+    finally:
+        if rep is not None:
+            rep.close()
+        lead.close()
+
+
 def test_a_destroyed_namespace_drops_the_replica_cache(be):
     lead = be.leader()      # (a facade re-creates its own default namespace after a destroy)
     rep = be.replica(namespace="doomed", replica_refresh_s=3600)
