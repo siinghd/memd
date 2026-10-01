@@ -43,6 +43,14 @@ billing = ["stripe>=15"]
 # moto[server]: the aws-kms provider tests (in-process) and the multi-node
 # router tests (a moto server the node processes share)
 dev = ["pytest>=8", "pytest-timeout>=2", "stripe>=15", "moto[server]>=5"]
+# the docs site (mkdocs.yml): mkdocs build --strict. mkdocs < 2: the 2.0
+# rewrite drops the plugin system material and mkdocstrings are built on
+docs = [
+  "mkdocs>=1.6,<2",
+  "mkdocs-material>=9.5",
+  "mkdocstrings[python]>=0.26",
+  "mkdocs-include-markdown-plugin>=7",
+]
 
 [project.scripts]
 memd = "memd.cli:main"
