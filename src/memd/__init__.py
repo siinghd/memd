@@ -2,6 +2,6 @@
 from memd.core.schema import Kind, MemoryRecord, Scope, Source
 from memd.engine.memory import Memory
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 __all__ = ["Memory", "MemoryRecord", "Scope", "Source", "Kind", "__version__"]

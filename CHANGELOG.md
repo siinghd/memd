@@ -6,6 +6,8 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-01
+
 ### Fixed
 - **A cache sweep never deletes files another process serves from.**
   Processes sharing one local cache directory each serve their namespaces
