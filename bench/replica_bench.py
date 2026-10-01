@@ -11,13 +11,26 @@ moto KMS (the multi-node setup), one hot namespace:
   throughput  eventual searches against the hot namespace from a fixed
               pool of client threads in separate processes, spread over 1
               (the leader alone), 2 or 3 serving nodes: requests/s and
-              latency per configuration.
+              latency per configuration, in two query mixes:
+                repeat  8 fixed queries - after warm-up nearly every
+                        search is a hit in the node's repeat-query cache
+                        (what an agent re-asking the same prompts sees);
+                unique  the same queries, each made unique by a token that
+                        matches nothing (terms are OR'ed: the search does
+                        the same work) - every search a cache miss.
+              The nodes' own cache hit/miss counters (/metrics) are reported
+              with each run.
   leader      the leader's write-ack and search latency with no replica
               open, then with the other nodes' replicas attached (refreshing),
               then with them serving a read load.
 
     MEMD_TEST_S3_ENDPOINT=http://127.0.0.1:9310 python bench/replica_bench.py \\
-        [--writes 200] [--records 2000] [--seconds 20] [--clients 12] [--refresh 2]
+        [--writes 200] [--records 2000] [--seconds 20] [--clients 12] [--refresh 2] \\
+        [--modes repeat,unique] [--keep]
+
+Everything it creates is removed at the end: the temporary directory (node
+state, logs; kept with --keep, or when a node fails to start) and the
+bucket prefix the nodes wrote.
 
 A loopback MinIO and every process on one machine: the absolute latencies
 are a floor, and the throughput ceiling is this machine's cores, shared by
@@ -30,6 +43,7 @@ import json
 import multiprocessing as mp
 import os
 import random
+import shutil
 import signal
 import socket
 import statistics
@@ -183,8 +197,15 @@ QUERIES = ["how do we deploy", "who owns the billing service", "where is the sta
            "on call rotation", "database migration plan"]
 
 
+def _query(unique: bool) -> str:
+    q = random.choice(QUERIES)
+    # an extra term that matches nothing: lexical terms are OR'ed, so the
+    # search does the same work - but no two requests share a cache key
+    return f"{q} zq{uuid.uuid4().hex[:12]}" if unique else q
+
+
 def _client_proc(urls: list[str], ns: str, seconds: float, threads: int, eventual: bool, q,
-                 admin: str):
+                 admin: str, unique: bool = False):
     import httpx
 
     # a child process re-imports this module (forkserver/spawn): ADMIN there
@@ -206,7 +227,7 @@ def _client_proc(urls: list[str], ns: str, seconds: float, threads: int, eventua
                 t0 = time.monotonic()
                 try:
                     r = c.post(f"{url}/v1/ns/{ns}/search", headers=hdr,
-                               json={"query": random.choice(QUERIES)})
+                               json={"query": _query(unique)})
                     ok = r.status_code == 200
                 except Exception:
                     ok = False
@@ -227,11 +248,29 @@ def _client_proc(urls: list[str], ns: str, seconds: float, threads: int, eventua
     q.put((out, errs[0], served))
 
 
-def measure_throughput(urls: list[str], ns: str, seconds: float, clients: int, eventual: bool) -> dict:
+def _cache_counts(urls: list[str]) -> tuple[float, float]:
+    """(hits, misses) of the repeat-query cache, summed over the nodes."""
+    import httpx
+
+    hits = misses = 0.0
+    for url in urls:
+        text = httpx.get(f"{url}/metrics", headers=H, timeout=30).text
+        for line in text.splitlines():
+            name = line.split("{", 1)[0].split(" ", 1)[0]
+            if name == "memd_search_cache_hits_total":
+                hits += float(line.rsplit(" ", 1)[1])
+            elif name == "memd_search_cache_misses_total":
+                misses += float(line.rsplit(" ", 1)[1])
+    return hits, misses
+
+
+def measure_throughput(urls: list[str], ns: str, seconds: float, clients: int, eventual: bool,
+                       unique: bool = False) -> dict:
     procs = max(1, min(4, clients // 3))
     per = max(1, clients // procs)
     q: mp.Queue = mp.Queue()
-    ps = [mp.Process(target=_client_proc, args=(urls, ns, seconds, per, eventual, q, ADMIN))
+    h0, m0 = _cache_counts(urls)
+    ps = [mp.Process(target=_client_proc, args=(urls, ns, seconds, per, eventual, q, ADMIN, unique))
           for _ in range(procs)]
     for p in ps:
         p.start()
@@ -246,9 +285,13 @@ def measure_throughput(urls: list[str], ns: str, seconds: float, clients: int, e
             served[k] = served.get(k, 0) + v
     for p in ps:
         p.join()
-    return {"nodes": len(urls), "clients": procs * per, "req_per_s": round(len(lat) / seconds, 1),
+    h1, m1 = _cache_counts(urls)
+    looked = (h1 - h0) + (m1 - m0)
+    return {"mode": "unique" if unique else "repeat", "nodes": len(urls), "clients": procs * per,
+            "req_per_s": round(len(lat) / seconds, 1),
             "p50_ms": round(pctl(lat, 0.5), 2), "p99_ms": round(pctl(lat, 0.99), 2), "errors": errs,
-            "served_by": served}
+            "served_by": served,
+            "cache_hit_rate": round((h1 - h0) / looked, 4) if looked else None}
 
 
 # ----------------------------------------------------------------- leader
@@ -302,6 +345,9 @@ def main() -> None:
     ap.add_argument("--refresh", type=float, default=2.0)
     ap.add_argument("--leader-n", type=int, default=300)
     ap.add_argument("--only", default="lag,throughput,leader")
+    ap.add_argument("--modes", default="repeat,unique",
+                    help="throughput query mixes: repeat (cache hits), unique (cache misses)")
+    ap.add_argument("--keep", action="store_true", help="keep the temporary directory (logs)")
     args = ap.parse_args()
     if not ENDPOINT:
         raise SystemExit("set MEMD_TEST_S3_ENDPOINT")
@@ -325,6 +371,7 @@ def main() -> None:
     fleet = Fleet(tmp, kms_url, arn, args.refresh)
     results: dict = {"setup": {"cores": os.cpu_count(), "refresh_s": args.refresh, "nodes": 3,
                                "store": "MinIO on loopback", "kms": "moto server", "embedder": "hash"}}
+    ok = False
     try:
         for nid in ("n1", "n2", "n3"):
             fleet.start(nid)
@@ -364,16 +411,36 @@ def main() -> None:
             print("leader, replicas serving reads:", results["leader_replicas_under_read_load"], flush=True)
         if "throughput" in args.only:
             tp = []
-            for k in (1, 2, 3):
-                urls = [fleet.urls[owner]] + [fleet.urls[n] for n in others][:k - 1]
-                res = measure_throughput(urls, ns, args.seconds, args.clients, eventual=True)
-                print("throughput:", res, flush=True)
-                tp.append(res)
+            for mode in [m.strip() for m in args.modes.split(",") if m.strip()]:
+                for k in (1, 2, 3):
+                    urls = [fleet.urls[owner]] + [fleet.urls[n] for n in others][:k - 1]
+                    res = measure_throughput(urls, ns, args.seconds, args.clients, eventual=True,
+                                             unique=(mode == "unique"))
+                    print("throughput:", res, flush=True)
+                    tp.append(res)
             results["throughput"] = tp
         print(json.dumps(results, indent=2))
+        ok = True
     finally:
         fleet.close()
         kms.stop()
+        _remove_prefix(s3, fleet.prefix)
+        if ok and not args.keep:
+            shutil.rmtree(tmp, ignore_errors=True)
+        else:
+            print(f"(kept {tmp})", flush=True)
+
+
+def _remove_prefix(s3, prefix: str) -> None:
+    """Delete every object the nodes wrote under the bench's bucket prefix."""
+    try:
+        pag = s3.get_paginator("list_objects_v2")
+        for page in pag.paginate(Bucket=BUCKET, Prefix=prefix + "/"):
+            keys = [{"Key": o["Key"]} for o in page.get("Contents", []) or []]
+            for i in range(0, len(keys), 1000):
+                s3.delete_objects(Bucket=BUCKET, Delete={"Objects": keys[i:i + 1000], "Quiet": True})
+    except Exception as ex:  # noqa: BLE001 - a leftover prefix is not a failed bench
+        print(f"could not remove s3://{BUCKET}/{prefix}/: {ex}", flush=True)
 
 
 if __name__ == "__main__":
