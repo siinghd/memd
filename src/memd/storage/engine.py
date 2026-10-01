@@ -716,6 +716,9 @@ class NamespaceStore:
         self._pending_hard: list[tuple[str, int]] = []
         self._pending_hard_ids: set[str] = set()
         self._rotating = False  # re-entrancy guard for rotate-inside-append_ops
+        # the seq of the first durable event the index failed to apply (None:
+        # it has applied every one) - see _apply_durable / _index_mark
+        self._index_owed: int | None = None
         self._replayed_at_open = False
         self._migrated_t0: float | None = None  # set by a migrating open (progress log)
         self.segments_collected = 0
@@ -2471,8 +2474,7 @@ class NamespaceStore:
             self.manifest.wal_size = my_end
             self.manifest.seq = seq
             self._manifest_dirty = True
-            qflags = {r.id: bool(r.meta.get("quarantined")) for r in records}
-            self.index.upsert_batch([(r, None, "") for r in records], qflags)
+            self._apply_durable(seq, records, [])
             size = self.manifest.wal_size
         self._durably_written(my_end, my_gen)   # ack only after fsync
         frames_over = (not self._has_log_writer()
@@ -2632,16 +2634,61 @@ class NamespaceStore:
                 raise
             self.manifest.ops_size = size
             self._manifest_dirty = True
+            # The ops are durable: the purge schedule and the index reflect
+            # them BEFORE any maintenance runs. The rotate below used to come
+            # first, and one that raised (a damaged WAL frame makes every
+            # fold refuse) skipped both: the delete was logged, get() and
+            # search still served the record, and its purge was never
+            # scheduled.
+            for op in ops:
+                if op.get("op") == "hard_delete" and op.get("id"):
+                    self._track_pending_hard(op["id"], int(op.get("deadline", 0)))
+            METRICS.set_gauge("memd_pending_purges", len(self._pending_hard), ns=self.namespace)
+            self._apply_durable(ops[0]["seq"], [], ops)
             # rotate is skipped while a rotation is already folding this log:
             # re-entering would fold mid-replay state. The outer fold re-reads
             # everything we just appended.
             if size >= self.wal_rotate_bytes and not self._rotating:
                 self.rotate("ops-size")
-            for op in ops:
-                if op.get("op") == "hard_delete" and op.get("id"):
-                    self._track_pending_hard(op["id"], int(op.get("deadline", 0)))
-            METRICS.set_gauge("memd_pending_purges", len(self._pending_hard), ns=self.namespace)
-            self._apply_to_index([], ops)
+
+    def _apply_durable(self, seq: int, records: list[MemoryRecord], ops: list[dict]) -> None:
+        """(ns lock held) Apply events already durable in a log - a WAL frame
+        at `seq`, or ops from `seq` on - to the index.
+
+        An apply that raises leaves the index behind the log: _index_owed
+        remembers the first event it missed, so the watermark stamped from
+        then on (_index_mark) stays below it and the next open replays it,
+        and every later apply - and every fold, which retires ops - first
+        catches the index up in seq order (_catch_up_index). close() used to
+        stamp manifest.seq regardless: an op the index never applied was
+        then below the watermark, and no reopen replayed it."""
+        if self._index_owed is None:
+            try:
+                self._apply_to_index(records, ops)
+            except BaseException:
+                self._index_owed = seq
+                raise
+            return
+        self._catch_up_index()   # this event is durable: the replay applies it too
+
+    def _catch_up_index(self) -> None:
+        """(ns lock held) If an apply failed, replay every event past the last
+        one the index applied - checkpoints, WAL frames and ops, in the one
+        seq order open uses. Raises (the index still owed) if it cannot."""
+        if self._index_owed is None:
+            return
+        applied = self._index_owed - 1
+        versions, carried, _ = self._load_checkpoints(applied, where="segment-replay")
+        frames = [(s, recs) for s, recs in self._wal_events("replay-wal") if s > applied]
+        self._replay_into_index(versions, _merge_events(carried + self._read_ops(), frames,
+                                                        after=applied))
+        self._index_owed = None
+        _log.info("namespace %s: index caught up from seq %d", self.namespace, applied + 1)
+
+    def _index_mark(self) -> int:
+        """The watermark to stamp: the last seq the index has applied every
+        event up to."""
+        return self.manifest.seq if self._index_owed is None else self._index_owed - 1
 
     def _cut_ops_back(self, size: int) -> None:
         """Best effort: truncate the ops log to `size` if a failed append
@@ -2712,6 +2759,7 @@ class NamespaceStore:
 
     def _rotate_locked(self, reason: str) -> str:
         """Fold body (caller holds the ns lock and set _rotating)."""
+        self._catch_up_index()   # the fold retires ops: none the index missed
         METRICS.inc("memd_rotations_total", ns=self.namespace, reason=reason)
         ops = self._read_ops()
         frames = self._wal_events("rotate-wal")
@@ -2813,6 +2861,7 @@ class NamespaceStore:
             # not folded (nothing of it is known), so it stays referenced -
             # quarantined in place - and no later fold or collection deletes
             # it either. (A wrong key never gets this far: see _verify_key.)
+            self._catch_up_index()   # the fold retires ops: none the index missed
             damaged: list[dict] = []
             versions, carried, _ = self._load_checkpoints(unreadable=damaged)
             ops = self._read_ops()
@@ -2888,6 +2937,9 @@ class NamespaceStore:
             purged = sum(1 for op in folded if op.get("op") == "hard_delete") > len(pending_ops)
             if purged:
                 self.manifest.scrub_seq = self.manifest.seq
+            # nothing this fold deleted is served (and a purged row goes
+            # before the scrub below erases what it left in the file)
+            self._settle_dropped(purged_ids, folded)
             self.index.flush()  # rows durable before advancing the watermark
             self.index.set_meta("applied_seq", str(self.manifest.seq))
             # commit the new-segment-only view BEFORE deleting anything it
@@ -2950,6 +3002,32 @@ class NamespaceStore:
         rep.duration_ms = int((time.monotonic() - t0) * 1000)
         return rep
 
+    def _settle_dropped(self, dropped: set[str], folded: list[dict]) -> None:
+        """(compaction, ns lock held) Ids the fold dropped - deleted - that
+        the index still serves: a hard-deleted one's rows go, a soft-deleted
+        one is tombstoned. The write path applies every delete, so this
+        finds nothing - except in a cache an older build left behind an op
+        it never applied (a rotate that raised first, a close that stamped
+        the watermark past it): no replay applies such an op, and this fold
+        retires it."""
+        if not dropped:
+            return
+        hard = {op["id"] for op in folded if op.get("op") == "hard_delete" and op.get("id") in dropped}
+        at = {_op_target(op): _op_at(op) for op in folded if op.get("op") == "tombstone"}
+        fix = []
+        for rec in self.index.get_many(sorted(dropped)):
+            if rec.id in hard:
+                fix.append({"op": "hard_delete", "id": rec.id})
+            elif not rec.deleted:
+                fix.append({"op": "tombstone", "id": rec.id, "at": at.get(rec.id) or now_ms()})
+        if fix:
+            METRICS.inc("memd_index_settled_total", len(fix),
+                        help="deleted records a compaction found the index still serving",
+                        ns=self.namespace)
+            _log.warning("namespace %s: the index still served %d record(s) deleted in the "
+                         "log; applied their deletes", self.namespace, len(fix))
+            self.index.apply_ops_batch(fix)
+
     def _compaction_is_noop(self) -> bool:
         """True only when folding provably cannot change anything.
 
@@ -2986,6 +3064,7 @@ class NamespaceStore:
             # the same ordered replay as open (applying every op after every
             # record deleted re-adds and resurrected WAL-resident deletes)
             self._replay_into_index(versions, _merge_events(carried + ops, frames))
+            self._index_owed = None
             self.index.flush()
             self.index.set_meta("applied_seq", str(self.manifest.seq))
         return len(set(versions) | {r.id for _, recs in frames for r in recs})
@@ -3057,9 +3136,10 @@ class NamespaceStore:
                 pass
             self._wal_writer = None
         # fold the index watermark so the next open only replays the tail
+        # (and an event the index failed to apply: _index_mark)
         try:
             self.index.flush()
-            self.index.set_meta("applied_seq", str(self.manifest.seq))
+            self.index.set_meta("applied_seq", str(self._index_mark()))
         except Exception:
             pass  # closed/deleted index; replay covers it
         self.index.close()

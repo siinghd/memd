@@ -6,6 +6,24 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
 
 ## [Unreleased]
 
+### Fixed - data integrity
+- **A durable delete always reaches the index (D7).** `append_ops` ran the
+  ops log's size-triggered rotate before applying the op to the index, so a
+  rotate that raised (a damaged WAL frame makes every fold refuse) left the
+  delete logged but unapplied: `get()` and search served the record, a hard
+  delete's purge was not scheduled, and `close()` stamped the index
+  watermark past the op, so no reopen replayed it - after the documented
+  frame recovery export said the record was gone while `get()`/search
+  served it and its text stayed in the local index. The op now reaches the
+  index and the purge schedule before any maintenance runs; an index apply
+  that fails keeps the watermark below the op (the next open replays it,
+  and the next write or fold first catches the index up in seq order); and
+  a compaction tombstones or removes any record it dropped that the index
+  still serves (`memd_index_settled_total`), which also heals deleted
+  records 0.2.1 and earlier left served. A skipped supersede or quarantine
+  from 0.2.1 and earlier is not healed by compaction; reopening with a cold
+  cache (delete the namespace's local index) rebuilds it.
+
 ## [0.2.1] - 2026-09-26
 
 Security / data-integrity patch release on 0.2.0: a restore with the wrong keys,
