@@ -17,6 +17,14 @@ every namespace (never hand it to an application). `/health` needs no key.
 machine-readable `code` (for example `not_found`, `rate_limited`,
 `preview_mismatch`); a rate-limited request also gets `Retry-After`.
 
+**Read consistency.** Reads are strong (served by the namespace's writer)
+unless a search or get sends `X-Memd-Read-Consistency: eventual` (or
+`?consistency=eventual`), optionally with `X-Memd-Max-Staleness-Ms`: in a
+cluster it may then be served by a read replica no staler than that. Every
+search and get answers `X-Memd-Served-By: leader|replica`; a replica adds
+`X-Memd-Replica-Seq` (the seq it had applied) and `X-Memd-Replica-Age-Ms`.
+See [Operations: read replicas](../operations.md#read-replicas-eventual-reads).
+
 **Clients.** The [Python SDK](python.md#hosted-client) (`HostedMemory`) and
 the [TypeScript SDK](typescript.md) wrap every route below.
 

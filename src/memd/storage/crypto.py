@@ -143,6 +143,13 @@ class KeyProvider:
     def describe(self) -> dict:
         return {"provider": self.name}
 
+    def read_view(self, *, connect_timeout_s: float, read_timeout_s: float,
+                  max_attempts: int) -> "KeyProvider":
+        """This provider for a reader that must not hang (a read replica):
+        calls with short timeouts and few attempts. Itself when its calls are
+        bounded already (or make no remote call)."""
+        return self
+
 
 class LocalKeyProvider(KeyProvider):
     """Root key held in process memory (loaded from a file by the caller).
@@ -215,6 +222,8 @@ class AwsKmsProvider(KeyProvider):
         self._template = key_id
         self.shred_action = shred
         self.pending_window_days = int(pending_window_days)
+        self._client_args = None if client is not None else {"region_name": region,
+                                                             "endpoint_url": endpoint_url}
         if client is None:
             try:
                 import boto3
@@ -224,6 +233,23 @@ class AwsKmsProvider(KeyProvider):
             client = boto3.client("kms", region_name=region, endpoint_url=endpoint_url,
                                   config=Config(retries={"max_attempts": 5, "mode": "standard"}))
         self._kms = client
+
+    def read_view(self, *, connect_timeout_s: float, read_timeout_s: float,
+                  max_attempts: int) -> "AwsKmsProvider":
+        """The same CMK through a client with short timeouts and few attempts
+        (Decrypt only, for a read replica): with the default client (60 s
+        timeouts, 5 attempts with backoff) an unreachable KMS cost every
+        replica open 12-20 s. An injected client is shared as it is."""
+        if self._client_args is None:
+            return self
+        import boto3
+        from botocore.config import Config
+
+        client = boto3.client("kms", **self._client_args, config=Config(
+            retries={"total_max_attempts": max(1, int(max_attempts)), "mode": "standard"},
+            connect_timeout=float(connect_timeout_s), read_timeout=float(read_timeout_s)))
+        return AwsKmsProvider(self._template, client=client, shred=self.shred_action,
+                              pending_window_days=self.pending_window_days)
 
     def key_id(self, namespace: str) -> str:
         return self._template.format(namespace=namespace) if _per_namespace(self._template) \
@@ -449,6 +475,13 @@ class KeyEnvelope:
                 "key: the key is not the one it was written with (lost, replaced, restored from "
                 "another deployment) or the ciphertext is damaged") from None
 
+    def read_view(self, store: Any = None, **timeouts) -> "KeyEnvelope":
+        """This envelope for a read replica: one that reads
+        `store` (a view of the object store with short timeouts) and calls
+        its provider with short `timeouts` (connect_timeout_s,
+        read_timeout_s, max_attempts). Itself when it makes no remote call."""
+        return self
+
     def key_check(self, namespace: str) -> str:
         """A public fingerprint of `namespace`'s data key: HMAC-SHA256 under
         the key of a fixed label, 128 bits. Kept beside the data (the
@@ -490,7 +523,7 @@ class LocalKeyEnvelope(KeyEnvelope):
 
     provider_name = "local"
 
-    def __init__(self, dir_path: str, root_key: bytes | None = None):
+    def __init__(self, dir_path: str, root_key: bytes | None = None, *, read_only: bool = False):
         self.dir = dir_path
         # unwrapped per-namespace data keys, LRU-bounded. Caching is sound:
         # every encrypt/decrypt needs the raw key in process memory anyway.
@@ -506,6 +539,11 @@ class LocalKeyEnvelope(KeyEnvelope):
         # together with the first data key it wraps (data_key).
         self._root_key: bytes | None = root_key
         self._provider: LocalKeyProvider | None = None
+        if read_only:
+            # a read replica's process shares the writer's
+            # keys directory and changes nothing in it - not even the
+            # residue of an interrupted shred, which the writer sweeps
+            return
         _sweep_shreds(dir_path)
         if root_key is not None and not os.path.exists(self._rk_path):
             try:
@@ -670,9 +708,11 @@ class LocalKeyEnvelope(KeyEnvelope):
             self._cache.popitem(last=False)
         return dk
 
-    def peek_data_key(self, namespace: str) -> bytes | None:
-        """The namespace's key if it has one - never mints (key migration)."""
-        if namespace in self._cache:
+    def peek_data_key(self, namespace: str, *, fresh: bool = False) -> bytes | None:
+        """The namespace's key if it has one - never mints (key migration,
+        read replicas). `fresh`: from its key file, never this envelope's
+        cache (a read replica: the cached copy may be a key since shredded)."""
+        if not fresh and namespace in self._cache:
             return self._cache[namespace]
         p = self._key_path(namespace)
         return self._unwrap_file(namespace, p) if os.path.exists(p) else None
@@ -846,6 +886,14 @@ class ObjectStoreKeyEnvelope(KeyEnvelope):
         self._ns_locks: dict[str, list] = {}
         self._custody_written = False
 
+    def read_view(self, store: Any = None, **timeouts) -> "ObjectStoreKeyEnvelope":
+        """Wrapped key records read from `store`, unwrapped by the provider
+        with short timeouts; a cache of its own (a replica resolves through
+        peek_data_key, which never fills one)."""
+        provider = self.provider.read_view(**timeouts) if timeouts else self.provider
+        return ObjectStoreKeyEnvelope(provider, store if store is not None else self.store,
+                                      legacy_dir=self.legacy_dir)
+
     # the plaintext DEK cache is as in LocalKeyEnvelope: a DEK has to be in
     # process memory to encrypt anyway
 
@@ -938,8 +986,10 @@ class ObjectStoreKeyEnvelope(KeyEnvelope):
             _log.warning("memd: could not write the key-custody marker", exc_info=True)
         self._custody_written = True
 
-    def peek_data_key(self, namespace: str) -> bytes | None:
-        if namespace in self._cache:
+    def peek_data_key(self, namespace: str, *, fresh: bool = False) -> bytes | None:
+        """The namespace's key if it has one - never mints. `fresh`: from its
+        wrapped key object, never this envelope's cache (as LocalKeyEnvelope)."""
+        if not fresh and namespace in self._cache:
             return self._cache[namespace]
         rec = self.read_record(namespace)
         return None if rec is None else self._unwrap_record(namespace, rec)
@@ -994,6 +1044,85 @@ class ObjectStoreKeyEnvelope(KeyEnvelope):
                                 ver, fence=False)
         return {"namespace": namespace, "from": [old.key_id, old.key_version],
                 "to": [new.key_id, new.key_version]}
+
+
+class ReadOnlyKeyEnvelope(KeyEnvelope):
+    """A read replica's view of an envelope: it resolves a
+    namespace's EXISTING data key - unwraps it, never mints one - and
+    refuses everything that would write: encrypt, destroy, rewrap. A key
+    that is not there is a KeyCustodyError, never a fresh key: a replica of
+    a namespace whose key is held elsewhere must not read as empty, and must
+    not create the key object (or local key file) the writer will own.
+
+    It resolves through the wrapped envelope's peek_data_key (no minting,
+    no custody marker) - from the key's durable record, never the wrapped
+    envelope's cache: a copy this process kept from an earlier tenure of the
+    namespace may be a key since shredded - and keeps its own LRU of the
+    keys it resolved. forget() drops one: the namespace was destroyed, or
+    another tenure began (it may have been created again, with a new key)."""
+
+    prefetch_at_open = False
+    CACHE_MAX = 1024
+
+    def __init__(self, inner: "KeyEnvelope"):
+        self._inner = inner
+        self.enabled = bool(getattr(inner, "enabled", True))
+        self.provider_name = getattr(inner, "provider_name", "abstract")
+        self._cache: "OrderedDict[str, bytes]" = OrderedDict()
+        self._mu = threading.Lock()
+
+    @property
+    def inner(self) -> "KeyEnvelope":
+        return self._inner
+
+    def has_key(self, namespace: str) -> bool:
+        return namespace in self._cache or self._inner.has_key(namespace)
+
+    def key_on_disk(self, namespace: str) -> bool:
+        probe = getattr(self._inner, "key_on_disk", None)
+        return bool(probe(namespace)) if callable(probe) else False
+
+    def data_key(self, namespace: str) -> bytes:
+        with self._mu:
+            dk = self._cache.get(namespace)
+            if dk is not None:
+                self._cache.move_to_end(namespace)
+                return dk
+        if not self.enabled:
+            return self._inner.data_key(namespace)   # (NullKeyEnvelope: no key, nothing written)
+        peek = getattr(self._inner, "peek_data_key", None)
+        dk = peek(namespace, fresh=True) if callable(peek) else None
+        if dk is None:
+            raise KeyCustodyError(
+                f"namespace {namespace!r} has no data key here (a read replica resolves an "
+                "existing key only - it never mints one): the key is held elsewhere, or the "
+                "namespace was destroyed")
+        with self._mu:
+            self._cache[namespace] = dk
+            while len(self._cache) > self.CACHE_MAX:
+                self._cache.popitem(last=False)
+        return dk
+
+    def forget(self, namespace: str) -> None:
+        """Drop the key from this view: the next use resolves it again from
+        its record (the namespace is gone - crypto-shred - or may have been
+        created again under its name with a new key)."""
+        with self._mu:
+            self._cache.pop(namespace, None)
+
+    def _refuse(self, what: str):
+        from memd.storage.objectstore import ReadOnlyError
+
+        return ReadOnlyError(f"a read replica never {what}")
+
+    def encrypt(self, namespace: str, plaintext: bytes) -> bytes:
+        raise self._refuse("encrypts (it writes nothing)")
+
+    def destroy(self, namespace: str) -> bool:
+        raise self._refuse("destroys a key")
+
+    def rewrap(self, namespace: str):
+        raise self._refuse("re-wraps a key")
 
 
 class NullKeyEnvelope(KeyEnvelope):
@@ -1146,7 +1275,7 @@ def write_custody(store: Any, provider: KeyProvider) -> None:
 
 
 def envelope_from_config(cfg: dict | None, local_dir: str, store: Any, *,
-                         encrypt: bool = True) -> KeyEnvelope:
+                         encrypt: bool = True, read_only: bool = False) -> KeyEnvelope:
     """The envelope a Memory opens with.
 
     `local` (default): LocalKeyEnvelope under `<local_dir>/keys`, exactly as
@@ -1154,7 +1283,8 @@ def envelope_from_config(cfg: dict | None, local_dir: str, store: Any, *,
     been moved to a remote provider (a node with the old config would
     otherwise mint fresh keys over data it can no longer read).
     Remote: ObjectStoreKeyEnvelope over `store`, with `<local_dir>/keys` as
-    the legacy directory the mint guard checks."""
+    the legacy directory the mint guard checks. `read_only` (a read
+    replica's process): the local keys directory is left exactly as it is."""
     keys_dir = os.path.join(local_dir, "keys")
     if not encrypt:
         # (the keys it would have: an open still tells an encrypted namespace
@@ -1174,7 +1304,7 @@ def envelope_from_config(cfg: dict | None, local_dir: str, store: Any, *,
         # namespace on a shared bucket) is refused at open, nothing minted:
         # NamespaceStore._verify_key, on every root. The key is resolved
         # lazily, only once that check passed (and the root key with it).
-        return LocalKeyEnvelope(keys_dir)
+        return LocalKeyEnvelope(keys_dir, read_only=read_only)
     if custody and custody.get("provider") != name:
         raise KeyCustodyError(
             f"this store's data keys are held by {custody.get('provider')!r}, not {name!r}")

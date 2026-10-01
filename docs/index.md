@@ -38,8 +38,9 @@ Honest limits:
 
 - **One writer per namespace.** A second process on the same namespace fails
   fast with `NamespaceBusyError`; scale by spreading namespaces across
-  processes. Several writers inside one namespace and read replicas are not
-  built.
+  processes. Several writers inside one namespace are not built; reads can
+  scale out with read replicas, which serve eventually consistent reads
+  (opt-in, within a staleness bound).
 - **Fact extraction is pattern-based by default.** An LLM extractor is
   available with your own key; it has not been evaluated.
 - **The quality evidence is retrieval on one public dataset.** The

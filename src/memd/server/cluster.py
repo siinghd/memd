@@ -35,6 +35,15 @@ one server:
 Handoff: a graceful stop deregisters, then closes the engine (flush +
 lease release); a crashed node's leases go stale after the TTL and the next
 request for each namespace is routed to a live node, which reclaims it.
+
+Read replicas: a search or get that opted into eventual
+consistency (X-Memd-Read-Consistency: eventual) and reaches a node that does
+not hold the namespace's lease is served by THAT node's replica of the
+namespace - no hop, so a load balancer spreads a hot namespace's reads over
+every node. A replica that cannot serve it within the caller's staleness
+bound answers 503 X-Memd-Replica-Unavailable, which is intercepted here: the
+request then takes the normal route to the writer, invisibly. Writes, strong
+reads and requests a peer routed in are never served by a replica.
 """
 from __future__ import annotations
 
@@ -59,6 +68,11 @@ NODE_PREFIX = "_cluster/nodes"
 NODE_NS_PREFIX = "memd-node."
 ROUTE_HEADER = "x-memd-route"
 NOT_OWNER_HEADER = "x-memd-not-owner"
+CONSISTENCY_HEADER = "x-memd-read-consistency"
+REPLICA_UNAVAILABLE_HEADER = "x-memd-replica-unavailable"
+# the reads a replica may serve: POST .../search and GET .../memories/{id}
+_REPLICA_READS = (("POST", re.compile(r"^/v1/ns/[^/]+/search/?$")),
+                  ("GET", re.compile(r"^/v1/ns/[^/]+/memories/[^/]+/?$")))
 _NODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _NS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")   # memd.storage.engine._validate_ns
 # hop-by-hop headers (RFC 9110 7.6.1) plus the ones the client recomputes
@@ -478,6 +492,19 @@ class ClusterMiddleware:
         return {"node": node, "client": client}
 
     @staticmethod
+    def _wants_replica(scope) -> bool:
+        """An eligible read that accepts eventual consistency."""
+        if not any(scope["method"] == m and rx.match(scope["path"]) for m, rx in _REPLICA_READS):
+            return False
+        for k, v in scope.get("headers") or []:
+            if k == CONSISTENCY_HEADER.encode():
+                return v.decode("latin-1").strip().lower() == "eventual"
+        from urllib.parse import parse_qs
+
+        qs = parse_qs((scope.get("query_string") or b"").decode("latin-1"))
+        return (qs.get("consistency") or [""])[-1].strip().lower() == "eventual"
+
+    @staticmethod
     def _client_of(scope) -> str:
         """The same pre-auth identity rule as the REST server's _client_id."""
         client = (scope.get("client") or ("unknown", 0))[0]
@@ -512,11 +539,28 @@ class ClusterMiddleware:
                         decision="routed_in")
             return await self.app(scope, self._replay(body, receive), send)
         client = _clean_client(self._client_of(scope))
+        from starlette.concurrency import run_in_threadpool
+
+        if self._wants_replica(scope):
+            try:
+                held = await run_in_threadpool(self.router.store.holds_lease, ns, True)
+            except Exception:  # noqa: BLE001 - cannot tell: let the replica serve it
+                held = False
+            if not held:
+                # served by this node's replica of the namespace; one that
+                # cannot (too stale, a custody refusal, ...) says so and the
+                # request takes the writer's route below instead
+                rscope = dict(scope)
+                rscope["state"] = dict(scope.get("state") or {}, memd_replica_ok=True)
+                if await self._local(rscope, body, receive, send,
+                                     intercept=(NOT_OWNER_HEADER, REPLICA_UNAVAILABLE_HEADER)):
+                    METRICS.inc("memd_router_requests_total", decision="replica")
+                    return
+                METRICS.inc("memd_router_requests_total", decision="replica_fallback")
         deadline = time.monotonic() + self.cfg.route_retry_s
         exclude: set[str] = set()
         attempt = 0
         last = "no route"
-        from starlette.concurrency import run_in_threadpool
 
         while True:
             t_r = time.monotonic()
@@ -551,14 +595,17 @@ class ClusterMiddleware:
         await self._send_json(send, 503, f"namespace owner unavailable ({last}); retry",
                               "namespace_unavailable", [(b"retry-after", b"1")])
 
-    async def _local(self, scope, body: bytes, receive, send) -> bool:
-        """Run the local app. False (nothing sent) when it answered
-        not-owner: another node won the lease between resolve and open."""
+    async def _local(self, scope, body: bytes, receive, send,
+                     intercept: tuple[str, ...] = (NOT_OWNER_HEADER,)) -> bool:
+        """Run the local app. False (nothing sent) when it answered with one
+        of the `intercept` headers: not-owner (another node won the lease
+        between resolve and open), or replica-unavailable."""
         state = {"not_owner": False}
+        wanted = {h.encode() for h in intercept}
 
         async def send_wrapper(msg):
             if msg["type"] == "http.response.start":
-                if any(k.lower() == NOT_OWNER_HEADER.encode() for k, _ in msg.get("headers") or []):
+                if any(k.lower() in wanted for k, _ in msg.get("headers") or []):
                     state["not_owner"] = True
                     return
             elif state["not_owner"]:

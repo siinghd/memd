@@ -129,6 +129,8 @@ Every method accepts per-call options: `namespace` (overrides the client's), `si
 
 Request fields keep the server's names (`user_id`, `session_id`, `budget_tokens`, `entity_keys`, …). `null` and `undefined` both mean "use the server default".
 
+Reads are strong by default (served by the namespace's writer). `consistency: "eventual"` (with an optional `maxStalenessMs`), in the client options or per `search` / `pack` / `get` call, lets a read replica serve them; `client.lastRead` then says who served the last one: `{ servedBy: "leader" | "replica", appliedSeq, ageMs }` (the replica's applied seq and age, `null` for the leader).
+
 An export is complete unless the server had to leave out a damaged WAL frame: it then exports everything it can read and says how many frames it left out in the `X-Memd-Export-Skipped-Frames` response header. After `export`, `exportJsonl` or `exportStream` (before its first record), `client.lastExportSkippedFrames` holds that count; `0` means complete.
 
 ### pack / observe

@@ -127,6 +127,13 @@ they are the number that decides both the cost model and how a WAN changes
 things. A warm search touches object storage zero times because retrieval is
 served by the local derived index.
 
+Timeouts: the writer's data client (segments, log parts, the manifest) has a
+10 s connect timeout and botocore's 60 s read timeout - an append is a
+conditional PUT, never retried early; leases and the cluster registry go
+through a client of their own with 2 s / 4 s, and a read replica's bucket and
+KMS calls through clients with `MEMD_REPLICA_CONNECT_TIMEOUT_S` /
+`MEMD_REPLICA_READ_TIMEOUT_S` (2 s / 5 s; see "Read replicas").
+
 What stays local: the SQLite derived index (rebuildable by contract — the
 index snapshot published to the store is what makes a cold node cheap) and, with the default `local`
 key provider, the envelope **keys**. Then data is remote and keys are not:
@@ -230,8 +237,141 @@ SIGKILLed → next write acked after 3.6-3.8 s (bound: TTL + ε); SIGTERM →
 0.03-1.1 s; frozen past its TTL → 4.8-6.2 s, with no acked write lost in any
 case. On MinIO a node frozen in the middle of a lease write holds that
 object's lock for MinIO's ~30 s timeout, and its takeover waits for it
-(observed in 2 of 14 frozen runs; AWS S3 does not lock). Not built yet: read replicas (every read goes to the leaseholder) and
+(observed in 2 of 14 frozen runs; AWS S3 does not lock). Not built yet:
 multiple writers inside one namespace.
+
+### Read replicas (eventual reads)
+
+Reads are **strong by default**: the node holding the namespace's lease
+serves them, as above. A search or a get may opt into **eventual
+consistency**, and is then served by a **read replica** - on whichever node
+received it, with no hop - so a load balancer in front spreads a hot
+namespace's reads over every node:
+
+```bash
+curl -X POST "$NODE/v1/ns/acme/search" -H "Authorization: Bearer $KEY" \
+     -H "X-Memd-Read-Consistency: eventual" -H "X-Memd-Max-Staleness-Ms: 5000" \
+     -d '{"query": "how do we deploy?"}'
+# X-Memd-Served-By: replica   X-Memd-Replica-Seq: 4211   X-Memd-Replica-Age-Ms: 840
+```
+
+```python
+mem = HostedMemory(api_key=..., base_url=..., consistency="eventual")   # or per call
+mem.search("how do we deploy?"); mem.last_read   # {"served_by": "replica", "applied_seq": ..., "age_ms": ...}
+```
+
+- A replica takes **no lease and never writes or deletes an object** (no
+  manifest, part, fence, key, custody marker, audit entry or snapshot) - it
+  is opened over a read-only view of the store and the keys. It bootstraps
+  from the published index snapshot and the segments, then follows the
+  writer: every `MEMD_REPLICA_REFRESH_S` (2 s) it reads the manifest, the
+  WAL and ops tails since its last read (S3: one LIST and a GET per new
+  part), and the manifest again; a compaction, takeover or new tenure
+  rebuilds it from the bucket, a rotation is caught up.
+- **Staleness bound**: every write acknowledged before the replica's last
+  refresh started is served. A read accepts a replica no older than
+  `X-Memd-Max-Staleness-Ms` (default 3 x the refresh interval); for an
+  older one the read waits for a refresh at most
+  `MEMD_REPLICA_REFRESH_WAIT_MS` (1 s) - never on one already running that
+  long (a bucket or KMS that hangs) - and a read it still cannot serve - or
+  one that hits a key-custody or store error - goes to the writer instead,
+  invisibly. A read that can go to the writer waits no longer for a
+  replica's open either: the open goes on in the background, and reads go
+  to the writer until it completes (an embedded `read_only` Memory, with no
+  writer to go to, waits for it). A replica that failed to open is not
+  opened again by reads for 5 s (doubling to 60 s while it keeps failing):
+  they go to the writer at once. A replica's bucket and KMS calls have short timeouts of their own
+  (below); the writer's data client has a 10 s connect timeout and
+  botocore's 60 s read timeout. Every search and get answers
+  `X-Memd-Served-By: leader|replica` (a replica adds `X-Memd-Replica-Seq`
+  and `X-Memd-Replica-Age-Ms`, the age of the state the read was served
+  from).
+- **Read-your-writes** holds for strong reads only: an eventual read may
+  miss a write acknowledged less than the bound ago, and may still serve a
+  record deleted that recently. A hard delete stops being served by every
+  replica within the bound, and is scrubbed from the replica's files when
+  it applies it - or when it builds them from durable data that still
+  holds it, its purge pending (SECURITY.md). A replica never serves an
+  older state than one it has served: a rebuilt replica serves nothing
+  until the refresh that rebuilt it has applied the log tail too (a read
+  waits for that at most `MEMD_REPLICA_REFRESH_WAIT_MS`, then is refused:
+  over the router it goes to the writer).
+- Served by replicas: `search` and `get` (`GET .../memories/{id}`). Always
+  the writer: every write, `export` (audited in the namespace's ledger, which
+  only the writer appends to), `find_ids` / `forget` (a preview must match
+  what the confirm deletes), `stats`. A replica-served search is audited in
+  the serving node's own ledger (`memd-node.<id>`, `replica_search`).
+- A replica needs the namespace's data key like a writer (provider access
+  for `aws-kms` / `vault-transit`); it never mints one, and a key it cannot
+  use refuses (over the router, the read then goes to the writer).
+- Embedded: `Memory(path, read_only=True)` opens every namespace as a
+  replica - every mutating call raises `ReadOnlyError`, nothing is written
+  to the store or the keys directory, and reads follow the writer (another
+  process) within the bound. With no writer to fall back to, a read the
+  replica refuses raises `ReplicaUnavailableError` to the caller: after a
+  rebuild until the log tail is applied, when the replica is staler than
+  the bound and its refresh has run longer than the read's wait, or after
+  a failed rebuild. Retry it, or read from the writer. `search(..., consistency="eventual")` /
+  `get(...)` on a writer `Memory` reads its own store when the namespace is
+  open in it, else a replica.
+- A namespace destroyed (crypto-shredded) and created again under its name
+  is followed like any new tenure: the replica rebuilds and resolves the
+  new key from its record. A replica whose rebuild failed (the bucket or the
+  key provider unreachable) serves nothing until a rebuild completes - the
+  reads go to the writer - and tries again on its next refresh.
+
+**Measured** (`bench/replica_bench.py`: three node processes on one MinIO
+bucket on loopback, moto KMS, hash embedder, no reranker, one namespace of
+2,000 records; everything on one 8-core machine, so the absolute latencies
+are a floor and the throughput ceiling is this machine):
+
+| replica lag, write ack -> first eventual read that sees it | p50 | p90 | p99 | max |
+|---|---|---|---|---|
+| refresh every 2 s (default), 300 samples | 996 ms | 1,815 ms | 2,005 ms | 2,014 ms |
+| refresh every 0.5 s, 200 samples | 282 ms | 488 ms | 525 ms | 538 ms |
+
+The lag is the phase against the refresh cycle plus one refresh (~10-20 ms
+here); no write was missed. Eventual searches, 12 client threads, 20 s per
+row, in two query mixes - **repeat**: 8 fixed queries, so nearly every
+search is a hit in the node's repeat-query cache (this measures the request
+path around the cache, not a search); **unique**: the same queries made
+unique by an extra term that matches nothing, so every search is a cache
+miss (the search itself). The hit rate is each run's own `/metrics` count:
+
+| query mix | serving nodes | searches/s | p50 | p99 | cache hits |
+|---|---|---|---|---|---|
+| repeat | 1 (the writer) | 155.8 | 71.4 ms | 250.9 ms | 99.4% |
+| repeat | 2 (writer + 1 replica) | 333.1 | 34.0 ms | 89.0 ms | 99.8% |
+| repeat | 3 (writer + 2 replicas) | 509.1 | 22.1 ms | 47.4 ms | 99.9% |
+| unique | 1 (the writer) | 35.4 | 338.7 ms | 571.5 ms | 0.0% |
+| unique | 2 (writer + 1 replica) | 94.0 | 125.6 ms | 252.2 ms | 0.0% |
+| unique | 3 (writer + 2 replicas) | 170.3 | 67.6 ms | 147.3 ms | 0.0% |
+
+Each serving node took an equal share. The cache-miss mix is the measure of
+the read capacity replicas add; it scales better than linearly here only
+because one node is far past saturation with all 12 clients on it (35
+searches/s per node with 12 clients, 47 with 6, 57 with 4) - at a load one
+node absorbs, expect about linear. The writer's own latency with replicas
+attached (300 writes and strong searches): write p50 / p99 16.5 / 32.3 ms
+with no replica open, 16.4 / 27.9 ms with two attached, 17.4 / 43.8 ms with
+two serving a read load (shared CPU). A refresh with nothing new is 4
+object-store requests (2 manifest GETs, a LIST of each log) - ~2 requests/s
+per open replica at the default interval, which is why idle replicas close.
+
+**Outages** were measured separately, not by the benchmark: on the same
+machine, with a TCP proxy that refuses connections, or accepts them and
+never answers, in front of the replica's bucket or of one node's KMS. The
+bucket hanging for 150 s under an embedded `read_only` Memory refreshing
+every 0.5 s: no eventual read waited longer than 1.0 s before it was
+refused (over the router it goes to the writer), and the replica served
+again 0.9 s after the bucket's return. One node's KMS, in a four-node HTTP
+cluster on the same MinIO and moto KMS refreshing every 0.5 s, for three
+namespaces another node writes: refusing connections, the first eventual
+read of each namespace on that node went to the writer after 0.2-0.5 s
+(up to about 1.1 s on a loaded machine);
+hanging, after 1.0-1.1 s (the read's wait - the replica's open timed out
+in the background, 2 x 5 s); the following reads went to the writer in
+~20 ms.
 
 | setting | default | |
 |---|---|---|
@@ -244,6 +384,12 @@ multiple writers inside one namespace.
 | `MEMD_KEY_PROVIDER` | - | required: `aws-kms` or `vault-transit` (a `local` key file cannot be shared) |
 | `MEMD_LOCAL_DIR` | `.memd-local` | node-local cache, under `<dir>/node-<id>` |
 | `MEMD_CACHE_SWEEP_S` | 300 | how often a node drops its local copies of namespaces another node took over (also at startup; `0` = never) |
+| `MEMD_REPLICA_REFRESH_S` | 2 | how often a read replica follows its writer (the staleness bound's base; `replica_refresh_s` in `Memory(config=...)`) |
+| `MEMD_REPLICA_MAX_STALENESS_MS` | 3 x refresh | the default bound of an eventual read (`X-Memd-Max-Staleness-Ms` per request) |
+| `MEMD_MAX_REPLICAS` | 64 | replica namespaces per node (LRU; a closed replica's cache is deleted) |
+| `MEMD_REPLICA_IDLE_S` | 300 | a replica nobody read for this long is closed (each costs 4 object-store requests per refresh with nothing new) |
+| `MEMD_REPLICA_REFRESH_WAIT_MS` | 1000 | the longest an eventual read waits for a replica's refresh (or its open) before it goes to the writer |
+| `MEMD_REPLICA_CONNECT_TIMEOUT_S` / `MEMD_REPLICA_READ_TIMEOUT_S` / `MEMD_REPLICA_MAX_ATTEMPTS` | 2 / 5 / 2 | a replica's bucket and KMS calls (its own clients; the writer's data client has a 10 s connect timeout and keeps botocore's 60 s read timeout - an append is a conditional PUT that must not be retried early) |
 | `MEMD_S3_ACCESS_KEY` / `MEMD_S3_SECRET_KEY` | boto3 chain | bucket credentials, separate from the `AWS_*` ones KMS uses |
 | `MEMD_SHUTDOWN_GRACE_S` | 30 | uvicorn graceful drain on SIGTERM |
 

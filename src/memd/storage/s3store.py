@@ -127,6 +127,18 @@ class S3ObjectStore(ObjectStore):
         self.prefix = prefix.strip("/")
         self.lease_ttl_s = float(lease_ttl_s)
         self.fetch_concurrency = max(1, int(fetch_concurrency))
+        # what read_view() builds its own client from (None: a client was
+        # injected, and a view shares it)
+        self._client_args = None if client is not None else {
+            "endpoint_url": endpoint_url, "aws_access_key_id": access_key,
+            "aws_secret_access_key": secret_key, "region_name": region}
+        # Data-plane client. A connect timeout is short: nothing was sent, so
+        # failing (and retrying) it is always safe. The READ timeout stays
+        # botocore's 60 s: an append is a conditional PUT (IfNoneMatch), and a
+        # retry after a response lost to a timeout finds its own part there -
+        # 412, an AppendConflict ("another writer") - so a writer must not
+        # give up on a slow response early. Readers that must not hang use
+        # read_view().
         self._client = client or boto3.client(
             "s3",
             endpoint_url=endpoint_url,
@@ -134,7 +146,7 @@ class S3ObjectStore(ObjectStore):
             aws_secret_access_key=secret_key,
             region_name=region,
             config=Config(retries={"max_attempts": 5, "mode": "standard"},
-                          signature_version="s3v4",
+                          signature_version="s3v4", connect_timeout=10,
                           # the connection pool must cover the fetch fan-out or
                           # concurrent GETs serialize on connections instead
                           max_pool_connections=max(10, int(fetch_concurrency) + 4)),
@@ -205,6 +217,30 @@ class S3ObjectStore(ObjectStore):
         # host:pid. A cluster node names itself here so the router can map a
         # lease to the node serving it (see memd.server.cluster)
         self.lease_holder = lease_holder
+
+    def read_view(self, *, connect_timeout_s: float = 2.0, read_timeout_s: float = 5.0,
+                  max_attempts: int = 2) -> "S3ObjectStore":
+        """This bucket and prefix for a READER that must not hang - a read
+        replica: a client of its own with short connect and
+        read timeouts and few attempts. With the data-plane client's
+        botocore defaults (60 s x 5 attempts) one outage that accepts
+        connections and never answers held a replica's refresh - and every
+        read waiting on it - for minutes. A reader only GETs, HEADs and
+        LISTs: a timeout is retried or reported, never an ambiguous write.
+        The view shares no state with this store (no write bookkeeping, no
+        lease); an injected client is shared as it is."""
+        client = self._client
+        if self._client_args is not None:
+            import boto3
+            from botocore.config import Config
+
+            client = boto3.client("s3", **self._client_args, config=Config(
+                retries={"total_max_attempts": max(1, int(max_attempts)), "mode": "standard"},
+                signature_version="s3v4", connect_timeout=float(connect_timeout_s),
+                read_timeout=float(read_timeout_s),
+                max_pool_connections=max(10, self.fetch_concurrency + 4)))
+        return S3ObjectStore(self.bucket, self.prefix, client=client, lease_ttl_s=self.lease_ttl_s,
+                             fetch_concurrency=self.fetch_concurrency, lease_holder=self.lease_holder)
 
     # ------------------------------------------------------------- plumbing
 
@@ -744,6 +780,70 @@ class S3ObjectStore(ObjectStore):
 
     def _remember_size(self, key: str, total: int) -> None:
         self._size_cache[key] = total
+
+    # ---------------------------------------------- following a log (replicas)
+
+    # part numbers are never reused (see set_log_floor / delete_log), so a
+    # follower's cursor - the next part number - survives every fold
+    log_cursors_survive_folds = True
+
+    def _list_parts_from(self, key: str, start: int) -> list[tuple[int, str, int]]:
+        """(number, full key, size) of the parts numbered >= start, in order.
+        Unlike _parts this records nothing (no _seen_hw): a follower's reads
+        must not move the bound a writer's deletes are limited to."""
+        prefix = self._full(key) + _PART_SEP
+        after = f"{prefix}{start - 1:0{_PART_WIDTH}d}" if start > 0 else None
+        out = []
+        for full, size in self._iter_keys(prefix, after):
+            m = _PART_RE.match(full)
+            if m and int(m.group("seq")) >= start:
+                out.append((int(m.group("seq")), full, size))
+        out.sort()
+        return out
+
+    def log_tail(self, key: str, cursor=None) -> tuple[list[tuple[object, bytes]], object, bool]:
+        """A cursor is the next part number to read (None: the base object
+        first, then every part). One LIST from the cursor and a GET per new
+        part - O(new parts), never O(log).
+
+        A LIST running while the writer appends may show a part without the
+        one before it (each was complete before the next began, but one
+        listing is not a snapshot): a listing with a hole below its newest
+        part is repeated once - the second LIST starts after the first one
+        saw that newest part, so it sees every earlier part that exists. A
+        hole that remains is a number no part took (a failed PUT, a fence
+        that moved up)."""
+        _count_op("log_tail")
+        _validate_key(key)
+        start = 0 if cursor is None else int(cursor)
+        listed = self._list_parts_from(key, start)
+
+        def holes(parts) -> bool:
+            nums = [n for n, _, _ in parts]
+            if cursor is not None:
+                nums = [start - 1] + nums
+            return any(b - a > 1 for a, b in zip(nums, nums[1:]))
+
+        if holes(listed):
+            again = self._list_parts_from(key, start)
+            top = listed[-1][0]
+            listed = [p for p in again if p[0] <= top] if again else listed
+        chunks: list[tuple[object, bytes]] = []
+        if cursor is None:
+            base = self._raw_get(self._full(key))   # a put-then-append log reads its base first
+            if base:
+                chunks.append((0, base))
+        want = [(full, size) for _, full, size in listed if size > 0]
+        got = iter(self._fetch_parts(want)) if want else iter(())
+        for n, _full, size in listed:
+            chunks.append((n + 1, next(got) if size > 0 else b""))
+        end = listed[-1][0] + 1 if listed else start
+        return chunks, end, False
+
+    def log_cursor_back(self, cursor, nbytes: int):
+        # a part is a whole append: one that ends mid-frame is damage, not a
+        # write in progress - the follower refuses it rather than wait
+        return cursor
 
     def truncate(self, key: str, size: int) -> None:
         """Cut the logical object back to `size` bytes (torn-tail repair)."""

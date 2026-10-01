@@ -105,8 +105,9 @@ done; how these were measured and what they do not show is in
 
 - **One writer per namespace.** A second process opening the same namespace
   fails fast with `NamespaceBusyError`; scale by spreading namespaces across
-  processes. Several writers inside one namespace and read replicas are not
-  built.
+  processes. Several writers inside one namespace are not built; reads can
+  scale out with read replicas, which serve eventually consistent reads
+  (opt-in, within a staleness bound).
 - **Fact extraction is pattern-based by default.** An LLM extractor is
   available with your own key; it has not been evaluated.
 - **Alpha software.** What changed in each release is in the

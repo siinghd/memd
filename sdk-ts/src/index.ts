@@ -9,6 +9,7 @@ export type {
   GetOptions,
   MemdClientOptions,
   ObserveOptions,
+  ReadOptions,
   RememberOptions,
   RequestOptions,
   SearchOptions,

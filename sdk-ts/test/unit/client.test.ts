@@ -161,6 +161,41 @@ describe("reads", () => {
     expect(calls[0]!.url).toBe("http://memd.test/v1/ns/default/memories/01A?history=true&include_deleted=true");
   });
 
+  it("reads are strong by default and send no consistency header", async () => {
+    const { fetch, calls } = scriptedFetch(json(SEARCH_RESULT, 200, { "x-memd-served-by": "leader" }));
+    const c = client(fetch);
+    await c.search("q");
+    expect(calls[0]!.headers["x-memd-read-consistency"]).toBeUndefined();
+    expect(calls[0]!.headers["x-memd-max-staleness-ms"]).toBeUndefined();
+    expect(c.lastRead).toEqual({ servedBy: "leader", appliedSeq: null, ageMs: null });
+  });
+
+  it("eventual reads send the consistency and staleness headers and record who served them", async () => {
+    const replica = { "x-memd-served-by": "replica", "x-memd-replica-seq": "42", "x-memd-replica-age-ms": "180" };
+    const { fetch, calls } = scriptedFetch(json(SEARCH_RESULT, 200, replica), json(RECORD, 200, replica));
+    const c = client(fetch, { consistency: "eventual", maxStalenessMs: 5000 });
+    expect(c.lastRead).toBeNull();
+    await c.search("q");
+    expect(calls[0]!.headers["x-memd-read-consistency"]).toBe("eventual");
+    expect(calls[0]!.headers["x-memd-max-staleness-ms"]).toBe("5000");
+    expect(c.lastRead).toEqual({ servedBy: "replica", appliedSeq: 42, ageMs: 180 });
+    // per call: a strong get overrides the client's eventual default
+    await c.get("01A", { consistency: "strong", maxStalenessMs: 250 });
+    expect(calls[1]!.headers["x-memd-read-consistency"]).toBe("strong");
+    expect(calls[1]!.headers["x-memd-max-staleness-ms"]).toBe("250");
+    expect(c.lastRead).toEqual({ servedBy: "replica", appliedSeq: 42, ageMs: 180 });
+  });
+
+  it("writes never send a consistency header", async () => {
+    const { fetch, calls } = scriptedFetch(json({ ids: ["01A"], accepted: 1 }, 202));
+    await client(fetch, { consistency: "eventual" }).add("x");
+    expect(calls[0]!.headers["x-memd-read-consistency"]).toBeUndefined();
+  });
+
+  it("rejects an unknown consistency", () => {
+    expect(() => client(scriptedFetch(json({})).fetch, { consistency: "sometimes" as never })).toThrow(TypeError);
+  });
+
   it("findIds returns the id list", async () => {
     const { fetch, calls } = scriptedFetch(json({ ids: ["a", "b"] }));
     expect(await client(fetch).findIds("deploy", { kinds: ["fact"], user_id: "u1" })).toEqual(["a", "b"]);

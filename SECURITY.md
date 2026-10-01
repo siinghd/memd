@@ -116,6 +116,16 @@ any probe fails the build.
   is refused instead.
 - **Plaintext data keys are in node memory** while a namespace is open (they
   must be, to encrypt), LRU-bounded to 1024 namespaces per process.
+  Known limitation: a process keeps a namespace's key in that cache after
+  it stops writing the namespace (LRU eviction, a lost lease). If another
+  process - another node - destroys the namespace and creates it again
+  under its name, and this process later opens it as its writer again, the
+  open checks the new data with the cached old key and refuses it
+  (`KeyCustodyError`: fails closed, nothing read or written) until the
+  process restarts or the key leaves the cache. Read replicas are not
+  affected: a replica resolves the key from its record again when it
+  rebuilds for another tenure (a new lineage) and after a custody refusal,
+  and never keeps a key that failed verification.
 - **Crypto-shred with a SHARED CMK / transit key** (the normal deployment)
   deletes the namespace's wrapped key object - including every noncurrent
   version on a versioned bucket (a versioned bucket whose versions API memd
@@ -204,6 +214,45 @@ any probe fails the build.
   next open, which finishes it in the background if such a reader still
   holds on; no index snapshot is published until it is done. Do not attach
   long-lived readers to the cache files.
+- **Read replicas keep a plaintext copy too, and are
+  eventually consistent.** A replica (an eventual read on a node that does
+  not hold the namespace's lease, or `Memory(..., read_only=True)`) keeps its
+  own derived cache - SQLite index, tantivy copy, ANN sidecar - under
+  `<cache dir>/replicas/<pid>-<token>/`, for exactly as long as it is open:
+  closing it (LRU eviction, `MEMD_REPLICA_IDLE_S` without reads, shutdown)
+  deletes the files, and a process that died with replicas open has its
+  directory deleted by the next memd process starting on the same cache
+  directory (each process holds an `flock` on its own). On a replica,
+  a hard delete the writer acknowledged is applied by the replica's next
+  refresh - it stops being served within the staleness bound (default 3 x
+  `MEMD_REPLICA_REFRESH_S`, 6 s; a replica older than the bound is not read)
+  - and the replica then scrubs its own files (FTS merge, vacuum, WAL
+  truncation, tantivy and ANN sidecar rebuilt), in the background; that is
+  sooner than the writer's own purge (up to the 72 h deadline). A
+  compaction, a takeover or a new tenure makes the replica delete its files
+  and rebuild from the bucket - whose durable data still holds a
+  hard-deleted record until the writer's purge: a replica built from it
+  (bootstrapped or rebuilt) applies the delete and scrubs its files the same
+  way, and a rebuilt replica serves nothing until it has applied the log
+  tail as well, so a delete it has served is never served again. A
+  destroyed (crypto-shredded) namespace's replica deletes its files and
+  drops the data key it held at its next refresh - and so does one
+  destroyed and created again under its name before that refresh: the
+  rebuild resolves the new incarnation's key from its record (never from a
+  cache), and a key that fails verification is
+  never kept. A replica never writes or deletes an object - no manifest, log
+  part, fence, wrapped key, custody marker, audit entry or snapshot (it is
+  opened over a read-only view of the store and the keys, and every write
+  path refuses on it) - and never mints a data key: it needs the
+  namespace's key exactly like a writer (the same `keys/` directory with
+  `local`, provider access with `aws-kms` / `vault-transit`), and a missing
+  or wrong key is a `KeyCustodyError` (never an empty replica; over the
+  router, the read goes to the writer). Eventual reads are opt-in
+  (`X-Memd-Read-Consistency: eventual`): one may miss a write or still
+  serve a delete acknowledged less than the bound ago. A search a replica
+  serves is audited in the serving node's own ledger (`memd-node.<id>`,
+  action `replica_search`, naming the namespace) - a replica cannot append
+  to the namespace's - and an embedded `read_only` Memory audits nothing.
 
 - **Hosted mode & billing (`--hosted`, off by default).**
   - *The Stripe webhook is authenticated by its signature only.*
