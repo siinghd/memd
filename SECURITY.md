@@ -116,6 +116,14 @@ any probe fails the build.
   is refused instead.
 - **Plaintext data keys are in node memory** while a namespace is open (they
   must be, to encrypt), LRU-bounded to 1024 namespaces per process.
+  Known limitation: a process keeps a namespace's key in that cache after
+  it stops writing the namespace (LRU eviction, a lost lease). If another
+  process - another node - destroys the namespace and creates it again
+  under its name, and this process later opens it as its writer again, the
+  open checks the new data with the cached old key and refuses it
+  (`KeyCustodyError`: fails closed, nothing read or written) until the
+  process restarts or the key leaves the cache. Read replicas are not
+  affected: they resolve a key from its record on every rebuild.
 - **Crypto-shred with a SHARED CMK / transit key** (the normal deployment)
   deletes the namespace's wrapped key object - including every noncurrent
   version on a versioned bucket (a versioned bucket whose versions API memd
@@ -222,7 +230,10 @@ any probe fails the build.
   compaction, a takeover or a new tenure makes the replica delete its files
   and rebuild from the bucket. A destroyed (crypto-shredded) namespace's
   replica deletes its files and drops the data key it held at its next
-  refresh. A replica never writes or deletes an object - no manifest, log
+  refresh - and so does one destroyed and created again under its name
+  before that refresh: the rebuild resolves the new incarnation's key from
+  its record (never from a cache), and a key that fails verification is
+  never kept. A replica never writes or deletes an object - no manifest, log
   part, fence, wrapped key, custody marker, audit entry or snapshot (it is
   opened over a read-only view of the store and the keys, and every write
   path refuses on it) - and never mints a data key: it needs the

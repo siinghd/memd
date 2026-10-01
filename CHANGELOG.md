@@ -31,8 +31,25 @@ wrong, how it showed, and the numbers before and after where it has them.
   `consistency` / `maxStalenessMs`, `lastRead`; embedded `search` / `get`:
   `consistency=`, `max_staleness_ms=`. Settings: `MEMD_REPLICA_REFRESH_S`,
   `MEMD_REPLICA_MAX_STALENESS_MS`, `MEMD_MAX_REPLICAS` (64),
-  `MEMD_REPLICA_IDLE_S` (300). Behaviour and settings: README-engine.md,
+  `MEMD_REPLICA_IDLE_S` (300), `MEMD_REPLICA_REFRESH_WAIT_MS` (1000),
+  `MEMD_REPLICA_CONNECT_TIMEOUT_S` / `MEMD_REPLICA_READ_TIMEOUT_S` /
+  `MEMD_REPLICA_MAX_ATTEMPTS` (2 / 5 / 2). Behaviour, settings and
+  measurements (including a cache-miss read mix): README-engine.md,
   "Read replicas".
+- **Read replicas, hardened before release:**
+  a namespace destroyed and created again under its name between two
+  refreshes no longer leaves its replicas refusing every read for good (the
+  key is resolved again across a lineage, from its record; a refused key is
+  never kept; a rebuild that failed part-way runs again, and nothing is
+  served until it completes); a bucket that hangs no longer holds eventual
+  reads (152 s for one read before; now at most 1 s, then the writer: the
+  replica's own clients have short timeouts, and a read waits for a
+  refresh at most `MEMD_REPLICA_REFRESH_WAIT_MS`); a replica that failed to
+  open (KMS down) is not retried by every read (12-20 s each before; now
+  they go to the writer at once for 5 s, doubling to 60 s); a replica read
+  that falls back to the writer is charged once against the rate limits,
+  not twice. The writer's data client gets a 10 s connect timeout (its
+  read timeout is unchanged).
 
 ## [0.3.2] - 2026-10-01
 

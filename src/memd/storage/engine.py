@@ -5025,11 +5025,14 @@ class StorageEngine:
         """Where an EVENTUALLY consistent read of `ns` is served -> (store,
         info): the namespace's writer store when it is open here (always the
         freshest), else this engine's replica of it, refreshed first if it
-        is staler than `max_staleness_s` (default replica_max_staleness_s).
-        info: {"served_by", "applied_seq", "age_ms"}. A replica that cannot
-        serve it raises ReplicaUnavailableError (`wrap_errors`: whatever
-        stopped it - key custody, a store error - is wrapped in one, so a
-        router can send the read to the writer instead)."""
+        is staler than `max_staleness_s` (default replica_max_staleness_s) -
+        waiting at most replica_refresh_wait_s for that (ReplicaStore.
+        ensure_fresh). info: {"served_by", "applied_seq", "age_ms"}. A
+        replica that cannot serve it raises ReplicaUnavailableError
+        (`wrap_errors`: whatever stopped it - key custody, a store error - is
+        wrapped in one, so a router can send the read to the writer instead;
+        and an open that failed is not retried by such reads for a backoff,
+        see replica(backoff=True))."""
         from memd.storage.replica import ReplicaUnavailableError
 
         ns = _validate_ns(ns)

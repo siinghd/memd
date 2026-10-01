@@ -263,10 +263,15 @@ mem.search("how do we deploy?"); mem.last_read   # {"served_by": "replica", "app
   rebuilds it from the bucket, a rotation is caught up.
 - **Staleness bound**: every write acknowledged before the replica's last
   refresh started is served. A read accepts a replica no older than
-  `X-Memd-Max-Staleness-Ms` (default 3 x the refresh interval); an older
-  one refreshes inline once, and a read it still cannot serve - or one that
-  hits a key-custody or store error - goes to the writer instead,
-  invisibly. Every search and get answers `X-Memd-Served-By: leader|replica`
+  `X-Memd-Max-Staleness-Ms` (default 3 x the refresh interval); for an
+  older one the read waits for a refresh at most
+  `MEMD_REPLICA_REFRESH_WAIT_MS` (1 s) - never on one already running that
+  long (a bucket or KMS that hangs) - and a read it still cannot serve - or
+  one that hits a key-custody or store error - goes to the writer instead,
+  invisibly. A replica that failed to open is not opened again by reads for
+  5 s (doubling to 60 s while it keeps failing): they go to the writer at
+  once. A replica's bucket and KMS calls have short timeouts of their own
+  (below); the writer's are unchanged. Every search and get answers `X-Memd-Served-By: leader|replica`
   (a replica adds `X-Memd-Replica-Seq` and `X-Memd-Replica-Age-Ms`).
 - **Read-your-writes** holds for strong reads only: an eventual read may
   miss a write acknowledged less than the bound ago, and may still serve a
@@ -287,6 +292,54 @@ mem.search("how do we deploy?"); mem.last_read   # {"served_by": "replica", "app
   process) within the bound. `search(..., consistency="eventual")` /
   `get(...)` on a writer `Memory` reads its own store when the namespace is
   open in it, else a replica.
+- A namespace destroyed (crypto-shredded) and created again under its name
+  is followed like any new tenure: the replica rebuilds and resolves the
+  new key from its record. A replica whose rebuild failed (the bucket or the
+  key provider unreachable) serves nothing until a rebuild completes - the
+  reads go to the writer - and tries again on its next refresh.
+
+**Measured** (`bench/replica_bench.py`: three node processes on one MinIO
+bucket on loopback, moto KMS, hash embedder, no reranker, one namespace of
+2,000 records; everything on one 8-core machine, so the absolute latencies
+are a floor and the throughput ceiling is this machine):
+
+| replica lag, write ack -> first eventual read that sees it | p50 | p90 | p99 | max |
+|---|---|---|---|---|
+| refresh every 2 s (default), 300 samples | 996 ms | 1,815 ms | 2,005 ms | 2,014 ms |
+| refresh every 0.5 s, 200 samples | 282 ms | 488 ms | 525 ms | 538 ms |
+
+The lag is the phase against the refresh cycle plus one refresh (~10-20 ms
+here); no write was missed. Eventual searches, 12 client threads, 20 s per
+row, in two query mixes - **repeat**: 8 fixed queries, so nearly every
+search is a hit in the node's repeat-query cache (this measures the request
+path around the cache, not a search); **unique**: the same queries made
+unique by an extra term that matches nothing, so every search is a cache
+miss (the search itself). The hit rate is each run's own `/metrics` count:
+
+| query mix | serving nodes | searches/s | p50 | p99 | cache hits |
+|---|---|---|---|---|---|
+| repeat | 1 (the writer) | 155.8 | 71.4 ms | 250.9 ms | 99.4% |
+| repeat | 2 (writer + 1 replica) | 333.1 | 34.0 ms | 89.0 ms | 99.8% |
+| repeat | 3 (writer + 2 replicas) | 509.1 | 22.1 ms | 47.4 ms | 99.9% |
+| unique | 1 (the writer) | 35.4 | 338.7 ms | 571.5 ms | 0.0% |
+| unique | 2 (writer + 1 replica) | 94.0 | 125.6 ms | 252.2 ms | 0.0% |
+| unique | 3 (writer + 2 replicas) | 170.3 | 67.6 ms | 147.3 ms | 0.0% |
+
+Each serving node took an equal share. The cache-miss mix is the measure of
+the read capacity replicas add; it scales better than linearly here only
+because one node is far past saturation with all 12 clients on it (35
+searches/s per node with 12 clients, 47 with 6, 57 with 4) - at a load one
+node absorbs, expect about linear. The writer's own latency with replicas
+attached (300 writes and strong searches): write p50 / p99 16.5 / 32.3 ms
+with no replica open, 16.4 / 27.9 ms with two attached, 17.4 / 43.8 ms with
+two serving a read load (shared CPU). A refresh with nothing new is 4
+object-store requests (2 manifest GETs, a LIST of each log) - ~2 requests/s
+per open replica at the default interval, which is why idle replicas close.
+When the bucket hangs (accepts connections, never answers) for 150 s, the
+slowest eventual read takes 1.0 s before it goes to the writer, and the
+replica serves again within 0.5 s of the bucket's return; with a node's KMS
+unreachable, the first eventual read of a namespace goes to the writer
+after 0.1-0.8 s and the following ones in ~20 ms.
 
 | setting | default | |
 |---|---|---|
@@ -303,6 +356,8 @@ mem.search("how do we deploy?"); mem.last_read   # {"served_by": "replica", "app
 | `MEMD_REPLICA_MAX_STALENESS_MS` | 3 x refresh | the default bound of an eventual read (`X-Memd-Max-Staleness-Ms` per request) |
 | `MEMD_MAX_REPLICAS` | 64 | replica namespaces per node (LRU; a closed replica's cache is deleted) |
 | `MEMD_REPLICA_IDLE_S` | 300 | a replica nobody read for this long is closed (each costs ~3 object-store requests per refresh) |
+| `MEMD_REPLICA_REFRESH_WAIT_MS` | 1000 | the longest a stale replica's read waits for a refresh before it goes to the writer |
+| `MEMD_REPLICA_CONNECT_TIMEOUT_S` / `MEMD_REPLICA_READ_TIMEOUT_S` / `MEMD_REPLICA_MAX_ATTEMPTS` | 2 / 5 / 2 | a replica's bucket and KMS calls (its own clients; the writer keeps botocore's 60 s read timeout - an append is a conditional PUT that must not be retried early) |
 | `MEMD_S3_ACCESS_KEY` / `MEMD_S3_SECRET_KEY` | boto3 chain | bucket credentials, separate from the `AWS_*` ones KMS uses |
 | `MEMD_SHUTDOWN_GRACE_S` | 30 | uvicorn graceful drain on SIGTERM |
 
