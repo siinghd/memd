@@ -34,7 +34,7 @@ print(mem.search("how do we deploy?", user_id="u1").packed_context)
 
 ## What memd is not, yet
 
-Honest limits, each stated in the design docs or the changelog:
+Honest limits:
 
 - **One writer per namespace.** A second process on the same namespace fails
   fast with `NamespaceBusyError`; scale by spreading namespaces across
