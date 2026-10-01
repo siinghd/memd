@@ -6,6 +6,14 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-01
+
+Data-integrity patch release on 0.2.1: a rotate that raised (a damaged WAL
+frame makes every fold refuse) could leave an acknowledged delete served -
+a hard delete's text included - and the same frame made export refuse and
+writes that had landed report errors. Upgrade from 0.2.1 in place; no
+migration.
+
 ### Fixed - data integrity
 - **A durable delete always reaches the index (D7).** `append_ops` ran the
   ops log's size-triggered rotate before applying the op to the index, so a
