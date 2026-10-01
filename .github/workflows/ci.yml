@@ -17,7 +17,8 @@ jobs:
   test:
     name: tests (py${{ matrix.python }}, ${{ matrix.lexical }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # the suite with the S3 tests on took 23 min on a loaded 8-core dev host
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
