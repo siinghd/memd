@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import re
 import secrets
 from collections import OrderedDict
 
@@ -206,6 +207,11 @@ class LocalKeyEnvelope(KeyEnvelope):
 
 
 _SHRED_SUFFIX = ".shred-"
+# what _overwrite_unlink renames a key file to: "<file>.key.shred-" + 8 hex
+# digits, at the END of the name. A substring test is not enough: a
+# namespace may be called "a.shred-b", and its live key file
+# ("ns-a.shred-b.key") must never be taken for a shred leftover.
+_SHRED_RE = re.compile(r"\.key\.shred-[0-9a-f]{8}\Z")
 
 
 def _fsync_dir(d: str) -> None:
@@ -255,7 +261,7 @@ def _sweep_shreds(d: str) -> None:
     except OSError:
         return
     for fn in names:
-        if _SHRED_SUFFIX in fn:
+        if _SHRED_RE.search(fn):
             try:
                 _shred_file(os.path.join(d, fn))
             except FileNotFoundError:

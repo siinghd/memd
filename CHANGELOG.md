@@ -15,6 +15,11 @@ writes that had landed report errors. Upgrade from 0.2.1 in place; no
 migration.
 
 ### Fixed - data integrity
+- **A namespace whose name contains `.shred-` lost its key** (0.2.1 only).
+  0.2.1's crash-safe key shred finished interrupted shreds by shredding any
+  key file whose name contained `.shred-`, so the live key of a namespace
+  called e.g. `a.shred-b` was destroyed the next time the keys directory
+  was loaded. Only the exact leftover name is matched now.
 - **A durable delete always reaches the index (D7).** `append_ops` ran the
   ops log's size-triggered rotate before applying the op to the index, so a
   rotate that raised (a damaged WAL frame makes every fold refuse) left the
