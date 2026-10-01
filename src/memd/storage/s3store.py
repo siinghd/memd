@@ -127,6 +127,18 @@ class S3ObjectStore(ObjectStore):
         self.prefix = prefix.strip("/")
         self.lease_ttl_s = float(lease_ttl_s)
         self.fetch_concurrency = max(1, int(fetch_concurrency))
+        # what read_view() builds its own client from (None: a client was
+        # injected, and a view shares it)
+        self._client_args = None if client is not None else {
+            "endpoint_url": endpoint_url, "aws_access_key_id": access_key,
+            "aws_secret_access_key": secret_key, "region_name": region}
+        # Data-plane client. A connect timeout is short: nothing was sent, so
+        # failing (and retrying) it is always safe. The READ timeout stays
+        # botocore's 60 s: an append is a conditional PUT (IfNoneMatch), and a
+        # retry after a response lost to a timeout finds its own part there -
+        # 412, an AppendConflict ("another writer") - so a writer must not
+        # give up on a slow response early. Readers that must not hang use
+        # read_view().
         self._client = client or boto3.client(
             "s3",
             endpoint_url=endpoint_url,
@@ -134,7 +146,7 @@ class S3ObjectStore(ObjectStore):
             aws_secret_access_key=secret_key,
             region_name=region,
             config=Config(retries={"max_attempts": 5, "mode": "standard"},
-                          signature_version="s3v4",
+                          signature_version="s3v4", connect_timeout=10,
                           # the connection pool must cover the fetch fan-out or
                           # concurrent GETs serialize on connections instead
                           max_pool_connections=max(10, int(fetch_concurrency) + 4)),
@@ -205,6 +217,30 @@ class S3ObjectStore(ObjectStore):
         # host:pid. A cluster node names itself here so the router can map a
         # lease to the node serving it (see memd.server.cluster)
         self.lease_holder = lease_holder
+
+    def read_view(self, *, connect_timeout_s: float = 2.0, read_timeout_s: float = 5.0,
+                  max_attempts: int = 2) -> "S3ObjectStore":
+        """This bucket and prefix for a READER that must not hang - a read
+        replica: a client of its own with short connect and
+        read timeouts and few attempts. With the data-plane client's
+        botocore defaults (60 s x 5 attempts) one outage that accepts
+        connections and never answers held a replica's refresh - and every
+        read waiting on it - for minutes. A reader only GETs, HEADs and
+        LISTs: a timeout is retried or reported, never an ambiguous write.
+        The view shares no state with this store (no write bookkeeping, no
+        lease); an injected client is shared as it is."""
+        client = self._client
+        if self._client_args is not None:
+            import boto3
+            from botocore.config import Config
+
+            client = boto3.client("s3", **self._client_args, config=Config(
+                retries={"total_max_attempts": max(1, int(max_attempts)), "mode": "standard"},
+                signature_version="s3v4", connect_timeout=float(connect_timeout_s),
+                read_timeout=float(read_timeout_s),
+                max_pool_connections=max(10, self.fetch_concurrency + 4)))
+        return S3ObjectStore(self.bucket, self.prefix, client=client, lease_ttl_s=self.lease_ttl_s,
+                             fetch_concurrency=self.fetch_concurrency, lease_holder=self.lease_holder)
 
     # ------------------------------------------------------------- plumbing
 

@@ -214,11 +214,22 @@ class ReplicaStore(NamespaceStore):
     # a custody refusal mid-refresh resolves the key again at most this often
     KEY_RETRY_S = 30.0
 
+    # a stale read waits at most this long for a refresh (see ensure_fresh)
+    REFRESH_WAIT_S = 1.0
+
     def __init__(self, namespace: str, store: ObjectStore, cache_dir: str,
                  envelope: KeyEnvelope | None = None, *, lexical: dict | None = None,
-                 vector_index: dict | None = None, on_applied=None):
+                 vector_index: dict | None = None, on_applied=None,
+                 refresh_wait_s: float | None = None):
         self._serve = _ServeLock()
         self._refresh_lock = threading.Lock()
+        self.refresh_wait_s = self.REFRESH_WAIT_S if refresh_wait_s is None else float(refresh_wait_s)
+        # refreshes in flight and done, for reads that wait on one (ensure_fresh)
+        self._fresh_cv = threading.Condition()
+        self._running_since: float | None = None   # monotonic start of the refresh in flight
+        self._kicked = False                       # a read's refresh waits for the lock
+        self._done = 0                             # refreshes finished (either way)
+        self._last_done: tuple[float, BaseException | None] | None = None   # (its start, its error)
         self._lexical_cfg = lexical
         self._on_applied = on_applied
         self._opened = False
@@ -301,27 +312,72 @@ class ReplicaStore(NamespaceStore):
                     f"({self.last_error or 'in progress'})")
             yield self
 
-    def ensure_fresh(self, max_staleness_s: float) -> None:
+    def ensure_fresh(self, max_staleness_s: float, wait_s: float | None = None) -> None:
         """Make sure every write the writer acknowledged more than
-        `max_staleness_s` before now is applied: refresh inline if the last
-        good refresh started earlier than that. ReplicaUnavailableError if
-        it cannot."""
+        `max_staleness_s` before now is applied. Within that bound the
+        replica serves as it is, whatever refresh is running. Staler: it
+        waits for a refresh - the one in flight if it started within the
+        bound, else one it starts in the background - for at most `wait_s`
+        (refresh_wait_s, 1 s), and never on a refresh that has already run
+        that long (a store or key provider that hangs: the read must not
+        queue behind it). ReplicaUnavailableError when none completes in
+        time or the one it waited for failed - the router sends the read to
+        the writer."""
         t_req = time.monotonic()
         self.touch()
+        floor = t_req - max_staleness_s
         at = self.refreshed_at
-        if at is not None and at >= t_req - max_staleness_s:
+        if at is not None and at >= floor:
             return
+        wait = self.refresh_wait_s if wait_s is None else max(0.0, float(wait_s))
+        with self._fresh_cv:
+            done = self._done
+            while True:
+                at = self.refreshed_at
+                if at is not None and at >= floor:
+                    return
+                if self._closed:
+                    raise ReplicaUnavailableError(f"namespace {self.namespace!r}: the replica was closed")
+                last = self._last_done
+                if self._done != done and last is not None and last[1] is not None and last[0] >= floor:
+                    ex = last[1]
+                    raise ReplicaUnavailableError(
+                        f"namespace {self.namespace!r}: the replica could not refresh "
+                        f"({type(ex).__name__}: {ex})") from ex
+                running = self._running_since
+                if running is None or running < floor:
+                    # nothing in flight that can satisfy this read: queue one
+                    self._kick()
+                now = time.monotonic()
+                deadline = t_req + wait
+                if running is not None:
+                    deadline = min(deadline, running + wait)
+                if now >= deadline:
+                    why = (f"a refresh has been running for {int((now - running) * 1000)} ms"
+                           if running is not None and now - running >= wait
+                           else f"no refresh completed within {int(wait * 1000)} ms")
+                    raise ReplicaUnavailableError(
+                        f"namespace {self.namespace!r}: the replica is staler than "
+                        f"{int(max_staleness_s * 1000)} ms ({why})")
+                self._fresh_cv.wait(deadline - now)
+
+    def _kick(self) -> None:
+        """(Under _fresh_cv.) Start a refresh in the background for reads
+        waiting on one - at most one queued at a time."""
+        if self._kicked or self._closed:
+            return
+        self._kicked = True
+        threading.Thread(target=self._kicked_refresh, name=f"memd-replica-read-{self.namespace}",
+                         daemon=True).start()
+
+    def _kicked_refresh(self) -> None:
         try:
-            self.refresh()
-        except Exception as ex:  # noqa: BLE001 - the caller goes to the writer
-            raise ReplicaUnavailableError(
-                f"namespace {self.namespace!r}: the replica could not refresh "
-                f"({type(ex).__name__}: {ex})") from ex
-        at = self.refreshed_at
-        if at is None or at < t_req - max_staleness_s:
-            raise ReplicaUnavailableError(
-                f"namespace {self.namespace!r}: the replica is staler than "
-                f"{int(max_staleness_s * 1000)} ms")
+            self.refresh(_kicked=True)
+        except Exception:  # noqa: BLE001 - recorded on the replica; the waiting reads see it
+            pass
+        finally:
+            with self._fresh_cv:
+                self._kicked = False
 
     # ------------------------------------------------------------ open
 
@@ -340,7 +396,7 @@ class ReplicaStore(NamespaceStore):
         self.refreshed_at = t0
         self.refreshes += 1
 
-    def refresh(self) -> bool:
+    def refresh(self, *, _kicked: bool = False) -> bool:
         """Follow the writer once (see the module docstring). True when the
         index changed. One refresh at a time; a failed one leaves the replica
         as it was (its age grows until one succeeds)."""
@@ -348,7 +404,12 @@ class ReplicaStore(NamespaceStore):
             if self._closed:
                 raise RuntimeError(f"namespace {self.namespace!r} replica is closed")
             t0 = time.monotonic()
+            with self._fresh_cv:
+                self._running_since = t0
+                if _kicked:
+                    self._kicked = False    # the next stale read may queue another
             epoch = self.data_epoch
+            err: BaseException | None = None
             try:
                 try:
                     self._sync()
@@ -357,19 +418,27 @@ class ReplicaStore(NamespaceStore):
                         raise
                     self._sync()
             except BaseException as ex:
+                err = ex
                 self.failures += 1
                 self.last_error = f"{type(ex).__name__}: {ex}"[:300]
                 METRICS.inc("memd_replica_refreshes_total", help="replica refreshes by result",
                             ns=self.namespace, result="failed")
                 raise
-            self.refreshed_at = t0
-            self.refreshes += 1
-            self.failures = 0
-            self.last_error = None
-            METRICS.inc("memd_replica_refreshes_total", ns=self.namespace, result="ok")
-            METRICS.observe("memd_replica_refresh_ms", (time.monotonic() - t0) * 1000,
-                            help="replica refresh duration (ms)", ns=self.namespace)
-            return self.data_epoch != epoch
+            else:
+                self.refreshed_at = t0
+                self.refreshes += 1
+                self.failures = 0
+                self.last_error = None
+                METRICS.inc("memd_replica_refreshes_total", ns=self.namespace, result="ok")
+                METRICS.observe("memd_replica_refresh_ms", (time.monotonic() - t0) * 1000,
+                                help="replica refresh duration (ms)", ns=self.namespace)
+                return self.data_epoch != epoch
+            finally:
+                with self._fresh_cv:
+                    self._running_since = None
+                    self._done += 1
+                    self._last_done = (t0, err)
+                    self._fresh_cv.notify_all()
 
     def _resolve_key_again(self) -> bool:
         """A custody refusal mid-refresh: drop the key in hand and rebuild from
@@ -882,6 +951,8 @@ class ReplicaStore(NamespaceStore):
         try:
             self._closed = True
             self._evicted = True
+            with self._fresh_cv:
+                self._fresh_cv.notify_all()   # reads waiting on a refresh give up
             with self._scrub_mu:
                 self._scrub_want = 0
             with self._serve.write():

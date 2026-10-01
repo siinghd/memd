@@ -376,7 +376,12 @@ def test_a_replica_issues_no_mutating_store_call_while_the_leader_writes(be):
     calls = []
     try:
         if be.kind == "s3":
-            for client in (rep.engine.store._client, rep.engine.store._ctl):
+            # the engine's store, and the view with short timeouts the
+            # replica (and its key envelope) reads through
+            clients = {id(c): c for st in (rep.engine.store, rep.ns.store.inner)
+                       for c in (st._client, st._ctl)}
+            assert rep.ns.store.inner is not rep.engine.store
+            for client in clients.values():
                 client.meta.events.register(
                     "before-call.s3", lambda model, **kw: calls.append(model.name))
             allowed = {"GetObject", "HeadObject", "ListObjectsV2", "ListObjects"}
@@ -905,6 +910,153 @@ def test_a_stale_replica_refreshes_inline_before_it_serves(be):
         rep.get(rid, max_staleness_ms=60_000, read_info=info)
         assert info["served_by"] == "replica" and info["applied_seq"] >= 1
     finally:
+        rep.close()
+        lead.close()
+
+
+def test_a_read_never_waits_long_on_a_stuck_refresh(be):
+    """A refresh stuck on the store (an outage that accepts connections and
+    never answers) holds the refresh lock. A read within its staleness bound
+    is served at once; a staler one waits at most refresh_wait_s - and never
+    longer than the stuck refresh has already run - then is refused
+    (ReplicaUnavailableError: the router sends it to the writer). It used to
+    queue on the lock behind the stuck refresh for minutes."""
+    from memd.storage.replica import ReplicaUnavailableError
+
+    lead = be.leader()
+    rep = be.replica(replica_refresh_s=3600, replica_max_staleness_ms=200)
+    release = threading.Event()
+    try:
+        lead.add("served while the bucket hangs tango")
+        rep.ns.refresh()
+        store = rep.ns.store
+        real = store.get_versioned
+
+        def hung(key):
+            release.wait(8)
+            return real(key)
+
+        store.get_versioned = hung
+        def refresh_quietly():
+            try:
+                rep.ns.refresh()
+            except Exception:  # noqa: BLE001 - only its holding the lock matters here
+                pass
+
+        stuck = threading.Thread(target=refresh_quietly, daemon=True)
+        stuck.start()
+        time.sleep(0.4)                      # the replica is now staler than 200 ms
+        t0 = time.monotonic()
+        with pytest.raises(ReplicaUnavailableError):
+            rep.search("bucket hangs")
+        assert time.monotonic() - t0 < 2.0, "a read queued behind the stuck refresh"
+        t0 = time.monotonic()
+        with pytest.raises(ReplicaUnavailableError):
+            rep.get("whatever")
+        assert time.monotonic() - t0 < 0.5, "the refresh in flight is past the wait: refuse at once"
+        t0 = time.monotonic()
+        assert _texts(rep, "bucket hangs", max_staleness_ms=600_000) == {"served while the bucket hangs tango"}
+        assert time.monotonic() - t0 < 1.0, "a read within its bound must not wait for the refresh"
+        release.set()
+        store.get_versioned = real
+        stuck.join(10)
+        assert _wait(lambda: _texts(rep, "bucket hangs") == {"served while the bucket hangs tango"})
+    finally:
+        release.set()
+        rep.close()
+        lead.close()
+
+
+class _Blackhole:
+    """A TCP proxy in front of MinIO that can start accepting connections
+    and never answering them (an outage that hangs instead of refusing)."""
+
+    def __init__(self, target: str):
+        import socket
+        from urllib.parse import urlparse
+
+        u = urlparse(target)
+        self.target = (u.hostname, u.port)
+        self.hang = False
+        self.held = []
+        self.ls = socket.socket()
+        self.ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.ls.bind(("127.0.0.1", 0))
+        self.ls.listen(64)
+        self.url = f"http://127.0.0.1:{self.ls.getsockname()[1]}"
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        import socket
+
+        while True:
+            try:
+                c, _ = self.ls.accept()
+            except OSError:
+                return
+            if self.hang:
+                self.held.append(c)
+                continue
+            u = socket.create_connection(self.target)
+            for a, b in ((c, u), (u, c)):
+                threading.Thread(target=self._pipe, args=(a, b), daemon=True).start()
+
+    def _pipe(self, a, b):
+        try:
+            while True:
+                d = a.recv(65536)
+                if not d or self.hang:
+                    break
+                b.sendall(d)
+        except OSError:
+            pass
+        for x in (a, b):
+            try:
+                x.close()
+            except OSError:
+                pass
+
+    def close(self):
+        self.ls.close()
+        for c in self.held:
+            c.close()
+
+
+def test_a_replicas_store_calls_have_short_timeouts(tmp_path):
+    """A replica reads the bucket through a client of its own with short
+    connect/read timeouts and few attempts (replica_connect_timeout_s,
+    replica_read_timeout_s, replica_max_attempts): a hung bucket fails a
+    refresh in seconds, not botocore's 60 s x 5 attempts."""
+    be = Backend("s3", tmp_path)
+    proxy = _Blackhole(ENDPOINT)
+    lead = be.leader()
+    rep = Memory(be.path, read_only=True, config=be.cfg(
+        s3_endpoint_url=proxy.url, replica_refresh_s=3600, replica_connect_timeout_s=1,
+        replica_read_timeout_s=1, replica_max_attempts=1))
+    try:
+        lead.add("before the bucket hangs uniform")
+        rep.ns.refresh()
+        proxy.hang = True
+        done = threading.Event()
+        err = []
+
+        def run():
+            try:
+                rep.ns.refresh()
+            except Exception as ex:  # noqa: BLE001
+                err.append(ex)
+            done.set()
+
+        t0 = time.monotonic()
+        threading.Thread(target=run, daemon=True).start()
+        assert done.wait(10), "a refresh against a hung bucket did not time out"
+        assert err and time.monotonic() - t0 < 10
+        # the leader's own data client keeps its long read timeout (an append
+        # is a conditional PUT: a retry after a lost response would conflict)
+        assert lead.engine.store._client.meta.config.read_timeout == 60
+    finally:
+        proxy.hang = False
+        proxy.close()
         rep.close()
         lead.close()
 

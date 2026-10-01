@@ -687,7 +687,13 @@ class Memory:
                                     replica_idle_s=_opt_float(cfg, "replica_idle_s"),
                                     replica_max_staleness_s=(
                                         None if cfg.get("replica_max_staleness_ms") is None
-                                        else float(cfg["replica_max_staleness_ms"]) / 1000.0))
+                                        else float(cfg["replica_max_staleness_ms"]) / 1000.0),
+                                    replica_refresh_wait_s=(
+                                        None if cfg.get("replica_refresh_wait_ms") is None
+                                        else float(cfg["replica_refresh_wait_ms"]) / 1000.0),
+                                    replica_connect_timeout_s=_opt_float(cfg, "replica_connect_timeout_s"),
+                                    replica_read_timeout_s=_opt_float(cfg, "replica_read_timeout_s"),
+                                    replica_max_attempts=cfg.get("replica_max_attempts"))
         self.namespace_name = namespace
         # Audit ledgers are PER NAMESPACE. They are held in an LRU keyed by
         # namespace (mirroring the engine's namespace table) and routed by the

@@ -143,6 +143,13 @@ class KeyProvider:
     def describe(self) -> dict:
         return {"provider": self.name}
 
+    def read_view(self, *, connect_timeout_s: float, read_timeout_s: float,
+                  max_attempts: int) -> "KeyProvider":
+        """This provider for a reader that must not hang (a read replica):
+        calls with short timeouts and few attempts. Itself when its calls are
+        bounded already (or make no remote call)."""
+        return self
+
 
 class LocalKeyProvider(KeyProvider):
     """Root key held in process memory (loaded from a file by the caller).
@@ -215,6 +222,8 @@ class AwsKmsProvider(KeyProvider):
         self._template = key_id
         self.shred_action = shred
         self.pending_window_days = int(pending_window_days)
+        self._client_args = None if client is not None else {"region_name": region,
+                                                             "endpoint_url": endpoint_url}
         if client is None:
             try:
                 import boto3
@@ -224,6 +233,23 @@ class AwsKmsProvider(KeyProvider):
             client = boto3.client("kms", region_name=region, endpoint_url=endpoint_url,
                                   config=Config(retries={"max_attempts": 5, "mode": "standard"}))
         self._kms = client
+
+    def read_view(self, *, connect_timeout_s: float, read_timeout_s: float,
+                  max_attempts: int) -> "AwsKmsProvider":
+        """The same CMK through a client with short timeouts and few attempts
+        (Decrypt only, for a read replica): with the default client (60 s
+        timeouts, 5 attempts with backoff) an unreachable KMS cost every
+        replica open 12-20 s. An injected client is shared as it is."""
+        if self._client_args is None:
+            return self
+        import boto3
+        from botocore.config import Config
+
+        client = boto3.client("kms", **self._client_args, config=Config(
+            retries={"total_max_attempts": max(1, int(max_attempts)), "mode": "standard"},
+            connect_timeout=float(connect_timeout_s), read_timeout=float(read_timeout_s)))
+        return AwsKmsProvider(self._template, client=client, shred=self.shred_action,
+                              pending_window_days=self.pending_window_days)
 
     def key_id(self, namespace: str) -> str:
         return self._template.format(namespace=namespace) if _per_namespace(self._template) \
@@ -448,6 +474,13 @@ class KeyEnvelope:
                 f"a ciphertext of namespace {namespace!r} does not authenticate under its data "
                 "key: the key is not the one it was written with (lost, replaced, restored from "
                 "another deployment) or the ciphertext is damaged") from None
+
+    def read_view(self, store: Any = None, **timeouts) -> "KeyEnvelope":
+        """This envelope for a read replica: one that reads
+        `store` (a view of the object store with short timeouts) and calls
+        its provider with short `timeouts` (connect_timeout_s,
+        read_timeout_s, max_attempts). Itself when it makes no remote call."""
+        return self
 
     def key_check(self, namespace: str) -> str:
         """A public fingerprint of `namespace`'s data key: HMAC-SHA256 under
@@ -852,6 +885,14 @@ class ObjectStoreKeyEnvelope(KeyEnvelope):
         self._locks_guard = threading.Lock()
         self._ns_locks: dict[str, list] = {}
         self._custody_written = False
+
+    def read_view(self, store: Any = None, **timeouts) -> "ObjectStoreKeyEnvelope":
+        """Wrapped key records read from `store`, unwrapped by the provider
+        with short timeouts; a cache of its own (a replica resolves through
+        peek_data_key, which never fills one)."""
+        provider = self.provider.read_view(**timeouts) if timeouts else self.provider
+        return ObjectStoreKeyEnvelope(provider, store if store is not None else self.store,
+                                      legacy_dir=self.legacy_dir)
 
     # the plaintext DEK cache is as in LocalKeyEnvelope: a DEK has to be in
     # process memory to encrypt anyway

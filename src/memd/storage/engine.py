@@ -4253,6 +4253,10 @@ class StorageEngine:
         max_replicas: int | None = None,
         replica_idle_s: float | None = None,
         replica_max_staleness_s: float | None = None,
+        replica_refresh_wait_s: float | None = None,
+        replica_connect_timeout_s: float | None = None,
+        replica_read_timeout_s: float | None = None,
+        replica_max_attempts: int | None = None,
     ):
         self.root = root
         # {"backend": "fts5"|"tantivy", "commit_ms", "commit_docs"}
@@ -4327,6 +4331,24 @@ class StorageEngine:
             ms = _env("MEMD_REPLICA_MAX_STALENESS_MS", None)
             replica_max_staleness_s = ms / 1000.0 if ms is not None else 3 * max(self.replica_refresh_s, 0.5)
         self.replica_max_staleness_s = float(replica_max_staleness_s)
+        # a stale replica's read waits at most this long for a refresh (the
+        # one in flight, or one it starts) - never on a refresh stuck longer
+        # than that - then fails over (see ReplicaStore.ensure_fresh)
+        if replica_refresh_wait_s is None:
+            ms = _env("MEMD_REPLICA_REFRESH_WAIT_MS", None)
+            replica_refresh_wait_s = ms / 1000.0 if ms is not None else 1.0
+        self.replica_refresh_wait_s = max(0.0, float(replica_refresh_wait_s))
+        # what a replica's store and key provider calls may take (its own
+        # clients: see S3ObjectStore.read_view, KeyEnvelope.read_view)
+        self.replica_io = {
+            "connect_timeout_s": float(replica_connect_timeout_s if replica_connect_timeout_s is not None
+                                       else _env("MEMD_REPLICA_CONNECT_TIMEOUT_S", 2.0)),
+            "read_timeout_s": float(replica_read_timeout_s if replica_read_timeout_s is not None
+                                    else _env("MEMD_REPLICA_READ_TIMEOUT_S", 5.0)),
+            "max_attempts": max(1, int(replica_max_attempts if replica_max_attempts is not None
+                                       else _env("MEMD_REPLICA_MAX_ATTEMPTS", 2))),
+        }
+        self._replica_backend_: tuple | None = None
         self._replicas: "OrderedDict[str, object]" = OrderedDict()
         self._replica_opening: dict[str, list] = {}
         self._replica_path: str | None = None
@@ -4859,6 +4881,22 @@ class StorageEngine:
             self._replica_path, self._replica_lock_fd, self._replica_lock_path = path, fd, lock_path
             return path
 
+    def _replica_backend(self) -> tuple:
+        """(store, envelope) replicas open with: views of this engine's own
+        with short timeouts and few attempts (replica_io) - a replica's
+        refresh and bootstrap must not hang on a store or key provider that
+        accepts connections and never answers. The writer's clients are
+        left as they are (see S3ObjectStore.__init__)."""
+        with self._lock:
+            if self._replica_backend_ is None:
+                view = getattr(self.store, "read_view", None)
+                store = view(**self.replica_io) if callable(view) else self.store
+                env = self.envelope
+                if env is not None:
+                    env = env.read_view(store, **self.replica_io)
+                self._replica_backend_ = (store, env)
+            return self._replica_backend_
+
     def replica(self, ns: str):
         """The read replica of `ns` (memd.storage.replica.ReplicaStore),
         opened - bootstrapped from the bucket - if this engine has none."""
@@ -4881,9 +4919,11 @@ class StorageEngine:
                 if self._replica_stop.is_set():
                     raise RuntimeError("the storage engine is closed")
             d = self._replica_dir()
+            store, env = self._replica_backend()
             try:
-                rep = ReplicaStore(ns, self.store, d, self.envelope, lexical=self.lexical,
-                                   vector_index=self.vector_index, on_applied=self._replica_applied)
+                rep = ReplicaStore(ns, store, d, env, lexical=self.lexical,
+                                   vector_index=self.vector_index, on_applied=self._replica_applied,
+                                   refresh_wait_s=self.replica_refresh_wait_s)
             except BaseException:
                 with contextlib.suppress(Exception):
                     _drop_cache_files(d, ns)
