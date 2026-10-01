@@ -57,7 +57,14 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   compaction scrubs outside the namespace lock. The scrub still never gives
   up and warns every 60 s; a close interrupts it (`Memory.close()` stops
   it before draining background maintenance) and the next open finishes
-  it.
+  it. The LRU does not evict a namespace while its scrub is in progress
+  (an eviction used to interrupt it), and an open no longer waits for such
+  a reader: it waits up to 1 s for the scrub, then finishes it in the
+  background (`memd_index_scrubs_deferred_total`) - an interrupted scrub
+  used to make the next open block for the reader's whole lifetime (a
+  15 s reader: 14.45 s). Until the scrub is done the purged records are
+  not served (their rows are gone; only the file holds the bytes), no
+  index snapshot is published, and the cache is not stamped scrubbed.
 
 ## [0.3.0] - 2026-09-26
 

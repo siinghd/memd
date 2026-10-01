@@ -188,8 +188,11 @@ any probe fails the build.
   read transaction open on the SQLite file (a backup tool, an ad-hoc
   `sqlite3` shell) keeps the erased text in the file's WAL for as long as
   it holds on - memd keeps retrying and logs a warning every 60 s while
-  serving normally. A close in the meantime leaves the scrub to the next
-  open. Do not attach long-lived readers to the cache files.
+  serving normally (the namespace stays open: the LRU does not close it
+  while its scrub runs). A close in the meantime leaves the scrub to the
+  next open, which finishes it in the background if such a reader still
+  holds on; no index snapshot is published until it is done. Do not attach
+  long-lived readers to the cache files.
 
 - **Hosted mode & billing (`--hosted`, off by default).**
   - *The Stripe webhook is authenticated by its signature only.*

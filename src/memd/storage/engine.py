@@ -766,6 +766,13 @@ class NamespaceStore:
         self._maint_retry_at = 0.0
         # the WAL frames the last export skipped as unreadable (_visible_records)
         self.last_export_skipped: list[dict] = []
+        # purge scrubs of this index in progress - a compaction's (outside the
+        # namespace lock), or one an open left to finish in the background
+        # (_scrub_in_background): the LRU does not evict the namespace
+        # meanwhile (see StorageEngine._evict_locked)
+        self._scrubs = 0
+        self._scrubs_lock = threading.Lock()
+        self._scrub_thread: threading.Thread | None = None
         self._replayed_at_open = False
         self._installed_vec: tuple | None = None  # (index snapshot, its vec_uid, vec_wm) installed at open
         self._migrated_t0: float | None = None  # set by a migrating open (progress log)
@@ -1686,7 +1693,12 @@ class NamespaceStore:
         there. The snapshot is dropped (a full replay is always correct); the
         index is scrubbed unless it was created by this open from durable
         data alone, and the tantivy copy is rebuilt. A snapshot older than
-        the newest compaction is dropped as well (see _snapshot_floor)."""
+        the newest compaction is dropped as well (see _snapshot_floor).
+
+        The scrub waits for every reader of the index file to let go of the
+        snapshot it holds, and one memd does not control may hold on for as
+        long as it likes: the open waits for it only briefly, then finishes
+        it in the background (_scrub_in_background)."""
         m = self.manifest
         vs = m.vector_snapshot or {}
         stale = [seq for name, seq in ((m.snapshot_name, m.snapshot_seq),
@@ -1701,11 +1713,79 @@ class NamespaceStore:
             done = 0
         if m.scrub_seq <= done:
             return
-        if not self.index.created:
-            self._replayed_at_open = True  # tantivy is rebuilt from the scrubbed rows
-            if not self.index.scrub():
-                return  # closed first: the next open scrubs again
-        self.index.set_meta("scrubbed_seq", str(m.scrub_seq))
+        if self.index.created:
+            self.index.set_meta("scrubbed_seq", str(m.scrub_seq))
+            return
+        self._replayed_at_open = True  # tantivy is rebuilt from the scrubbed rows
+        self._scrub_in_background(m.scrub_seq)
+
+    # how long an open waits for the scrub it starts before leaving it to
+    # finish in the background
+    OPEN_SCRUB_WAIT_S = 1.0
+
+    def _scrub_in_background(self, scrub_seq: int) -> None:
+        """(open) Scrub the index to purge `scrub_seq` in a thread of its own,
+        waiting OPEN_SCRUB_WAIT_S for it: without another reader of the file
+        it is done by then, as it was inline. A scrub a close interrupted -
+        the compaction's own, waiting for a reader memd does not control -
+        used to run again here INLINE, and the open waited for that reader's
+        whole lifetime. Now the open completes and the scrub goes on, never
+        giving up (D10), as a compaction's does. Meanwhile:
+          - nothing purged is served: the purge deleted its rows before the
+            commit this cache is caught up to (only the file still holds
+            the bytes, in free pages, old FTS segments and the WAL);
+          - no index snapshot is published (write_index_snapshot refuses an
+            image not scrubbed to the newest purge), and the LRU does not
+            close the namespace (_evict_locked);
+          - the cache is stamped scrubbed only once the bytes are gone; a
+            close interrupts the scrub, and the next open starts it again."""
+        idx = self.index
+        finished = threading.Event()
+        self._scrub_begin()
+
+        def run() -> None:
+            try:
+                if idx.scrub():
+                    self._mark_scrubbed(idx, scrub_seq)
+            except Exception as ex:  # noqa: BLE001 - the next open scrubs again
+                if not idx.closing:
+                    _log.warning("namespace %s: the purge scrub of the local index failed "
+                                 "(%s); the next open retries", self.namespace, ex)
+            finally:
+                self._scrub_end()
+                finished.set()
+
+        t = threading.Thread(target=run, name=f"memd-scrub-{self.namespace}", daemon=True)
+        self._scrub_thread = t
+        t.start()
+        if not finished.wait(self.OPEN_SCRUB_WAIT_S):
+            METRICS.inc("memd_index_scrubs_deferred_total",
+                        help="purge scrubs an open left to finish in the background "
+                             "(a reader held the index)", ns=self.namespace)
+            _log.info("namespace %s: a reader holds the local index; the purge scrub "
+                      "finishes in the background", self.namespace)
+
+    def _scrub_begin(self) -> None:
+        with self._scrubs_lock:
+            self._scrubs += 1
+
+    def _scrub_end(self) -> None:
+        with self._scrubs_lock:
+            self._scrubs -= 1
+
+    @property
+    def scrubbing(self) -> bool:
+        """A purge scrub of this namespace's index is in progress."""
+        return self._scrubs > 0
+
+    @staticmethod
+    def _mark_scrubbed(idx: NamespaceIndex, scrub_seq: int) -> None:
+        """Stamp `idx` scrubbed to purge `scrub_seq` - never back below a
+        newer purge's stamp (an open's background scrub can finish after a
+        compaction's)."""
+        with idx._lock:
+            if int(idx.get_meta("scrubbed_seq") or 0) < scrub_seq:
+                idx.set_meta("scrubbed_seq", str(scrub_seq))
 
     def _drop_snapshot(self, reason: str) -> None:
         """Unreference and delete the index snapshot (a replay replaces it),
@@ -3563,6 +3643,10 @@ class NamespaceStore:
             rep.records_folded = len(kept)
             rep.bytes_after = self.store.size(f"{self.prefix}/{name}") if kept or header_ops else 0
             self.index.invalidate_vec_cache()  # fold dead rows out of the scan matrix
+            if scrub_seq:
+                # announced under the namespace lock: an LRU eviction, which
+                # takes it, then sees the scrub and leaves the namespace open
+                self._scrub_begin()
         ann_ticket = 0
         if scrub_seq:
             # The text is gone from durable data; now from this cache - OUTSIDE
@@ -3571,16 +3655,20 @@ class NamespaceStore:
             # or a reader memd does not control, for as long as that one holds
             # on (D10: it never gives up). Under the lock, every append and
             # close() waited with it - for that reader's whole lifetime. A
-            # close interrupts it; the next open scrubs again.
-            if self.index.scrub():
-                self.index.set_meta("scrubbed_seq", str(scrub_seq))
-            # ...and from the ANN sidecar: its files go now (usearch removal
-            # only marked the purged vectors), and it is rebuilt from SQLite -
-            # after the scrub, whose full VACUUM may renumber rowids
-            with self._lock:
-                ann = self.index.ann
-                if ann is not None and not self.index.closing:
-                    ann_ticket = ann.purged(scrub_seq)
+            # close interrupts it (the next open finishes it, in the
+            # background); the LRU does not evict the namespace meanwhile.
+            try:
+                if self.index.scrub():
+                    self._mark_scrubbed(self.index, scrub_seq)
+                # ...and from the ANN sidecar: its files go now (usearch removal
+                # only marked the purged vectors), and it is rebuilt from SQLite -
+                # after the scrub, whose full VACUUM may renumber rowids
+                with self._lock:
+                    ann = self.index.ann
+                    if ann is not None and not self.index.closing:
+                        ann_ticket = ann.purged(scrub_seq)
+            finally:
+                self._scrub_end()
         if self.index.closing:
             # a close cut the scrub short: no snapshot of this index now (the
             # next open finishes the scrub; close() collects orphans)
@@ -3745,10 +3833,7 @@ class NamespaceStore:
     def close(self) -> None:
         if self._lost:
             # another writer owns it: persist nothing, collect nothing
-            try:
-                self.index.close()
-            except Exception:
-                pass
+            self._close_index()
             return
         with self._lock:
             if self._manifest_dirty:
@@ -3757,10 +3842,7 @@ class NamespaceStore:
                 except LeaseLostError:
                     pass   # fenced by the write itself: nothing of ours to persist
         if self._lost:
-            try:
-                self.index.close()
-            except Exception:
-                pass
+            self._close_index()
             return
         # a clean close collects what a crash orphaned, while this process
         # still holds the namespace; the engine audits it (take_collected)
@@ -3781,8 +3863,21 @@ class NamespaceStore:
             self.index.set_meta("applied_seq", str(self._index_mark()))
         except Exception:
             pass  # closed/deleted index; replay covers it
-        self.index.close()
+        self._close_index(quiet=False)
         self._release_ownership()
+
+    def _close_index(self, quiet: bool = True) -> None:
+        """Close the index - which interrupts a purge scrub waiting for its
+        readers - and let an open's background scrub thread end with it."""
+        try:
+            self.index.close()
+        except Exception:
+            if not quiet:
+                raise
+        finally:
+            t = self._scrub_thread
+            if t is not None and t is not threading.current_thread():
+                t.join(timeout=5.0)
 
     def _release_ownership(self, *, clean: bool = True, discard: bool = False) -> None:
         if self._owner_path:
@@ -3950,6 +4045,12 @@ class StorageEngine:
                 victim = self._namespaces[name]
                 if not victim._lock.acquire(blocking=False):
                     continue  # in-flight op on this store; retry next pass
+                if victim.scrubbing:
+                    # a purge's scrub (outside the namespace lock) may be
+                    # waiting for a reader of the index: a close would cut
+                    # it short and leave it to the next open - skip it
+                    victim._lock.release()
+                    continue
                 ent = self._claim_open_locked(name)
                 if ent is None:  # being destroyed: that closes it
                     victim._lock.release()
