@@ -115,11 +115,15 @@ interface CallSpec {
   /** Safe to retry: repeating it cannot change server state beyond the first success. */
   idempotent: boolean;
   accept?: string;
+  /** Called with a successful response's headers, before its body is read. */
+  onHeaders?: (headers: Headers) => void;
 }
 
 type Attempt<T> = { ok: true; value: T } | { ok: false; error: MemdError; retryable: boolean };
 
 const DEFAULT_BASE_URL = "http://localhost:8700";
+/** How many unreadable WAL frames the server left out of an export. */
+const EXPORT_SKIPPED_HEADER = "x-memd-export-skipped-frames";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_RETRIES = 2;
 /** A server asking for a longer pause than this gets the error back instead. */
@@ -187,6 +191,15 @@ export class MemdClient {
   private readonly retryMaxDelayMs: number;
   private readonly fetchImpl: FetchLike;
   private readonly extraHeaders: Record<string, string>;
+  /**
+   * How many unreadable WAL frames the server left out of the last export
+   * (`export`, `exportJsonl`, `exportStream`; set once its headers are in).
+   * `0`: the export is complete. The server exports everything it can read
+   * and says how much it could not in the `X-Memd-Export-Skipped-Frames`
+   * header; its audit entry and log say where. Concurrent exports on one
+   * client overwrite it: read it right after the export it belongs to.
+   */
+  lastExportSkippedFrames = 0;
 
   constructor(options: MemdClientOptions) {
     if (!options || typeof options.apiKey !== "string" || options.apiKey === "") {
@@ -321,7 +334,10 @@ export class MemdClient {
     return this.json<HealthResult>({ method: "GET", path: "/health", idempotent: true }, options);
   }
 
-  /** Every live record in the namespace, parsed. Use `exportStream()` for large namespaces. */
+  /**
+   * Every live record in the namespace, parsed. Use `exportStream()` for large
+   * namespaces. `lastExportSkippedFrames` then says whether it is complete.
+   */
   async export(options: RequestOptions = {}): Promise<MemoryRecord[]> {
     const text = await this.exportJsonl(options);
     const out: MemoryRecord[] = [];
@@ -331,12 +347,18 @@ export class MemdClient {
     return out;
   }
 
-  /** The namespace export as raw NDJSON (one record per line): the anti-lock-in format. */
+  /**
+   * The namespace export as raw NDJSON (one record per line): the anti-lock-in
+   * format. `lastExportSkippedFrames` then says whether it is complete.
+   */
   async exportJsonl(options: RequestOptions = {}): Promise<string> {
     return (await this.execute(this.exportSpec(options), options, "text")) as string;
   }
 
-  /** Stream the export record by record without buffering the namespace in memory. */
+  /**
+   * Stream the export record by record without buffering the namespace in
+   * memory. `lastExportSkippedFrames` is set before the first record.
+   */
   async *exportStream(options: RequestOptions = {}): AsyncGenerator<MemoryRecord, void, undefined> {
     const { res, release } = (await this.execute(this.exportSpec(options), options, "stream")) as {
       res: Response;
@@ -501,6 +523,10 @@ export class MemdClient {
       path: this.nsPath(options, "/export"),
       idempotent: true,
       accept: "application/x-ndjson",
+      onHeaders: (headers) => {
+        const n = Number.parseInt(headers.get(EXPORT_SKIPPED_HEADER) ?? "0", 10);
+        this.lastExportSkippedFrames = Number.isFinite(n) && n > 0 ? n : 0;
+      },
     };
   }
 
@@ -538,7 +564,7 @@ export class MemdClient {
 
     for (let attempt = 0; ; attempt++) {
       if (options.signal?.aborted) throw new RequestAbortedError(options.signal.reason);
-      const outcome = await this.attempt(url, init, timeoutMs, options.signal, read);
+      const outcome = await this.attempt(url, init, timeoutMs, options.signal, read, spec.onHeaders);
       if (outcome.ok) return outcome.value;
       if (outcome.retryable && attempt < retries) {
         const delay = this.backoff(attempt, outcome.error.retryAfter);
@@ -558,6 +584,7 @@ export class MemdClient {
     timeoutMs: number,
     signal: AbortSignal | undefined,
     read: "json" | "text" | "stream",
+    onHeaders?: (headers: Headers) => void,
   ): Promise<Attempt<unknown>> {
     const ctrl = new AbortController();
     let timedOut = false;
@@ -582,6 +609,7 @@ export class MemdClient {
           retryable: RETRYABLE_STATUS.has(res.status),
         };
       }
+      onHeaders?.(res.headers);
       if (read === "stream") {
         // headers are in: the timeout bounded time-to-first-byte; the
         // caller's signal keeps governing the body until release()

@@ -19,10 +19,10 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   that fails keeps the watermark below the op (the next open replays it,
   and the next write or fold first catches the index up in seq order); and
   a compaction tombstones or removes any record it dropped that the index
-  still serves (`memd_index_settled_total`), which also heals deleted
-  records an older build left served. A skipped supersede or quarantine
-  from an older build is not healed by compaction; reopening with a cold
-  cache (delete the namespace's local index) rebuilds it.
+  still serves, and gives a record a supersede or quarantine op it retires
+  targets the log's supersedence and quarantine flag
+  (`memd_index_settled_total`), which also heals the deletes, supersedes and
+  quarantines an older build left unapplied in the index.
 - **One damaged WAL frame no longer blocks export or fails writes.**
   Export - the recovery path - read the WAL with the reader every fold
   uses, which refuses a complete frame that does not read, so a single
@@ -30,7 +30,14 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   leaves that frame out and exports everything readable: a warning names
   the frame's byte offset, `memd_export_frames_skipped_total` counts it,
   and the export's audit entry lists it (`skipped_frames`: log, byte,
-  fault); nothing is cut or deleted. A frame under a key this process may
+  fault); nothing is cut or deleted. REST and SDK callers are told too:
+  every `POST /v1/ns/{ns}/export` answers `X-Memd-Export-Skipped-Frames: N`
+  (0 when complete; the fold now runs before the response starts, so an
+  export that refuses answers an error status instead of a 200 stream cut
+  short), and the NDJSON body stays records only; the Python SDK's
+  `export_jsonl()` sets `last_export_skipped_frames` (with a warning when
+  it is not 0), the TypeScript SDK `lastExportSkippedFrames`, and embedded
+  `Memory` `last_export_skipped_frames`. A frame under a key this process may
   not hold still refuses the export (every frame would read that way). And
   once the WAL or ops log passed its rotate threshold, every write and
   delete ran the size-triggered rotate after it was durable and raised its
@@ -57,7 +64,41 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   compaction scrubs outside the namespace lock. The scrub still never gives
   up and warns every 60 s; a close interrupts it (`Memory.close()` stops
   it before draining background maintenance) and the next open finishes
-  it.
+  it. The LRU does not evict a namespace while its scrub is in progress
+  (an eviction used to interrupt it), and an open no longer waits for such
+  a reader: it waits up to 1 s for the scrub, then finishes it in the
+  background (`memd_index_scrubs_deferred_total`) - an interrupted scrub
+  used to make the next open block for the reader's whole lifetime (a
+  15 s reader: 14.45 s). Until the scrub is done the purged records are
+  not served (their rows are gone; only the file holds the bytes), no
+  index snapshot is published, and the cache is not stamped scrubbed.
+
+- **Concurrent first-key creation never reads a partial key file.** With
+  the `local` key provider, `root.key` and each namespace's wrapped key
+  file were created first and written after: a process creating the first
+  key at the same moment could read the file empty and fail ("AESGCM key
+  must be 128, 192, or 256 bits"; 17 of 1200 processes in a race). A key
+  file is now written and fsynced under a temporary name and hard-linked
+  into place (never replacing one that exists), a key file read short -
+  one an older build is still writing - is read again for up to 1 s, and
+  a temporary key file a crash left (`*.key.tmp-*`, over 5 minutes old)
+  is shredded by the next envelope.
+- **A node drops its copy of a namespace another node took over (D7).**
+  Every node keeps the namespaces it served in its local cache directory -
+  the SQLite index (with its `-wal`/`-shm`), the tantivy copy and the ANN
+  sidecar, all plaintext - and a node that lost a namespace (its lease
+  reclaimed, or released cleanly and taken by another node) kept that copy
+  until it took the namespace back: text hard-deleted and purged on the
+  new owner stayed on its disk. A node now drops the copy once the
+  namespace is closed after a lost lease, and - on a store with leases -
+  at startup and every `cache_sweep_s` (300 s; `MEMD_CACHE_SWEEP_S`, `0` =
+  never) for every namespace it does not have open whose manifest names
+  another tenure's lineage, or that no longer exists
+  (`memd_index_cache_drops_total{reason}`). The copy of a namespace this
+  node was the last to serve stays (a plain reopen is still warm), as does
+  one another process has open (a shared `local_dir`) and one a pending
+  migration still reads. Crypto-shred now also deletes the image of a
+  snapshot install a crash interrupted.
 
 ## [0.3.0] - 2026-09-26
 

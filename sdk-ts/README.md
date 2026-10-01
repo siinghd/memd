@@ -129,6 +129,8 @@ Every method accepts per-call options: `namespace` (overrides the client's), `si
 
 Request fields keep the server's names (`user_id`, `session_id`, `budget_tokens`, `entity_keys`, …). `null` and `undefined` both mean "use the server default".
 
+An export is complete unless the server had to leave out a damaged WAL frame: it then exports everything it can read and says how many frames it left out in the `X-Memd-Export-Skipped-Frames` response header. After `export`, `exportJsonl` or `exportStream` (before its first record), `client.lastExportSkippedFrames` holds that count; `0` means complete.
+
 ### pack / observe
 
 These take the same messages as the Python SDK: OpenAI-style `{ role, content }`. `content` may be a string or an array of parts, and text parts are used.

@@ -412,8 +412,16 @@ def create_app(
         # never "repaired" - an operator must restore the key
         METRICS.inc("memd_http_key_custody_errors_total",
                     help="requests refused: the namespace's data key is not available")
-        return _error(500, "the namespace's data key is not available on this node "
-                           "(key custody); see the server log", "key_custody")
+        # the refusal covers a wrong/missing key AND a damaged log frame
+        # under the right one: say which, never the frame's contents
+        msg = str(exc)
+        if ": the frame is damaged." in msg:
+            text = ("the namespace's log has a damaged frame; nothing was changed. "
+                    "See SECURITY.md 'Recovering from an unreadable log frame' and the server log")
+        else:
+            text = ("the namespace's data key is not available on this node "
+                    "(key custody); see the server log")
+        return _error(500, text, "key_custody")
 
     @app.exception_handler(LeaseLostError)
     async def lease_lost_handler(request: Request, exc: LeaseLostError):
@@ -682,13 +690,19 @@ def create_app(
     @app.post("/v1/ns/{ns}/export")
     def export_ns(ns: str, p: Principal = Depends(auth)):
         heavy(ns, "export", p)
-        # streaming NDJSON: first byte leaves before the namespace is
-        # materialized - bulk egress must not buffer O(namespace) bytes in RAM
+        # streaming NDJSON: lines are serialized as they leave - bulk egress
+        # must not buffer O(namespace) bytes in RAM
         from fastapi.responses import StreamingResponse
 
-        gen = engine.export_jsonl_iter(namespace=ns)
-        headers = {"Content-Disposition": f'attachment; filename="{ns}-export.jsonl"'}
-        return StreamingResponse(gen, media_type="application/x-ndjson", headers=headers)
+        # The fold runs HERE, before the response starts (it ran before the
+        # first line anyway): the headers can then say whether the export is
+        # complete - a WAL frame that does not read is left out, and a
+        # client could not tell that 200 from a complete one. The body stays
+        # records only: a marker line would break every NDJSON parser.
+        exp = engine.export_stream(namespace=ns)
+        headers = {"Content-Disposition": f'attachment; filename="{ns}-export.jsonl"',
+                   "X-Memd-Export-Skipped-Frames": str(exp.skipped)}
+        return StreamingResponse(iter(exp), media_type="application/x-ndjson", headers=headers)
 
     @app.get("/v1/ns/{ns}/stats")
     def stats(ns: str, p: Principal = Depends(auth)):

@@ -174,22 +174,34 @@ any probe fails the build.
   `memd[fast]`, the tantivy index (`<ns>.tantivy/` beside it) contain record
   text unencrypted, with owner-only permissions. Both are deleted on
   crypto-shred and are rebuildable from the (encrypted) log.
-  In a multi-node deployment each node keeps its own local copy for the
-  namespaces it has served, and a hard delete is scrubbed physically only
-  on the node that owns the namespace when it runs. A node that served a
-  namespace earlier and has not taken it back since still holds the text
-  it indexed then, including records hard-deleted later on another node,
-  until it next opens that namespace (its stale copy is then discarded) or
-  its cache directory is removed. It never serves that copy, but it is on
-  its disk: when a hard delete must reach every disk, clear the local cache
-  directory (`local_dir`) of the nodes that no longer own the namespace.
+  In a multi-node deployment each node keeps its own local copy (the
+  SQLite index with its `-wal`/`-shm`, the tantivy copy, the ANN sidecar)
+  of the namespaces it serves, and a hard delete is scrubbed physically
+  only on the node that owns the namespace when it runs. A node drops its
+  copy of a namespace another node has taken over since it last served it
+  (another tenure's lineage in the manifest, or the namespace is gone):
+  when the namespace is closed after this node lost its lease (if the new
+  owner has already committed its tenure; otherwise at the next sweep), at
+  startup, and every `cache_sweep_s` (300 s; `MEMD_CACHE_SWEEP_S`, `0` = never) for
+  every namespace it does not have open - so text another node
+  hard-deletes leaves this node's disk within that interval of the other
+  node taking the namespace over, typically before the delete itself. It
+  never served that copy. The copy of a namespace this node was the last
+  to serve is kept (its reopen stays warm), and so is one another process
+  has open (processes sharing a `local_dir` serve from the same files).
+  Each sweep reads one manifest per such namespace. A node that is stopped
+  keeps its copies until it starts again: when a node is taken out of
+  service, remove its local cache directory (`local_dir`).
   On the owning node the purge's scrub waits until no reader holds a
   snapshot of the index older than it: a process outside memd that keeps a
   read transaction open on the SQLite file (a backup tool, an ad-hoc
   `sqlite3` shell) keeps the erased text in the file's WAL for as long as
   it holds on - memd keeps retrying and logs a warning every 60 s while
-  serving normally. A close in the meantime leaves the scrub to the next
-  open. Do not attach long-lived readers to the cache files.
+  serving normally (the namespace stays open: the LRU does not close it
+  while its scrub runs). A close in the meantime leaves the scrub to the
+  next open, which finishes it in the background if such a reader still
+  holds on; no index snapshot is published until it is done. Do not attach
+  long-lived readers to the cache files.
 
 - **Hosted mode & billing (`--hosted`, off by default).**
   - *The Stripe webhook is authenticated by its signature only.*
@@ -300,15 +312,22 @@ serving, and fails closed only where the frame would be lost:
 - *Export leaves a damaged WAL frame out* and exports everything else -
   run it before step 1 to have the readable data in hand. A warning names
   the frame's byte offset, `memd_export_frames_skipped_total` counts it,
-  and the export's audit entry lists it (`skipped_frames`). A damaged `ops`
-  frame still refuses the export: leaving out a delete would export the
-  records it deleted, hard-deleted text included.
+  and the export's audit entry lists it (`skipped_frames`). Over REST every
+  export answers `X-Memd-Export-Skipped-Frames: N` (`0` when it is
+  complete; the NDJSON body holds records only); the Python SDK's
+  `export_jsonl()` sets `last_export_skipped_frames` (and logs a warning
+  when it is not 0), the TypeScript SDK sets `lastExportSkippedFrames`, and
+  embedded `Memory` sets `last_export_skipped_frames` too. A damaged `ops`
+  frame still refuses the export (now with an error status, not a 200
+  stream cut short): leaving out a delete would export the records it
+  deleted, hard-deleted text included.
 - *Every acknowledged delete is applied at once* - to the index and, for a
   hard delete, to the purge schedule - so `get()` and search stop serving
   the record whatever the rotate does. (Through 0.3.0 the refused rotate ran
   first and skipped both; a cache left that way is healed by the first
   compaction after recovery, which removes anything the log deleted that
-  the index still serves - `memd_index_settled_total`.)
+  the index still serves, and applies a supersede or quarantine the index
+  missed - `memd_index_settled_total`.)
 
 A damaged segment never blocks an open: it is skipped by reads, kept by
 compaction (`"unreadable": true` in the manifest,

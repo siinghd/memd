@@ -652,6 +652,86 @@ def _release_owner(lock_path: str) -> None:
             os.close(held[0])
 
 
+# how often (s) a node with leases re-checks the local caches of namespaces
+# it does not have open for one another node has taken over since (see
+# StorageEngine.sweep_stale_caches); MEMD_CACHE_SWEEP_S, 0 = never
+DEFAULT_CACHE_SWEEP_S = 300.0
+# the files and directories of one namespace's local derived caches
+_CACHE_SUFFIXES = (".sqlite", ".tantivy", ".usearch")
+
+
+def _drop_cache_files(cache_dir: str, ns: str, *, if_unused: bool = False) -> bool:
+    """Delete namespace `ns`'s local derived caches - the SQLite index with
+    its -wal/-shm (and the image of a snapshot install a crash interrupted),
+    the tantivy copy, and the ANN sidecar's files, whose handed-off final
+    save is cancelled (a write in flight waited for) first. Nothing of the
+    namespace may be open in this process. `if_unused`: keep them all while
+    another process has the index open (a cache directory shared by
+    several processes - each serving from the same files). True if
+    anything was deleted."""
+    from memd.index import ann_usearch
+
+    base = os.path.join(cache_dir, ns.replace("/", "__"))
+    if if_unused and os.path.exists(base + ".sqlite") and not _unused_elsewhere(base + ".sqlite"):
+        return False
+    found = False
+    for p in (base + ".sqlite", base + ".sqlite-wal", base + ".sqlite-shm",
+              base + ".sqlite.incoming"):
+        try:
+            os.unlink(p)
+            found = True
+        except FileNotFoundError:
+            pass
+    ann_usearch.settle(base + ".usearch", cancel=True)
+    for d in (base + ".tantivy", base + ".usearch"):
+        if os.path.isdir(d):
+            found = True
+            shutil.rmtree(d, ignore_errors=True)
+    return found
+
+
+def _existing_db_uri(path: str) -> str:
+    """An SQLite URI that opens `path` read-write but never creates it."""
+    from urllib.parse import quote
+
+    return f"file:{quote(os.path.abspath(path))}?mode=rw"
+
+
+def _unused_elsewhere(path: str) -> bool:
+    """No other process has the SQLite file at `path` open: only the sole
+    connection may take a database out of WAL mode (the file is deleted
+    next, so the change does not matter). False when that cannot be told."""
+    import sqlite3
+
+    try:
+        con = sqlite3.connect(_existing_db_uri(path), uri=True, timeout=0)
+        try:
+            con.execute("PRAGMA busy_timeout=0")
+            mode = con.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return False
+    return str(mode).lower() == "delete"
+
+
+def _cache_lineages(path: str) -> tuple[str, str] | None:
+    """(lineage, lineage_pending) a closed index cache was stamped with (see
+    NamespaceStore._stale_cache); None when it cannot be read."""
+    import sqlite3
+
+    try:
+        con = sqlite3.connect(_existing_db_uri(path), uri=True, timeout=1.0)
+        try:
+            meta = dict(con.execute(
+                "SELECT k, v FROM meta WHERE k IN ('lineage', 'lineage_pending')").fetchall())
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+    return str(meta.get("lineage") or ""), str(meta.get("lineage_pending") or "")
+
+
 class NamespaceStore:
     """One namespace: WAL + segments + ops + derived index.
 
@@ -766,6 +846,13 @@ class NamespaceStore:
         self._maint_retry_at = 0.0
         # the WAL frames the last export skipped as unreadable (_visible_records)
         self.last_export_skipped: list[dict] = []
+        # purge scrubs of this index in progress - a compaction's (outside the
+        # namespace lock), or one an open left to finish in the background
+        # (_scrub_in_background): the LRU does not evict the namespace
+        # meanwhile (see StorageEngine._evict_locked)
+        self._scrubs = 0
+        self._scrubs_lock = threading.Lock()
+        self._scrub_thread: threading.Thread | None = None
         self._replayed_at_open = False
         self._installed_vec: tuple | None = None  # (index snapshot, its vec_uid, vec_wm) installed at open
         self._migrated_t0: float | None = None  # set by a migrating open (progress log)
@@ -1686,7 +1773,12 @@ class NamespaceStore:
         there. The snapshot is dropped (a full replay is always correct); the
         index is scrubbed unless it was created by this open from durable
         data alone, and the tantivy copy is rebuilt. A snapshot older than
-        the newest compaction is dropped as well (see _snapshot_floor)."""
+        the newest compaction is dropped as well (see _snapshot_floor).
+
+        The scrub waits for every reader of the index file to let go of the
+        snapshot it holds, and one memd does not control may hold on for as
+        long as it likes: the open waits for it only briefly, then finishes
+        it in the background (_scrub_in_background)."""
         m = self.manifest
         vs = m.vector_snapshot or {}
         stale = [seq for name, seq in ((m.snapshot_name, m.snapshot_seq),
@@ -1701,11 +1793,79 @@ class NamespaceStore:
             done = 0
         if m.scrub_seq <= done:
             return
-        if not self.index.created:
-            self._replayed_at_open = True  # tantivy is rebuilt from the scrubbed rows
-            if not self.index.scrub():
-                return  # closed first: the next open scrubs again
-        self.index.set_meta("scrubbed_seq", str(m.scrub_seq))
+        if self.index.created:
+            self.index.set_meta("scrubbed_seq", str(m.scrub_seq))
+            return
+        self._replayed_at_open = True  # tantivy is rebuilt from the scrubbed rows
+        self._scrub_in_background(m.scrub_seq)
+
+    # how long an open waits for the scrub it starts before leaving it to
+    # finish in the background
+    OPEN_SCRUB_WAIT_S = 1.0
+
+    def _scrub_in_background(self, scrub_seq: int) -> None:
+        """(open) Scrub the index to purge `scrub_seq` in a thread of its own,
+        waiting OPEN_SCRUB_WAIT_S for it: without another reader of the file
+        it is done by then, as it was inline. A scrub a close interrupted -
+        the compaction's own, waiting for a reader memd does not control -
+        used to run again here INLINE, and the open waited for that reader's
+        whole lifetime. Now the open completes and the scrub goes on, never
+        giving up (D10), as a compaction's does. Meanwhile:
+          - nothing purged is served: the purge deleted its rows before the
+            commit this cache is caught up to (only the file still holds
+            the bytes, in free pages, old FTS segments and the WAL);
+          - no index snapshot is published (write_index_snapshot refuses an
+            image not scrubbed to the newest purge), and the LRU does not
+            close the namespace (_evict_locked);
+          - the cache is stamped scrubbed only once the bytes are gone; a
+            close interrupts the scrub, and the next open starts it again."""
+        idx = self.index
+        finished = threading.Event()
+        self._scrub_begin()
+
+        def run() -> None:
+            try:
+                if idx.scrub():
+                    self._mark_scrubbed(idx, scrub_seq)
+            except Exception as ex:  # noqa: BLE001 - the next open scrubs again
+                if not idx.closing:
+                    _log.warning("namespace %s: the purge scrub of the local index failed "
+                                 "(%s); the next open retries", self.namespace, ex)
+            finally:
+                self._scrub_end()
+                finished.set()
+
+        t = threading.Thread(target=run, name=f"memd-scrub-{self.namespace}", daemon=True)
+        self._scrub_thread = t
+        t.start()
+        if not finished.wait(self.OPEN_SCRUB_WAIT_S):
+            METRICS.inc("memd_index_scrubs_deferred_total",
+                        help="purge scrubs an open left to finish in the background "
+                             "(a reader held the index)", ns=self.namespace)
+            _log.info("namespace %s: a reader holds the local index; the purge scrub "
+                      "finishes in the background", self.namespace)
+
+    def _scrub_begin(self) -> None:
+        with self._scrubs_lock:
+            self._scrubs += 1
+
+    def _scrub_end(self) -> None:
+        with self._scrubs_lock:
+            self._scrubs -= 1
+
+    @property
+    def scrubbing(self) -> bool:
+        """A purge scrub of this namespace's index is in progress."""
+        return self._scrubs > 0
+
+    @staticmethod
+    def _mark_scrubbed(idx: NamespaceIndex, scrub_seq: int) -> None:
+        """Stamp `idx` scrubbed to purge `scrub_seq` - never back below a
+        newer purge's stamp (an open's background scrub can finish after a
+        compaction's)."""
+        with idx._lock:
+            if int(idx.get_meta("scrubbed_seq") or 0) < scrub_seq:
+                idx.set_meta("scrubbed_seq", str(scrub_seq))
 
     def _drop_snapshot(self, reason: str) -> None:
         """Unreference and delete the index snapshot (a replay replaces it),
@@ -3522,8 +3682,9 @@ class NamespaceStore:
             if purged:
                 self.manifest.scrub_seq = self.manifest.seq
             # nothing this fold deleted is served (and a purged row goes
-            # before the scrub below erases what it left in the file)
-            self._settle_dropped(purged_ids, folded)
+            # before the scrub below erases what it left in the file), and
+            # what it superseded or quarantined is served as such
+            self._settle_index(purged_ids, folded, kept)
             self.index.flush()  # rows durable before advancing the watermark
             self.index.set_meta("applied_seq", str(self.manifest.seq))
             # commit the new-segment-only view BEFORE deleting anything it
@@ -3563,6 +3724,10 @@ class NamespaceStore:
             rep.records_folded = len(kept)
             rep.bytes_after = self.store.size(f"{self.prefix}/{name}") if kept or header_ops else 0
             self.index.invalidate_vec_cache()  # fold dead rows out of the scan matrix
+            if scrub_seq:
+                # announced under the namespace lock: an LRU eviction, which
+                # takes it, then sees the scrub and leaves the namespace open
+                self._scrub_begin()
         ann_ticket = 0
         if scrub_seq:
             # The text is gone from durable data; now from this cache - OUTSIDE
@@ -3571,16 +3736,20 @@ class NamespaceStore:
             # or a reader memd does not control, for as long as that one holds
             # on (D10: it never gives up). Under the lock, every append and
             # close() waited with it - for that reader's whole lifetime. A
-            # close interrupts it; the next open scrubs again.
-            if self.index.scrub():
-                self.index.set_meta("scrubbed_seq", str(scrub_seq))
-            # ...and from the ANN sidecar: its files go now (usearch removal
-            # only marked the purged vectors), and it is rebuilt from SQLite -
-            # after the scrub, whose full VACUUM may renumber rowids
-            with self._lock:
-                ann = self.index.ann
-                if ann is not None and not self.index.closing:
-                    ann_ticket = ann.purged(scrub_seq)
+            # close interrupts it (the next open finishes it, in the
+            # background); the LRU does not evict the namespace meanwhile.
+            try:
+                if self.index.scrub():
+                    self._mark_scrubbed(self.index, scrub_seq)
+                # ...and from the ANN sidecar: its files go now (usearch removal
+                # only marked the purged vectors), and it is rebuilt from SQLite -
+                # after the scrub, whose full VACUUM may renumber rowids
+                with self._lock:
+                    ann = self.index.ann
+                    if ann is not None and not self.index.closing:
+                        ann_ticket = ann.purged(scrub_seq)
+            finally:
+                self._scrub_end()
         if self.index.closing:
             # a close cut the scrub short: no snapshot of this index now (the
             # next open finishes the scrub; close() collects orphans)
@@ -3613,31 +3782,53 @@ class NamespaceStore:
         rep.duration_ms = int((time.monotonic() - t0) * 1000)
         return rep
 
-    def _settle_dropped(self, dropped: set[str], folded: list[dict]) -> None:
-        """(compaction, ns lock held) Ids the fold dropped - deleted - that
-        the index still serves: a hard-deleted one's rows go, a soft-deleted
-        one is tombstoned. The write path applies every delete, so this
-        finds nothing - except in a cache an older build left behind an op
-        it never applied (a rotate that raised first, a close that stamped
-        the watermark past it): no replay applies such an op, and this fold
+    def _settle_index(self, dropped: set[str], folded: list[dict], kept: list[MemoryRecord]) -> None:
+        """(compaction, ns lock held) Make the index agree with the fold on
+        every record an op it retires touched. Ids the fold dropped -
+        deleted - that the index still serves: a hard-deleted one's rows
+        go, a soft-deleted one is tombstoned. A kept record a supersede or
+        quarantine op targets: its index row gets the fold's supersedence
+        and quarantine flag. The write path applies every op, so this finds
+        nothing - except in a cache an older build left behind an op it
+        never applied (a rotate that raised first, a close that stamped the
+        watermark past it): no replay applies such an op, and this fold
         retires it."""
-        if not dropped:
-            return
-        hard = {op["id"] for op in folded if op.get("op") == "hard_delete" and op.get("id") in dropped}
-        at = {_op_target(op): _op_at(op) for op in folded if op.get("op") == "tombstone"}
         fix = []
-        for rec in self.index.get_many(sorted(dropped)):
-            if rec.id in hard:
-                fix.append({"op": "hard_delete", "id": rec.id})
-            elif not rec.deleted:
-                fix.append({"op": "tombstone", "id": rec.id, "at": at.get(rec.id) or now_ms()})
+        if dropped:
+            hard = {op["id"] for op in folded if op.get("op") == "hard_delete" and op.get("id") in dropped}
+            at = {_op_target(op): _op_at(op) for op in folded if op.get("op") == "tombstone"}
+            for rec in self.index.get_many(sorted(dropped)):
+                if rec.id in hard:
+                    fix.append({"op": "hard_delete", "id": rec.id})
+                elif not rec.deleted:
+                    fix.append({"op": "tombstone", "id": rec.id, "at": at.get(rec.id) or now_ms()})
+        flagged = {_op_target(op) for op in folded if op.get("op") in ("supersede", "quarantine")}
+        want = {r.id: r for r in kept if r.id in flagged}
+        flags = []
+        for rec in self.index.get_many(sorted(want)):
+            w = want[rec.id]
+            if w.time.superseded_by and rec.time.superseded_by != w.time.superseded_by:
+                flags.append(("supersede", rec.id, w))
+            if bool(w.meta.get("quarantined")) != bool(rec.meta.get("quarantined")):
+                flags.append(("quarantine", rec.id, w))
+        if not fix and not flags:
+            return
+        METRICS.inc("memd_index_settled_total", len(fix) + len(flags),
+                    help="records a compaction found the index serving unlike the log "
+                         "(a delete, supersede or quarantine it never applied)",
+                    ns=self.namespace)
+        _log.warning("namespace %s: the index served %d record(s) unlike the log (%d deleted, "
+                     "%d superseded or (un)quarantined); applied the log's state",
+                     self.namespace, len(fix) + len(flags), len(fix), len(flags))
         if fix:
-            METRICS.inc("memd_index_settled_total", len(fix),
-                        help="deleted records a compaction found the index still serving",
-                        ns=self.namespace)
-            _log.warning("namespace %s: the index still served %d record(s) deleted in the "
-                         "log; applied their deletes", self.namespace, len(fix))
             self.index.apply_ops_batch(fix)
+        for kind, rid, w in flags:
+            if kind == "supersede":
+                self.index.mark_superseded(rid, w.time.superseded_by,
+                                           w.time.invalidated_at or now_ms())
+            else:
+                # (clearing scrubs the stored meta flag too, as a decay does)
+                self.index.mark_quarantined(rid, bool(w.meta.get("quarantined")))
 
     def _compaction_is_noop(self) -> bool:
         """True only when folding provably cannot change anything.
@@ -3703,11 +3894,26 @@ class NamespaceStore:
         A WAL frame that does not read is left out, not refused (it used to
         make the recovery path itself refuse): last_export_skipped says
         where it is (see _wal_events)."""
+        recs, _skipped = self.export_records()
+        for r in recs:
+            yield self.export_line(r)
+
+    def export_records(self) -> tuple[list[MemoryRecord], list[dict]]:
+        """The fold export_jsonl_iter streams, done now: (every record a read
+        can see, in export order; the WAL frames it left out as unreadable -
+        this export's, whatever another export sets last_export_skipped to
+        meanwhile). A streaming surface learns from it, before its first
+        byte, whether the export is complete (see Memory.export_stream)."""
         with self._lock:
             recs = self._visible_records()
+            skipped = list(self.last_export_skipped)
         recs.sort(key=lambda r: (r.time.t_ingested, r.id))
-        for r in recs:
-            yield json.dumps(r.to_dict(), separators=(",", ":")).encode() + b"\n"
+        return recs, skipped
+
+    @staticmethod
+    def export_line(rec: MemoryRecord) -> bytes:
+        """One export NDJSON line."""
+        return json.dumps(rec.to_dict(), separators=(",", ":")).encode() + b"\n"
 
     def _visible_records(self) -> list[MemoryRecord]:
         """Every record a read can see, folded from durable state in the one
@@ -3743,12 +3949,12 @@ class NamespaceStore:
         return st
 
     def close(self) -> None:
+        if not self._lost and self.lease_lost():
+            self._lost = True   # fenced: another node reclaimed the lease
         if self._lost:
-            # another writer owns it: persist nothing, collect nothing
-            try:
-                self.index.close()
-            except Exception:
-                pass
+            # another writer owns it: persist nothing, collect nothing (the
+            # engine then drops this node's copy - see _close_claimed)
+            self._close_index()
             return
         with self._lock:
             if self._manifest_dirty:
@@ -3756,11 +3962,10 @@ class NamespaceStore:
                     self._persist_manifest()
                 except LeaseLostError:
                     pass   # fenced by the write itself: nothing of ours to persist
+        if not self._lost and self.lease_lost():
+            self._lost = True
         if self._lost:
-            try:
-                self.index.close()
-            except Exception:
-                pass
+            self._close_index()
             return
         # a clean close collects what a crash orphaned, while this process
         # still holds the namespace; the engine audits it (take_collected)
@@ -3781,8 +3986,21 @@ class NamespaceStore:
             self.index.set_meta("applied_seq", str(self._index_mark()))
         except Exception:
             pass  # closed/deleted index; replay covers it
-        self.index.close()
+        self._close_index(quiet=False)
         self._release_ownership()
+
+    def _close_index(self, quiet: bool = True) -> None:
+        """Close the index - which interrupts a purge scrub waiting for its
+        readers - and let an open's background scrub thread end with it."""
+        try:
+            self.index.close()
+        except Exception:
+            if not quiet:
+                raise
+        finally:
+            t = self._scrub_thread
+            if t is not None and t is not threading.current_thread():
+                t.join(timeout=5.0)
 
     def _release_ownership(self, *, clean: bool = True, discard: bool = False) -> None:
         if self._owner_path:
@@ -3866,6 +4084,7 @@ class StorageEngine:
         max_open_namespaces: int = 64,
         lexical: dict | None = None,
         vector_index: dict | None = None,
+        cache_sweep_s: float | None = None,
     ):
         self.root = root
         # {"backend": "fts5"|"tantivy", "commit_ms", "commit_docs"}
@@ -3909,6 +4128,19 @@ class StorageEngine:
         # buffered audit entries must be written under the lease, and a later
         # tenure must not start from this one's ledger tail or search cache.
         self.close_hook = None
+        # D7: on a store with leases (several nodes on one bucket) this node
+        # drops its local copy of every namespace another node has taken
+        # over since it last served it - at startup, then every
+        # cache_sweep_s (see sweep_stale_caches). 0: never.
+        if cache_sweep_s is None:
+            cache_sweep_s = float(os.environ.get("MEMD_CACHE_SWEEP_S") or DEFAULT_CACHE_SWEEP_S)
+        self.cache_sweep_s = float(cache_sweep_s)
+        self._sweep_stop = threading.Event()
+        self._sweeper: threading.Thread | None = None
+        if self.cache_sweep_s > 0 and callable(getattr(self.store, "try_acquire_owner", None)):
+            self._sweeper = threading.Thread(target=self._sweep_loop, name="memd-cache-sweep",
+                                             daemon=True)
+            self._sweeper.start()
 
     def _closing(self, ns: str, lost: bool = False) -> None:
         if self.close_hook is not None:
@@ -3950,6 +4182,12 @@ class StorageEngine:
                 victim = self._namespaces[name]
                 if not victim._lock.acquire(blocking=False):
                     continue  # in-flight op on this store; retry next pass
+                if victim.scrubbing:
+                    # a purge's scrub (outside the namespace lock) may be
+                    # waiting for a reader of the index: a close would cut
+                    # it short and leave it to the next open - skip it
+                    victim._lock.release()
+                    continue
                 ent = self._claim_open_locked(name)
                 if ent is None:  # being destroyed: that closes it
                     victim._lock.release()
@@ -3992,13 +4230,47 @@ class StorageEngine:
             finally:
                 if held:
                     nstore._lock.release()
+            if nstore._lost:
+                # another node took it over: this node's copy is stale - and
+                # may hold text that node hard-deletes (D7). The open lock is
+                # still held: nothing reopens it meanwhile.
+                self._drop_if_superseded(name, "lease_lost")
             return [(name, d) for d in nstore.take_collected()]
         finally:
-            ent[0].release()
-            with self._lock:
-                ent[1] -= 1
-                if ent[1] == 0 and self._opening.get(name) is ent:
-                    del self._opening[name]
+            self._release_claim(name, ent)
+
+    def _release_claim(self, name: str, ent: list) -> None:
+        """Release an open lock taken with _claim_open_locked."""
+        ent[0].release()
+        with self._lock:
+            ent[1] -= 1
+            if ent[1] == 0 and self._opening.get(name) is ent:
+                del self._opening[name]
+
+    def _drop_if_superseded(self, ns: str, reason: str | None = None) -> bool:
+        """(ns open lock held, ns not open here) Delete this node's local
+        copy of `ns` (_drop_cache_files) if another tenure superseded it
+        (_cache_superseded) and no other process serves from it. `reason`
+        (a metric label) defaults to why it is stale."""
+        try:
+            why = self._cache_superseded(ns)
+        except Exception as ex:  # noqa: BLE001 - the next sweep retries
+            METRICS.inc("memd_index_cache_sweep_failures_total",
+                        help="local cache sweeps that failed", detail=type(ex).__name__)
+            return False
+        if why is None:
+            return False
+        try:
+            dropped = _drop_cache_files(self.cache_dir, ns, if_unused=True)
+        except Exception as ex:  # noqa: BLE001 - the next sweep or open retries
+            _log.warning("namespace %s: could not drop the local index cache (%s)", ns, ex)
+            return False
+        if dropped:
+            METRICS.inc("memd_index_cache_drops_total",
+                        help="local index caches dropped: another node took the namespace over",
+                        reason=reason or why)
+            _log.info("namespace %s: local index cache dropped (%s)", ns, reason or why)
+        return dropped
 
     @contextlib.contextmanager
     def _ns_open_lock(self, ns: str):
@@ -4040,10 +4312,7 @@ class StorageEngine:
             self._closing(ns, lost=True)
             stale._owner_lease = None       # not ours to release any more
             stale._release_ownership()      # the local flock's refcount, if any
-            try:
-                stale.index.close()
-            except Exception:
-                pass
+            stale._close_index()
         if nstore is None:
             # Opened under this namespace's own lock, not the engine's. An
             # open replays the namespace, and the first one after an upgrade
@@ -4054,6 +4323,11 @@ class StorageEngine:
             with self._ns_open_lock(ns):
                 with self._lock:
                     nstore = self._namespaces.get(ns)
+                if nstore is None and stale is not None:
+                    # the store just dropped lost its lease: another node
+                    # took the namespace over, and this node's copy of it
+                    # is stale (D7) - whether or not the reopen below wins
+                    self._drop_if_superseded(ns, "lease_lost")
                 if nstore is None:
                     nstore = NamespaceStore(
                         ns, self.store, self.cache_dir, self.envelope, self.wal_rotate_bytes,
@@ -4138,6 +4412,86 @@ class StorageEngine:
                 out[name] = st
         return out
 
+    def _sweep_loop(self) -> None:
+        while not self._sweep_stop.is_set():
+            try:
+                self.sweep_stale_caches()
+            except Exception as ex:  # noqa: BLE001 - the next sweep retries
+                METRICS.inc("memd_index_cache_sweep_failures_total",
+                            help="local cache sweeps that failed", detail=type(ex).__name__)
+            if self._sweep_stop.wait(self.cache_sweep_s):
+                return
+
+    def sweep_stale_caches(self) -> list[str]:
+        """Drop this node's local copy of every namespace it does not have
+        open that another node has taken over since this node last served
+        it (D7). Returns the namespaces dropped.
+
+        The copy - SQLite index, tantivy copy, ANN sidecar, all plaintext -
+        stayed until this node opened the namespace again: a record another
+        node hard-deleted, and purged, since stayed on this node's disk. A
+        copy is superseded once the namespace's manifest names another
+        tenure's lineage than the one the copy was brought up to date in (the
+        test an open applies, _stale_cache), or the namespace is gone.
+        Kept: a copy of the tenure that opened the namespace last - this
+        node's, when nobody took it since, so its reopen stays warm - and
+        that of a namespace still to be migrated (its old local index is
+        evidence the migration reads) or of an older build's manifest (its
+        open decides), and any copy another process has open (several
+        processes sharing one cache directory serve from the same files).
+        Each check holds that namespace's open lock - one an open or
+        destroy holds is left to the next sweep - and costs one manifest
+        read."""
+        try:
+            names = os.listdir(self.cache_dir)
+        except FileNotFoundError:
+            return []
+        cached = set()
+        for fn in names:
+            for suffix in _CACHE_SUFFIXES:
+                ns = fn[:-len(suffix)]
+                if fn.endswith(suffix) and _NS_RE.fullmatch(ns):
+                    cached.add(ns)
+        dropped = []
+        for ns in sorted(cached):
+            if self._sweep_stop.is_set():
+                break
+            with self._lock:
+                if ns in self._namespaces:
+                    continue
+                ent = self._claim_open_locked(ns)
+            if ent is None:
+                continue
+            try:
+                with self._lock:
+                    if ns in self._namespaces:
+                        continue
+                if self._drop_if_superseded(ns):
+                    dropped.append(ns)
+            finally:
+                self._release_claim(ns, ent)
+        return dropped
+
+    def _cache_superseded(self, ns: str) -> str | None:
+        """Why this node's copy of `ns` (not open here) is stale for good -
+        a metric label - or None to keep it (see sweep_stale_caches)."""
+        path = os.path.join(self.cache_dir, f"{ns.replace('/', '__')}.sqlite")
+        if not os.path.exists(path):
+            # a tantivy or sidecar directory with no index beside it: an
+            # index created from now on gets a new lineage, so nothing ever
+            # reads them again
+            return "orphaned"
+        raw = self.store.get(f"ns/{ns}/manifest.json")
+        if not raw:
+            return "namespace_gone"
+        m = Manifest.from_dict(json.loads(raw))
+        if m.format < STORE_FORMAT or not m.lineage:
+            return None
+        stamped = _cache_lineages(path)
+        if stamped is None or m.lineage in stamped:
+            return None
+        return "taken_over"
+
     def has_namespace(self, ns: str) -> bool:
         """True if `ns` is open here or has a manifest; never materializes it."""
         ns = _validate_ns(ns)
@@ -4185,28 +4539,18 @@ class StorageEngine:
                 except Exception:
                     pass
         n = self.store.remove_prefix(f"ns/{ns}")
-        # purge derived index cache (rebuildable data tied to the shredded ns)
-        safe = ns.replace("/", "__")
-        idx_path = os.path.join(self.cache_dir, f"{safe}.sqlite")
-        for suffix in ("", "-wal", "-shm"):
-            try:
-                os.unlink(idx_path + suffix)
-            except FileNotFoundError:
-                pass
-        # the tantivy accelerator holds the same text (tokenized): shred it too
-        shutil.rmtree(os.path.join(self.cache_dir, f"{safe}.tantivy"), ignore_errors=True)
-        # and the ANN sidecar holds its vectors: its handed-off final save is
-        # cancelled (and any write in flight waited for) before they go
-        from memd.index import ann_usearch
-
-        ann_path = os.path.join(self.cache_dir, f"{safe}.usearch")
-        ann_usearch.settle(ann_path, cancel=True)
-        shutil.rmtree(ann_path, ignore_errors=True)
+        # purge the derived caches (rebuildable data tied to the shredded ns):
+        # the index, the tantivy copy (the same text, tokenized) and the ANN
+        # sidecar (its vectors)
+        _drop_cache_files(self.cache_dir, ns)
         if self.envelope is not None:
             self.envelope.destroy(ns)
         return existed or n > 0
 
     def close(self) -> None:
+        self._sweep_stop.set()
+        if self._sweeper is not None and self._sweeper is not threading.current_thread():
+            self._sweeper.join(timeout=10.0)
         # opens in flight finish (and land in the table) before it is closed
         with self._lock:
             opening = [ent[0] for ent in self._opening.values()]

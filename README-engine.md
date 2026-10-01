@@ -243,6 +243,7 @@ multiple writers inside one namespace.
 | `MEMD_STATE_DIR` | - | required: keys.toml.json / hosted admin db |
 | `MEMD_KEY_PROVIDER` | - | required: `aws-kms` or `vault-transit` (a `local` key file cannot be shared) |
 | `MEMD_LOCAL_DIR` | `.memd-local` | node-local cache, under `<dir>/node-<id>` |
+| `MEMD_CACHE_SWEEP_S` | 300 | how often a node drops its local copies of namespaces another node took over (also at startup; `0` = never) |
 | `MEMD_S3_ACCESS_KEY` / `MEMD_S3_SECRET_KEY` | boto3 chain | bucket credentials, separate from the `AWS_*` ones KMS uses |
 | `MEMD_SHUTDOWN_GRACE_S` | 30 | uvicorn graceful drain on SIGTERM |
 

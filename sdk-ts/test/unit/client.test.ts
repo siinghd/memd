@@ -325,6 +325,31 @@ describe("export", () => {
     expect(got).toEqual(lines);
   });
 
+  it("lastExportSkippedFrames says an export left out unreadable frames", async () => {
+    const incomplete = () =>
+      new Response(ndjson, { headers: { "x-memd-export-skipped-frames": "2" } });
+    const complete = () => new Response(ndjson, { headers: { "x-memd-export-skipped-frames": "0" } });
+    const { fetch } = scriptedFetch(incomplete, complete, incomplete, complete, incomplete, () => new Response(ndjson));
+    const c = client(fetch);
+    expect(c.lastExportSkippedFrames).toBe(0);
+    expect(await c.export()).toEqual(lines);
+    expect(c.lastExportSkippedFrames).toBe(2);
+    await c.exportJsonl();
+    expect(c.lastExportSkippedFrames).toBe(0);
+    expect(await c.exportJsonl()).toBe(ndjson);
+    expect(c.lastExportSkippedFrames).toBe(2);
+    await c.exportJsonl();
+    const got = [];
+    for await (const rec of c.exportStream()) {
+      // set from the headers, before the first record
+      expect(c.lastExportSkippedFrames).toBe(2);
+      got.push(rec);
+    }
+    expect(got).toEqual(lines);
+    await c.export(); // an older server sends no header: complete as far as anyone can tell
+    expect(c.lastExportSkippedFrames).toBe(0);
+  });
+
   it("exportStream cancels the body when the consumer stops early", async () => {
     let cancelled = false;
     const body = new ReadableStream<Uint8Array>({

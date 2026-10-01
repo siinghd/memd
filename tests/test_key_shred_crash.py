@@ -4,6 +4,7 @@ every later open of the namespace name with a misleading 'wrong root key'
 error (crash oracle seed 15)."""
 import os
 import sys
+import time
 
 import pytest
 
@@ -66,3 +67,33 @@ def test_a_plain_destroy_still_shreds(tmp_path):
     env.data_key("side")
     assert env.destroy("side") is True
     assert os.listdir(kd) == ["root.key"]
+
+
+@pytest.mark.parametrize("ns", ["a.shred-b", "x.key.shred-0123abcd", "y.shred-0123abcd"])
+def test_a_namespace_named_like_a_shred_keeps_its_key(tmp_path, ns):
+    kd = str(tmp_path / "keys")
+    env = LocalKeyEnvelope(kd)
+    blob = env.encrypt(ns, b"precious")
+    before = sorted(os.listdir(kd))
+    env2 = LocalKeyEnvelope(kd)          # runs the shred sweep
+    assert sorted(os.listdir(kd)) == before
+    assert env2.decrypt(ns, blob) == b"precious"
+
+
+@pytest.mark.parametrize("victim", ["root.key", "ns-alpha.key"])
+def test_a_stale_temp_hard_linked_to_a_live_key_is_unlinked_not_shredded(tmp_path, victim):
+    # a crash between os.link(tmp, key) and os.unlink(tmp): the temp name
+    # and the live key are one inode - the sweep must not overwrite it
+    kd = str(tmp_path / "keys")
+    env = LocalKeyEnvelope(kd)
+    blob = env.encrypt("alpha", b"precious")
+    live = os.path.join(kd, victim)
+    before = open(live, "rb").read()
+    tmp = f"{live}.tmp-{'ab' * 6}"
+    os.link(live, tmp)
+    old = time.time() - 3600
+    os.utime(tmp, (old, old))
+    env2 = LocalKeyEnvelope(kd)          # runs the sweep
+    assert not os.path.exists(tmp)
+    assert open(live, "rb").read() == before
+    assert env2.decrypt("alpha", blob) == b"precious"

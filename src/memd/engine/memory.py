@@ -370,6 +370,21 @@ def forget_fingerprint(ids: list[str]) -> str:
     return hashlib.sha256("\n".join(sorted(ids)).encode()).hexdigest()[:32]
 
 
+class ExportStream:
+    """An export whose fold has run (Memory.export_stream). Iterating yields
+    its NDJSON lines. `skipped_frames`: the unreadable WAL frames it left out
+    (log, byte offset, fault); `skipped`: how many (also set where only the
+    count is known - a hosted client). 0: the export is complete."""
+
+    def __init__(self, lines, skipped_frames: list[dict], skipped: int | None = None):
+        self._lines = lines
+        self.skipped_frames = list(skipped_frames)
+        self.skipped = len(self.skipped_frames) if skipped is None else int(skipped)
+
+    def __iter__(self):
+        return self._lines
+
+
 class ForgetPreviewMismatch(Exception):
     """A confirmed forget() would delete a different set than its preview."""
 
@@ -641,7 +656,8 @@ class Memory:
                                         "commit_ms": int(cfg.get("lexical_commit_ms", DEFAULT_COMMIT_MS)),
                                         "commit_docs": int(cfg.get("lexical_commit_docs", DEFAULT_COMMIT_DOCS)),
                                     },
-                                    vector_index=vector_index_config(cfg, self.vector_index))
+                                    vector_index=vector_index_config(cfg, self.vector_index),
+                                    cache_sweep_s=cfg.get("cache_sweep_s"))
         self.namespace_name = namespace
         # D7 #7 ledgers are PER NAMESPACE. They are held in an LRU keyed by
         # namespace (mirroring the engine's namespace table) and routed by the
@@ -1911,60 +1927,72 @@ class Memory:
                           detail={"key_shred": shred} if shred else None)
         return ok
 
-    def export_jsonl_iter(self, namespace: str | None = None):
-        """Streaming export (embedded mode): NDJSON lines, O(1) line-sized
-        buffers. Hosted mode has no streaming REST surface yet; callers there
-        fall back to the buffered blob."""
+    # how many unreadable WAL frames the last export left out (0: complete) -
+    # see export_stream
+    last_export_skipped_frames = 0
+
+    def export_stream(self, namespace: str | None = None) -> "ExportStream":
+        """Streaming export whose fold has already run: iterate it for the
+        NDJSON lines (O(1) line-sized buffers). Its `skipped` - the
+        unreadable WAL frames it left out (see NamespaceStore._wal_events) -
+        is known before the first line, so a streaming surface can say the
+        export is incomplete up front (REST: X-Memd-Export-Skipped-Frames).
+        Metered and audited once the last line is out. Hosted mode has no
+        streaming REST surface yet: one buffered blob."""
         impl = self._hosted()
         if impl is not None:
-            yield impl.export_jsonl(namespace=namespace)
-            return
+            blob = impl.export_jsonl(namespace=namespace)
+            n = int(getattr(impl, "last_export_skipped_frames", 0) or 0)
+            self.last_export_skipped_frames = n
+            return ExportStream(iter([blob]), [], skipped=n)
         name = namespace or self.namespace_name
         t0 = time.monotonic()
-        n = 0
         nstore = self.engine.namespace(name)
-        for line in nstore.export_jsonl_iter():
-            n += 1
-            yield line
-        METRICS.observe("memd_export_ms", (time.monotonic() - t0) * 1000,
-                        help="export duration (ms)", ns=name)
-        METRICS.inc("memd_exports_total", ns=name)
-        METRICS.inc("memd_export_records_total", n, ns=name,
-                    help="records streamed by exports")
-        self._audit_for(name).append(actor="export", action="export", target=name,
-                          detail=self._export_detail(nstore, records=n))
+        recs, skipped = nstore.export_records()
+        self.last_export_skipped_frames = len(skipped)
+
+        def lines():
+            n = 0
+            for rec in recs:
+                n += 1
+                yield nstore.export_line(rec)
+            self._exported(name, t0, skipped, records=n)
+
+        return ExportStream(lines(), skipped)
+
+    def export_jsonl_iter(self, namespace: str | None = None):
+        """Streaming export: NDJSON lines (see export_stream)."""
+        yield from self.export_stream(namespace=namespace)
 
     def export_jsonl(self, namespace: str | None = None) -> bytes:
         """Buffered variant (CLI/SDK convenience). Emits its own metrics +
-        one audit record; prefer export_jsonl_iter() on streaming surfaces."""
+        one audit record; prefer export_stream() on streaming surfaces.
+        last_export_skipped_frames says whether it is complete."""
         impl = self._hosted()
         if impl is not None:
-            return impl.export_jsonl(namespace=namespace)
+            data = impl.export_jsonl(namespace=namespace)
+            self.last_export_skipped_frames = int(getattr(impl, "last_export_skipped_frames", 0) or 0)
+            return data
         name = namespace or self.namespace_name
         t0 = time.monotonic()
-        buf = bytearray()
-        n = 0
         nstore = self.engine.namespace(name)
-        for line in nstore.export_jsonl_iter():
-            n += 1
-            buf += line
-        data = bytes(buf)
+        recs, skipped = nstore.export_records()
+        self.last_export_skipped_frames = len(skipped)
+        data = b"".join(nstore.export_line(rec) for rec in recs)
+        self._exported(name, t0, skipped, bytes=len(data), records=len(recs))
+        return data
+
+    def _exported(self, name: str, t0: float, skipped: list[dict], **detail) -> None:
+        """Meter and audit one export. Its audit detail lists the unreadable
+        WAL frames it left out (log, byte offset, fault), if any."""
         METRICS.observe("memd_export_ms", (time.monotonic() - t0) * 1000,
                         help="export duration (ms)", ns=name)
         METRICS.inc("memd_exports_total", ns=name)
-        METRICS.inc("memd_export_records_total", n, ns=name,
+        METRICS.inc("memd_export_records_total", int(detail.get("records", 0)), ns=name,
                     help="records streamed by exports")
-        self._audit_for(name).append(actor="export", action="export", target=name,
-                          detail=self._export_detail(nstore, bytes=len(data), records=n))
-        return data
-
-    @staticmethod
-    def _export_detail(nstore, **detail) -> dict:
-        """An export's audit detail: plus the unreadable WAL frames it left
-        out (log, byte offset, fault), if any - see NamespaceStore._wal_events."""
-        if nstore.last_export_skipped:
-            detail["skipped_frames"] = list(nstore.last_export_skipped)
-        return detail
+        if skipped:
+            detail["skipped_frames"] = list(skipped)
+        self._audit_for(name).append(actor="export", action="export", target=name, detail=detail)
 
     def compact(self, force: bool = False, namespace: str | None = None) -> dict:
         impl = self._hosted()
