@@ -5,9 +5,10 @@ segments are normalize_entity_key dot-parts ([a-z0-9_-]+). The mismatch
 silently zeroed the entity lane on most punctuated queries - masked because
 BM25/vector lanes still found the record.
 """
+import os
 import sys
 
-sys.path.insert(0, "/home/deploy/agent-memory/src")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import pytest
 

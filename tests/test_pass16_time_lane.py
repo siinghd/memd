@@ -6,9 +6,10 @@ lane produced "time" hits, so temporal queries had no recency-proximate
 candidates. This pins the lane's existence, its contribution, and its
 ordering effect.
 """
+import os
 import sys
 
-sys.path.insert(0, "/home/deploy/agent-memory/src")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from memd.engine.memory import Memory
 

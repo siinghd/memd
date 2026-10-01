@@ -6,9 +6,10 @@ entries could pin >100MB of RAM from one authenticated client. Now:
   - oversized contexts are never cached
   - total cached bytes are capped with LRU eviction
 """
+import os
 import sys
 
-sys.path.insert(0, "/home/deploy/agent-memory/src")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from memd.engine.memory import _SearchCache, PackedContext, SearchHit, SearchResult
 

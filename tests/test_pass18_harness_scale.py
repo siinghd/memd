@@ -3,9 +3,10 @@
 --users is free-form CLI input; the generator indexed names[u] directly and
 IndexError'd the entire harness for users > 8.
 """
+import os
 import sys
 
-sys.path.insert(0, "/home/deploy/agent-memory/src")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import pytest
 

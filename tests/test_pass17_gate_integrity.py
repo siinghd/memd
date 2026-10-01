@@ -4,9 +4,10 @@ Both longmemeval-synthetic and halumem-ops emit system='memd'. A bare
 system-keyed dict let halumem's summary silently replace longmemeval's, so
 the token-ratio check graded ~51 tokens against a bar computed from
 longmemeval's full-context size and could never fail."""
+import os
 import sys
 
-sys.path.insert(0, "/home/deploy/agent-memory/src")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from memd.harness.core import CaseResult, SuiteReport
 from memd.harness.run import gate_check

@@ -7,10 +7,11 @@ unpacking bug in NamespaceStore._open made every segment replay throw,
 get swallowed, and the handler itself NameError - so node loss silently
 reduced a namespace to its WAL tail while metrics counted 'parse errors'.
 """
+import os
 import shutil
 import sys
 
-sys.path.insert(0, "/home/deploy/agent-memory/src")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from memd.engine.memory import Memory
 
