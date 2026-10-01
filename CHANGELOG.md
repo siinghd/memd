@@ -19,10 +19,10 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   that fails keeps the watermark below the op (the next open replays it,
   and the next write or fold first catches the index up in seq order); and
   a compaction tombstones or removes any record it dropped that the index
-  still serves (`memd_index_settled_total`), which also heals deleted
-  records an older build left served. A skipped supersede or quarantine
-  from an older build is not healed by compaction; reopening with a cold
-  cache (delete the namespace's local index) rebuilds it.
+  still serves, and gives a record a supersede or quarantine op it retires
+  targets the log's supersedence and quarantine flag
+  (`memd_index_settled_total`), which also heals the deletes, supersedes and
+  quarantines an older build left unapplied in the index.
 - **One damaged WAL frame no longer blocks export or fails writes.**
   Export - the recovery path - read the WAL with the reader every fold
   uses, which refuses a complete frame that does not read, so a single

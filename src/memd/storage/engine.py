@@ -3682,8 +3682,9 @@ class NamespaceStore:
             if purged:
                 self.manifest.scrub_seq = self.manifest.seq
             # nothing this fold deleted is served (and a purged row goes
-            # before the scrub below erases what it left in the file)
-            self._settle_dropped(purged_ids, folded)
+            # before the scrub below erases what it left in the file), and
+            # what it superseded or quarantined is served as such
+            self._settle_index(purged_ids, folded, kept)
             self.index.flush()  # rows durable before advancing the watermark
             self.index.set_meta("applied_seq", str(self.manifest.seq))
             # commit the new-segment-only view BEFORE deleting anything it
@@ -3781,31 +3782,53 @@ class NamespaceStore:
         rep.duration_ms = int((time.monotonic() - t0) * 1000)
         return rep
 
-    def _settle_dropped(self, dropped: set[str], folded: list[dict]) -> None:
-        """(compaction, ns lock held) Ids the fold dropped - deleted - that
-        the index still serves: a hard-deleted one's rows go, a soft-deleted
-        one is tombstoned. The write path applies every delete, so this
-        finds nothing - except in a cache an older build left behind an op
-        it never applied (a rotate that raised first, a close that stamped
-        the watermark past it): no replay applies such an op, and this fold
+    def _settle_index(self, dropped: set[str], folded: list[dict], kept: list[MemoryRecord]) -> None:
+        """(compaction, ns lock held) Make the index agree with the fold on
+        every record an op it retires touched. Ids the fold dropped -
+        deleted - that the index still serves: a hard-deleted one's rows
+        go, a soft-deleted one is tombstoned. A kept record a supersede or
+        quarantine op targets: its index row gets the fold's supersedence
+        and quarantine flag. The write path applies every op, so this finds
+        nothing - except in a cache an older build left behind an op it
+        never applied (a rotate that raised first, a close that stamped the
+        watermark past it): no replay applies such an op, and this fold
         retires it."""
-        if not dropped:
-            return
-        hard = {op["id"] for op in folded if op.get("op") == "hard_delete" and op.get("id") in dropped}
-        at = {_op_target(op): _op_at(op) for op in folded if op.get("op") == "tombstone"}
         fix = []
-        for rec in self.index.get_many(sorted(dropped)):
-            if rec.id in hard:
-                fix.append({"op": "hard_delete", "id": rec.id})
-            elif not rec.deleted:
-                fix.append({"op": "tombstone", "id": rec.id, "at": at.get(rec.id) or now_ms()})
+        if dropped:
+            hard = {op["id"] for op in folded if op.get("op") == "hard_delete" and op.get("id") in dropped}
+            at = {_op_target(op): _op_at(op) for op in folded if op.get("op") == "tombstone"}
+            for rec in self.index.get_many(sorted(dropped)):
+                if rec.id in hard:
+                    fix.append({"op": "hard_delete", "id": rec.id})
+                elif not rec.deleted:
+                    fix.append({"op": "tombstone", "id": rec.id, "at": at.get(rec.id) or now_ms()})
+        flagged = {_op_target(op) for op in folded if op.get("op") in ("supersede", "quarantine")}
+        want = {r.id: r for r in kept if r.id in flagged}
+        flags = []
+        for rec in self.index.get_many(sorted(want)):
+            w = want[rec.id]
+            if w.time.superseded_by and rec.time.superseded_by != w.time.superseded_by:
+                flags.append(("supersede", rec.id, w))
+            if bool(w.meta.get("quarantined")) != bool(rec.meta.get("quarantined")):
+                flags.append(("quarantine", rec.id, w))
+        if not fix and not flags:
+            return
+        METRICS.inc("memd_index_settled_total", len(fix) + len(flags),
+                    help="records a compaction found the index serving unlike the log "
+                         "(a delete, supersede or quarantine it never applied)",
+                    ns=self.namespace)
+        _log.warning("namespace %s: the index served %d record(s) unlike the log (%d deleted, "
+                     "%d superseded or (un)quarantined); applied the log's state",
+                     self.namespace, len(fix) + len(flags), len(fix), len(flags))
         if fix:
-            METRICS.inc("memd_index_settled_total", len(fix),
-                        help="deleted records a compaction found the index still serving",
-                        ns=self.namespace)
-            _log.warning("namespace %s: the index still served %d record(s) deleted in the "
-                         "log; applied their deletes", self.namespace, len(fix))
             self.index.apply_ops_batch(fix)
+        for kind, rid, w in flags:
+            if kind == "supersede":
+                self.index.mark_superseded(rid, w.time.superseded_by,
+                                           w.time.invalidated_at or now_ms())
+            else:
+                # (clearing scrubs the stored meta flag too, as a decay does)
+                self.index.mark_quarantined(rid, bool(w.meta.get("quarantined")))
 
     def _compaction_is_noop(self) -> bool:
         """True only when folding provably cannot change anything.

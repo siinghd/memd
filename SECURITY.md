@@ -325,7 +325,8 @@ serving, and fails closed only where the frame would be lost:
   the record whatever the rotate does. (Through 0.3.0 the refused rotate ran
   first and skipped both; a cache left that way is healed by the first
   compaction after recovery, which removes anything the log deleted that
-  the index still serves - `memd_index_settled_total`.)
+  the index still serves, and applies a supersede or quarantine the index
+  missed - `memd_index_settled_total`.)
 
 A damaged segment never blocks an open: it is skipped by reads, kept by
 compaction (`"unreadable": true` in the manifest,
