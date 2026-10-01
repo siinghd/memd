@@ -46,10 +46,18 @@ wrong, how it showed, and the numbers before and after where it has them.
   replica's own clients have short timeouts, and a read waits for a
   refresh at most `MEMD_REPLICA_REFRESH_WAIT_MS`); a replica that failed to
   open (KMS down) is not retried by every read (12-20 s each before; now
-  they go to the writer at once for 5 s, doubling to 60 s); a replica read
-  that falls back to the writer is charged once against the rate limits,
-  not twice. The writer's data client gets a 10 s connect timeout (its
-  read timeout is unchanged).
+  they go to the writer at once for 5 s, doubling to 60 s), and a read
+  waits for a replica's open at most `MEMD_REPLICA_REFRESH_WAIT_MS` too (a
+  KMS that hangs held the first eventual read of each namespace 10-11 s); a
+  read that waited for a rebuild no longer reads the rebuilt index before
+  the log tail is applied (a hard delete the replica had served was served
+  again, 3.5 s after it was acknowledged against a 1.5 s bound), and a
+  read's `age_ms` is that of the state it was served from; a replica built
+  from durable data that still holds a hard-deleted record (its purge
+  pending) scrubs its files (the text stayed in its WAL until the writer's
+  purge); a replica read that falls back to the writer is charged once
+  against the rate limits, not twice. The writer's data client gets a 10 s
+  connect timeout (its read timeout is unchanged).
 
 ## [0.3.2] - 2026-10-01
 

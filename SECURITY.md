@@ -123,7 +123,9 @@ any probe fails the build.
   open checks the new data with the cached old key and refuses it
   (`KeyCustodyError`: fails closed, nothing read or written) until the
   process restarts or the key leaves the cache. Read replicas are not
-  affected: they resolve a key from its record on every rebuild.
+  affected: a replica resolves the key from its record again when it
+  rebuilds for another tenure (a new lineage) and after a custody refusal,
+  and never keeps a key that failed verification.
 - **Crypto-shred with a SHARED CMK / transit key** (the normal deployment)
   deletes the namespace's wrapped key object - including every noncurrent
   version on a versioned bucket (a versioned bucket whose versions API memd
@@ -228,11 +230,16 @@ any probe fails the build.
   truncation, tantivy and ANN sidecar rebuilt), in the background; that is
   sooner than the writer's own purge (up to the 72 h deadline). A
   compaction, a takeover or a new tenure makes the replica delete its files
-  and rebuild from the bucket. A destroyed (crypto-shredded) namespace's
-  replica deletes its files and drops the data key it held at its next
-  refresh - and so does one destroyed and created again under its name
-  before that refresh: the rebuild resolves the new incarnation's key from
-  its record (never from a cache), and a key that fails verification is
+  and rebuild from the bucket - whose durable data still holds a
+  hard-deleted record until the writer's purge: a replica built from it
+  (bootstrapped or rebuilt) applies the delete and scrubs its files the same
+  way, and a rebuilt replica serves nothing until it has applied the log
+  tail as well, so a delete it has served is never served again. A
+  destroyed (crypto-shredded) namespace's replica deletes its files and
+  drops the data key it held at its next refresh - and so does one
+  destroyed and created again under its name before that refresh: the
+  rebuild resolves the new incarnation's key from its record (never from a
+  cache), and a key that fails verification is
   never kept. A replica never writes or deletes an object - no manifest, log
   part, fence, wrapped key, custody marker, audit entry or snapshot (it is
   opened over a read-only view of the store and the keys, and every write

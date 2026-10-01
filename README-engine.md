@@ -127,6 +127,13 @@ they are the number that decides both the cost model and how a WAN changes
 things. A warm search touches object storage zero times because retrieval is
 served by the local derived index.
 
+Timeouts: the writer's data client (segments, log parts, the manifest) has a
+10 s connect timeout and botocore's 60 s read timeout - an append is a
+conditional PUT, never retried early; leases and the cluster registry go
+through a client of their own with 2 s / 4 s, and a read replica's bucket and
+KMS calls through clients with `MEMD_REPLICA_CONNECT_TIMEOUT_S` /
+`MEMD_REPLICA_READ_TIMEOUT_S` (2 s / 5 s; see "Read replicas").
+
 What stays local: the SQLite derived index (rebuildable by contract — the
 index snapshot published to the store is what makes a cold node cheap) and, with the default `local`
 key provider, the envelope **keys**. Then data is remote and keys are not:
@@ -268,16 +275,27 @@ mem.search("how do we deploy?"); mem.last_read   # {"served_by": "replica", "app
   `MEMD_REPLICA_REFRESH_WAIT_MS` (1 s) - never on one already running that
   long (a bucket or KMS that hangs) - and a read it still cannot serve - or
   one that hits a key-custody or store error - goes to the writer instead,
-  invisibly. A replica that failed to open is not opened again by reads for
-  5 s (doubling to 60 s while it keeps failing): they go to the writer at
-  once. A replica's bucket and KMS calls have short timeouts of their own
-  (below); the writer's are unchanged. Every search and get answers `X-Memd-Served-By: leader|replica`
-  (a replica adds `X-Memd-Replica-Seq` and `X-Memd-Replica-Age-Ms`).
+  invisibly. A read that can go to the writer waits no longer for a
+  replica's open either: the open goes on in the background, and reads go
+  to the writer until it completes (an embedded `read_only` Memory, with no
+  writer to go to, waits for it). A replica that failed to open is not
+  opened again by reads for 5 s (doubling to 60 s while it keeps failing):
+  they go to the writer at once. A replica's bucket and KMS calls have short timeouts of their own
+  (below); the writer's data client has a 10 s connect timeout and
+  botocore's 60 s read timeout. Every search and get answers
+  `X-Memd-Served-By: leader|replica` (a replica adds `X-Memd-Replica-Seq`
+  and `X-Memd-Replica-Age-Ms`, the age of the state the read was served
+  from).
 - **Read-your-writes** holds for strong reads only: an eventual read may
   miss a write acknowledged less than the bound ago, and may still serve a
   record deleted that recently. A hard delete stops being served by every
   replica within the bound, and is scrubbed from the replica's files when
-  it applies it (SECURITY.md).
+  it applies it - or when it builds them from durable data that still
+  holds it, its purge pending (SECURITY.md). A replica never serves an
+  older state than one it has served: a rebuilt replica serves nothing
+  until the refresh that rebuilt it has applied the log tail too (a read
+  waits for that at most `MEMD_REPLICA_REFRESH_WAIT_MS`, then goes to the
+  writer).
 - Served by replicas: `search` and `get` (`GET .../memories/{id}`). Always
   the writer: every write, `export` (audited in the namespace's ledger, which
   only the writer appends to), `find_ids` / `forget` (a preview must match
@@ -335,11 +353,20 @@ with no replica open, 16.4 / 27.9 ms with two attached, 17.4 / 43.8 ms with
 two serving a read load (shared CPU). A refresh with nothing new is 4
 object-store requests (2 manifest GETs, a LIST of each log) - ~2 requests/s
 per open replica at the default interval, which is why idle replicas close.
-When the bucket hangs (accepts connections, never answers) for 150 s, the
-slowest eventual read takes 1.0 s before it goes to the writer, and the
-replica serves again within 0.5 s of the bucket's return; with a node's KMS
-unreachable, the first eventual read of a namespace goes to the writer
-after 0.1-0.8 s and the following ones in ~20 ms.
+
+**Outages** were measured separately, not by the benchmark: on the same
+machine, with a TCP proxy that refuses connections, or accepts them and
+never answers, in front of the replica's bucket or of one node's KMS. The
+bucket hanging for 150 s under an embedded `read_only` Memory refreshing
+every 0.5 s: no eventual read waited longer than 1.0 s before it was
+refused (over the router it goes to the writer), and the replica served
+again 0.9 s after the bucket's return. One node's KMS, in a four-node HTTP
+cluster on the same MinIO and moto KMS refreshing every 0.5 s, for three
+namespaces another node writes: refusing connections, the first eventual
+read of each namespace on that node went to the writer after 0.2-0.5 s;
+hanging, after 1.0-1.1 s (the read's wait - the replica's open timed out
+in the background, 2 x 5 s); the following reads went to the writer in
+~20 ms.
 
 | setting | default | |
 |---|---|---|
@@ -355,9 +382,9 @@ after 0.1-0.8 s and the following ones in ~20 ms.
 | `MEMD_REPLICA_REFRESH_S` | 2 | how often a read replica follows its writer (the staleness bound's base; `replica_refresh_s` in `Memory(config=...)`) |
 | `MEMD_REPLICA_MAX_STALENESS_MS` | 3 x refresh | the default bound of an eventual read (`X-Memd-Max-Staleness-Ms` per request) |
 | `MEMD_MAX_REPLICAS` | 64 | replica namespaces per node (LRU; a closed replica's cache is deleted) |
-| `MEMD_REPLICA_IDLE_S` | 300 | a replica nobody read for this long is closed (each costs ~3 object-store requests per refresh) |
-| `MEMD_REPLICA_REFRESH_WAIT_MS` | 1000 | the longest a stale replica's read waits for a refresh before it goes to the writer |
-| `MEMD_REPLICA_CONNECT_TIMEOUT_S` / `MEMD_REPLICA_READ_TIMEOUT_S` / `MEMD_REPLICA_MAX_ATTEMPTS` | 2 / 5 / 2 | a replica's bucket and KMS calls (its own clients; the writer keeps botocore's 60 s read timeout - an append is a conditional PUT that must not be retried early) |
+| `MEMD_REPLICA_IDLE_S` | 300 | a replica nobody read for this long is closed (each costs 4 object-store requests per refresh with nothing new) |
+| `MEMD_REPLICA_REFRESH_WAIT_MS` | 1000 | the longest an eventual read waits for a replica's refresh (or its open) before it goes to the writer |
+| `MEMD_REPLICA_CONNECT_TIMEOUT_S` / `MEMD_REPLICA_READ_TIMEOUT_S` / `MEMD_REPLICA_MAX_ATTEMPTS` | 2 / 5 / 2 | a replica's bucket and KMS calls (its own clients; the writer's data client has a 10 s connect timeout and keeps botocore's 60 s read timeout - an append is a conditional PUT that must not be retried early) |
 | `MEMD_S3_ACCESS_KEY` / `MEMD_S3_SECRET_KEY` | boto3 chain | bucket credentials, separate from the `AWS_*` ones KMS uses |
 | `MEMD_SHUTDOWN_GRACE_S` | 30 | uvicorn graceful drain on SIGTERM |
 
