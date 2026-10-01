@@ -679,6 +679,11 @@ _SHRED_SUFFIX = ".shred-"
 # whatever its namespace is called. One older than _TMP_STALE_S is what a
 # crash left, and is shredded (_sweep_shreds).
 _TMP_RE = re.compile(r"\.key\.tmp-[0-9a-f]{12}\Z")
+# what _overwrite_unlink renames a key file to: "<file>.key.shred-" + 8 hex
+# digits, at the END of the name. A substring test is not enough: a
+# namespace may be called "a.shred-b", and its live key file
+# ("ns-a.shred-b.key") must never be taken for a shred leftover.
+_SHRED_RE = re.compile(r"\.key\.shred-[0-9a-f]{8}\Z")
 _TMP_STALE_S = 300.0
 
 
@@ -734,7 +739,7 @@ def _sweep_shreds(d: str) -> None:
     for fn in names:
         p = os.path.join(d, fn)
         try:
-            if _SHRED_SUFFIX in fn:
+            if _SHRED_RE.search(fn):
                 _shred_file(p)
             elif _TMP_RE.search(fn) and time.time() - os.path.getmtime(p) > _TMP_STALE_S:
                 _shred_file(p)

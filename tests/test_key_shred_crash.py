@@ -66,3 +66,14 @@ def test_a_plain_destroy_still_shreds(tmp_path):
     env.data_key("side")
     assert env.destroy("side") is True
     assert os.listdir(kd) == ["root.key"]
+
+
+@pytest.mark.parametrize("ns", ["a.shred-b", "x.key.shred-0123abcd", "y.shred-0123abcd"])
+def test_a_namespace_named_like_a_shred_keeps_its_key(tmp_path, ns):
+    kd = str(tmp_path / "keys")
+    env = LocalKeyEnvelope(kd)
+    blob = env.encrypt(ns, b"precious")
+    before = sorted(os.listdir(kd))
+    env2 = LocalKeyEnvelope(kd)          # runs the shred sweep
+    assert sorted(os.listdir(kd)) == before
+    assert env2.decrypt(ns, blob) == b"precious"
