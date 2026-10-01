@@ -180,8 +180,9 @@ any probe fails the build.
   only on the node that owns the namespace when it runs. A node drops its
   copy of a namespace another node has taken over since it last served it
   (another tenure's lineage in the manifest, or the namespace is gone):
-  once the namespace is closed after this node lost its lease, at startup,
-  and every `cache_sweep_s` (300 s; `MEMD_CACHE_SWEEP_S`, `0` = never) for
+  when the namespace is closed after this node lost its lease (if the new
+  owner has already committed its tenure; otherwise at the next sweep), at
+  startup, and every `cache_sweep_s` (300 s; `MEMD_CACHE_SWEEP_S`, `0` = never) for
   every namespace it does not have open - so text another node
   hard-deletes leaves this node's disk within that interval of the other
   node taking the namespace over, typically before the delete itself. It

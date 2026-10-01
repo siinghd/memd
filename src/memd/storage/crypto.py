@@ -594,6 +594,7 @@ class LocalKeyEnvelope(KeyEnvelope):
         finally:
             try:
                 os.unlink(tmp)
+                _fsync_dir(d)
             except FileNotFoundError:
                 pass
 
@@ -742,7 +743,15 @@ def _sweep_shreds(d: str) -> None:
             if _SHRED_RE.search(fn):
                 _shred_file(p)
             elif _TMP_RE.search(fn) and time.time() - os.path.getmtime(p) > _TMP_STALE_S:
-                _shred_file(p)
+                if os.stat(p).st_nlink > 1:
+                    # a crash between os.link(tmp, key) and os.unlink(tmp)
+                    # (_write_secret): this name and the LIVE key file are
+                    # one inode. Overwriting it would destroy the key; drop
+                    # the extra name only.
+                    os.unlink(p)
+                    _fsync_dir(d)
+                else:
+                    _shred_file(p)
         except FileNotFoundError:
             pass  # a concurrent sweep (or its creator) finished it
 
