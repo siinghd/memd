@@ -21,11 +21,11 @@ pushes to the default branch:
 - **The npm scope.** `@memd/client` needs an npm organization `memd`
   (create it on npmjs.com), or rename the package in `sdk-ts/package.json`
   and its README.
-- **The GitHub owner and repository.** `github.com/memd/memd` is a
-  placeholder in `pyproject.toml` (`[project.urls]`), `sdk-ts/package.json`
-  (`repository`, `homepage`) and `mkdocs.yml` (`repo_url`, `repo_name`).
-  npm provenance fails unless `repository.url` in `sdk-ts/package.json` is
-  the repository the workflow runs in.
+- **The GitHub owner and repository** are `github.com/siinghd/memd`, set in
+  `pyproject.toml` (`[project.urls]`), `sdk-ts/package.json` (`repository`,
+  `homepage`) and `mkdocs.yml` (`repo_url`, `repo_name`, `site_url`). npm
+  provenance fails unless `repository.url` in `sdk-ts/package.json` is the
+  repository the workflow runs in: update all three if the repo moves.
 - **The docs URL.** GitHub Pages serves `https://<owner>.github.io/<repo>/`;
   a custom domain needs a `docs/CNAME` file and a DNS record. Set `site_url`
   in `mkdocs.yml` and add a `Documentation` entry to `[project.urls]`.

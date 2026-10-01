@@ -11,10 +11,10 @@
     "retrieval",
     "rag"
   ],
-  "homepage": "https://github.com/memd/memd/tree/main/sdk-ts#readme",
+  "homepage": "https://github.com/siinghd/memd/tree/master/sdk-ts#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/memd/memd.git",
+    "url": "git+https://github.com/siinghd/memd.git",
     "directory": "sdk-ts"
   },
   "type": "module",

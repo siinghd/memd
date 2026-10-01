@@ -5,10 +5,9 @@
 # HTTP reference from the server's own OpenAPI schema.
 site_name: memd
 site_description: The SQLite of agent memory - an embedded-first, Apache-2.0 agent memory engine
-# placeholders until the repository exists: set repo_url (and site_url once
-# the Pages URL or a custom domain is known) - see RELEASING.md
-repo_url: https://github.com/memd/memd
-repo_name: memd/memd
+site_url: https://siinghd.github.io/memd/
+repo_url: https://github.com/siinghd/memd
+repo_name: siinghd/memd
 edit_uri: edit/master/docs/
 copyright: memd contributors - Apache-2.0
 

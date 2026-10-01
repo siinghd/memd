@@ -56,7 +56,9 @@ docs = [
 memd = "memd.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/memd/memd"
+Homepage = "https://github.com/siinghd/memd"
+Documentation = "https://siinghd.github.io/memd/"
+Issues = "https://github.com/siinghd/memd/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
