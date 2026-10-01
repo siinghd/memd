@@ -6,6 +6,22 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-01
+
+### Fixed - data integrity / security
+- **A namespace whose name contains `.shred-` lost its key** (0.3.0; also
+  0.2.1, fixed in 0.2.2). Finishing interrupted key shreds matched any key
+  file whose name contained `.shred-`, so the live key of a namespace called
+  e.g. `a.shred-b` was destroyed the next time the keys directory was
+  loaded. Only the exact leftover name (`<file>.key.shred-` + 8 hex digits)
+  is matched now.
+- **A crash while creating a key file can no longer destroy that key later.**
+  A key file is written under a temporary name and hard-linked into place;
+  a crash before the temporary name was removed left it sharing the live
+  key's bytes, and the sweep that shreds stale temporaries would have
+  overwritten the live key (a `root.key`: every namespace). A stale
+  temporary that shares its inode is now only unlinked.
+
 ### Fixed
 - **A durable delete always reaches the index (D7).** `append_ops` ran the
   ops log's size-triggered rotate before applying the op to the index, so a
