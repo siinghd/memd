@@ -6,6 +6,57 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
 
 ## [Unreleased]
 
+### Fixed
+- **A durable delete always reaches the index (D7).** `append_ops` ran the
+  ops log's size-triggered rotate before applying the op to the index, so a
+  rotate that raised (a damaged WAL frame makes every fold refuse) left the
+  delete logged but unapplied: `get()` and search served the record, a hard
+  delete's purge was not scheduled, and `close()` stamped the index
+  watermark past the op, so no reopen replayed it - after the documented
+  frame recovery export said the record was gone while `get()`/search
+  served it and its text stayed in the local index. The op now reaches the
+  index and the purge schedule before any maintenance runs; an index apply
+  that fails keeps the watermark below the op (the next open replays it,
+  and the next write or fold first catches the index up in seq order); and
+  a compaction tombstones or removes any record it dropped that the index
+  still serves (`memd_index_settled_total`), which also heals caches an
+  older build left in that state.
+- **One damaged WAL frame no longer blocks export or fails writes.**
+  Export - the recovery path - read the WAL with the reader every fold
+  uses, which refuses a complete frame that does not read, so a single
+  damaged frame made `export()` raise and nothing could be exported. It now
+  leaves that frame out and exports everything readable: a warning names
+  the frame's byte offset, `memd_export_frames_skipped_total` counts it,
+  and the export's audit entry lists it (`skipped_frames`: log, byte,
+  fault); nothing is cut or deleted. A frame under a key this process may
+  not hold still refuses the export (every frame would read that way). And
+  once the WAL or ops log passed its rotate threshold, every write and
+  delete ran the size-triggered rotate after it was durable and raised its
+  refusal - callers saw errors for writes that had landed, and retried
+  them; `close_session()` raised after its facts were written. Automatic
+  maintenance (that rotate, a session close's fold, a hard delete's
+  background purge compaction) that raises no longer fails the write: it
+  is logged, metered (`memd_ns_maintenance_failures_total{op}`,
+  `memd_ns_maintenance_failing`), surfaced as `maintenance` in `stats()`
+  and `status()` and as a count in `/health` (`maintenance_failing`), and
+  retried after a backoff (30 s, doubling to 10 min) instead of on every
+  write; `close_session()` returns `"segment": ""`. Rotate and compaction
+  themselves keep refusing until the frame is repaired.
+- **A reader outside memd no longer stalls a namespace during a purge.**
+  The scrub after a hard-delete purge retries until the index's WAL is
+  truncated, and a reader memd does not control (another connection
+  holding an old snapshot of the SQLite file) keeps that from happening
+  for as long as it holds on. Each attempt waited out the 5 s busy timeout
+  holding the index lock, and the compaction ran the scrub holding the
+  namespace lock: searches and index writes waited ~5 s at p99, and
+  appends and `close()` for the reader's whole lifetime (a 75 s reader:
+  append p99 75.7 s). An attempt now waits 50 ms, the index lock is
+  released between attempts (backoff 50 ms doubling to 1 s), and the
+  compaction scrubs outside the namespace lock. The scrub still never gives
+  up and warns every 60 s; a close interrupts it (`Memory.close()` stops
+  it before draining background maintenance) and the next open finishes
+  it.
+
 ## [0.3.0] - 2026-09-26
 
 ### Added

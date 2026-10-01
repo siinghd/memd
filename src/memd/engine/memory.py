@@ -1452,7 +1452,9 @@ class Memory:
                                                  detail={"raw_skipped": len(seg_records) - len(to_extract),
                                                          "facts_capped": facts_capped})
         facts_written, consolidation = self._write_facts(ns, extracted, seg_records)
-        seg_name = ns.rotate(f"session-close:{session_id}")
+        # the facts are durable: a fold that refuses (a damaged log frame)
+        # leaves the session unfolded - "" - and is surfaced, never raised
+        seg_name = ns.maintain_rotate(f"session-close:{session_id}")
         self._taints.drop(session_id)  # taint is per-session; closed = gone
         self._enforce_purge_deadlines(ns)  # segment fold enforces due purges too
         self._audit_for(ns.namespace).append(actor="system", action="close_session", target=session_id,
@@ -1704,7 +1706,9 @@ class Memory:
         if ns is None or not ns.has_due_deletes():
             return False
         t0 = time.monotonic()
-        rep = ns.compact(force=False)  # force=False still enforces due deadlines
+        rep = ns.maintain_compact()  # force=False still enforces due deadlines
+        if rep is None:
+            return False  # a failed fold's backoff: the next purge trigger retries
         METRICS.inc("memd_auto_compactions_total", reason="hard_delete_deadline", ns=ns_name)
         METRICS.observe("memd_compaction_ms", (time.monotonic() - t0) * 1000,
                         help="compaction duration (ms)", ns=ns_name, forced="auto")
@@ -1918,7 +1922,8 @@ class Memory:
         name = namespace or self.namespace_name
         t0 = time.monotonic()
         n = 0
-        for line in self.engine.namespace(name).export_jsonl_iter():
+        nstore = self.engine.namespace(name)
+        for line in nstore.export_jsonl_iter():
             n += 1
             yield line
         METRICS.observe("memd_export_ms", (time.monotonic() - t0) * 1000,
@@ -1927,7 +1932,7 @@ class Memory:
         METRICS.inc("memd_export_records_total", n, ns=name,
                     help="records streamed by exports")
         self._audit_for(name).append(actor="export", action="export", target=name,
-                          detail={"records": n})
+                          detail=self._export_detail(nstore, records=n))
 
     def export_jsonl(self, namespace: str | None = None) -> bytes:
         """Buffered variant (CLI/SDK convenience). Emits its own metrics +
@@ -1939,7 +1944,8 @@ class Memory:
         t0 = time.monotonic()
         buf = bytearray()
         n = 0
-        for line in self.engine.namespace(name).export_jsonl_iter():
+        nstore = self.engine.namespace(name)
+        for line in nstore.export_jsonl_iter():
             n += 1
             buf += line
         data = bytes(buf)
@@ -1949,8 +1955,16 @@ class Memory:
         METRICS.inc("memd_export_records_total", n, ns=name,
                     help="records streamed by exports")
         self._audit_for(name).append(actor="export", action="export", target=name,
-                          detail={"bytes": len(data), "records": n})
+                          detail=self._export_detail(nstore, bytes=len(data), records=n))
         return data
+
+    @staticmethod
+    def _export_detail(nstore, **detail) -> dict:
+        """An export's audit detail: plus the unreadable WAL frames it left
+        out (log, byte offset, fault), if any - see NamespaceStore._wal_events."""
+        if nstore.last_export_skipped:
+            detail["skipped_frames"] = list(nstore.last_export_skipped)
+        return detail
 
     def compact(self, force: bool = False, namespace: str | None = None) -> dict:
         impl = self._hosted()
@@ -2011,6 +2025,10 @@ class Memory:
         impl = self._hosted()
         if impl is not None:
             return impl.status()
+        # open namespaces whose automatic maintenance (rotate/compaction) is
+        # failing: writes succeed meanwhile, the logs grow (see
+        # NamespaceStore.maintain_rotate)
+        failing = self.engine.maintenance_failing()
         if ns_filter is not None:
             names = ([ns_filter]
                      if self.engine.store.exists(f"ns/{ns_filter}/manifest.json")
@@ -2022,6 +2040,7 @@ class Memory:
                 "embedder": self.embedder.name,
                 "extractor": self.extractor.name,
                 "version": __import__("memd").__version__,
+                "maintenance": {k: v for k, v in failing.items() if k == ns_filter},
             }
         names = self.engine.list_namespaces()
         return {
@@ -2031,6 +2050,7 @@ class Memory:
             "embedder": self.embedder.name,
             "extractor": self.extractor.name,
             "version": __import__("memd").__version__,
+            "maintenance": failing,
         }
 
     # ------------------------------------------------------------------ internals
@@ -2159,6 +2179,10 @@ class Memory:
         # bounded drain before stopping: a clean close should not silently
         # discard the vector lane it was asked to persist
         self._embed_worker.stop(drain_timeout_s=float(self._embed_close_drain_s))
+        # a purge's scrub waiting for a reader of the index (one memd does
+        # not control may hold on indefinitely) would hold the drain below:
+        # it stops waiting, and the next open finishes it
+        self.engine.stop_waiting()
         self._maint.stop(drain_timeout_s=float(self._embed_close_drain_s))
         if self.rerank is not None:
             self.rerank.close()

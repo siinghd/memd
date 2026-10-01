@@ -48,7 +48,9 @@ any probe fails the build.
   segment is skipped by reads but kept on disk (and the deletes a compaction
   could not apply to it stay pending until it reads again); a damaged log
   frame refuses the open - see "Recovering from an unreadable log frame"
-  below.
+  below. In a namespace already open it refuses every fold, and only that:
+  writes and deletes still succeed (the size-triggered rotate after them
+  is deferred and reported), and export leaves the frame out.
 - **With the S3 backend and `local` keys, data is remote but KEYS ARE LOCAL.**
   Crypto-shred works (destroying the local key makes the remote ciphertext
   inert), but a second node cannot decrypt the bucket - it refuses to open a
@@ -181,6 +183,13 @@ any probe fails the build.
   its cache directory is removed. It never serves that copy, but it is on
   its disk: when a hard delete must reach every disk, clear the local cache
   directory (`local_dir`) of the nodes that no longer own the namespace.
+  On the owning node the purge's scrub waits until no reader holds a
+  snapshot of the index older than it: a process outside memd that keeps a
+  read transaction open on the SQLite file (a backup tool, an ad-hoc
+  `sqlite3` shell) keeps the erased text in the file's WAL for as long as
+  it holds on - memd keeps retrying and logs a warning every 60 s while
+  serving normally. A close in the meantime leaves the scrub to the next
+  open. Do not attach long-lived readers to the cache files.
 
 - **Hosted mode & billing (`--hosted`, off by default).**
   - *The Stripe webhook is authenticated by its signature only.*
@@ -274,6 +283,32 @@ case it is. Nothing was changed in any of them.
      text is served again. After recovering, repeat any delete that was
      acknowledged around the time of the damage.
   4. Open again; another damaged frame, if any, is reported the same way.
+
+While the namespace stays open with a damaged frame (a warm open does not
+read every frame, so it may only show up at the next rotate), it keeps
+serving, and fails closed only where the frame would be lost:
+
+- *Rotate and compaction refuse*, with the message above: each deletes the
+  log it read. Writes and deletes succeed all the same - the rotate or
+  purge compaction they trigger is deferred, not raised: it is logged,
+  counted (`memd_ns_maintenance_failures_total{op}`,
+  `memd_ns_maintenance_failing`), shown as `maintenance` in `stats()` and
+  `status()` (`/v1/status`) and as a count in `/health`
+  (`maintenance_failing`), and retried after a backoff (30 s, doubling to
+  10 min). The logs grow until a fold succeeds, and a due hard delete is not
+  purged until then: alert on `memd_ns_maintenance_failing`.
+- *Export leaves a damaged WAL frame out* and exports everything else -
+  run it before step 1 to have the readable data in hand. A warning names
+  the frame's byte offset, `memd_export_frames_skipped_total` counts it,
+  and the export's audit entry lists it (`skipped_frames`). A damaged `ops`
+  frame still refuses the export: leaving out a delete would export the
+  records it deleted, hard-deleted text included.
+- *Every acknowledged delete is applied at once* - to the index and, for a
+  hard delete, to the purge schedule - so `get()` and search stop serving
+  the record whatever the rotate does. (Through 0.3.0 the refused rotate ran
+  first and skipped both; a cache left that way is healed by the first
+  compaction after recovery, which removes anything the log deleted that
+  the index still serves - `memd_index_settled_total`.)
 
 A damaged segment never blocks an open: it is skipped by reads, kept by
 compaction (`"unreadable": true` in the manifest,

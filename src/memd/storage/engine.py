@@ -755,6 +755,17 @@ class NamespaceStore:
         self._pending_hard: list[tuple[str, int]] = []
         self._pending_hard_ids: set[str] = set()
         self._rotating = False  # re-entrancy guard for rotate-inside-append_ops
+        # the seq of the first durable event the index failed to apply (None:
+        # it has applied every one) - see _apply_durable / _index_mark
+        self._index_owed: int | None = None
+        # automatic maintenance (maintain_rotate / maintain_compact) that
+        # raised and has not succeeded since - surfaced by stats(), status()
+        # and /health - and when it may run again (monotonic; see
+        # _maintenance_failed)
+        self._maint_failure: dict | None = None
+        self._maint_retry_at = 0.0
+        # the WAL frames the last export skipped as unreadable (_visible_records)
+        self.last_export_skipped: list[dict] = []
         self._replayed_at_open = False
         self._installed_vec: tuple | None = None  # (index snapshot, its vec_uid, vec_wm) installed at open
         self._migrated_t0: float | None = None  # set by a migrating open (progress log)
@@ -2556,12 +2567,20 @@ class NamespaceStore:
             good_end, n = end, i + 1
         return out, good_end, n, last_seq
 
-    def _wal_events(self, where: str) -> list[tuple[int, list[MemoryRecord]]]:
+    def _wal_events(self, where: str, skipped: list[dict] | None = None
+                    ) -> list[tuple[int, list[MemoryRecord]]]:
         """Every WAL frame past wal_base_seq as (seq, records) (fold paths,
         not the torn-tail repair). A complete frame that does not read -
         does not decrypt, or does not parse - raises KeyCustodyError: every
         fold deletes the log it read, and skipping such a frame destroyed it
-        (see _frame_fault)."""
+        (see _frame_fault).
+
+        `skipped` - export, which deletes nothing - leaves a damaged frame
+        out instead (one a single damaged frame made the recovery path
+        refuse), warns with its byte offset and collects it there as
+        {"log", "at", "fault"}. A frame under a key this process may not
+        hold ("key") is still refused: every frame would read that way, and
+        the export would come out empty."""
         base = self.manifest.wal_base_seq
         out: list[tuple[int, list[MemoryRecord]]] = []
         data = self.store.get(self.wal_key) or b""
@@ -2571,14 +2590,26 @@ class NamespaceStore:
             try:
                 payload = self._decrypt_frame(fr)
                 recs = records_from_jsonl(payload)
-            except KeyCustodyError as ex:
-                # every fold deletes the log it read: never past a frame
-                # under another key
-                raise self._frame_refusal("WAL", at=at) from ex
-            except Exception as ex:  # noqa: BLE001 - it does not parse
-                METRICS.inc("memd_storage_parse_errors_total", where=where, ns=self.namespace)
-                raise self._frame_refusal("WAL", self._frame_fault(fr, "WAL") or "damaged",
-                                          at=at) from ex
+            except Exception as ex:  # noqa: BLE001 - classified below
+                if isinstance(ex, KeyCustodyError):
+                    fault = "damaged" if self._key_proven else "key"
+                else:  # it does not parse
+                    METRICS.inc("memd_storage_parse_errors_total", where=where, ns=self.namespace)
+                    fault = self._frame_fault(fr, "WAL") or "damaged"
+                if skipped is None or at is None or fault == "key":
+                    # every fold deletes the log it read: never past a frame
+                    # that does not read
+                    raise self._frame_refusal("WAL", fault, at=at) from ex
+                skipped.append({"log": self.wal_key, "at": at, "fault": fault})
+                METRICS.inc("memd_export_frames_skipped_total",
+                            help="unreadable WAL frames an export left out (nothing deleted)",
+                            ns=self.namespace)
+                _log.warning("namespace %s: export skipped a complete WAL frame (at byte %d of "
+                             "%s) that does not read (%s): the records it holds are not in this "
+                             "export. Nothing was truncated or deleted; see \"Recovering from an "
+                             "unreadable log frame\" in SECURITY.md",
+                             self.namespace, at, self.wal_key, fault)
+                continue
             s = _frame_seq(payload)
             if s > base:
                 out.append((s, recs))
@@ -2935,8 +2966,7 @@ class NamespaceStore:
             self.manifest.wal_size = my_end
             self.manifest.seq = seq
             self._manifest_dirty = True
-            qflags = {r.id: bool(r.meta.get("quarantined")) for r in records}
-            self.index.upsert_batch([(r, None, "") for r in records], qflags)
+            self._apply_durable(seq, records, [])
             size = self.manifest.wal_size
         self._durably_written(my_end, my_gen)   # ack only after fsync
         frames_over = (not self._has_log_writer()
@@ -2947,7 +2977,7 @@ class NamespaceStore:
                         self.manifest.wal_size >= self.wal_rotate_bytes
                         or (not self._has_log_writer()
                             and self._wal_frames >= self.wal_rotate_frames)):
-                    self.rotate("frames" if frames_over else "size")
+                    self.maintain_rotate("frames" if frames_over else "size")
                 size = self.manifest.wal_size
         return size
 
@@ -3096,16 +3126,61 @@ class NamespaceStore:
                 raise
             self.manifest.ops_size = size
             self._manifest_dirty = True
-            # rotate is skipped while a rotation is already folding this log:
-            # re-entering would fold mid-replay state. The outer fold re-reads
-            # everything we just appended.
-            if size >= self.wal_rotate_bytes and not self._rotating:
-                self.rotate("ops-size")
+            # The ops are durable: the purge schedule and the index reflect
+            # them BEFORE any maintenance runs. The rotate below used to come
+            # first, and one that raised (a damaged WAL frame makes every
+            # fold refuse) skipped both: the delete was logged, get() and
+            # search still served the record, and its purge was never
+            # scheduled.
             for op in ops:
                 if op.get("op") == "hard_delete" and op.get("id"):
                     self._track_pending_hard(op["id"], int(op.get("deadline", 0)))
             METRICS.set_gauge("memd_pending_purges", len(self._pending_hard), ns=self.namespace)
-            self._apply_to_index([], ops)
+            self._apply_durable(ops[0]["seq"], [], ops)
+            # rotate is skipped while a rotation is already folding this log:
+            # re-entering would fold mid-replay state. The outer fold re-reads
+            # everything we just appended.
+            if size >= self.wal_rotate_bytes and not self._rotating:
+                self.maintain_rotate("ops-size")
+
+    def _apply_durable(self, seq: int, records: list[MemoryRecord], ops: list[dict]) -> None:
+        """(ns lock held) Apply events already durable in a log - a WAL frame
+        at `seq`, or ops from `seq` on - to the index.
+
+        An apply that raises leaves the index behind the log: _index_owed
+        remembers the first event it missed, so the watermark stamped from
+        then on (_index_mark) stays below it and the next open replays it,
+        and every later apply - and every fold, which retires ops - first
+        catches the index up in seq order (_catch_up_index). close() used to
+        stamp manifest.seq regardless: an op the index never applied was
+        then below the watermark, and no reopen replayed it."""
+        if self._index_owed is None:
+            try:
+                self._apply_to_index(records, ops)
+            except BaseException:
+                self._index_owed = seq
+                raise
+            return
+        self._catch_up_index()   # this event is durable: the replay applies it too
+
+    def _catch_up_index(self) -> None:
+        """(ns lock held) If an apply failed, replay every event past the last
+        one the index applied - checkpoints, WAL frames and ops, in the one
+        seq order open uses. Raises (the index still owed) if it cannot."""
+        if self._index_owed is None:
+            return
+        applied = self._index_owed - 1
+        versions, carried, _ = self._load_checkpoints(applied, where="segment-replay")
+        frames = [(s, recs) for s, recs in self._wal_events("replay-wal") if s > applied]
+        self._replay_into_index(versions, _merge_events(carried + self._read_ops(), frames,
+                                                        after=applied))
+        self._index_owed = None
+        _log.info("namespace %s: index caught up from seq %d", self.namespace, applied + 1)
+
+    def _index_mark(self) -> int:
+        """The watermark to stamp: the last seq the index has applied every
+        event up to."""
+        return self.manifest.seq if self._index_owed is None else self._index_owed - 1
 
     def _cut_ops_back(self, size: int) -> None:
         """Best effort: truncate the ops log to `size` if a failed append
@@ -3140,9 +3215,98 @@ class NamespaceStore:
             self._seal_wal_writer_locked()
             self._rotating = True
             try:
-                return self._rotate_locked(reason)
+                name = self._rotate_locked(reason)
             finally:
                 self._rotating = False
+            self._maintenance_ok()
+            return name
+
+    # automatic maintenance after a failure: the next try waits this long,
+    # doubling per consecutive failure up to the cap (a try reads every log)
+    MAINT_RETRY_S = 30.0
+    MAINT_RETRY_MAX_S = 600.0
+
+    def maintain_rotate(self, reason: str) -> str:
+        """rotate() as maintenance - the size-triggered fold after a write, a
+        session close's - run once what triggered it is durable and applied.
+        One that raises does not fail that write. It used to: once a damaged
+        WAL frame made every fold refuse, every write and delete past the
+        rotate threshold raised AFTER it was durable, so callers saw errors
+        for writes that had landed - and retried them. The failure is now
+        logged, metered and surfaced (_maintenance_failed), and no write
+        tries again before its backoff has passed; the fold itself still
+        refuses until the frame is repaired. Returns the new segment's name,
+        or "" when nothing was folded. A closed store and a lost lease still
+        raise: those are not maintenance failures."""
+        with self._lock:
+            self._ensure_open()
+            if time.monotonic() < self._maint_retry_at:
+                return ""
+            try:
+                return self.rotate(reason)
+            except LeaseLostError:
+                raise
+            except Exception as ex:  # noqa: BLE001 - the write stands; surfaced instead
+                if self._closed:
+                    raise
+                self._maintenance_failed("rotate", ex)
+                return ""
+
+    def maintain_compact(self) -> CompactionReport | None:
+        """compact() as maintenance (a hard delete's purge deadline, off the
+        request path): None while a failed fold's backoff runs; one that
+        raises is surfaced (_maintenance_failed) and re-raised."""
+        with self._lock:
+            if time.monotonic() < self._maint_retry_at:
+                return None
+        try:
+            return self.compact(force=False)
+        except LeaseLostError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - surfaced, then the caller's
+            if not self._closed:
+                self._maintenance_failed("compact", ex)
+            raise
+
+    def _maintenance_failed(self, op: str, ex: BaseException) -> None:
+        """Automatic maintenance raised: log and meter it, keep it for
+        stats(), status() and /health until a fold succeeds, and hold the
+        next automatic try off for a backoff that doubles per consecutive
+        failure."""
+        with self._lock:
+            prev = self._maint_failure or {}
+            n = int(prev.get("failures", 0)) + 1
+            delay = min(self.MAINT_RETRY_MAX_S, self.MAINT_RETRY_S * 2 ** min(n - 1, 16))
+            self._maint_retry_at = time.monotonic() + delay
+            t = now_ms()
+            self._maint_failure = {
+                "op": op, "error": f"{type(ex).__name__}: {ex}", "failures": n,
+                "since_ms": int(prev.get("since_ms", t)), "last_ms": t,
+                "retry_at_ms": t + int(delay * 1000)}
+        METRICS.inc("memd_ns_maintenance_failures_total",
+                    help="automatic rotates/compactions that raised (the writes that triggered "
+                         "them stand)", ns=self.namespace, op=op)
+        METRICS.set_gauge("memd_ns_maintenance_failing", 1,
+                          help="1 while an open namespace's automatic maintenance is failing",
+                          ns=self.namespace)
+        _log.warning("namespace %s: automatic %s failed (%d in a row); the writes that triggered "
+                     "it are durable and stay acknowledged; next try in %d s: %s: %s",
+                     self.namespace, op, n, int(delay), type(ex).__name__, ex)
+
+    def _maintenance_ok(self) -> None:
+        """(ns lock held) A fold succeeded: maintenance is healthy again."""
+        if self._maint_failure is not None:
+            _log.info("namespace %s: maintenance recovered after %d failure(s)",
+                      self.namespace, self._maint_failure.get("failures", 0))
+            METRICS.set_gauge("memd_ns_maintenance_failing", 0, ns=self.namespace)
+        self._maint_failure = None
+        self._maint_retry_at = 0.0
+
+    def maintenance_status(self) -> dict | None:
+        """The failing automatic maintenance - op, error, failures (in a
+        row), since_ms, last_ms, retry_at_ms - or None while it is healthy."""
+        f = self._maint_failure
+        return dict(f) if f else None
 
     def _reset_wal_frames(self) -> None:
         self._wal_frames = 0
@@ -3176,6 +3340,7 @@ class NamespaceStore:
 
     def _rotate_locked(self, reason: str) -> str:
         """Fold body (caller holds the ns lock and set _rotating)."""
+        self._catch_up_index()   # the fold retires ops: none the index missed
         METRICS.inc("memd_rotations_total", ns=self.namespace, reason=reason)
         ops = self._read_ops()
         frames = self._wal_events("rotate-wal")
@@ -3278,6 +3443,7 @@ class NamespaceStore:
             # not folded (nothing of it is known), so it stays referenced -
             # quarantined in place - and no later fold or collection deletes
             # it either. (A wrong key never gets this far: see _verify_key.)
+            self._catch_up_index()   # the fold retires ops: none the index missed
             damaged: list[dict] = []
             versions, carried, _ = self._load_checkpoints(unreadable=damaged)
             ops = self._read_ops()
@@ -3355,6 +3521,9 @@ class NamespaceStore:
             purged = sum(1 for op in folded if op.get("op") == "hard_delete") > len(pending_ops)
             if purged:
                 self.manifest.scrub_seq = self.manifest.seq
+            # nothing this fold deleted is served (and a purged row goes
+            # before the scrub below erases what it left in the file)
+            self._settle_dropped(purged_ids, folded)
             self.index.flush()  # rows durable before advancing the watermark
             self.index.set_meta("applied_seq", str(self.manifest.seq))
             # commit the new-segment-only view BEFORE deleting anything it
@@ -3387,20 +3556,36 @@ class NamespaceStore:
             for rid in held_hard:
                 self._track_pending_hard(rid, _HELD_FOR_QUARANTINE)
             self._persist_manifest()
-            # the text is gone from durable data; now from this cache (the
-            # scrub waits out - aborts - a snapshot copy's pinned image, and
-            # one cut short by a close is redone by the next open)
-            if purged and self.index.scrub():
-                self.index.set_meta("scrubbed_seq", str(self.manifest.scrub_seq))
-            # ...and from the ANN sidecar: its files go now (usearch removal
-            # only marked the purged vectors), and it is rebuilt from SQLite
-            ann_ticket = (self.index.ann.purged(self.manifest.scrub_seq)
-                          if purged and self.index.ann is not None else 0)
+            self._maintenance_ok()
+            scrub_seq = self.manifest.scrub_seq if purged else 0
             METRICS.set_gauge("memd_pending_purges", len(self._pending_hard), ns=self.namespace)
             rep.segments_out = len(self.manifest.segments)
             rep.records_folded = len(kept)
             rep.bytes_after = self.store.size(f"{self.prefix}/{name}") if kept or header_ops else 0
             self.index.invalidate_vec_cache()  # fold dead rows out of the scan matrix
+        ann_ticket = 0
+        if scrub_seq:
+            # The text is gone from durable data; now from this cache - OUTSIDE
+            # the namespace lock. The scrub waits until no reader holds a
+            # snapshot older than it: a snapshot copy's pinned image (aborted),
+            # or a reader memd does not control, for as long as that one holds
+            # on (D10: it never gives up). Under the lock, every append and
+            # close() waited with it - for that reader's whole lifetime. A
+            # close interrupts it; the next open scrubs again.
+            if self.index.scrub():
+                self.index.set_meta("scrubbed_seq", str(scrub_seq))
+            # ...and from the ANN sidecar: its files go now (usearch removal
+            # only marked the purged vectors), and it is rebuilt from SQLite -
+            # after the scrub, whose full VACUUM may renumber rowids
+            with self._lock:
+                ann = self.index.ann
+                if ann is not None and not self.index.closing:
+                    ann_ticket = ann.purged(scrub_seq)
+        if self.index.closing:
+            # a close cut the scrub short: no snapshot of this index now (the
+            # next open finishes the scrub; close() collects orphans)
+            rep.duration_ms = int((time.monotonic() - t0) * 1000)
+            return rep
         # Compaction is the natural snapshot point: the index has just been
         # folded and stamped with this manifest.seq, and compaction already
         # costs O(live) and runs off the request path (pass 17), so the
@@ -3427,6 +3612,32 @@ class NamespaceStore:
             self._collect_garbage_now(defer_audit=False)
         rep.duration_ms = int((time.monotonic() - t0) * 1000)
         return rep
+
+    def _settle_dropped(self, dropped: set[str], folded: list[dict]) -> None:
+        """(compaction, ns lock held) Ids the fold dropped - deleted - that
+        the index still serves: a hard-deleted one's rows go, a soft-deleted
+        one is tombstoned. The write path applies every delete, so this
+        finds nothing - except in a cache an older build left behind an op
+        it never applied (a rotate that raised first, a close that stamped
+        the watermark past it): no replay applies such an op, and this fold
+        retires it."""
+        if not dropped:
+            return
+        hard = {op["id"] for op in folded if op.get("op") == "hard_delete" and op.get("id") in dropped}
+        at = {_op_target(op): _op_at(op) for op in folded if op.get("op") == "tombstone"}
+        fix = []
+        for rec in self.index.get_many(sorted(dropped)):
+            if rec.id in hard:
+                fix.append({"op": "hard_delete", "id": rec.id})
+            elif not rec.deleted:
+                fix.append({"op": "tombstone", "id": rec.id, "at": at.get(rec.id) or now_ms()})
+        if fix:
+            METRICS.inc("memd_index_settled_total", len(fix),
+                        help="deleted records a compaction found the index still serving",
+                        ns=self.namespace)
+            _log.warning("namespace %s: the index still served %d record(s) deleted in the "
+                         "log; applied their deletes", self.namespace, len(fix))
+            self.index.apply_ops_batch(fix)
 
     def _compaction_is_noop(self) -> bool:
         """True only when folding provably cannot change anything.
@@ -3464,6 +3675,7 @@ class NamespaceStore:
             # the same ordered replay as open (applying every op after every
             # record deleted re-adds and resurrected WAL-resident deletes)
             self._replay_into_index(versions, _merge_events(carried + ops, frames))
+            self._index_owed = None
             self.index.flush()
             self.index.set_meta("applied_seq", str(self.manifest.seq))
         return len(set(versions) | {r.id for _, recs in frames for r in recs})
@@ -3486,7 +3698,11 @@ class NamespaceStore:
         Exports what a read can see (_visible_records). It used to dump the
         raw stored copies with no op applied: records deleted - soft or hard,
         acked - came back out of every export until a compaction purged them,
-        and superseded facts lost their supersedence."""
+        and superseded facts lost their supersedence.
+
+        A WAL frame that does not read is left out, not refused (it used to
+        make the recovery path itself refuse): last_export_skipped says
+        where it is (see _wal_events)."""
         with self._lock:
             recs = self._visible_records()
         recs.sort(key=lambda r: (r.time.t_ingested, r.id))
@@ -3500,7 +3716,9 @@ class NamespaceStore:
         bytes still sit in a segment. Superseded and quarantined records stay
         (history; the flags travel with them)."""
         versions, carried, _ = self._load_checkpoints(where="export-segment")
-        frames = self._wal_events("export-wal")
+        skipped: list[dict] = []
+        frames = self._wal_events("export-wal", skipped=skipped)
+        self.last_export_skipped = skipped
         kept, _pending, _unq, _folded, deferred = _fold_events(
             versions, _merge_events(carried + self._read_ops(), frames), now_ms(), force=False)
         return [r for r in kept if r.id not in deferred]
@@ -3519,6 +3737,9 @@ class NamespaceStore:
         )
         st["segments_collected"] = self.segments_collected
         st["snapshots_collected"] = self.snapshots_collected
+        # failing automatic maintenance (None while healthy): writes succeed
+        # meanwhile, and the logs grow until a fold succeeds
+        st["maintenance"] = self.maintenance_status()
         return st
 
     def close(self) -> None:
@@ -3550,10 +3771,14 @@ class NamespaceStore:
             except Exception:
                 pass
             self._wal_writer = None
+        if self._maint_failure is not None:
+            # the gauge counts OPEN namespaces failing maintenance
+            METRICS.set_gauge("memd_ns_maintenance_failing", 0, ns=self.namespace)
         # fold the index watermark so the next open only replays the tail
+        # (and an event the index failed to apply: _index_mark)
         try:
             self.index.flush()
-            self.index.set_meta("applied_seq", str(self.manifest.seq))
+            self.index.set_meta("applied_seq", str(self._index_mark()))
         except Exception:
             pass  # closed/deleted index; replay covers it
         self.index.close()
@@ -3891,6 +4116,27 @@ class StorageEngine:
         the ones whose writer lease it holds)."""
         with self._lock:
             return list(self._namespaces)
+
+    def stop_waiting(self) -> None:
+        """A close is coming: every open namespace's purge scrub stops
+        waiting for readers of its index (NamespaceIndex.stop_waiting), so
+        maintenance in flight can finish before the close."""
+        with self._lock:
+            stores = list(self._namespaces.values())
+        for nstore in stores:
+            nstore.index.stop_waiting()
+
+    def maintenance_failing(self) -> dict[str, dict]:
+        """Open namespaces whose automatic maintenance is failing -> its
+        status (NamespaceStore.maintenance_status). Touches no LRU order."""
+        with self._lock:
+            stores = list(self._namespaces.items())
+        out = {}
+        for name, nstore in stores:
+            st = nstore.maintenance_status()
+            if st:
+                out[name] = st
+        return out
 
     def has_namespace(self, ns: str) -> bool:
         """True if `ns` is open here or has a manifest; never materializes it."""
