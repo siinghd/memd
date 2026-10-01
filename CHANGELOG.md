@@ -73,6 +73,23 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   not served (their rows are gone; only the file holds the bytes), no
   index snapshot is published, and the cache is not stamped scrubbed.
 
+- **A node drops its copy of a namespace another node took over (D7).**
+  Every node keeps the namespaces it served in its local cache directory -
+  the SQLite index (with its `-wal`/`-shm`), the tantivy copy and the ANN
+  sidecar, all plaintext - and a node that lost a namespace (its lease
+  reclaimed, or released cleanly and taken by another node) kept that copy
+  until it took the namespace back: text hard-deleted and purged on the
+  new owner stayed on its disk. A node now drops the copy once the
+  namespace is closed after a lost lease, and - on a store with leases -
+  at startup and every `cache_sweep_s` (300 s; `MEMD_CACHE_SWEEP_S`, `0` =
+  never) for every namespace it does not have open whose manifest names
+  another tenure's lineage, or that no longer exists
+  (`memd_index_cache_drops_total{reason}`). The copy of a namespace this
+  node was the last to serve stays (a plain reopen is still warm), as does
+  one another process has open (a shared `local_dir`) and one a pending
+  migration still reads. Crypto-shred now also deletes the image of a
+  snapshot install a crash interrupted.
+
 ## [0.3.0] - 2026-09-26
 
 ### Added

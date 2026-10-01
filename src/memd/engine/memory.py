@@ -656,7 +656,8 @@ class Memory:
                                         "commit_ms": int(cfg.get("lexical_commit_ms", DEFAULT_COMMIT_MS)),
                                         "commit_docs": int(cfg.get("lexical_commit_docs", DEFAULT_COMMIT_DOCS)),
                                     },
-                                    vector_index=vector_index_config(cfg, self.vector_index))
+                                    vector_index=vector_index_config(cfg, self.vector_index),
+                                    cache_sweep_s=cfg.get("cache_sweep_s"))
         self.namespace_name = namespace
         # D7 #7 ledgers are PER NAMESPACE. They are held in an LRU keyed by
         # namespace (mirroring the engine's namespace table) and routed by the

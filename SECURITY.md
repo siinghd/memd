@@ -174,15 +174,23 @@ any probe fails the build.
   `memd[fast]`, the tantivy index (`<ns>.tantivy/` beside it) contain record
   text unencrypted, with owner-only permissions. Both are deleted on
   crypto-shred and are rebuildable from the (encrypted) log.
-  In a multi-node deployment each node keeps its own local copy for the
-  namespaces it has served, and a hard delete is scrubbed physically only
-  on the node that owns the namespace when it runs. A node that served a
-  namespace earlier and has not taken it back since still holds the text
-  it indexed then, including records hard-deleted later on another node,
-  until it next opens that namespace (its stale copy is then discarded) or
-  its cache directory is removed. It never serves that copy, but it is on
-  its disk: when a hard delete must reach every disk, clear the local cache
-  directory (`local_dir`) of the nodes that no longer own the namespace.
+  In a multi-node deployment each node keeps its own local copy (the
+  SQLite index with its `-wal`/`-shm`, the tantivy copy, the ANN sidecar)
+  of the namespaces it serves, and a hard delete is scrubbed physically
+  only on the node that owns the namespace when it runs. A node drops its
+  copy of a namespace another node has taken over since it last served it
+  (another tenure's lineage in the manifest, or the namespace is gone):
+  once the namespace is closed after this node lost its lease, at startup,
+  and every `cache_sweep_s` (300 s; `MEMD_CACHE_SWEEP_S`, `0` = never) for
+  every namespace it does not have open - so text another node
+  hard-deletes leaves this node's disk within that interval of the other
+  node taking the namespace over, typically before the delete itself. It
+  never served that copy. The copy of a namespace this node was the last
+  to serve is kept (its reopen stays warm), and so is one another process
+  has open (processes sharing a `local_dir` serve from the same files).
+  Each sweep reads one manifest per such namespace. A node that is stopped
+  keeps its copies until it starts again: when a node is taken out of
+  service, remove its local cache directory (`local_dir`).
   On the owning node the purge's scrub waits until no reader holds a
   snapshot of the index older than it: a process outside memd that keeps a
   read transaction open on the SQLite file (a backup tool, an ad-hoc
