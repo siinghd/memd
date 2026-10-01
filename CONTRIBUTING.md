@@ -11,7 +11,19 @@ make ten-min       # fresh dir -> cross-session recall, the D4 onboarding story
 ```
 
 All three must pass before a change lands. CI runs exactly these on 3.11 and
-3.12, plus bandit, a clean-install smoke test, and a container smoke test.
+3.12 (against MinIO, so the S3 tests run too), plus bandit, a clean-install
+smoke test, a container smoke test, the TypeScript SDK and the docs build.
+
+```bash
+MEMD_TEST_S3_ENDPOINT=http://127.0.0.1:9000 make test   # with MinIO (see tests/test_s3_backend.py)
+python examples/01_quickstart.py                        # examples/ are run by tests/test_examples.py
+pip install -e ".[docs]" && mkdocs build --strict       # the docs site (mkdocs.yml); mkdocs serve to preview
+```
+
+The docs pages include README-engine.md, SECURITY.md, BENCHMARKS.md and
+CHANGELOG.md between their headings: rename a heading there and the strict
+build names the page to fix. Publishing is described in
+[RELEASING.md](RELEASING.md).
 
 ## What this project asks of a change that others don't
 
