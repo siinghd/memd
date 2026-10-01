@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "memd": {
+      "command": "memd",
+      "args": ["serve", "--mcp"],
+      "env": {
+        "MEMD_DATA": "/absolute/path/to/memd-data",
+        "MEMD_NS": "default"
+      }
+    }
+  }
+}

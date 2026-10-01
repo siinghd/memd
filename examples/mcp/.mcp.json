@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "memd": {
+      "type": "stdio",
+      "command": "memd",
+      "args": ["serve", "--mcp"],
+      "env": {
+        "MEMD_DATA": "${HOME}/.memd/data",
+        "MEMD_NS": "default"
+      }
+    }
+  }
+}
