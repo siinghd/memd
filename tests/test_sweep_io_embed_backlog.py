@@ -1,5 +1,5 @@
-"""Ralph iteration 1 fixes: batched destructive-sweep I/O, bounded embed
-backlog, HTTP route-label cardinality.
+"""Batched destructive-sweep I/O, bounded embed backlog, HTTP route-label
+cardinality.
 
 Complexity contracts asserted here:
   - forget()/delete_many(): O(n) arithmetic, O(1) durable appends (fsyncs),

@@ -1,4 +1,4 @@
-"""API keys & scoping capabilities (ADR-3, D7 control #6).
+"""API keys & scoping capabilities.
 
 Keys are namespace-scoped by default:
     memd_<namespace>_<secret>
@@ -364,7 +364,7 @@ class FailureLimiter:
 
 
 class RateLimiter:
-    """Per-principal token bucket (D6 noisy-neighbor containment)."""
+    """Per-principal token bucket (noisy-neighbor containment)."""
 
     def __init__(self, max_buckets: int = 100_000):
         self._buckets: dict[str, list] = {}

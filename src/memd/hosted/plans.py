@@ -1,10 +1,9 @@
 """Plans and entitlements: configuration, not code.
 
-Defaults follow 06-economics.md (amended by the billing spec): extraction on
-our key is the dominant COGS line, so it is capped (free) or metered (paid);
-Jev reranking (~$0.0004 per reranked search) gets its own meter. Operators
-override any of it with a JSON file at MEMD_PLANS_PATH, merged per plan and
-per meter over these defaults:
+Defaults: extraction on our key is the dominant COGS line, so it is capped
+(free) or metered (paid); Jev reranking (~$0.0004 per reranked search) gets
+its own meter. Operators override any of it with a JSON file at
+MEMD_PLANS_PATH, merged per plan and per meter over these defaults:
 
     {"dev": {"meters": {"searches": {"limit": 300000, "hard": true}}}}
 

@@ -1,6 +1,6 @@
-"""SLO micro-benchmarks (D2 acceptance): measures, doesn't guess.
+"""SLO micro-benchmarks: measures, doesn't guess.
 
-Embedded-mode targets from ../02-slos.md:
+memd's embedded-mode SLO targets:
   - durable write ack p99 <= 10ms (local fsync)
   - warm retrieval p50 <= 20ms / p99 <= 100ms
   - cold-namespace first query p90 <= 1.5s (embedded: index rebuild path)

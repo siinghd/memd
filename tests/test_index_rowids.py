@@ -5,7 +5,7 @@ the next write reuse their rowids. The tantivy accelerator indexes by rowid
 order (every row above its watermark is new), and only a delete of THE max
 rowid lowered its scan floor, to rowid-1: hard-deleting the two newest rows
 (lower one first) put the next write below the floor, missing from the bm25
-lane for good (v0.2.0 verifier, HIGH). The fix is at the source and
+lane for good (v0.2.0 review, HIGH). The fix is at the source and
 backend-independent: the highest rowid ever used is recorded in the delete's
 own transaction and new rows go above it (AUTOINCREMENT semantics).
 """

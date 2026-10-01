@@ -218,7 +218,7 @@ def test_add_events_batch_cap(tmp_path):
 
 
 def test_quarantine_expiry_restores_visibility(tmp_path):
-    """Decay path (D7 #3): expired quarantine must restore retrieval after
+    """Decay path: expired quarantine must restore retrieval after
     compaction folds the flag - previously the index kept it hidden forever."""
     from memd.engine.memory import Memory as _M
     from memd.core.schema import Kind, MemoryRecord, Scope, Source, now_ms as _now

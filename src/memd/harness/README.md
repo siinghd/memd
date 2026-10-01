@@ -1,7 +1,7 @@
-# memd eval harness (D5)
+# memd eval harness
 
 Rule: **no optimization ships without a number moving here.** The harness is
-the authority over the SLO table in `../02-slos.md`.
+the authority over memd's quality and cost targets.
 
 ## Principles (enforced by code, not convention)
 - **Frozen everything**: pinned answer/judge models + prompts + retrieval

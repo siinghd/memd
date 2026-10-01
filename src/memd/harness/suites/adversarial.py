@@ -1,4 +1,4 @@
-"""Adversarial suite (D5, ship-blocking): D7 controls under attack.
+"""Adversarial suite (ship-blocking): the security controls under attack.
 
 Probes (evidence: MINJA arXiv 2503.03704 - 95%+ injection on unprotected
 systems; stale-fact and contradiction pairs per HaluMem failure modes):
@@ -8,7 +8,7 @@ systems; stale-fact and contradiction pairs per HaluMem failure modes):
   4. stale-fact: after an update, the old value must not be retrievable as current
   5. taint escalation: explicit saves can't mint high-trust facts from a tainted session
 
-Gate: ANY regression = fail (zero-tolerance, per D2 adversarial row).
+Gate: ANY regression = fail (zero-tolerance).
 """
 from __future__ import annotations
 

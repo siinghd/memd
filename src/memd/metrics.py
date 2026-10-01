@@ -8,7 +8,7 @@ here; surfaces:
 
 UNIT CONTRACT (deliberate, and a deliberate deviation from Prometheus's
 seconds-base convention): every duration in memd is measured, named and
-bucketed in MILLISECONDS, suffix `_ms`. The D2 SLO table is written in ms
+bucketed in MILLISECONDS, suffix `_ms`. memd's SLO table is written in ms
 (write ack p99 <= 10ms, retrieval p50 <= 20ms / p99 <= 100ms, cold open
 p90 <= 1.5s); one unit end-to-end is what keeps a dashboard honest. Mixing
 the two is what previously made every latency quantile wrong - see
@@ -150,7 +150,7 @@ class Registry:
     def sample_resources(self, min_interval_s: float = 1.0) -> None:
         """Process resource use - RSS, open fds, threads, CPU seconds.
 
-        The brief requires resource use alongside latency/throughput/errors;
+        Observability needs resource use alongside latency/throughput/errors;
         none of it was ever gauged, so a memory or fd leak was invisible in the
         very surface built to catch it. Sampled lazily at export time and
         throttled, so a scrape storm cannot turn into a /proc storm. Linux

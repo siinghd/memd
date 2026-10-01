@@ -1,4 +1,4 @@
-"""End-to-end engine tests: the D2/D3/D7 acceptance behaviors."""
+"""End-to-end engine tests: the SLO, storage and security acceptance paths."""
 import time
 
 import pytest
@@ -15,7 +15,7 @@ def mem(tmp_path):
 
 
 def test_ten_minute_story(mem):
-    """The literal D4 §4.4 acceptance path (embedded variant)."""
+    """The literal ten-minute-story acceptance path (embedded variant)."""
     mem.add("We deploy with `make ship`, never CI", session_id="s1", user_id="u1", role="user")
     hits = mem.search("how do we deploy?", user_id="u1", budget_tokens=1500)
     assert "make ship" in hits.packed_context

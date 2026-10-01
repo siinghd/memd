@@ -6,7 +6,7 @@ recall against the exact scan (parity), the same filters and isolation as
 every other lane (even with its SQL prefilter sabotaged), deletes,
 supersession, quarantine and hard deletes honoured at once, a missing,
 corrupt, foreign, stale or half-written file rebuilt (never served), no
-purged vector left in any file (D7), a published snapshot a cold node can
+purged vector left in any file, a published snapshot a cold node can
 install, and the auto threshold switching flat <-> usearch.
 """
 import json
@@ -652,7 +652,7 @@ def test_searches_during_writes_and_a_rebuild_never_see_a_torn_index(tmp_path):
         e.close()
 
 
-# ------------------------------------------------------------ D7
+# ------------------------------------------------------------ hard-delete purge
 
 def test_a_hard_delete_purge_leaves_no_vector_bytes_in_the_sidecar(tmp_path):
     root = str(tmp_path / "d")
@@ -1005,7 +1005,7 @@ def test_a_destroy_cancels_a_pending_final_save(tmp_path, monkeypatch):
         e.close()
 
 
-# ------------------------------------------------------------ verification round (D1-D5)
+# ------------------------------------------------------------ verification round
 
 CORRUPT_CHILD = r"""
 import os, sys, json

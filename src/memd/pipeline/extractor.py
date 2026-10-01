@@ -1,11 +1,11 @@
-"""Extractor contract (ADR-6): raw segments -> candidate facts.
+"""Extractor contract: raw segments -> candidate facts.
 
 Contract rules:
   - Extraction is a *derived index build*: re-runnable, versioned, never the
     only copy of information (raw lane is retained).
   - Every fact carries `entity_keys` (normalized cluster keys) and `lineage`
     (the raw record ids it came from).
-  - Trust-tier propagation (D7): facts inherit the *cap* of their sources'
+  - Trust-tier propagation: facts inherit the *cap* of their sources'
     tiers - extraction from untrusted raw can never mint higher-trust facts.
   - Conservative by default: precision over recall; consolidation resolves
     conflicts cluster-locally via supersedence, never globally.

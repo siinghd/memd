@@ -156,7 +156,7 @@ def test_a_wrong_key_is_refused_and_nothing_is_touched(tmp_path, layout, cache, 
         m.close()
 
 
-def test_the_verifiers_repro_segments_survive_and_the_right_key_serves_them(tmp_path):
+def test_the_review_repro_segments_survive_and_the_right_key_serves_them(tmp_path):
     root = str(tmp_path / "d")
     assert _write(root, "segments") == 6
     segs = _segments(root)

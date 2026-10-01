@@ -1,4 +1,4 @@
-"""Embedding providers (ADR-8).
+"""Embedding providers.
 
 Policy: the binary ships with no model. Selection is explicit when asked for:
 config["embedder"] (or env MEMD_EMBEDDER) is one of "auto", "hash",
@@ -6,7 +6,7 @@ config["embedder"] (or env MEMD_EMBEDDER) is one of "auto", "hash",
 never falls back. "auto" (the default) resolves in this order:
   1. BYO API key  -> OpenAICompatibleEmbedder (OpenAI / Voyage / Ollama / LM Studio)
   2. local ONNX   -> FastEmbedEmbedder (optional extra; model license must be
-                     re-verified from the model card before bundling - ADR-8)
+                     re-verified from the model card before bundling)
   3. fallback     -> HashEmbedder: deterministic feature-hashing embedding.
                      Fully functional offline; degraded *semantic* recall
                      (BM25 + time/entity lanes carry retrieval). Honest mode,

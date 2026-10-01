@@ -1,4 +1,4 @@
-"""LongMemEval-class synthetic suite (D5).
+"""LongMemEval-class synthetic suite.
 
 Deterministic generator (seeded): sessions of facts per user, then query
 classes mirroring LongMemEval's: single-hop, multi-hop, temporal, and the

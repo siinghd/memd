@@ -388,7 +388,7 @@ def test_jev_fans_out_in_chunks_of_25_with_the_validated_wording(monkeypatch):
     sdk = _FakeSDK(delay_s=0.05)
     monkeypatch.setitem(sys.modules, "typesafe_sdk", sdk.module)
     jev = JevReranker(api_key="ts-test", timeout_s=1.5)
-    jev.load()  # (a cold client skips with "warming": see the verifier regressions)
+    jev.load()  # (a cold client skips with "warming": see the review regressions)
     try:
         cands = _cands(30)
         out = jev.scores("where are the kumquats?", cands)
@@ -752,7 +752,7 @@ def test_local_reranker_serves_nothing_until_loaded(tmp_path, monkeypatch):
         m.close()
 
 
-# ------------------------------------------------------------ v0.2.0 verifier regressions
+# ------------------------------------------------------------ v0.2.0 review regressions
 
 class _Blocking:
     """A reranker that hangs until released, counting the calls it STARTED."""

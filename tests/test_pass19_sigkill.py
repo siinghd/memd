@@ -1,6 +1,6 @@
 """Pass 19: real crash-consistency evidence - SIGKILL mid-write-stream.
 
-The core contract (ADR-2/D2): write ack = durable append (fsync); any
+The core contract: write ack = durable append (fsync); any
 process can reopen any namespace by replaying the object-store log.
 Prior durability tests SIMULATED crash states (torn frames, orphan
 segments). This module kills a live writer with SIGKILL at arbitrary

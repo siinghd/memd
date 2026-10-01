@@ -1,7 +1,7 @@
-"""HaluMem-style operation-level suite (D5): extraction/update correctness.
+"""HaluMem-style operation-level suite: extraction/update correctness.
 
 Gates the biggest quality wedge: incumbents' update ops are <50% correct.
-Target (D2): latest-fact correctness >=0.95, stale-answer rate <=2%.
+Target: latest-fact correctness >=0.95, stale-answer rate <=2%.
 """
 from __future__ import annotations
 

@@ -7,7 +7,7 @@ python -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev,mcp]"
 make test          # pytest, ~4 min
 make gate          # eval gate: accuracy, cost bar, adversarial zero-regression
-make ten-min       # fresh dir -> cross-session recall, the D4 onboarding story
+make ten-min       # fresh dir -> cross-session recall, the ten-minute story
 ```
 
 All three must pass before a change lands. CI runs exactly these on 3.11 and
@@ -27,24 +27,24 @@ build names the page to fix. Publishing is described in
 
 ## What this project asks of a change that others don't
 
-**Reproduce before you fix.** Every defect in `.ralph/audit-log.md` was
-demonstrated with a runnable probe *before* a line changed, and the probe's
-output is in the log. "Looks wrong" is not a finding; a failing script is.
-This is not ceremony - it is the only thing separating a fix from a guess, and
-the log records several cases where a plausible reading of the code turned out
-to be wrong.
+**Reproduce before you fix.** Demonstrate the defect with a runnable probe
+*before* a line changes, and put the probe and its output in the pull request.
+"Looks wrong" is not a finding; a failing script is. This is not ceremony - it
+is the only thing separating a fix from a guess, and this project has had
+several cases where a plausible reading of the code turned out to be wrong.
 
 **Write the test so it would fail on the old code.** A test that passes both
-before and after guards nothing. Two examples from the log, both caught late:
-a lockout test used 25 attempts against a 30-failure threshold, and an index
-test allowed *any* index so it passed on the tree that had no index at all.
-When in doubt, check out the parent commit and run your test against it.
+before and after guards nothing. Two examples from this project, both caught
+late: a lockout test used 25 attempts against a 30-failure threshold, and an
+index test allowed *any* index so it passed on the tree that had no index at
+all. When in doubt, check out the parent commit and run your test against it.
 
 **Measure old versus new, interleaved.** Benchmarks on a shared machine drift.
 Run the arms alternately (`BASE, NEW, BASE, NEW, ...`) and compare medians, or
-you will report the machine's mood as your improvement. The log contains an
-apparent 25% p99 regression that turned out to be a measurement artifact, and
-a real one that only an interleaved run separated from noise.
+you will report the machine's mood as your improvement. State the numbers
+before and after in the pull request. This project has seen an apparent 25%
+p99 regression that turned out to be a measurement artifact, and a real one
+that only an interleaved run separated from noise.
 
 **State complexity in O() with the variable named**, and count I/O separately
 from arithmetic. "Fast" is not a claim. Round trips to disk or network must be
@@ -69,9 +69,8 @@ commit message.
 | `src/memd/server/` | REST, MCP, auth |
 | `src/memd/harness/` | The eval gate - suites, adversarial probes, scoring |
 | `bench/` | SLO and scale benchmarks (informational, never a CI gate) |
-| `.ralph/audit-log.md` | The engineering log: every defect found, fixed, deferred, with before/after numbers |
 
-## Invariants you should not break without an ADR
+## Invariants you should not break without a design discussion
 
 - **Object storage + WAL/segments are the source of truth.** The SQLite index
   is a cache. Anything that makes the index authoritative is a design change.

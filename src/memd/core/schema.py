@@ -1,4 +1,4 @@
-"""memd.core.schema - the memory record model (ADR-1).
+"""memd.core.schema - the memory record model.
 
 A memory is an immutable, provenance-carrying, bitemporal record.
 Two lanes share one schema: raw events (verbatim capture) and derived
@@ -43,7 +43,7 @@ def now_ms() -> int:
 
 
 # ---------------------------------------------------------------------------
-# Trust tiers (D7 control #2): user > agent > tool > web > import.
+# Trust tiers: user > agent > tool > web > import.
 
 
 class Source(IntEnum):

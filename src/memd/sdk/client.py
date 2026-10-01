@@ -1,4 +1,4 @@
-"""Hosted client: same API as embedded Memory, over REST (D4 §4.2)."""
+"""Hosted client: same API as embedded Memory, over REST."""
 from __future__ import annotations
 
 import logging

@@ -7,9 +7,9 @@ and resolution must not be deferred past the session boundary):
     (cluster-local tombstone; O(cluster), never O(namespace))
   - nothing is merged into new sentences; nothing crosses clusters
 
-Quarantine (D7 control #3, ADR-10 - cheapest-to-reverse, iterate behind the
-adversarial gate): suspect writes are stored but excluded from retrieval
-until review or decay expiry.
+Quarantine (cheapest to reverse; iterated behind the adversarial gate):
+suspect writes are stored but excluded from retrieval until review or decay
+expiry.
 """
 from __future__ import annotations
 
@@ -130,7 +130,7 @@ class QuarantinePolicy:
         for actor, recs in by_actor.items():
             # Rate-limit quarantine targets untrusted/automated writers
             # (MINJA shape). Human-tier bulk imports (USER/AGENT only) are a
-            # legitimate pattern - D7 scopes out self-poisoning of one's own
+            # legitimate pattern - the threat model scopes out self-poisoning of one's own
             # namespace.
             min_tier = min(int(r.provenance.source) for r in recs)
             if min_tier >= int(Source.AGENT):

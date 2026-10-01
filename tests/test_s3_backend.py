@@ -1,8 +1,8 @@
 """The engine on a real S3 API (MinIO), not a mock.
 
-ADR-2 has always said object storage is the source of truth, but until now
-LocalObjectStore was the only implementation, so every hosted claim in
-02-slos.md was unevidenced by construction. These tests run the actual engine
+memd's design has always made object storage the source of truth, but until
+now LocalObjectStore was the only implementation, so every hosted SLO was
+unevidenced by construction. These tests run the actual engine
 paths - write/recall, restart durability, compaction, cold start from the
 index snapshot, crypto-shred, and the single-writer lease - against a real
 S3 server.
@@ -198,7 +198,7 @@ class TestSingleWriter:
             m.close()
 
     def test_the_lease_is_released_on_close(self, tmp_path, prefix, _bucket):
-        """Asserts the lease is RELEASED (ADR-12: a released tombstone,
+        """Asserts the lease is RELEASED (a released tombstone,
         compare-and-swapped onto the lease so a stale holder cannot delete a
         successor's lease) and a DIFFERENT holder can take it.
 

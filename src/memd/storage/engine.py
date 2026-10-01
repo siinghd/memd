@@ -1,4 +1,4 @@
-"""Durable storage engine (ADR-2): object storage is the source of truth.
+"""Durable storage engine: object storage is the source of truth.
 
 Per-namespace layout under the object store:
 
@@ -13,7 +13,7 @@ Invariants:
   - The index (memd.index.NamespaceIndex) is a derived, rebuildable view kept
     on local disk (NVMe-class cache in hosted mode).
   - Hard delete: synchronous tombstone + physical purge guaranteed by forced
-    compaction within the deadline (72h default, D7 control #8).
+    compaction within the deadline (72h default).
   - Namespace deletion = prefix removal + key destruction (crypto-shred).
   - History has ONE order: manifest.seq numbers every durable event (a WAL
     frame, an op) and open / rebuild / rotate / compact all fold events in
@@ -128,7 +128,7 @@ class Manifest:
     # catch an older image up across it.
     compact_seq: int = 0
     # Per append log ("wal", "ops", "audit"): one past the highest part number
-    # any holder had used when it committed (ADR-12). A LIST cannot see parts
+    # any holder had used when it committed. A LIST cannot see parts
     # a fold deleted, and a part number must never be reused - a writer
     # paused mid-append or mid-delete still means that exact name - so every
     # new tenure numbers above this (S3ObjectStore.set_log_floor).
@@ -477,7 +477,7 @@ def _fold_events(
 
     Returns (live_records, pending_ops, unquarantined_ids, folded_ops,
     deferred). Pending ops are not-yet-due hard deletes; they must survive
-    folds so the forced-compaction deadline (D7) stays enforceable. Their
+    folds so the forced-compaction deadline stays enforceable. Their
     target's bytes may stay until then: deferred maps such a kept id to the
     hard delete's seq, and the segment must record that its copy PRECEDES it
     (see _segment_blob) or replay would serve it again. unquarantined_ids
@@ -584,8 +584,8 @@ def _rotated_after(seg: dict, ts: int) -> bool:
 # lease, no leader. Every process kept its OWN in-RAM Manifest and blindly
 # put() it, and LocalLogWriter held a long-lived fd on a wal that another
 # process's rotate/compact unlinks. Two processes on one root (uvicorn
-# --workers 2, two container replicas on one volume - the deployment shape
-# 03-architecture.md advertises) silently DESTROY acked data: a writer's
+# --workers 2, two container replicas on one volume - the obvious deployment
+# shape) silently DESTROY acked data: a writer's
 # appends go to an unlinked inode while its manifest put() erases the other
 # process's segment reference, leaving an unreachable orphan that
 # _adopt_orphan_segments refuses because its fold_seq reads 0.
@@ -905,7 +905,7 @@ class NamespaceStore:
         self._evicted = False
         self._closed = False
         # scheduled physical purges: [(record_id, deadline_ms)] + id set - the
-        # D7 hard-delete deadline is only a guarantee if something can SEE when
+        # hard-delete deadline is only a guarantee if something can SEE when
         # it comes due without rescanning the whole ops log. The set keeps
         # tracking idempotent (a rotate replaying an op must not double-count).
         self._pending_hard: list[tuple[str, int]] = []
@@ -985,7 +985,7 @@ class NamespaceStore:
         self._attach_lexical(lexical)
 
     def _fence_previous_writer(self) -> None:
-        """Storage-side fence after reclaiming a stale lease (ADR-12).
+        """Storage-side fence after reclaiming a stale lease.
 
         The previous holder may be STALLED, not dead - a GC pause, a frozen
         VM - with an append already past its lease check. Its next part number
@@ -1244,7 +1244,7 @@ class NamespaceStore:
             # on purpose. Publishing must take it: a destroy racing this would
             # otherwise put() an object under a crypto-SHREDDED namespace and,
             # worse, envelope.encrypt() would mint a FRESH data key for it -
-            # resurrecting the namespace and defeating the shred (D7 #9). This
+            # resurrecting the namespace and defeating the shred. This
             # is the same hazard the audit ledger has, guarded there in pass 16
             # and reintroduced here.
             with self._lock:
@@ -1810,7 +1810,7 @@ class NamespaceStore:
         """Replace this node's index cache with a new, empty one: the file,
         its WAL, the tantivy copy and the ANN sidecar's files deleted - not
         wiped - so the replay that follows builds it from durable data
-        alone. Deleting them is also the physical purge (D7): a stale cache
+        alone. Deleting them is also the physical purge: a stale cache
         holds the text (and the vectors) of records another node
         hard-deleted, and purged, since; a new file holds only what is
         written into it from now on (see NamespaceIndex.created). Runs
@@ -1842,7 +1842,7 @@ class NamespaceStore:
                   self.namespace, why)
 
     def _scrub_caches(self) -> None:
-        """Bring this node's derived copies up to the newest purge (D7).
+        """Bring this node's derived copies up to the newest purge.
 
         A compaction that purges hard-deleted records scrubs the local index
         and republishes the snapshot; if it was killed first, or this node's
@@ -1983,7 +1983,7 @@ class NamespaceStore:
         A crash between a compaction's commit and its deletes left the
         segments it replaced on disk for good: never read again (adoption
         needs the manifest to name them), but never removed - a hard delete's
-        bytes outlived the D7 purge deadline there. The same holds for an
+        bytes outlived the purge deadline there. The same holds for an
         index snapshot replaced between its successor's publish and its
         delete. Open - and every purge compaction and clean close (see
         _collect_garbage_now) - deletes every seg-* / index-*.snap object the
@@ -3119,7 +3119,7 @@ class NamespaceStore:
                 self.index.mark_quarantined(op["id"], bool(op.get("flag", True)))
             elif kind == "set_vector":
                 # Applied when a log carries one, but nothing in memd writes
-                # it: vectors are derived state (ADR-5, ADR-8). The embed
+                # it: vectors are derived state. The embed
                 # worker and reembed() put them straight into the index and
                 # never log them, and no fold keeps this op (a record holds
                 # no vector). Its vector then lives only in the index cache
@@ -4190,7 +4190,7 @@ class StorageEngine:
         self.wal_rotate_frames = wal_rotate_frames
         # LRU-bounded open-namespace table. Every open NamespaceStore pins a
         # SQLite connection + WAL handle + manifest; the tenant mix is
-        # "many tiny, heavy tail, mostly idle" (D2), so an unbounded table
+        # "many tiny, heavy tail, mostly idle", so an unbounded table
         # leaks fds/RAM in proportion to tenants EVER touched, not tenants
         # ACTIVE. Idle stores close cleanly: all state is durable blobs +
         # manifest; reopen replays the tail. Pinned namespaces (the facade's
@@ -4220,7 +4220,7 @@ class StorageEngine:
         # buffered audit entries must be written under the lease, and a later
         # tenure must not start from this one's ledger tail or search cache.
         self.close_hook = None
-        # D7: on a store with leases (several nodes on one bucket) this node
+        # Hard delete: on a store with leases (several nodes on one bucket) this node
         # drops its local copy of every namespace another node has taken
         # over since it last served it - at startup, then every
         # cache_sweep_s (see sweep_stale_caches). 0: never.
@@ -4324,7 +4324,7 @@ class StorageEngine:
                     nstore._lock.release()
             if nstore._lost:
                 # another node took it over: this node's copy is stale - and
-                # may hold text that node hard-deletes (D7). The open lock is
+                # may hold text that node hard-deletes. The open lock is
                 # still held: nothing reopens it meanwhile.
                 self._drop_if_superseded(name, "lease_lost")
             return [(name, d) for d in nstore.take_collected()]
@@ -4437,7 +4437,7 @@ class StorageEngine:
                 if nstore is None and stale is not None:
                     # the store just dropped lost its lease: another node
                     # took the namespace over, and this node's copy of it
-                    # is stale (D7) - whether or not the reopen below wins
+                    # is stale - whether or not the reopen below wins
                     self._drop_if_superseded(ns, "lease_lost")
                 if nstore is None:
                     nstore = NamespaceStore(
@@ -4536,7 +4536,7 @@ class StorageEngine:
     def sweep_stale_caches(self) -> list[str]:
         """Drop this node's local copy of every namespace it does not have
         open that another node has taken over since this node last served
-        it (D7). Returns the namespaces dropped.
+        it. Returns the namespaces dropped.
 
         The copy - SQLite index, tantivy copy, ANN sidecar, all plaintext -
         stayed until this node opened the namespace again: a record another

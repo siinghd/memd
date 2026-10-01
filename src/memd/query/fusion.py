@@ -1,4 +1,4 @@
-"""RRF fusion + trust-aware scoring (D3 §3.5 step 3, D7 control #5)."""
+"""RRF fusion + trust-aware scoring."""
 from __future__ import annotations
 
 import hashlib
@@ -85,6 +85,6 @@ def rrf_fuse(
 
 def recency_boost(score: float, t_event_ms: int, now_ms: int, half_life_days: float = 365.0) -> float:
     """Gentle recency tilt for long-horizon memory: a year-old fact keeps
-    half its score. Decay is demotion, not deletion (D3 §3.6)."""
+    half its score. Decay is demotion, not deletion."""
     age_days = max(0.0, (now_ms - t_event_ms) / 86_400_000)
     return score * (0.5 ** (age_days / half_life_days))

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Scale benchmark: SLO verification at the flat-scan design ceiling.
 
-The D2 retrieval SLOs (warm p50<=20ms / p99<=100ms embedded) are stated for
+The embedded retrieval SLOs (warm p50<=20ms / p99<=100ms embedded) are stated for
 namespaces at real scale. Toy corpora hide asymptotics; this bench seeds
 50K records (the documented ceiling before IVF replaces the flat scan),
 then measures warm retrieval by query class, cold open, compaction cost,

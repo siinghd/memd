@@ -1,4 +1,4 @@
-"""Object store abstraction (ADR-2).
+"""Object store abstraction.
 
 Object storage is the source of truth from the first byte. The embedded
 mode plays object store with the local filesystem; hosted mode points the
@@ -187,7 +187,7 @@ class ObjectStore(ABC):
     # is written with compare-and-swap: "replace it only if it is still the
     # version I last observed or wrote" (None: "only if it does not exist").
     # A writer that was paused past its lease and resumed then fails instead
-    # of overwriting its successor's state (ADR-12). Objects under NEW
+    # of overwriting its successor's state. Objects under NEW
     # unique names (segments, snapshots) need no condition: nothing reads
     # them until a conditional manifest commit references them.
 

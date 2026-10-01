@@ -11,7 +11,7 @@ from memd.engine.memory import Memory
 
 def test_search_degrades_when_embedder_down(tmp_path):
     """BM25+entity lanes must serve during an embedder API outage - retrieval
-    degrades, it never dies (ADR-8 BM25-only mode)."""
+    degrades, it never dies (BM25-only mode)."""
     m = Memory(str(tmp_path / "d"))
     try:
         m.add("the deploy window is tuesdays at noon", user_id="u1")

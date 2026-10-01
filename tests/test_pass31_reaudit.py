@@ -14,7 +14,7 @@ and a re-audit aimed squarely at the newest machinery is what surfaced them.
  2. HIGH  The pass-22 index snapshot published OUTSIDE the namespace lock, so a
           concurrent destroy left it writing an object under a crypto-SHREDDED
           namespace - and envelope.encrypt() minted a FRESH DATA KEY for it,
-          resurrecting what D7 #9 had just destroyed.
+          resurrecting what the crypto-shred had just destroyed.
  3. MED   The pass-20 audit ring deletes sealed segments past KEEP_SEGMENTS.
           verify() anchored at 0*64, so the moment the ring engaged it went
           permanently False - reading as "tampered" when the truth was "pruned
@@ -114,7 +114,7 @@ def test_snapshot_cannot_resurrect_a_shredded_namespace(tmp_path, monkeypatch):
     """A crypto-shred must stay shredded even if a snapshot is mid-flight.
 
     Writing the snapshot object would re-create the namespace prefix, and
-    encrypting it would mint a fresh data key - defeating D7 #9.
+    encrypting it would mint a fresh data key - defeating the crypto-shred.
     """
     from memd.storage import engine as E
 

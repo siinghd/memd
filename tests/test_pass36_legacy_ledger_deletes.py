@@ -10,7 +10,7 @@ hash-chained audit ledger; the migration now reads it (chain verified first,
 nothing past a break applied) and deletes every record durable data still
 holds that the ledger says was deleted.
 
-The fixtures are the verifier's kill-matrix histories that ended with such a
+The fixtures are the review's kill-matrix histories that ended with such a
 loss (seeds 108 and 110 on f979ea8 and faa1012; 108, 110 and 111 on 18246db),
 replayed through each OLD build's Memory facade (audit_flush_every=1, the
 compliance setting) with the process killed at that re-append; plus two

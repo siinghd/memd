@@ -1,4 +1,4 @@
-"""Trust-tier spoofing attacks at the REST auth boundary (D7 #1/#2)."""
+"""Trust-tier spoofing attacks at the REST auth boundary."""
 import pytest
 from fastapi.testclient import TestClient
 

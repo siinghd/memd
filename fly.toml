@@ -1,8 +1,8 @@
 # memd multi-node on Fly.io - a TEMPLATE. Nothing is deployed from this
-# repository (ADR-12: no deployment until a target is chosen). Every
+# repository (there is no deployment until a target is chosen). Every
 # CHANGE-ME must be filled in, and the result reviewed, before `fly deploy`.
 #
-# Shape: N identical machines, each one memd cluster node (ADR-12). The
+# Shape: N identical machines, each one memd cluster node. The
 # bucket is the source of truth (Tigris, R2 or S3), data keys are wrapped by
 # AWS KMS, and machines find each other through the registry in the bucket,
 # advertising their 6PN private address. Fly's proxy may send a request to

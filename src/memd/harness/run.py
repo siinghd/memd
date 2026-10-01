@@ -33,7 +33,7 @@ def run_longmemeval(data_dir: str | None = None, seed: int = 42, users: int = 8)
     max_budget = 2000
     full_budget = 10**9  # the baseline gets unlimited context
 
-    # D2 cost bar: injected tokens <= 10% of FULL CONTEXT. On production
+    # Cost bar: injected tokens <= 10% of FULL CONTEXT. On production
     # long-horizon corpora (100K+ token contexts) the default 2000 budget
     # clears it; on a toy corpus whose full context averages ~12K tokens a
     # fixed 2000 budget mathematically cannot. The honest implementation is
@@ -132,7 +132,7 @@ def run_adversarial(data_dir: str | None = None) -> dict:
 
 
 def gate_check(reports: list[SuiteReport], adv: dict) -> tuple[bool, list[str]]:
-    """Phase-1 exit bar (D5): memd >= baselines on accuracy at <=10% of
+    """Exit bar: memd >= baselines on accuracy at <=10% of
     full-context tokens; knowledge-update >= 0.95; zero adversarial regressions;
     cost regression >20% vs baseline fails by default.
 
@@ -158,7 +158,7 @@ def gate_check(reports: list[SuiteReport], adv: dict) -> tuple[bool, list[str]]:
                 f"token ratio {m['tokens_per_query_avg']}/{fc['tokens_per_query_avg']} > 10% of full-context"
             )
     if rag and m["accuracy"] < rag["accuracy"]:
-        failures.append(f"accuracy {m['accuracy']} < plain-rag {rag['accuracy']} (Phase-0 kill signal)")
+        failures.append(f"accuracy {m['accuracy']} < plain-rag {rag['accuracy']} (kill signal)")
     ku_cases = [c for c in lm_memd.results if c.qclass == "knowledge_update"]
     if ku_cases:
         acc = sum(c.correct for c in ku_cases) / len(ku_cases)

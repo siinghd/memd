@@ -1,5 +1,4 @@
-"""Pass 44: a node drops its local copy of a namespace another node took over
-(D7, K9).
+"""Pass 44: a node drops its local copy of a namespace another node took over.
 
 Each node keeps a plaintext copy of every namespace it served - the SQLite
 index (and its -wal/-shm), the tantivy copy, the ANN sidecar - in its local

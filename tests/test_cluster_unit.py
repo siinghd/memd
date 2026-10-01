@@ -1,4 +1,4 @@
-"""ADR-12 router and lease pieces, without processes.
+"""Multi-node router and lease pieces, without processes.
 
 Local: rendezvous hashing, lease-holder parsing, route-header signing,
 config validation. S3 (MinIO, skipped without MEMD_TEST_S3_ENDPOINT): the
@@ -323,7 +323,7 @@ def test_a_second_node_with_local_keys_refuses_instead_of_rekeying(tmp_path):
     m.close()
 
 
-# ------------------------------------------- conditional writes (ADR-12)
+# ------------------------------------------- conditional writes
 
 
 def test_local_compare_and_swap(tmp_path):

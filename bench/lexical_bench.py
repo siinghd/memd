@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 """Lexical backend bench: FTS5 vs the tantivy accelerator, through memd.
 
-Experiment 008 measured the two engines bare (index-only, unfiltered). This
-measures what a caller gets: FILTERED search (user-scoped, the common case)
-through Memory.search and through the bm25 lane alone, at 10K / 50K / 150K
+An earlier measurement compared the two engines bare (index-only, unfiltered).
+This measures what a caller gets: FILTERED search (user-scoped, the common
+case) through Memory.search and through the bm25 lane alone, at 10K / 50K / 150K
 records, plus the durable write ack with each backend (tantivy must not move
 it: FTS5 stays on the ack path, tantivy indexes in the background).
 
@@ -35,7 +35,8 @@ from memd.engine.memory import Memory  # noqa: E402
 from memd.index.sqlite_index import IndexFilter  # noqa: E402
 from memd.query.planner import plan_query  # noqa: E402
 
-DEFAULT_CORPUS = "/tmp/claude-1000/prof-corpus/turns.jsonl"
+# LongMemEval turns, one JSON object per line with "content"
+DEFAULT_CORPUS = os.path.join(os.path.expanduser("~"), ".cache", "memd", "longmemeval", "turns.jsonl")
 LME_CACHE = os.path.join(os.path.expanduser("~"), ".cache", "memd", "longmemeval",
                          "longmemeval_s_cleaned.json")
 WORDS = ("kumquat mango orchard ferry harbor violin rehearsal passport visa dentist invoice "

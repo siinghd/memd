@@ -7,8 +7,8 @@ Six defects, each reproduced against the pass-16 baseline before the fix:
           lost with no error, warning or metric.
  2. CRIT  A due hard-delete purge deadline ran a FULL-NAMESPACE compaction
           inline on the next ordinary write: 804.8ms write ack at 20K records
-          (vs 5.4ms), scaling linearly - 150x the embedded p99 SLO, and D2
-          says per-write maintenance is "O(entity cluster), never O(namespace)".
+          (vs 5.4ms), scaling linearly - 150x the embedded p99 SLO, and the SLOs
+          say per-write maintenance is "O(entity cluster), never O(namespace)".
  3. HIGH  The BM25 AND tier DISCARDED its hits when it found fewer than ten -
           exactly the high-precision case - and then failed to re-find the
           document in a saturated OR window.

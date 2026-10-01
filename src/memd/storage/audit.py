@@ -1,4 +1,4 @@
-"""Append-only, hash-chained audit log per namespace (D7 control #7).
+"""Append-only, hash-chained audit log per namespace.
 
 Nearly free on immutable segments; exportable for SIEM. Each entry commits
 to the previous entry's digest: tampering breaks the chain.
@@ -146,7 +146,7 @@ class AuditLog:
             # Empty the live ledger - on a leasing store only of what the copy
             # just sealed (log_bound: the parts this process saw), so a writer
             # paused here and resumed after another node took the namespace
-            # over cannot wipe entries that node appended since (ADR-12)
+            # over cannot wipe entries that node appended since
             bound_of = getattr(self.store, "log_bound", None)
             bound = bound_of(self.key) if callable(bound_of) else None
             if bound is None:
@@ -278,7 +278,7 @@ class AuditLog:
                 put = getattr(self.store, "put_hint", None) or self.store.put
                 put(self._state_key(), data)
             else:
-                # Rewritten in place, so conditional (ADR-12): never on top of
+                # Rewritten in place, so conditional: never on top of
                 # a sidecar someone else wrote since we last read or wrote it.
                 # A conflict is not necessarily a lost lease (two ledger
                 # handles in one process, briefly), so it skips this write and

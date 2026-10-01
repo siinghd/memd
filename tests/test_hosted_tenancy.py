@@ -1,6 +1,6 @@
 """Hosted mode: tenancy, entitlements and the usage ledger (no Stripe calls).
 
-Covers the billing spec's required tests that do not need the Stripe API:
+Covers the hosted-mode behaviour that does not need the Stripe API:
 quota enforcement (free hard cap -> 402, paid overage metered, grace ->
 read-only, deletes always allowed), tenant isolation, the sk_live_ guard,
 the usage ledger's crash safety under SIGKILL, and "embedded memd never

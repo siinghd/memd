@@ -1,4 +1,4 @@
-"""Namespace router: any node serves any namespace (ADR-12 item 2).
+"""Namespace router: any node serves any namespace.
 
 memd scales by NAMESPACE, not by concurrent writers inside one: each
 namespace has exactly one writer at a time - the node holding its S3 lease
@@ -172,7 +172,7 @@ class NodeRegistry:
 
     def _beat(self, *, stopped: bool = False) -> None:
         """Write our registry entry - conditionally, on the version we last
-        read or wrote (ADR-12): if anyone else wrote it since (a twin with
+        read or wrote: if anyone else wrote it since (a twin with
         our node id, an operator), we stop advertising rather than fight."""
         from memd.storage.objectstore import PreconditionFailed
 

@@ -10,8 +10,8 @@ gate runs memd's public path on real data every night:
     a cache dir if absent, and SKIPS (exit 0) when it cannot (offline);
   - takes the 60 fixed questions in bench/lme_gate_qids.json: 10 per
     question type, drawn with a fixed seed from the dev split (index % 5 != 0,
-    abstention variants excluded; index % 5 == 0 is the lab's held-out set
-    and is never used here);
+    abstention variants excluded; index % 5 == 0 is the held-out set (see
+    BENCHMARKS.md) and is never used here);
   - ingests each question's haystack into a fresh Memory (one user, one
     add_events batch per session, t_event = the session date), searches the
     question, ranks sessions by first appearance in the result;

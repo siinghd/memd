@@ -84,13 +84,13 @@ Concretely:
 - **`uvicorn --workers N` with N > 1 will not work.** Run one worker.
 - Two containers on one volume will not work.
 - To scale, scale *namespaces* across processes, not processes across one
-  namespace - which is exactly what [multi-node serving](#multi-node-adr-12)
+  namespace - which is exactly what [multi-node serving](#multi-node)
   does on an `s3://` data root. `MEMD_ALLOW_MULTI_PROCESS=1` disables the lock
   and re-enables the data loss; it exists for recovery tooling, not for
   serving.
 
-A multi-writer protocol inside one namespace (manifest CAS on ETag) is
-deferred (ADR-12 item 5).
+A multi-writer protocol inside one namespace (manifest CAS on ETag) is not
+built yet.
 
 ## Object storage as the source of truth (S3 / R2 / MinIO)
 
@@ -127,8 +127,8 @@ they are the number that decides both the cost model and how a WAN changes
 things. A warm search touches object storage zero times because retrieval is
 served by the local derived index.
 
-What stays local: the SQLite derived index (rebuildable by contract — pass
-22's snapshot is what makes a cold node cheap) and, with the default `local`
+What stays local: the SQLite derived index (rebuildable by contract — the
+index snapshot published to the store is what makes a cold node cheap) and, with the default `local`
 key provider, the envelope **keys**. Then data is remote and keys are not:
 *one node with remote durability*. Crypto-shred works (destroy the local key
 and the ciphertext is inert), but a second node cannot decrypt. With a remote
@@ -176,7 +176,7 @@ local key files only after every namespace verified under the new provider.
 A node still set to `local` then refuses the store instead of minting keys.
 What crypto-shred means with a shared CMK is spelled out in SECURITY.md.
 
-## Multi-node (ADR-12)
+## Multi-node
 
 Several `memd serve --http` processes on ONE `s3://` data root serve every
 namespace between them: scale by namespace, one writer per namespace at a
@@ -286,8 +286,8 @@ org and is never metered. Self-hosted keys (`keys.toml.json`) are not honoured
 in hosted mode; adopt them into an org with
 `memd key migrate --hosted --org org_...` (the key strings keep working).
 
-**Plans** (defaults from [06-economics.md](06-economics.md); config, not code -
-override any value with a JSON file at `MEMD_PLANS_PATH`):
+**Plans** (the defaults are config, not code - override any value with a JSON
+file at `MEMD_PLANS_PATH`):
 
 | meter | free (hard caps) | dev, $29/mo | scale (usage-based) |
 |---|---|---|---|
@@ -451,14 +451,14 @@ key; the local heuristic extractor is never billed.
 
 ## What's inside
 
-- **Storage** (ADR-2): per-namespace WAL → immutable segments → manifest on an
+- **Storage**: per-namespace WAL → immutable segments → manifest on an
   object-store interface (local FS embedded; S3/R2 backend is the same
   interface). Durable write ack = fsync'd append; no LLM/embedding on the
   write path. Compaction folds tombstones and enforces hard-delete deadlines.
-- **Revisability** (ADR-1): bitemporal records — new fact on an entity key
+- **Revisability**: bitemporal records — new fact on an entity key
   supersedes the old cluster-locally. `search(as_of=...)` time-travels;
   `?history=true` walks supersedence chains.
-- **Provenance & trust** (D7): every record carries source tier
+- **Provenance & trust**: every record carries source tier
   (user > agent > tool > web > import), lineage, actor. Untrusted content is
   fenced in packed context; explicit saves inherit session taint; quarantine +
   rate limits catch MINJA-style injection; hash-chained audit log; namespace
@@ -473,7 +473,7 @@ key; the local heuristic extractor is never billed.
   lineage-deduped, budget-cut packing that keeps prefix-stable order
   (KV-cache friendly), or, as an experimental opt-in, gated evidence packing.
   The hash embedder's vector lane is not fused (`fuse_vector`, below).
-- **Extraction** (ADR-6): async, batched, re-runnable. BYO OpenAI-compatible
+- **Extraction**: async, batched, re-runnable. BYO OpenAI-compatible
   key for LLM extraction/embeddings; heuristic provider keeps facts working
   with zero keys; local ONNX embeddings via the optional fastembed extra.
 
@@ -516,7 +516,7 @@ fully functional, honestly degraded, clearly labeled in `stats()`.
   candidates judged relevant (p ≥ `rerank_gate`, else the top 3), each with
   its neighbouring turns, grouped by session under a session-date header,
   still capped by `budget_tokens` and with the same provenance fencing. It
-  trades recall for tokens: in the lab it matched top-k QA accuracy at 27%
+  trades recall for tokens: in an experiment it matched top-k QA accuracy at 27%
   fewer tokens over a 100-candidate shortlist, but over the product's top-30
   it drops second evidence sessions (LongMemEval_S session recall_all@5
   0.803 gated vs 0.928 ranked, with Jev). The default packs ranked.
@@ -593,8 +593,8 @@ fully functional, honestly degraded, clearly labeled in `stats()`.
 ## Ops
 
 ```bash
-python bench/slo_bench.py                        # D2 acceptance numbers
-python -m memd.harness.run --suite all --gate    # quality+cost gate (D5)
+python bench/slo_bench.py                        # SLO acceptance numbers
+python -m memd.harness.run --suite all --gate    # quality+cost gate
 python bench/lme_gate.py                         # real-data gate: LongMemEval_S, 60 q (nightly)
 python bench/lexical_bench.py                    # FTS5 vs tantivy, filtered, 10K-150K records
 python bench/ann_bench.py                        # vector lane: usearch vs exact, 50K-1M vectors
@@ -608,6 +608,5 @@ SLOs measured on this machine (see `bench/slo_bench.py`): durable write ack
 p99 ≈ 7ms (target ≤10ms embedded); warm retrieval p50 ≈ 12ms / p99 ≈ 52ms
 (targets ≤20/≤100ms); cold restart + first query ≈ 44ms.
 
-Design pack: see `01..09-*.md` in this repo, ADRs in `adr/ADRs.md`. Harness
-version hash is stamped into every result file — a result without a hash
-doesn't exist.
+The eval harness stamps its version hash into every result file — a result
+without a hash doesn't exist.

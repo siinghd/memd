@@ -1,4 +1,4 @@
-"""ADR-12 item 1: pluggable key providers (local / aws-kms / vault-transit).
+"""Pluggable key providers (local / aws-kms / vault-transit).
 
 What must hold for every provider:
   - data at rest is ciphertext; a fresh process (another node) with the
@@ -62,7 +62,7 @@ def _all_objects(root: str) -> dict[str, bytes]:
 
 class TestLocalProvider:
     def test_wrap_format_is_unchanged(self, tmp_path):
-        """A key file written by the pre-ADR-12 code (nonce || AESGCM(root,
+        """A key file written before key providers existed (nonce || AESGCM(root,
         dk, aad=ns)) must still unwrap, and new files keep that format."""
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 

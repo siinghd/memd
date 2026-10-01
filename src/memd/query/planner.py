@@ -1,4 +1,4 @@
-"""Query planner (D3 §3.5): rules + optional tiny classifier -> strategy.
+"""Query planner: rules + optional tiny classifier -> strategy.
 
 Explicitly NO reflection loop (survey finding: planning helps, reflection
 doesn't). Output: query class, lane weights, filter hints.

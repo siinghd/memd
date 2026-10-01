@@ -1,4 +1,4 @@
-"""ADR-12: several memd nodes (real processes) on ONE bucket, with KMS keys.
+"""Multi-node: several memd nodes (real processes) on ONE bucket, with KMS keys.
 
 What is pinned here, end to end over HTTP:
   - any node serves any namespace: the router proxies a request to the

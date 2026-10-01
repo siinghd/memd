@@ -2,8 +2,7 @@
 webhook, the meter-event push and the daily reconciliation.
 
 `stripe` (the memd[billing] extra) is imported lazily, only when a Stripe
-call or a webhook verification actually happens. Structure follows the
-design reference the spec names (snaplab's billing routes): checkout /
+call or a webhook verification actually happens. Structure: checkout /
 portal / webhook, subscription sync from the billed PRICE rather than echoed
 metadata, idempotency by Stripe event id, and a per-org cursor so re-ordered
 deliveries cannot roll a plan back.

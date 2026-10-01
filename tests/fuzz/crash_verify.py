@@ -6,7 +6,7 @@ argv: src root
 Checks: acked writes survive; acked deletes stay deleted; no unknown rows;
 atomic batches; supersede chains; side-namespace destroy; warm, warm after a
 compaction, cold, rebuilt and compacted opens all agree; EXPORT holds exactly
-what reads serve at every stage that exports; and D7: no due, acked
+what reads serve at every stage that exports; and the purge: no due, acked
 hard-deleted record's text remains in any file under the data root after a
 compaction (with a positive control on live records' text).
 """
@@ -278,10 +278,10 @@ if base:
 for k, v in d7.items():
     if v and v["left"]:
         res["problems"].append(
-            f"D7 {k}: hard-deleted text remains: {v['left'][:3]} (n={len(v['left'])}/{v['checked']})")
+            f"PURGE {k}: hard-deleted text remains: {v['left'][:3]} (n={len(v['left'])}/{v['checked']})")
 for k, v in d7.items():
     if v and v["ctl"].split("/")[0] != v["ctl"].split("/")[1]:
-        res["problems"].append(f"D7-CONTROL {k}: live text not found in segments {v['ctl']}")
+        res["problems"].append(f"PURGE-CONTROL {k}: live text not found in segments {v['ctl']}")
 res["d7_checked"] = {k: (f"{v['checked']} ctl={v['ctl']}" if v else None) for k, v in d7.items()}
 res["sessions"] = sum(1 for e in lines if e["t"] == "sess")
 res["n_live"] = len(base["main"]) if base else None

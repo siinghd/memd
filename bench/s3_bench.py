@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """Hosted-path SLOs against a real S3 API.
 
-02-slos.md states hosted numbers (durable write ack p50<=150ms/p90<=300ms,
-warm retrieval p50<=100ms/p99<=400ms, cold first query p90<=1.5s) that were
+memd's hosted SLO targets (durable write ack p50<=150ms/p90<=300ms, warm
+retrieval p50<=100ms/p99<=400ms, cold first query p90<=1.5s) were
 UNEVIDENCED by construction until an S3 backend existed - LocalObjectStore was
 the only implementation.
 

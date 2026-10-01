@@ -1,11 +1,11 @@
 """Pass 47: a logged `set_vector` op is derived state, like every vector.
 
-A verifier's probe appended a `set_vector` op (an arbitrary vector, under
+A review's probe appended a `set_vector` op (an arbitrary vector, under
 the model name "hash") and found it gone after close + reopen, warm and
 cold. Triage: nothing in memd writes that op - the embed worker and
 reembed() put vectors straight into the index (`index.set_vectors`) and
 never log them; the op kind is only applied when a log carries one. Vectors
-are derived state (ADR-5, ADR-8): a record's vector is the embedder's output
+are derived state: a record's vector is the embedder's output
 on its raw text, which is retained, and an index cache that lost it - or
 holds one of another model - is healed by re-embedding (the open's
 vector-lane self-heal, Memory._report_vector_health). The probe's warm loss

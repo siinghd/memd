@@ -76,7 +76,7 @@ def test_core_latency_families_obey_the_ms_unit_contract():
 
 def test_bucket_ladder_covers_every_slo_boundary():
     top = LATENCY_MS_BUCKETS[-1]
-    for slo_ms in (10, 20, 100, 150, 400, 1500, 60_000):  # D2 SLO table, ms
+    for slo_ms in (10, 20, 100, 150, 400, 1500, 60_000):  # the SLO table, ms
         assert slo_ms <= top, f"ladder cannot grade an SLO at {slo_ms}ms"
     assert DEFAULT_BUCKETS is LATENCY_MS_BUCKETS
 

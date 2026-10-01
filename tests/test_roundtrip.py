@@ -1,6 +1,6 @@
 """Anti-lock-in roundtrip: export -> fresh namespace -> import -> parity.
 
-The promise (D4 §4.5): leaving must be as easy as arriving. A memd export
+The promise: leaving must be as easy as arriving. A memd export
 restores with full fidelity - kind, provenance tiers, bitemporal fields,
 scopes, entity keys - and remains searchable with original event times."""
 import json

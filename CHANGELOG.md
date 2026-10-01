@@ -1,8 +1,8 @@
 # Changelog
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-This project's engineering log - every defect with its reproduction and
-before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
+This changelog is the project's engineering record: each fix says what was
+wrong, how it showed, and the numbers before and after where it has them.
 
 ## [Unreleased]
 
@@ -70,7 +70,7 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   temporary that shares its inode is now only unlinked.
 
 ### Fixed
-- **A durable delete always reaches the index (D7).** `append_ops` ran the
+- **A durable delete always reaches the index.** `append_ops` ran the
   ops log's size-triggered rotate before applying the op to the index, so a
   rotate that raised (a damaged WAL frame makes every fold refuse) left the
   delete logged but unapplied: `get()` and search served the record, a hard
@@ -146,7 +146,7 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   one an older build is still writing - is read again for up to 1 s, and
   a temporary key file a crash left (`*.key.tmp-*`, over 5 minutes old)
   is shredded by the next envelope.
-- **A node drops its copy of a namespace another node took over (D7).**
+- **A node drops its copy of a namespace another node took over.**
   Every node keeps the namespaces it served in its local cache directory -
   the SQLite index (with its `-wal`/`-shm`), the tantivy copy and the ANN
   sidecar, all plaintext - and a node that lost a namespace (its lease
@@ -166,7 +166,7 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
 ## [0.3.0] - 2026-09-26
 
 ### Added
-- **Key providers (ADR-12).** `MEMD_KEY_PROVIDER=local|aws-kms|vault-transit`
+- **Key providers.** `MEMD_KEY_PROVIDER=local|aws-kms|vault-transit`
   (`Memory(config={"key_provider": ...})`). `local` stays the default and
   byte-compatible; `aws-kms` (boto3, encryption context per namespace) and
   `vault-transit` (httpx, associated data per namespace) keep the wrapped
@@ -179,7 +179,7 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   key. `memd keys status|migrate|rotate` (migrate is crash-safe and
   idempotent, holds every namespace's writer lock, and removes local key
   files only after verification). See SECURITY.md "Key custody".
-- **Multi-node serving (ADR-12).** `memd serve --http --node-id N` (with
+- **Multi-node serving.** `memd serve --http --node-id N` (with
   `MEMD_CLUSTER_SECRET`, `MEMD_STATE_DIR`, an `s3://` `MEMD_DATA`): nodes
   heartbeat a registry object in the bucket and proxy each namespace's
   requests to the node holding its lease (rendezvous hashing over live nodes
@@ -202,8 +202,8 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
     rollup in one fsynced transaction after the operation and before its
     ack) with the meters `memories_stored` and `stored_gb` (daily gauges),
     `searches`, `reranked_searches`, `extractions_our_key` and `writes`.
-  - Plan entitlements from config (free / dev / scale per 06-economics.md,
-    overridable with `MEMD_PLANS_PATH`): hard caps answer
+  - Plan entitlements from config (free / dev / scale, overridable
+    with `MEMD_PLANS_PATH`): hard caps answer
     `402 {"code": "quota_exceeded", "meter", "limit"}` and hold under
     concurrency (atomic check-and-reserve in the admin store; 50 concurrent
     requests at a cap of 20 admit exactly 20); paid-plan overage is
@@ -265,9 +265,9 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   Stripe's idempotency semantics, and `stripe/stripe-mock` in docker for the
   end-to-end test, skipped without docker).
 - **usearch ANN sidecar for the vector lane** (`pip install "memd[ann]"`,
-  `vector_index` / `MEMD_VECTOR_INDEX` = `auto | flat | usearch`; decision
-  D6). `auto` serves namespaces with at least `ann_min_vectors` (20000)
-  vectors from an HNSW index (usearch >= 2.25, cosine, f16 or `ann_dtype`
+  `vector_index` / `MEMD_VECTOR_INDEX` = `auto | flat | usearch`). `auto`
+  serves namespaces with at least `ann_min_vectors` (20000) vectors from an
+  HNSW index (usearch >= 2.25, cosine, f16 or `ann_dtype`
   i8, connectivity 16) keyed by record rowid, and smaller ones from the
   exact scan; an explicit `usearch` that cannot be honoured raises. The
   index is derived from SQLite's vectors table: changes are queued under the
@@ -280,7 +280,7 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   filters (<= `ann_exact_max`, 2000 rows), sweeps and short windows are
   answered exactly (`stats()["vector_index"]["fallback_exact_total"]`).
   A hard-delete purge deletes the sidecar's files and rebuilds it from
-  SQLite, because usearch `remove` only marks entries (D7). The sidecar is
+  SQLite, because usearch `remove` only marks entries. The sidecar is
   published with the index snapshot (`vector-*.snap`, same generation and
   purge rules), so a cold node installs it instead of rebuilding.
   `bench/ann_bench.py` measures it at 50K / 200K / 1M vectors: recall@10
@@ -406,7 +406,7 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   never published), waits for it to let go without the index lock, and
   retries until the WAL is truncated; it no longer gives up after the busy
   timeout, which left the erased text and vectors in the local SQLite
-  file until the next open (D7).
+  file until the next open.
 
 ### Changed
 - **The S3 owner lease is a compare-and-swap** on its ETag for every write
@@ -429,7 +429,7 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   namespace opens, and one is never minted for a namespace that already has
   a manifest; `MEMD_KEYS_ALLOW_MINT_EXISTING=1` overrides that (e.g. a
   namespace written unencrypted).
-- **Conditional writes for every object rewritten in place** (ADR-12):
+- **Conditional writes for every object rewritten in place**:
   the manifest commit, the migration report, the audit checkpoint sidecar,
   the key-custody marker, wrapped-key rotation, the cluster registry and the
   lease release (a CAS'd "released" tombstone instead of read-then-delete)
@@ -438,7 +438,7 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   fences the namespace (`LeaseLostError`, 503 `lease_lost`), never retried.
   A takeover rewrites the manifest before replay; log deletes after a commit
   are bounded to what the commit read, and part numbers never go backwards.
-- **Handoffs no longer lose acked writes** (ADR-12 re-verification): the
+- **Handoffs no longer lose acked writes** (found re-verifying multi-node): the
   S3 store's part counters were cached per process, so a node taking a
   namespace back (A -> B -> A, no fault needed) numbered new parts below the
   ones written meanwhile, and a retaking node failed writes with "append
@@ -455,7 +455,7 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   `lineage` of the tenure that opened the namespace last; a cache is caught
   up only in its own lineage, and any other is deleted - file, WAL and
   tantivy copy and the usearch sidecar's files, so purged text and vectors
-  go with it (D7) - and rebuilt from the snapshot plus the tail. An open
+  go with it - and rebuilt from the snapshot plus the tail. An open
   killed between committing its lineage and stamping its cache (a crash in a
   usearch sidecar load lands there) keeps that cache: a pending stamp,
   written once the replay is flushed, says it is current for that lineage. A clean release racing a heartbeat renewal no
@@ -565,16 +565,16 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
   `memd_rerank_fallback_total{reason}`; search never fails because of it.
   `local` is a fastembed cross-encoder (default `BAAI/bge-reranker-base`),
   loaded in the background. LongMemEval_S session ndcg@5: bm25 0.891 ->
-  bm25 + Jev 0.954 (lab experiment 015).
+  bm25 + Jev 0.954 (experiment 015).
 - **Gated evidence packing**, experimental and opt-in (`pack_mode="gated"`;
   `auto` = ranked with every reranker): the context holds only the
   candidates a calibrated reranker judges relevant (p >= `rerank_gate`,
   default 0.5, else the top 3) plus the turn before and after each in the
   same session, grouped by session under a session-date header,
-  budget-capped, with the same provenance fencing. Lab 018: equal QA
+  budget-capped, with the same provenance fencing. Experiment 018: equal QA
   accuracy to top-k packing at 27% fewer tokens over a 100-candidate
   shortlist; over the product's top-30 it drops second evidence sessions
-  (lab 020/021, Jev: session ndcg@5 0.906 / recall_all@5 0.803 gated vs
+  (experiments 020/021, Jev: session ndcg@5 0.906 / recall_all@5 0.803 gated vs
   0.955 / 0.928 ranked), so it is not the default.
 - **tantivy lexical accelerator** (`pip install "memd[fast]"`,
   `lexical_backend` = `auto | fts5 | tantivy`). A derived index fed in the
@@ -601,7 +601,7 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
   object is their ordered concatenation: one durable write ack = one PUT, and a
   torn frame cannot exist. Single-writer is enforced by a lease rather than a
   file lock, since `flock` cannot see another machine. Exercised in CI against
-  a real S3 server. This makes the hosted SLOs in `02-slos.md` evidenced rather
+  a real S3 server. This makes memd's hosted SLOs evidenced rather
   than aspirational - with the caveat that the measurements are against a
   server on loopback, so the latencies are a floor and the round-trip counts
   (1 PUT per write, 0 reads per warm search) are the durable claim.
@@ -686,7 +686,7 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
   in the migration report (`memd migrate --report`, see Added). (The first
   cut applied every entry: a record deleted in one namespace and restored
   into another was deleted by v0.1's misfiled entry, and a restore after a
-  delete in the same namespace was deleted again.) On the verifier's
+  delete in the same namespace was deleted again.) On the recorded crash
   histories that lost a hard delete (replayed through the old versions'
   facade: 2, 2 and 3 runs on the three builds) the upgraded store serves
   what the old warm open served, warm and cold; the purge runs as the
@@ -728,8 +728,8 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
   name of the segment they wrote in the same manifest put as the segment
   list (an explicit empty checkpoint when they wrote none) - and any other
   unreferenced segment is never read.
-- **A crash inside a compaction kept a hard delete's bytes past the D7
-  deadline**: the segments and the index snapshot it had replaced stayed on
+- **A crash inside a compaction kept a hard delete's bytes past the
+  purge deadline**: the segments and the index snapshot it had replaced stayed on
   disk for good. Open, every compaction that purges and a clean close now
   delete every unreferenced segment and index snapshot provably older than
   the newest checkpoint (written under an earlier manifest generation; a
@@ -772,9 +772,9 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
   of captured before it.
 - A due hard-delete purge ran a full-namespace compaction inline on the next
   ordinary write: 804ms write ack at 20K records, now 6.9ms on a maintenance
-  thread. The D7 purge guarantee is unchanged.
+  thread. The hard-delete purge guarantee is unchanged.
 - **A purge that came due while the process was down waited for a write.**
-  Only a write to the namespace checked the D7 deadline, so on one that
+  Only a write to the namespace checked the purge deadline, so on one that
   only served reads - or right after an upgrade that recovered hard
   deletes from the ledger, due at once - the text stayed on disk past the
   deadline. Opening a namespace now hands a due purge to the maintenance
@@ -870,7 +870,7 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
   a confirm that passes it back is refused with 409 (`preview_mismatch`)
   and deletes nothing if the matches changed since.
 - **A hard `DELETE` of a soft-deleted record answered 404**, so its text
-  could not be purged through REST (D7): hard delete now accepts it.
+  could not be purged through REST: hard delete now accepts it.
 - **`?history=true` served soft-deleted content** until a compaction purged
   it. Deleted records are no longer returned by `GET .../memories/{id}` or
   in a `history` chain (superseded versions still are), unless an
@@ -911,9 +911,10 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
   vs 3.4 one at a time on LongMemEval turns.
 - Write amplification: FTS5 no longer stores a second copy of every record and
   vectors are stored at half width. 800B records 7.29x -> 5.02x; 4KB 2.80x.
-  `02-slos.md`'s flat 3x bar is amended to a record-size-aware one, with the
-  arithmetic - a dense vector is a *fixed* cost per record, so a flat ratio
-  stated per raw byte is unreachable below ~4KB at any embedding dimension.
+  The write-amplification SLO's flat 3x bar is amended to a record-size-aware
+  one, with the arithmetic - a dense vector is a *fixed* cost per record, so a
+  flat ratio stated per raw byte is unreachable below ~4KB at any embedding
+  dimension.
 - Audit ledgers are per-namespace, O(1) to open, and bounded in size.
 - Index schema v1 -> v2, migrated on open. No re-embed required.
 

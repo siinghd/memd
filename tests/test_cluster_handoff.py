@@ -1,4 +1,4 @@
-"""ADR-12 re-verification: a namespace handed back and forth between nodes.
+"""Multi-node re-verification: a namespace handed back and forth between nodes.
 
 The defect: an S3ObjectStore cached per-log part counters for the life of
 the PROCESS, not of the lease. A node that held a namespace, released it,
@@ -253,7 +253,7 @@ def test_a_retaken_namespace_never_serves_what_another_node_deleted(cluster, fol
                 if line.strip()}
     assert exported == {r for r, v in a_view.items() if v is not None}, "get and export disagree"
     if fold == "compact":
-        # the purge B's compaction made must reach A's copies too (D7)
+        # the purge B's compaction made must reach A's copies too
         local = _local_bytes(A)
         assert word[9].encode() in local, "the scan does not see A's index cache"
         kept = [word[ids.index(r)] for r in a_hard + b_hard if word[ids.index(r)].encode() in local]
@@ -366,10 +366,10 @@ def test_an_open_killed_between_its_lineage_commit_and_stamp_keeps_its_cache(tmp
 
 
 def test_a_discarded_cache_takes_the_ann_sidecar_with_it(tmp_path, monkeypatch):
-    """The lineage check (ADR-12) with the usearch sidecar: a cache of
+    """The lineage check with the usearch sidecar: a cache of
     another lineage is deleted and rebuilt - and so are the sidecar's files,
     derived from it: they hold the vectors of records another node may have
-    hard-deleted and purged since (D7). Removed before the sidecar attaches,
+    hard-deleted and purged since. Removed before the sidecar attaches,
     so nothing of the old lineage is loaded from them either."""
     pytest.importorskip("usearch")
     import numpy as np

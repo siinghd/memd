@@ -1,7 +1,7 @@
 """Pass 37: the upgrade never deletes live data on ambiguous evidence.
 
 Pass 36 made the format-1 migration apply every `delete` / `hard_delete` its
-audit ledger records to any record durable data still held. The verifier
+audit ledger records to any record durable data still held. The review
 showed that deletes live data the user still has:
 
   - v0.1 (18246db) filed EVERY namespace's entries in the facade default

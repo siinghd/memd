@@ -28,7 +28,7 @@ mem.add("...", namespace="globex")            # every method takes namespace=
 Names match `[A-Za-z0-9][A-Za-z0-9_.-]{0,127}`; `_`-prefixed names are
 reserved. A namespace has **one writer at a time**: a file lock on a local
 root, a lease object on an `s3://` root. That is the scaling rule too: spread
-namespaces across processes (see [multi-node](operations.md#multi-node-adr-12)), never
+namespaces across processes (see [multi-node](operations.md#multi-node)), never
 processes across one namespace.
 
 ## Scopes

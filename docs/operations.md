@@ -16,14 +16,14 @@ A runnable walk-through on MinIO: [`examples/06_s3_minio.py`](../examples/06_s3_
 
 ## Key custody
 
-{% include-markdown "../README-engine.md" start="### Key custody: local, AWS KMS or Vault transit" end="## Multi-node (ADR-12)" %}
+{% include-markdown "../README-engine.md" start="### Key custody: local, AWS KMS or Vault transit" end="## Multi-node" %}
 
 The threat model of each provider, binding, and what crypto-shred can and
-cannot promise with a shared KMS key: [Security: key custody](security.md#key-custody-adr-12).
+cannot promise with a shared KMS key: [Security: key custody](security.md#key-custody).
 
-## Multi-node (ADR-12)
+## Multi-node
 
-{% include-markdown "../README-engine.md" start="## Multi-node (ADR-12)" end="## Hosted mode & billing" %}
+{% include-markdown "../README-engine.md" start="## Multi-node" end="## Hosted mode & billing" %}
 
 ## Backups
 
@@ -41,7 +41,7 @@ What to back up, as the rest of this page and [Security](security.md) state it:
 - **Erasure and backups.** A backup taken before a crypto-shred still holds
   the namespace's wrapped key: keep the `keys/` prefix under the retention
   you promise for erasure, or exclude it (details under
-  [Security: key custody](security.md#key-custody-adr-12)).
+  [Security: key custody](security.md#key-custody)).
 - **Hosted mode:** `admin/admin.sqlite3` (orgs, keys, the usage ledger) is
   not rebuildable; back it up with the data root.
 - **A portable copy:** `memd export --out backup.jsonl` writes a

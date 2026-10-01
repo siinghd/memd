@@ -7,7 +7,7 @@
    fingerprint no longer matches what it would delete.
 2. A hard DELETE of an already soft-deleted record answered 404 (the
    existence check hid soft-deleted records), so it could not be purged
-   through REST (D7).
+   through REST.
 3. `?history=true` served soft-deleted content until compaction. Deleted
    records are no longer returned by history reads (superseded history
    still is) unless an admin passes include_deleted=true.

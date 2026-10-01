@@ -1,8 +1,8 @@
 """Pass 20 regression: fresh-cache rebuild must recover EVERYTHING from
 segments.
 
-_node-loss scenario: the derived index cache (rebuildable by contract,
-ADR-5) is destroyed; a new process replays segments + WAL tail. A tuple-
+_node-loss scenario: the derived index cache (rebuildable by contract) is
+destroyed; a new process replays segments + WAL tail. A tuple-
 unpacking bug in NamespaceStore._open made every segment replay throw,
 get swallowed, and the handler itself NameError - so node loss silently
 reduced a namespace to its WAL tail while metrics counted 'parse errors'.

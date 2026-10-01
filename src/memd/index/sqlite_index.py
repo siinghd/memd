@@ -1,4 +1,4 @@
-"""Derived index for one namespace (ADR-5): indexes are rebuildable views.
+"""Derived index for one namespace: indexes are rebuildable views.
 
 Backing: SQLite (WAL mode) providing
   - BM25 via FTS5 (tantivy-class sparse retrieval without a second service)
@@ -202,7 +202,7 @@ class NamespaceIndex:
         self.exact_max_vectors = 2000
         self.vector_lane_skipped = 0
         self._vcount = (0, -1e18)  # (vectors, monotonic time counted)
-        # Hard-deleted text must not survive in this file (D7): zero every
+        # Hard-deleted text must not survive in this file: zero every
         # freed cell and page, and keep the freelist vacuumable (auto_vacuum
         # only takes effect before the first table exists - see scrub()).
         self._con.execute("PRAGMA secure_delete=ON")
@@ -903,7 +903,7 @@ class NamespaceIndex:
     SCRUB_WARN_EVERY_S = 60.0
 
     def scrub(self) -> bool:
-        """Remove what deleted rows left behind in the FILE (D7).
+        """Remove what deleted rows left behind in the FILE.
 
         Deleting a row is not erasing its text: FTS5 keeps a deleted row's
         terms in its older segments until they merge, pages freed before
@@ -1913,8 +1913,8 @@ class NamespaceIndex:
 
     def records_missing_embedding(self, model: str, limit: int = 100_000) -> list[MemoryRecord]:
         """Live, currently-valid records with no vector or an outdated
-        embedding_version - the worklist for the re-embedding batch job
-        (ADR-8). Quarantined records are excluded: never pre-arm unreviewed
+        embedding_version - the worklist for the re-embedding batch job.
+        Quarantined records are excluded: never pre-arm unreviewed
         content for retrieval. Deleted/superseded rows are excluded too:
         embedding budget must not be spent on state no default-view query
         can ever see."""
@@ -1968,8 +1968,8 @@ class NamespaceIndex:
         """Exact-session raw records for segment-close extraction. Unlike
         query visibility (which includes ancestor-scope rows), a session
         boundary must sweep ONLY that session's own writes - NEVER
-        quarantined ones (extraction is gate 2 of the poisoning defense,
-        D7 #4), and - when a user binding is supplied - only rows bound to
+        quarantined ones (extraction is gate 2 of the poisoning defense),
+        and - when a user binding is supplied - only rows bound to
         that user (blocks cross-user session-id injection)."""
         with self._lock:
             total = self._con.execute(

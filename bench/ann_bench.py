@@ -52,7 +52,8 @@ from memd.engine.memory import Memory  # noqa: E402
 from memd.index.sqlite_index import IndexFilter  # noqa: E402
 from memd.query.planner import plan_query  # noqa: E402
 
-DEFAULT_TURNS = "/tmp/claude-1000/prof-corpus/turns.jsonl"
+# LongMemEval turns, one JSON object per line with "content"
+DEFAULT_TURNS = os.path.join(os.path.expanduser("~"), ".cache", "memd", "longmemeval", "turns.jsonl")
 WORDS = ("kumquat mango orchard ferry harbor violin rehearsal passport visa dentist invoice "
          "mortgage marathon blister recipe sourdough telescope nebula keyboard firmware bicycle "
          "gardening compost tomato basil espresso grinder thermostat boiler insurance premium "

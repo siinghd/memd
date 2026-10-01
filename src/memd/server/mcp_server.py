@@ -1,4 +1,4 @@
-"""MCP server (D4 §4.3): `memd serve --mcp`
+"""MCP server: `memd serve --mcp`
 
 Exactly four tools (small surfaces get used correctly):
     memory_search(query, budget_tokens?) -> packed, provenance-tagged context

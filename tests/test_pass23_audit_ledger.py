@@ -1,7 +1,7 @@
 """Pass 16 regression: the audit ledger's ownership, open cost and chain.
 
-Three defects, all in D7 control #7 (the hash-chained, SIEM-exportable audit
-log), all confirmed by reproduction before the fix:
+Three defects, all in the hash-chained, SIEM-exportable audit log, all
+confirmed by reproduction before the fix:
 
  1. TENANCY. `self.audit` was bound to the facade's DEFAULT namespace, so a
     facade serving many namespaces (exactly what the REST door does - every

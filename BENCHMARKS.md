@@ -1,6 +1,6 @@
 # memd benchmarks (v0.2.0)
 
-All numbers below come from logged, pre-registered experiments in the memd research lab (a separate repository, not bundled here)
+All numbers below come from logged, pre-registered experiments kept in a separate research repository (not bundled here)
 (`experiments/NNN-*`, each with a PLAN written before running, a negative control, 3 disjoint question
 folds, and a hostile review). Nothing here is from memd's own synthetic suite.
 
@@ -78,7 +78,7 @@ Stratified 120-question sample (all 6 question types + abstention). Reader `open
 
 | context given to the reader | accuracy | mean context tokens | exp |
 |---|---|---|---|
-| memd v0.2 packed context (no reranker; lab build before the patch-3 fusion change) | 0.692 ± 0.029 | 3.8K | 018 |
+| memd v0.2 packed context (no reranker; a pre-release build, before a later fusion change) | 0.692 ± 0.029 | 3.8K | 018 |
 | + Jev rerank, top-k | 0.783 ± 0.014 | 3.1K | 018 |
 | + Jev probability-gated packing (100-candidate shortlist) | 0.792 ± 0.014 | 2.3K | 018 |
 

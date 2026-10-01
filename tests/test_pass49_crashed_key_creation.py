@@ -87,7 +87,7 @@ def test_a_crash_after_creating_a_key_file_is_reported_never_replaced(tmp_path, 
     path = os.path.join(d, "root.key" if which == "root" else "ns-alpha.key")
     assert os.path.exists(path) and _size(path) == 0, "precondition: the crash left it empty"
     # young or old, an empty key file is reported and never replaced: memd
-    # cannot tell a crashed creation from a truncated key (a verifier showed
+    # cannot tell a crashed creation from a truncated key (a review showed
     # an automatic replacement of an empty root.key orphaning every
     # namespace's key)
     for age in (0, 3600):
@@ -171,7 +171,7 @@ def test_a_failed_in_place_write_leaves_no_empty_key_file(tmp_path, monkeypatch,
 
 
 def test_an_empty_root_key_is_never_replaced_while_wrapped_keys_exist(tmp_path):
-    # the verifier's case: a truncated root.key, aged, then a NEW namespace
+    # the review's case: a truncated root.key, aged, then a NEW namespace
     d = str(tmp_path / "keys")
     env = LocalKeyEnvelope(d)
     blob = env.encrypt("old", b"precious")

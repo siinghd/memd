@@ -1,4 +1,4 @@
-"""Budget-aware packing (D3 §3.5 step 4).
+"""Budget-aware packing.
 
 Rules:
   - dedupe by lineage: never pack a fact AND the raw record it was extracted
@@ -6,10 +6,10 @@ Rules:
   - order by relevance x recency x trust on the exact score, recency
     measured against as_of or the newest candidate (never the wall clock),
     ties broken by t_event then a content hash - identical data always packs
-    in the identical order (KV-cache friendly, D3 §3.7)
+    in the identical order (KV-cache friendly)
   - cut at token budget; emit with per-item provenance tags
-  - untrusted items (tool/web/import) render inside data-fencing markup
-    (D7 control #2) - never as instruction-position text
+  - untrusted items (tool/web/import) render inside data-fencing markup -
+    never as instruction-position text
   - with a reranker, the reranked shortlist leads in the reranker's order
     (its score replaces the fused score; the recency tilt still applies),
     then the rest in fused order
@@ -113,7 +113,7 @@ def _packed_item(r: MemoryRecord, score: float, lanes: list[str]) -> PackedItem:
 
 def _lineage_sets(records) -> tuple[set[str], set[str]]:
     """(raw ids a packed fact was extracted from, raw ids demoted by
-    supersedence) - evidence that must not be packed twice (D3 §3.6)."""
+    supersedence) - evidence that must not be packed twice."""
     lineage: set[str] = set()
     demoted: set[str] = set()
     for r in records:
@@ -140,7 +140,7 @@ def pack_context(
         now = max((it.record.time.t_event for it in fused), default=0)
     # lineage dedupe: drop raw records whose producing fact is already packed,
     # plus raw evidence demoted by supersedence (fact.meta.demotes) - the
-    # stale source turns of updated facts never crowd the budget (D3 §3.6)
+    # stale source turns of updated facts never crowd the budget
     packed_fact_lineage, demoted_lineage = _lineage_sets(it.record for it in fused)
     scored: list[tuple[float, FusedItem]] = []
     reranked: list[tuple[float, int, FusedItem]] = []
@@ -205,10 +205,10 @@ def pack_gated(
     header: str = DEFAULT_HEADER,
 ) -> PackedContext:
     """Gated evidence packing - EXPERIMENTAL, opt-in (pack_mode="gated").
-    Lab 018: equal QA accuracy to a fixed top-k at 27% fewer context tokens
-    with a calibrated judge over a 100-candidate shortlist; over the
-    product's top-30 it drops second evidence sessions (lab 020/021: session
-    recall_all@5 0.803 vs 0.928 for the same reranker packed ranked).
+    Experiment 018: equal QA accuracy to a fixed top-k at 27% fewer context
+    tokens with a calibrated judge over a 100-candidate shortlist; over the
+    product's top-30 it drops second evidence sessions (experiments 020/021:
+    session recall_all@5 0.803 vs 0.928 for the same reranker packed ranked).
 
     `kept` (from gate_candidates) is packed in reranker order, each item
     with its neighbouring turns (`neighbours[id]`, already scope-filtered),

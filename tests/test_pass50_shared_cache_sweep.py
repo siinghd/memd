@@ -1,7 +1,7 @@
-"""Pass 50: a cache sweep never deletes files another process serves from (D7).
+"""Pass 50: a cache sweep never deletes files another process serves from.
 
 Several processes may share one local cache directory (local_dir), each
-serving its own namespaces from it. The stale-cache sweep (K9) dropped a
+serving its own namespaces from it. The stale-cache sweep (pass 44) dropped a
 namespace's copy when it was superseded and "no other process has it open"
 - a check, then the delete: a process that opened the namespace in between
 lost its live files (fu2-verify/sweep/shared_race.py: A1's sweep checked

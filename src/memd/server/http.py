@@ -1,4 +1,4 @@
-"""REST server (D4 §4.1) - the substrate; SDK and MCP are thin over it."""
+"""REST server - the substrate; SDK and MCP are thin over it."""
 from __future__ import annotations
 
 import logging
@@ -240,7 +240,7 @@ def create_app(
 
     `cluster` (a memd.server.cluster.ClusterConfig; `memd serve --node-id`)
     makes this process one node of a fleet on one s3:// data root: requests
-    for a namespace another node holds are proxied there (ADR-12).
+    for a namespace another node holds are proxied there.
     `state_dir` (default MEMD_STATE_DIR, else `data_dir`) holds the server's
     own state - keys.toml.json and the hosted admin database. Cluster nodes
     must share it (hosted: one admin database for the fleet)."""
@@ -272,7 +272,7 @@ def create_app(
     limiter = RateLimiter()
     failures = FailureLimiter()
     # tenancy-level ceiling: per-KEY budgets alone let a tenant multiply its
-    # quota by minting more keys, which defeats D6 noisy-neighbour containment
+    # quota by minting more keys, which defeats noisy-neighbour containment
     ns_limiter = RateLimiter()
     ns_rate_limit_per_min = int(os.environ.get("MEMD_NS_RATE_LIMIT_PER_MIN", "3000"))
     # heavy maintenance endpoints get a separate small budget: they are
@@ -516,7 +516,7 @@ def create_app(
 
         Charging the key alone made a tenant's effective quota scale with how
         many keys it minted: ten keys, ten times the budget, and the
-        noisy-neighbour containment D6 asks for evaporates. The namespace
+        noisy-neighbour containment it exists for evaporates. The namespace
         bucket is the tenancy-level ceiling; the key bucket still contains a
         single runaway client inside a tenant."""
         # labelled with the key's AUTHORIZED namespace, never the path's: this
@@ -541,7 +541,7 @@ def create_app(
 
     def apply_scope(p: Principal, body_user: str | None, body_session: str | None):
         """Scope pinning: a user-pinned key cannot widen its scope. Cross-user
-        reads require explicit scope_override capability (D7 #6)."""
+        reads require explicit scope_override capability."""
         user = body_user or p.pinned_user
         if body_user and p.pinned_user and body_user != p.pinned_user and not p.scope_override:
             raise HTTPException(403, "key pinned to another user (scope_override required)")
@@ -585,7 +585,7 @@ def create_app(
     @app.post("/v1/ns/{ns}/memories", status_code=201)
     def post_memory(ns: str, body: MemoryIn, p: Principal = Depends(auth)):
         user, _ = apply_scope(p, body.user_id, body.session_id)
-        # Trust-tier spoofing guard (D7 #1/#2): API keys are agent
+        # Trust-tier spoofing guard: API keys are agent
         # credentials - they cannot mint USER-tier facts by assertion.
         # Only scope_override-capable principals claim human tier.
         source = body.source
@@ -649,7 +649,7 @@ def create_app(
         got = engine.get(record_id, history=history, include_deleted=include_deleted, namespace=ns)
         if got is None:
             raise HTTPException(404, "not found")
-        # user-pinned keys must not read other users' records by id (D7 #6);
+        # user-pinned keys must not read other users' records by id;
         # 404 rather than 403 so existence isn't revealed
         rec_scope = got.get("scope") or {}
         if p.pinned_user and not p.scope_override and rec_scope.get("user") not in (None, p.pinned_user):
@@ -658,7 +658,7 @@ def create_app(
 
     @app.delete("/v1/ns/{ns}/memories/{record_id}")
     def delete_memory(ns: str, record_id: str, hard: bool = False, p: Principal = Depends(auth)):
-        # a hard delete of a soft-deleted record is how its text gets purged (D7)
+        # a hard delete of a soft-deleted record is how its text gets purged
         existing = engine.get(record_id, include_deleted=hard, namespace=ns)
         if existing is None:
             raise HTTPException(404, "not found")
@@ -772,7 +772,7 @@ def create_app(
 
     @app.post("/v1/ns/{ns}/reembed")
     def reembed(ns: str, p: Principal = Depends(auth)):
-        """Rebuild the vector lane from raw (ADR-8).
+        """Rebuild the vector lane from raw.
 
         Restoring segments onto a node without the derived index cache replays
         every record but zero vectors, so retrieval runs with one of its four

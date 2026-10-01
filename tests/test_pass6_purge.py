@@ -1,5 +1,5 @@
 """Pass-6 fixes: the hard-delete physical-purge deadline must be SELF-
-enforcing (D7 #8), not dependent on an operator calling /compact.
+enforcing, not dependent on an operator calling /compact.
 Attack = write a record, hard-delete it, let the deadline pass, then do
 ordinary work - the bytes must be gone from durable storage with zero
 manual intervention. Also: undue purges must NOT fire early, and embed

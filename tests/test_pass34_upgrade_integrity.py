@@ -1,6 +1,6 @@
 """Pass 34: upgrades, downgrades and the bulk read paths keep acked deletes deleted.
 
-A verifier ran randomized crash runs against a model oracle. Durability of
+A review ran randomized crash runs against a model oracle. Durability of
 the current format held; compatibility and some older paths did not:
 
   - format-1 WAL frames carry no seq, and the old seq counter was rebuilt

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The literal 10-minute story (D4 §4.4), CI-enforced:
+# The literal 10-minute story (README-engine.md), CI-enforced:
 # fresh directory -> working engine -> cross-session recall across restart.
 set -euo pipefail
 

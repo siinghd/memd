@@ -513,7 +513,7 @@ def test_write_path_is_not_blocked_by_the_indexer(tmp_path):
         m.close()
 
 
-# ------------------------------------------------------------ v0.2.0 verifier regressions
+# ------------------------------------------------------------ v0.2.0 review regressions
 
 def _rowid(m: Memory, rid: str) -> int:
     with m.ns.index._read() as c:

@@ -1,4 +1,4 @@
-"""Optional usearch ANN sidecar for the vector lane (`memd[ann]`, decision D6).
+"""Optional usearch ANN sidecar for the vector lane (`memd[ann]`).
 
 The vector lane was an exact flat scan over a cached float32 matrix: perfect
 recall, O(N) per query and 4 bytes x dim x N of RAM, with a documented
@@ -6,7 +6,7 @@ ceiling around 50K vectors per namespace. This module keeps an HNSW index
 (usearch, Apache-2.0; >= 2.25, earlier versions slowed ~90x on ascending
 sparse integer keys) beside the SQLite index as a DERIVED view, the way the
 tantivy accelerator sits beside FTS5. LanceDB was rejected: its deletes are
-markers, with weak physical-purge guarantees (D7).
+markers, with weak physical-purge guarantees.
 
 Selection (`vector_index` / MEMD_VECTOR_INDEX = auto | flat | usearch):
 auto uses the sidecar when usearch is importable AND the namespace holds at
@@ -73,9 +73,9 @@ Contract - SQLite (the vectors and records tables) stays the source of truth:
     While the sidecar is loading or rebuilding, a namespace over
     `flat_max_vectors` never loads the exact scan's float32 matrix (see
     NamespaceIndex.search_vector).
-  - D7: usearch `remove` only marks an entry; its bytes stay in RAM and in
-    the next save. A hard-delete purge therefore deletes the files at once
-    and rebuilds from SQLite (where the row is already gone); no save is made
+  - Hard delete: usearch `remove` only marks an entry; its bytes stay in RAM
+    and in the next save. A hard-delete purge therefore deletes the files at
+    once and rebuilds from SQLite (where the row is already gone); no save is made
     until that rebuild is done, so no purged vector reaches a file again.
   - queries (NamespaceIndex.search_vector): usearch top-(k x `ann_overfetch`),
     widened once, then the SAME SQL filter and _passes_filter post-check as
@@ -792,7 +792,7 @@ class UsearchSidecar:
         """(apply lock held) What a save of the live index at a COMMITTED
         vec_wm needs - `wm` when the caller just committed and read it, else
         now: (bytes or None, index, meta). None when nothing may be saved (not
-        ready, or a purge whose rebuild has not finished - D7) or the file is
+        ready, or a purge whose rebuild has not finished) or the file is
         already current. An empty index: (None, None, meta) - its files go."""
         if wm is None:
             with self.index._lock:
@@ -826,7 +826,7 @@ class UsearchSidecar:
             if not self._may_touch_files(final):
                 return False
             if int(meta["scrub_seq"]) < self._scrub_known:
-                return False  # a purge since: its vectors never reach a file (D7)
+                return False  # a purge since: its vectors never reach a file
             if self._file and self._saved_wm is not None and self._saved_wm >= int(meta["wm"]):
                 return True   # a newer save already landed
             t0 = time.monotonic()
@@ -1341,7 +1341,7 @@ class UsearchSidecar:
         return True
 
     def purged(self, scrub_seq: int) -> int:
-        """A hard-delete purge ran (D7). `remove` only marked the purged
+        """A hard-delete purge ran. `remove` only marked the purged
         vectors, so the files may hold their bytes: delete them now, refuse
         saves until the rebuild from SQLite (already without those rows) is
         done, and start it. Returns the build ticket."""

@@ -57,7 +57,7 @@ from memd.storage.objectstore import LocalObjectStore, count_io
 _log = logging.getLogger(__name__)
 
 DEFAULT_BUDGET_TOKENS = 2000
-HARD_DELETE_PURGE_MS = 72 * 3600 * 1000  # D7 #8 default physical-purge window
+HARD_DELETE_PURGE_MS = 72 * 3600 * 1000  # default physical-purge window for hard deletes
 
 
 @dataclass
@@ -91,8 +91,9 @@ class SearchResult:
 
 @dataclass
 class SessionTaint:
-    """D7: explicit writes inherit the session's lowest ingested trust tier -
-    an agent processing web content cannot mint user-tier facts from it."""
+    """Session taint: explicit writes inherit the session's lowest ingested
+    trust tier - an agent processing web content cannot mint user-tier facts
+    from it."""
     min_tier: int = 5
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -183,7 +184,7 @@ class _EmbedWorker:
     write burst (e.g. BYO API outage), submit() drops the embedding work for
     the overflow instead of buffering unbounded content strings in RAM - the
     record stays fully searchable via BM25/entity lanes and the vector lane
-    heals via reembed() (the ADR-8 degradation story, now memory-safe)."""
+    heals via reembed() (graceful degradation, now memory-safe)."""
 
     def __init__(self, embedder: Embedder, apply_fn, batch_size: int = 32, flush_s: float = 0.5,
                  max_retries: int = 3, max_queue: int = 5_000,
@@ -392,8 +393,8 @@ class ForgetPreviewMismatch(Exception):
 class _MaintenanceWorker:
     """Background runner for namespace-scale maintenance.
 
-    D2 is explicit: "Per-write maintenance scope: O(entity cluster), never
-    O(namespace)". Due hard-delete purges violated that by running
+    The SLOs are explicit: "Per-write maintenance scope: O(entity cluster),
+    never O(namespace)". Due hard-delete purges violated that by running
     `ns.compact()` INLINE on the writer's thread - compaction reads every live
     record and rewrites the whole live set, so the first ordinary write after
     a purge deadline came due paid 8131ms at 200K records (vs ~3ms for the
@@ -401,7 +402,7 @@ class _MaintenanceWorker:
     mode that write holds the namespace lock, stalling every concurrent
     request on the tenant.
 
-    The compliance guarantee (D7 #8) is unchanged: the purge still happens
+    The compliance guarantee is unchanged: the purge still happens
     with no operator intervention, and is still proven by a metric plus an
     audit entry - it just no longer happens on a caller's latency path.
     Work is deduped per namespace; flush()/close() drain it.
@@ -553,12 +554,12 @@ def resolve_pack_mode(config: dict | None) -> str:
     """config["pack_mode"] (or env MEMD_PACK_MODE): "auto" | "ranked" |
     "gated". "auto" means ranked, for every reranker.
 
-    "gated" is an EXPERIMENTAL opt-in for token savings. In the lab it
+    "gated" is an EXPERIMENTAL opt-in for token savings. In an experiment it
     matched top-k QA accuracy at 27% fewer tokens, but over a 100-candidate
     shortlist; over the product's top-30 it DROPS second evidence sessions:
     Jev + gated scored session ndcg@5 0.906 / recall_all@5 0.803 on
     LongMemEval_S dev (below no reranker's 0.835 recall_all@5), while Jev +
-    ranked scored 0.955 / 0.928 (lab 020/021)."""
+    ranked scored 0.955 / 0.928 (experiments 020/021)."""
     cfg = config or {}
     mode = str(cfg.get("pack_mode") or os.environ.get("MEMD_PACK_MODE") or "auto").strip().lower()
     if mode not in PACK_MODES:
@@ -610,7 +611,7 @@ class Memory:
             #     snapshot is what makes a cold node cheap), and
             #   - envelope keys WITH THE DEFAULT `local` KEY PROVIDER, which
             #     makes this "one node with remote durability". A remote
-            #     provider (key_provider="aws-kms" | "vault-transit", ADR-12)
+            #     provider (key_provider="aws-kms" | "vault-transit")
             #     keeps the wrapped keys in the bucket instead, and then any
             #     authorised node can serve any namespace.
             from memd.storage.s3store import S3ObjectStore
@@ -637,7 +638,7 @@ class Memory:
         remote = store is not None
         if store is None:
             store = LocalObjectStore(os.path.join(path, "store"))
-        # ADR-12: who holds the root key. `local` (default) keeps it in a file
+        # Key custody: who holds the root key. `local` (default) keeps it in a file
         # under <path>/keys exactly as before; a remote provider (aws-kms,
         # vault-transit) keeps wrapped data keys as objects in `store`, so any
         # node authorised on the provider can open any namespace. (With
@@ -659,7 +660,7 @@ class Memory:
                                     vector_index=vector_index_config(cfg, self.vector_index),
                                     cache_sweep_s=cfg.get("cache_sweep_s"))
         self.namespace_name = namespace
-        # D7 #7 ledgers are PER NAMESPACE. They are held in an LRU keyed by
+        # Audit ledgers are PER NAMESPACE. They are held in an LRU keyed by
         # namespace (mirroring the engine's namespace table) and routed by the
         # OPERATION's target namespace - see _audit_for(). Set up before any
         # namespace opens: opening one can already produce audit events
@@ -670,7 +671,7 @@ class Memory:
         self._audits: "OrderedDict[str, BufferedAuditLog]" = OrderedDict()
         # Namespaces crypto-shredded by this process. An audit append encrypts
         # its payload, and encrypting for a shredded namespace MINTS A FRESH
-        # DATA KEY - resurrecting what D7 #9 just destroyed. Pass 16 dropped
+        # DATA KEY - resurrecting what the crypto-shred just destroyed. Pass 16 dropped
         # the ledger on destroy, but any later _audit_for() rebuilt it: a
         # compaction whose audit entry lands after the destroy (the pass-22
         # snapshot widened that window) was enough. Bounded; cleared when the
@@ -700,7 +701,7 @@ class Memory:
         # Privacy: search queries are user content. Audit stores a short hash
         # by default (correlation without exposure); opt in to text for debug.
         self._audit_query_text = bool(cfg.get("audit_query_text", False))
-        # D7 #8: physical-purge window for hard deletes (hosted compliance
+        # Physical-purge window for hard deletes (hosted compliance
         # tiers may tighten it; the deadline is self-enforced, see
         # _enforce_purge_deadlines)
         self._purge_deadline_ms = int(cfg.get("hard_delete_deadline_ms", HARD_DELETE_PURGE_MS))
@@ -712,7 +713,7 @@ class Memory:
         self._embed_close_drain_s = float(cfg.get("embed_close_drain_s", 30.0))
         self._embed_flush_drain_s = float(cfg.get("embed_flush_drain_s", 60.0))
         self._maint = _MaintenanceWorker(self._run_maintenance)
-        # D7 #8 at open, too: a purge that came due while the process was down
+        # Purge deadlines at open, too: a purge that came due while the process was down
         # - or one the format-1 migration recovered from the audit ledger, due
         # at once - is scheduled as the namespace opens, not left on disk
         # until the next write there happens to check the deadline
@@ -1185,7 +1186,7 @@ class Memory:
             ("entity", lambda: ns.index.search_by_entity_tokens(tokens, filt, limit=20)),
         ]
         if plan.use_time_lane:
-            # the documented third fan-out (D3 architecture: time/entity btree
+            # the documented third fan-out (time/entity btree
             # scan). It returns the newest rows REGARDLESS of the query, so it
             # runs only on recency intent or an explicit time bound: invoked
             # unconditionally it injected query-independent rows into fusion
@@ -1198,7 +1199,7 @@ class Memory:
             lane_hits[lane_name] = lane_fn()
             METRICS.observe("memd_lane_ms", (time.monotonic() - _lt0) * 1000,
                             help="per-lane candidate fetch duration (ms)", ns=ns.namespace, lane=lane_name)
-        # graceful degradation (ADR-8): if the embedder is unreachable
+        # graceful degradation: if the embedder is unreachable
         # (BYO-key API outage) or its model is still loading in the embed
         # worker, BM25 + entity lanes still serve - retrieval degrades, it
         # never dies, and it never waits on a model load. The hash embedder's
@@ -1577,11 +1578,11 @@ class Memory:
         kept_recs = [r for res in results for r in res.kept]
         # lineage demotion: a fact that supersedes another carries the old
         # fact's raw lineage in meta.demotes - packing then skips that stale
-        # raw evidence (demotion, not deletion; D3 §3.6)
+        # raw evidence (demotion, not deletion)
         superseded_all = [p for res in results for p in res.superseded_pairs]
         # lineage demotion: a fact that supersedes another carries the old
         # fact's raw lineage in meta.demotes - packing then skips that stale
-        # raw evidence (demotion, not deletion; D3 §3.6)
+        # raw evidence (demotion, not deletion)
         old_fact_cache: dict[str, MemoryRecord | None] = {}
         for r in kept_recs:
             demoted: set[str] = set()
@@ -1670,7 +1671,7 @@ class Memory:
         return len(ids)
 
     def _enforce_purge_deadlines(self, ns) -> bool:
-        """Self-enforce the physical-purge guarantee (D7 #8) OFF the caller's
+        """Self-enforce the physical-purge guarantee OFF the caller's
         thread: when a scheduled hard delete comes due, schedule the
         compaction that erases it. Cheap no-op otherwise (one bounded list
         scan). See _MaintenanceWorker for why this must not run inline."""
@@ -1907,7 +1908,7 @@ class Memory:
         # The shredded namespace's ledger was encrypted under a data key that
         # no longer exists: its buffered tail is undecryptable, and appending
         # to it would re-create BOTH the object and a fresh data key beneath a
-        # crypto-shredded namespace (D7 #9). Drop it without flushing.
+        # crypto-shredded namespace. Drop it without flushing.
         with self._audit_lock:
             self._audits.pop(name, None)
             self._shredded[name] = None
@@ -1919,7 +1920,7 @@ class Memory:
         METRICS.inc("memd_destroys_total", ns=name)
         # destroy is an ADMINISTRATIVE act on the engine, so it lands in the
         # facade's own ledger - never in the ledger of the namespace just
-        # shredded. It records what the key provider did (ADR-12): the wrapped
+        # shredded. It records what the key provider did: the wrapped
         # key deleted, and any KMS-side disable / scheduled deletion
         env = self.engine.envelope
         shred = env.destroy_report(name) if env is not None and hasattr(env, "destroy_report") else {}
@@ -2127,7 +2128,7 @@ class Memory:
         ns.index.set_vectors(list(ids), [vecs[i] for i in range(len(ids))], self.embedder.name)
 
     def reembed(self, *, namespace: str | None = None, batch_size: int = 256) -> dict:
-        """Batch re-embedding job (ADR-8): rebuild the vector lane from raw.
+        """Batch re-embedding job: rebuild the vector lane from raw.
 
         Needed after restoring segments onto a machine without the derived
         index cache, after switching embedder models, or whenever records

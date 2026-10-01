@@ -1,8 +1,8 @@
 """S3-compatible ObjectStore (AWS S3, Cloudflare R2, MinIO, Ceph).
 
-ADR-2 says object storage is the source of truth from the first byte. Until
-now the only implementation was the local filesystem, so every hosted claim in
-D2 was unevidenced by construction. This is that backend.
+memd's design makes object storage the source of truth from the first byte.
+Until now the only implementation was the local filesystem, so every hosted
+SLO was unevidenced by construction. This is that backend.
 
 THE ONE HARD PART: S3 has no append.
 
@@ -19,7 +19,7 @@ designs were possible:
       concatenation of the whole object at `<key>` plus its parts.
 
 This implements (b). One append = one PUT = one durable ack, which is exactly
-the shape D2's hosted write-ack row cites, and it makes torn frames
+the shape the hosted write-ack SLO assumes, and it makes torn frames
 structurally impossible: a part either exists whole or does not exist.
 
 `open_log()` is deliberately NOT overridden. The engine's group-commit
@@ -348,7 +348,7 @@ class S3ObjectStore(ObjectStore):
                 f"{self._full(key)}{_PART_SEP}{hint_seq - 1:0{_PART_WIDTH}d}") is None:
             # The part the hint counts up to is gone: the prefix it sums was
             # deleted after it was written (a writer that lost its lease and
-            # resumed wrote it late, ADR-12). Rescan - but never let the
+            # resumed wrote it late). Rescan - but never let the
             # numbering go back below the hint's.
             seq, size = self._seed_seq_full(key)
             return max(seq, hint_seq), size
@@ -893,7 +893,7 @@ class S3ObjectStore(ObjectStore):
     # The lease object `ns/<ns>/.owner` holds "<holder>\n<wall-clock stamp>".
     # Every write of it after the first is a COMPARE-AND-SWAP on its ETag
     # (If-Match): renewals, refreshes and stale reclaims alike. Read-then-put
-    # left two holes a multi-node fleet hits for real (ADR-12):
+    # left two holes a multi-node fleet hits for real:
     #   - two nodes reclaiming one stale lease both "won" (last PUT wins, the
     #     first keeps writing until its next beat notices), and
     #   - a holder that stalled between reading its lease and renewing it
@@ -1158,7 +1158,7 @@ class S3ObjectStore(ObjectStore):
         This is deliberately a lease, not a distributed lock. Correctness
         leans on the TTL and self-fencing (see above) plus conditional part
         creation in append(); a correct multi-writer protocol (manifest CAS
-        on ETag) is a larger design and is deferred (ADR-12 item 4).
+        on ETag) is a larger design and is deferred.
         """
         key = self._owner_key(namespace)
         t0 = time.monotonic()

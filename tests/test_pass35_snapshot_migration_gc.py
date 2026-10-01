@@ -1,6 +1,6 @@
 """Pass 35: a stale index snapshot, an interrupted migration and crash orphans.
 
-A verifier's crash oracle and upgrade kill-matrix found:
+A review's crash oracle and upgrade kill-matrix found:
 
   - the index snapshot was installed whenever it was newer than the last
     purge, ignoring the compaction after it. A compaction retires the
@@ -360,7 +360,7 @@ os._exit(0)
 
 
 def test_a_kill_at_every_write_of_the_migrating_open_ends_where_one_run_does(tmp_path):
-    """The verifier's kill matrix: SIGKILL-equivalent at each durable
+    """The review's kill matrix: SIGKILL-equivalent at each durable
     mutation of the migrating open (before and after it lands), then a
     restart on the node's cache, then a cold node - always the uninterrupted
     result, which keeps what the old index proves."""

@@ -1,4 +1,4 @@
-# memd multi-node (ADR-12) on one host: MinIO + 3 memd nodes, optional Vault.
+# memd multi-node on one host: MinIO + 3 memd nodes, optional Vault.
 #
 # Any node serves any namespace (requests are proxied to the node holding
 # the namespace's writer lease); kill one and its namespaces move within the

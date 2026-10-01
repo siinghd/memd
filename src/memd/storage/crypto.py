@@ -1,11 +1,11 @@
-"""Per-namespace envelope encryption (D7 control #9).
+"""Per-namespace envelope encryption.
 
 Namespace = key scope. Every namespace has its own 256-bit data key (DEK);
 the DEK is stored only WRAPPED by a root key the process does not keep on
 disk next to the data. Deleting a namespace destroys its wrapped DEK:
 crypto-shred.
 
-Who holds the root key is a `KeyProvider` (ADR-12):
+Who holds the root key is a `KeyProvider`:
 
   local          a root key FILE beside the data (`<data>/keys/root.key`);
                  wrapped DEKs are files too. Today's behaviour and the
@@ -474,7 +474,7 @@ class LocalKeyEnvelope(KeyEnvelope):
     """Root key + per-namespace wrapped keys under {root}/keys/ (the `local`
     KeyProvider: LocalKeyProvider over the root key file).
 
-    Threat model (documented honestly per D7): protects data at rest on the
+    Threat model (documented honestly): protects data at rest on the
     volume and makes crypto-shred possible; not protection against a user
     with full filesystem read access on the same machine.
 

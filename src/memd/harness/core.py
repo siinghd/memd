@@ -1,4 +1,4 @@
-"""Harness core (D5): frozen configs, version hash, adapters, metrics.
+"""Harness core: frozen configs, version hash, adapters, metrics.
 
 Every result embeds HARNESS_VERSION - the content hash of the harness
 package. Quality and cost are emitted together; the gate fails on accuracy
@@ -163,7 +163,7 @@ class MemdAdapter(SystemAdapter):
 
 
 class FullContextAdapter(MemdAdapter):
-    """The Phase-1 baseline to beat: stuff everything into context.
+    """The baseline to beat: stuff everything into context.
     Accuracy ceiling at ~100x the token cost."""
 
     name = "full-context"

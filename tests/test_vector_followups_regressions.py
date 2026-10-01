@@ -10,7 +10,7 @@
    with no lock held. A hard-delete purge that ran meanwhile could not
    truncate the WAL past that reader within the busy timeout, gave up, and
    left the erased text and vector bytes in the local SQLite file until the
-   next open (D7).
+   next open.
 """
 import os
 import threading

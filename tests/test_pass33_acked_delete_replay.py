@@ -289,7 +289,7 @@ class TestFullReplayIsExact:
 
     def test_undue_hard_delete_may_keep_bytes_but_never_visibility(self, make_engine):
         """A not-yet-due hard delete may leave the bytes in the folded segment
-        until the deadline (D7), but replaying that segment must not serve
+        until the deadline, but replaying that segment must not serve
         the record - and a later re-add of the id must still win."""
         root, make = make_engine
         e = make()

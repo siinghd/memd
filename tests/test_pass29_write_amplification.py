@@ -1,6 +1,6 @@
 """Pass 21 regression: durable bytes per raw byte.
 
-Measured against D2's write-amplification SLO: 7.29x at 800-byte records and
+Measured against the write-amplification SLO: 7.29x at 800-byte records and
 48.08x at 90-byte records, with the vector lane fully materialized. Two of the
 copies were pure waste:
 
@@ -12,8 +12,8 @@ copies were pure waste:
 
 The rest is inherent: one dense vector per record is a FIXED cost, so a flat
 <=3x bar stated per RAW byte is unreachable below ~4KB records at any
-embedding dimension. D2 was amended accordingly (see 02-slos.md); this file
-guards the engineering half of that ruling.
+embedding dimension. The SLO was amended accordingly; this file guards the
+engineering half of that ruling.
 """
 import os
 import sqlite3
@@ -133,7 +133,7 @@ def test_recall_survives_the_byte_reductions(tmp_path):
 def test_write_amplification_meets_the_amended_bar(tmp_path, size, ceiling):
     """Guards the byte reductions, not the SLO itself.
 
-    D2's bar is stated at >=10K records, where this engine reads 5.02x at 800B
+    The SLO's bar is stated at >=10K records, where this engine reads 5.02x at 800B
     and 2.80x at 4KB. This test runs a 3K corpus (fixed costs have not
     amortized yet, so the ratio reads higher) and asserts ceilings calibrated
     there: 6.05x/3.39x measured now against 7.95x/4.60x before pass 21, so the

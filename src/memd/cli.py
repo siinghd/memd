@@ -20,7 +20,7 @@ def _cmd_serve(args) -> int:
     host = args.host or os.environ.get("MEMD_HOST", "127.0.0.1")
     port = args.port or int(os.environ.get("MEMD_PORT", "8700"))
     # --node-id (or MEMD_NODE_ID): one node of a fleet on one s3:// data
-    # root, routing each namespace to the node holding its lease (ADR-12).
+    # root, routing each namespace to the node holding its lease.
     # A single server never imports the cluster module.
     cluster = None
     if args.node_id or os.environ.get("MEMD_NODE_ID"):
@@ -239,7 +239,7 @@ def _import_native(records_in: list[dict], args, ns_name: str) -> int:
 
 def _cmd_import(args) -> int:
     """Importers map onto the explicit lane with provenance.source=import
-    and t_event preserved (gap accepted in D4 §4.5: no lineage)."""
+    and t_event preserved (a known gap: no lineage)."""
     import os as _os
 
     from memd.core.schema import Kind, MemoryRecord, Scope, Source
@@ -340,7 +340,7 @@ def _cmd_import(args) -> int:
 
 
 def _cmd_reindex(args) -> int:
-    """Re-embedding batch job (ADR-8): rebuild the vector lane from raw."""
+    """Re-embedding batch job: rebuild the vector lane from raw."""
     from memd.engine.memory import Memory
 
     mem = Memory(args.data, namespace=args.namespace)
@@ -427,7 +427,7 @@ def _keys_store(data: str):
 
 
 def _cmd_keys(args) -> int:
-    """`memd keys status|migrate|rotate`: data-key custody (ADR-12).
+    """`memd keys status|migrate|rotate`: data-key custody.
 
     migrate --to aws-kms|vault-transit re-wraps every namespace's LOCAL data
     key under the remote provider. The data key itself does not change, so
@@ -660,7 +660,7 @@ def main(argv=None) -> int:
     imp.add_argument("--data", default="./memd-data")
     imp.set_defaults(fn=_cmd_import)
 
-    rex = sub.add_parser("reindex", help="re-embed records missing/outdated vectors (ADR-8 batch job)")
+    rex = sub.add_parser("reindex", help="re-embed records missing/outdated vectors (batch job)")
     rex.add_argument("--namespace", default="default")
     rex.add_argument("--data", default="./memd-data")
     rex.set_defaults(fn=_cmd_reindex)
@@ -673,7 +673,7 @@ def main(argv=None) -> int:
     mt = sub.add_parser("metrics", help="dump in-process metrics snapshot (JSON)")
     mt.set_defaults(fn=_cmd_metrics)
 
-    ks = sub.add_parser("keys", help="data-key custody: status, migrate to a KMS, rotate (ADR-12)")
+    ks = sub.add_parser("keys", help="data-key custody: status, migrate to a KMS, rotate")
     kssub = ks.add_subparsers(dest="sub", required=True)
     kst = kssub.add_parser("status", help="custody marker + where each namespace's key is wrapped")
     ksm = kssub.add_parser("migrate", help="re-wrap local data keys under a remote provider")

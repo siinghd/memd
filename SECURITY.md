@@ -9,7 +9,9 @@ confirmed by a runnable probe.
 
 ## What the threat model covers
 
-memd's controls are mapped in [07-security.md](07-security.md) and gated by an
+memd's controls (trust tiers and provenance fencing, session taint, injection
+quarantine, per-namespace isolation, a hash-chained audit log, hard delete with
+a physical-purge deadline, per-namespace crypto-shred) are gated by an
 adversarial suite that runs in CI (`make gate`): cross-tenant isolation,
 untrusted-source fencing, injection quarantine, stale-fact-after-update,
 supersedence history integrity, and taint escalation. A change that regresses
@@ -66,11 +68,11 @@ any probe fails the build.
   object rewritten in place - the manifest commit above all - is written
   with compare-and-swap, so a holder frozen between its check and its write
   fails when it resumes instead of overwriting its successor. What remains
-  open (ADR-12): the audit ledger's rotation can still overwrite a
+  open: the audit ledger's rotation can still overwrite a
   successor's sealed audit segment in that window (the hash chain then fails
   verification), and clock skew between nodes must stay under TTL/3. Do not
   run two writers on one namespace and rely on it; the cluster router
-  (ADR-12) never does.
+  never does.
 - **The local data directory is trusted.** Derived caches under it (the
   SQLite index, the tantivy and usearch sidecars) are checksummed or
   rebuildable against accidental damage, not against someone who can write
@@ -80,7 +82,7 @@ any probe fails the build.
   first answers disagree with SQLite is rebuilt - but does not make usearch
   safe to load it. Protect the data directory like the key directory.
 
-## Key custody (ADR-12)
+## Key custody
 
 - **Where the root key lives.** `MEMD_KEY_PROVIDER=local` (default): a file,
   `<local_dir>/keys/root.key` (0600), on the node. `aws-kms`: in AWS KMS; memd
