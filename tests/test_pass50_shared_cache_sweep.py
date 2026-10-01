@@ -89,6 +89,8 @@ def test_a_namespace_opened_during_the_sweep_keeps_its_files(shared, monkeypatch
 
     def checked_then_b_opens(path):
         r = real(path)
+        if not path.startswith(cache + os.sep) or "thread" in out:
+            return r            # another test's leftover sweeper: not this race
         t = threading.Thread(target=open_b, daemon=True)
         t.start()
         opened.wait(1.0)        # B opens between A's check and A's delete - unless it must wait
@@ -142,6 +144,8 @@ def test_a_sweep_skips_a_namespace_open_in_another_process(shared, monkeypatch):
     a, b, cache = shared
     b.namespace(NS)
     monkeypatch.setattr(StorageEngine, "_cache_superseded", lambda self, ns: "taken_over")
-    monkeypatch.setattr(E, "_unused_elsewhere", lambda path: True)   # an older check that cannot tell
+    real = E._unused_elsewhere
+    monkeypatch.setattr(E, "_unused_elsewhere",           # an older check that cannot tell
+                        lambda path: path.startswith(cache + os.sep) or real(path))
     assert a.sweep_stale_caches() == []
     _serves(b, cache, 1)
