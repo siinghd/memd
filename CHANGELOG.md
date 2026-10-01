@@ -30,7 +30,14 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   leaves that frame out and exports everything readable: a warning names
   the frame's byte offset, `memd_export_frames_skipped_total` counts it,
   and the export's audit entry lists it (`skipped_frames`: log, byte,
-  fault); nothing is cut or deleted. A frame under a key this process may
+  fault); nothing is cut or deleted. REST and SDK callers are told too:
+  every `POST /v1/ns/{ns}/export` answers `X-Memd-Export-Skipped-Frames: N`
+  (0 when complete; the fold now runs before the response starts, so an
+  export that refuses answers an error status instead of a 200 stream cut
+  short), and the NDJSON body stays records only; the Python SDK's
+  `export_jsonl()` sets `last_export_skipped_frames` (with a warning when
+  it is not 0), the TypeScript SDK `lastExportSkippedFrames`, and embedded
+  `Memory` `last_export_skipped_frames`. A frame under a key this process may
   not hold still refuses the export (every frame would read that way). And
   once the WAL or ops log passed its rotate threshold, every write and
   delete ran the size-triggered rotate after it was durable and raised its

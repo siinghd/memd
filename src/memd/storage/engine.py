@@ -3791,11 +3791,26 @@ class NamespaceStore:
         A WAL frame that does not read is left out, not refused (it used to
         make the recovery path itself refuse): last_export_skipped says
         where it is (see _wal_events)."""
+        recs, _skipped = self.export_records()
+        for r in recs:
+            yield self.export_line(r)
+
+    def export_records(self) -> tuple[list[MemoryRecord], list[dict]]:
+        """The fold export_jsonl_iter streams, done now: (every record a read
+        can see, in export order; the WAL frames it left out as unreadable -
+        this export's, whatever another export sets last_export_skipped to
+        meanwhile). A streaming surface learns from it, before its first
+        byte, whether the export is complete (see Memory.export_stream)."""
         with self._lock:
             recs = self._visible_records()
+            skipped = list(self.last_export_skipped)
         recs.sort(key=lambda r: (r.time.t_ingested, r.id))
-        for r in recs:
-            yield json.dumps(r.to_dict(), separators=(",", ":")).encode() + b"\n"
+        return recs, skipped
+
+    @staticmethod
+    def export_line(rec: MemoryRecord) -> bytes:
+        """One export NDJSON line."""
+        return json.dumps(rec.to_dict(), separators=(",", ":")).encode() + b"\n"
 
     def _visible_records(self) -> list[MemoryRecord]:
         """Every record a read can see, folded from durable state in the one

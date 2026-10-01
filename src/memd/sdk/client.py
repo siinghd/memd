@@ -1,9 +1,12 @@
 """Hosted client: same API as embedded Memory, over REST (D4 §4.2)."""
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
+
+_log = logging.getLogger(__name__)
 
 
 class HostedError(RuntimeError):
@@ -13,7 +16,14 @@ class HostedError(RuntimeError):
         self.code = code  # machine-readable ("not_found", "rate_limited", ...)
 
 
+# how many unreadable WAL frames the server left out of an export
+EXPORT_SKIPPED_HEADER = "X-Memd-Export-Skipped-Frames"
+
+
 class HostedMemory:
+    # the last export_jsonl()'s count of WAL frames left out (0: complete)
+    last_export_skipped_frames = 0
+
     def __init__(self, api_key: str, base_url: str = "http://localhost:8700", namespace: str = "default",
                  transport: httpx.BaseTransport | None = None):
         self.api_key = api_key
@@ -138,8 +148,21 @@ class HostedMemory:
         return r.json()
 
     def export_jsonl(self, **kw) -> bytes:
-        r = self._client.post(f"/v1/ns/{self._ns(kw)}/export")
+        """The namespace's NDJSON export. An unreadable WAL frame on the
+        server is left out of it, not refused: last_export_skipped_frames
+        says how many (the X-Memd-Export-Skipped-Frames header; 0 when the
+        export is complete), and a warning is logged when it is not 0."""
+        ns = self._ns(kw)
+        r = self._client.post(f"/v1/ns/{ns}/export")
         self._raise(r)
+        try:
+            n = int(r.headers.get(EXPORT_SKIPPED_HEADER) or 0)
+        except ValueError:
+            n = 0
+        self.last_export_skipped_frames = n
+        if n:
+            _log.warning("memd export of namespace %r is incomplete: the server left out %d "
+                         "unreadable WAL frame(s) (its audit entry and log say where)", ns, n)
         return r.content
 
     def status(self, **kw) -> dict:

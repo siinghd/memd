@@ -303,9 +303,15 @@ serving, and fails closed only where the frame would be lost:
 - *Export leaves a damaged WAL frame out* and exports everything else -
   run it before step 1 to have the readable data in hand. A warning names
   the frame's byte offset, `memd_export_frames_skipped_total` counts it,
-  and the export's audit entry lists it (`skipped_frames`). A damaged `ops`
-  frame still refuses the export: leaving out a delete would export the
-  records it deleted, hard-deleted text included.
+  and the export's audit entry lists it (`skipped_frames`). Over REST every
+  export answers `X-Memd-Export-Skipped-Frames: N` (`0` when it is
+  complete; the NDJSON body holds records only); the Python SDK's
+  `export_jsonl()` sets `last_export_skipped_frames` (and logs a warning
+  when it is not 0), the TypeScript SDK sets `lastExportSkippedFrames`, and
+  embedded `Memory` sets `last_export_skipped_frames` too. A damaged `ops`
+  frame still refuses the export (now with an error status, not a 200
+  stream cut short): leaving out a delete would export the records it
+  deleted, hard-deleted text included.
 - *Every acknowledged delete is applied at once* - to the index and, for a
   hard delete, to the purge schedule - so `get()` and search stop serving
   the record whatever the rotate does. (Through 0.3.0 the refused rotate ran

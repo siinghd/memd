@@ -682,13 +682,19 @@ def create_app(
     @app.post("/v1/ns/{ns}/export")
     def export_ns(ns: str, p: Principal = Depends(auth)):
         heavy(ns, "export", p)
-        # streaming NDJSON: first byte leaves before the namespace is
-        # materialized - bulk egress must not buffer O(namespace) bytes in RAM
+        # streaming NDJSON: lines are serialized as they leave - bulk egress
+        # must not buffer O(namespace) bytes in RAM
         from fastapi.responses import StreamingResponse
 
-        gen = engine.export_jsonl_iter(namespace=ns)
-        headers = {"Content-Disposition": f'attachment; filename="{ns}-export.jsonl"'}
-        return StreamingResponse(gen, media_type="application/x-ndjson", headers=headers)
+        # The fold runs HERE, before the response starts (it ran before the
+        # first line anyway): the headers can then say whether the export is
+        # complete - a WAL frame that does not read is left out, and a
+        # client could not tell that 200 from a complete one. The body stays
+        # records only: a marker line would break every NDJSON parser.
+        exp = engine.export_stream(namespace=ns)
+        headers = {"Content-Disposition": f'attachment; filename="{ns}-export.jsonl"',
+                   "X-Memd-Export-Skipped-Frames": str(exp.skipped)}
+        return StreamingResponse(iter(exp), media_type="application/x-ndjson", headers=headers)
 
     @app.get("/v1/ns/{ns}/stats")
     def stats(ns: str, p: Principal = Depends(auth)):
