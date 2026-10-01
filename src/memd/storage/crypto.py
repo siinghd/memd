@@ -30,6 +30,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import time
@@ -41,6 +42,10 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 KEY_LEN = 32
+# a `local` wrapped data key: 12-byte nonce || AES-GCM(32-byte key) || 16-byte tag
+_WRAPPED_KEY_LEN = 12 + KEY_LEN + 16
+# how long a key file read keeps retrying one that is still being written
+_SECRET_SETTLE_S = 1.0
 _log = logging.getLogger(__name__)
 # the label a data key's public fingerprint is taken over (KeyEnvelope.key_check)
 _KEY_CHECK_LABEL = b"memd/key-check/v1"
@@ -499,7 +504,10 @@ class LocalKeyEnvelope(KeyEnvelope):
         self._provider: LocalKeyProvider | None = None
         _sweep_shreds(dir_path)
         if root_key is not None and not os.path.exists(self._rk_path):
-            self._write_secret(self._rk_path, root_key)
+            try:
+                self._write_secret(self._rk_path, root_key)
+            except FileExistsError:
+                pass  # a concurrent creator won: the file decides (see _root)
 
     @property
     def _root(self) -> bytes:
@@ -511,7 +519,7 @@ class LocalKeyEnvelope(KeyEnvelope):
                 raise KeyCustodyError(
                     f"no root key at {self._rk_path}: the data keys under {self.dir} cannot be "
                     "unwrapped without the root key they were wrapped with. Restore it")
-            self._root_key = self._read_secret(self._rk_path)
+            self._root_key = self._read_secret(self._rk_path, KEY_LEN)
         return self._root_key
 
     def _root_or_mint(self) -> bytes:
@@ -535,19 +543,59 @@ class LocalKeyEnvelope(KeyEnvelope):
         return self._provider
 
     @staticmethod
-    def _read_secret(path: str) -> bytes:
-        with open(path, "rb") as f:
-            return f.read()
+    def _read_secret(path: str, size: int = _WRAPPED_KEY_LEN) -> bytes:
+        """A key file's bytes. One shorter than `size` - an older build
+        creates the file first and writes it after, so a concurrent reader
+        could catch it empty - is read again for up to _SECRET_SETTLE_S
+        before it is returned as it is (and refused by its user)."""
+        deadline = time.monotonic() + _SECRET_SETTLE_S
+        while True:
+            with open(path, "rb") as f:
+                data = f.read()
+            if len(data) >= size or time.monotonic() >= deadline:
+                return data
+            time.sleep(0.01)
 
     @staticmethod
     def _write_secret(path: str, data: bytes) -> None:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        """Create the key file `path` holding `data`: FileExistsError when it
+        exists (a concurrent creator won - its key is the one). It used to
+        be created first and written after, and a process creating the
+        first key at the same moment read it empty in between. Now it is
+        written and fsynced under a temporary name and hard-linked into
+        place, which does not replace an existing file: it is never
+        visible without all of its bytes."""
+        d = os.path.dirname(path) or "."
+        os.makedirs(d, exist_ok=True)
+        tmp = f"{path}.tmp-{secrets.token_hex(6)}"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
-            os.write(fd, data)
-            os.fsync(fd)
+            try:
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(fd, view):]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            try:
+                os.link(tmp, path)
+            except FileExistsError:
+                raise   # a concurrent creator won (not the fallback below)
+            except OSError:
+                # no hard links here: create it in place (a reader retries
+                # one it catches short - see _read_secret)
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                try:
+                    os.write(fd, data)
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            _fsync_dir(d)
         finally:
-            os.close(fd)
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
 
     def _key_path(self, namespace: str) -> str:
         return legacy_key_path(self.dir, namespace)
@@ -626,6 +674,12 @@ def legacy_key_path(dir_path: str, namespace: str) -> str:
 
 
 _SHRED_SUFFIX = ".shred-"
+# a key file being created (LocalKeyEnvelope._write_secret): "<file>.tmp-"
+# + 12 hex digits - never the name of a key file, which ends in ".key"
+# whatever its namespace is called. One older than _TMP_STALE_S is what a
+# crash left, and is shredded (_sweep_shreds).
+_TMP_RE = re.compile(r"\.key\.tmp-[0-9a-f]{12}\Z")
+_TMP_STALE_S = 300.0
 
 
 def _fsync_dir(d: str) -> None:
@@ -669,17 +723,23 @@ def _shred_file(p: str) -> None:
 
 
 def _sweep_shreds(d: str) -> None:
-    """Finish shreds a crash interrupted (see _overwrite_unlink)."""
+    """Finish shreds a crash interrupted (see _overwrite_unlink), and shred
+    the temporary file of a key creation a crash interrupted - a key never
+    linked into place, so never used, but key material all the same (one
+    younger than _TMP_STALE_S may be a creation in progress: kept)."""
     try:
         names = os.listdir(d)
     except OSError:
         return
     for fn in names:
-        if _SHRED_SUFFIX in fn:
-            try:
-                _shred_file(os.path.join(d, fn))
-            except FileNotFoundError:
-                pass  # a concurrent sweep finished it
+        p = os.path.join(d, fn)
+        try:
+            if _SHRED_SUFFIX in fn:
+                _shred_file(p)
+            elif _TMP_RE.search(fn) and time.time() - os.path.getmtime(p) > _TMP_STALE_S:
+                _shred_file(p)
+        except FileNotFoundError:
+            pass  # a concurrent sweep (or its creator) finished it
 
 
 def wrapped_key_object(namespace: str) -> str:

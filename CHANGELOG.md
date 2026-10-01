@@ -73,6 +73,16 @@ before/after numbers - is [.ralph/audit-log.md](.ralph/audit-log.md).
   not served (their rows are gone; only the file holds the bytes), no
   index snapshot is published, and the cache is not stamped scrubbed.
 
+- **Concurrent first-key creation never reads a partial key file.** With
+  the `local` key provider, `root.key` and each namespace's wrapped key
+  file were created first and written after: a process creating the first
+  key at the same moment could read the file empty and fail ("AESGCM key
+  must be 128, 192, or 256 bits"; 17 of 1200 processes in a race). A key
+  file is now written and fsynced under a temporary name and hard-linked
+  into place (never replacing one that exists), a key file read short -
+  one an older build is still writing - is read again for up to 1 s, and
+  a temporary key file a crash left (`*.key.tmp-*`, over 5 minutes old)
+  is shredded by the next envelope.
 - **A node drops its copy of a namespace another node took over (D7).**
   Every node keeps the namespaces it served in its local cache directory -
   the SQLite index (with its `-wal`/`-shm`), the tantivy copy and the ANN
