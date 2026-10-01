@@ -326,6 +326,7 @@ class ReplicaStore(NamespaceStore):
         refresh that completes after a rebuild began is newer than the one a
         read checked its freshness against."""
         self.touch()
+        waited_since = None
         while True:
             with self.holding():
                 if self.exists and not self._synced:
@@ -335,8 +336,11 @@ class ReplicaStore(NamespaceStore):
                 if self.refreshed_at is not None:
                     yield self
                     return
-            # (the serve lock released: the refresh may rebuild again)
-            self._await_refresh(float("-inf"), time.monotonic(), self.refresh_wait_s,
+            # (the serve lock released: the refresh may rebuild again - the
+            # wait is counted from the first time, never started over)
+            if waited_since is None:
+                waited_since = time.monotonic()
+            self._await_refresh(float("-inf"), waited_since, self.refresh_wait_s,
                                 "the replica was rebuilt and has not applied the log tail yet")
 
     def ensure_fresh(self, max_staleness_s: float, wait_s: float | None = None) -> None:
