@@ -294,8 +294,8 @@ mem.search("how do we deploy?"); mem.last_read   # {"served_by": "replica", "app
   holds it, its purge pending (SECURITY.md). A replica never serves an
   older state than one it has served: a rebuilt replica serves nothing
   until the refresh that rebuilt it has applied the log tail too (a read
-  waits for that at most `MEMD_REPLICA_REFRESH_WAIT_MS`, then goes to the
-  writer).
+  waits for that at most `MEMD_REPLICA_REFRESH_WAIT_MS`, then is refused:
+  over the router it goes to the writer).
 - Served by replicas: `search` and `get` (`GET .../memories/{id}`). Always
   the writer: every write, `export` (audited in the namespace's ledger, which
   only the writer appends to), `find_ids` / `forget` (a preview must match
@@ -303,11 +303,15 @@ mem.search("how do we deploy?"); mem.last_read   # {"served_by": "replica", "app
   the serving node's own ledger (`memd-node.<id>`, `replica_search`).
 - A replica needs the namespace's data key like a writer (provider access
   for `aws-kms` / `vault-transit`); it never mints one, and a key it cannot
-  use refuses (the read then goes to the writer).
+  use refuses (over the router, the read then goes to the writer).
 - Embedded: `Memory(path, read_only=True)` opens every namespace as a
   replica - every mutating call raises `ReadOnlyError`, nothing is written
   to the store or the keys directory, and reads follow the writer (another
-  process) within the bound. `search(..., consistency="eventual")` /
+  process) within the bound. With no writer to fall back to, a read the
+  replica refuses raises `ReplicaUnavailableError` to the caller: after a
+  rebuild until the log tail is applied, when the replica is staler than
+  the bound and its refresh has run longer than the read's wait, or after
+  a failed rebuild. Retry it, or read from the writer. `search(..., consistency="eventual")` /
   `get(...)` on a writer `Memory` reads its own store when the namespace is
   open in it, else a replica.
 - A namespace destroyed (crypto-shredded) and created again under its name
@@ -363,7 +367,8 @@ refused (over the router it goes to the writer), and the replica served
 again 0.9 s after the bucket's return. One node's KMS, in a four-node HTTP
 cluster on the same MinIO and moto KMS refreshing every 0.5 s, for three
 namespaces another node writes: refusing connections, the first eventual
-read of each namespace on that node went to the writer after 0.2-0.5 s;
+read of each namespace on that node went to the writer after 0.2-0.5 s
+(up to about 1.1 s on a loaded machine);
 hanging, after 1.0-1.1 s (the read's wait - the replica's open timed out
 in the background, 2 x 5 s); the following reads went to the writer in
 ~20 ms.
