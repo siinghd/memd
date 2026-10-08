@@ -211,6 +211,16 @@ def test_kinds_without_raw_turns_do_not_expand():
     assert not any(x.startswith(("user: ", "assistant: ")) for x in out.text.split("\n"))
 
 
+def test_a_fact_speaks_with_its_source_turns_voice():
+    """an extracted fact's own source is the session's lowest trust tier
+    (an assistant turn in the session makes it "agent"): the label says who
+    said the turn it came from"""
+    w = World([rec("t", "my editor is helix"), rec("f", "the user's editor is helix", kind="fact",
+                                                     source="agent", lineage=["t"])])
+    t = w.pack(["f"], 1000).text
+    assert "user: my editor is helix\n[memory fact, said by the user: the user's editor is helix]" in t
+
+
 def test_other_kinds_are_labelled():
     w = World([rec("p", "deploy with make ship", kind="procedure", source="agent", session=None)])
     assert "[memory procedure, said by the assistant: deploy with make ship]" in w.pack(["p"], 1000).text

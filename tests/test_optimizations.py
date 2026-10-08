@@ -79,12 +79,15 @@ def test_packed_context_escapes_attr_injection(tmp_path):
     m = Memory(str(tmp_path / "d"))
     try:
         m.add('payload with quotes " and <tags>', user_id="u1", actor_id='h4x"><script>')
-        res = m.search("payload quotes tags", user_id="u1")
+        res = m.search("payload quotes tags", user_id="u1", packing="flat")
         ctx = res.packed_context
         assert 'actor="h4x&quot;&gt;&lt;script&gt;"' in ctx
         # the injected attribute must not appear as a real attribute
         first_block = ctx.split("</memory>")[0]
         assert 'kind="lie"' not in first_block
+        # the session layout renders no record metadata at all: nothing to inject into
+        sess = m.search("payload quotes tags", user_id="u1").packed_context
+        assert 'user: payload with quotes " and <tags>' in sess and "h4x" not in sess
     finally:
         m.close()
 

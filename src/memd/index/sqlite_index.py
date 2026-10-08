@@ -19,6 +19,7 @@ segments (synchronous=NORMAL is therefore correct, not a shortcut).
 """
 from __future__ import annotations
 
+import bisect
 import contextlib
 import json
 import logging
@@ -1384,6 +1385,39 @@ class NamespaceIndex:
                 out[rid] = got
         return out, positions
 
+    def session_turns(self, sessions: list[str], f: IndexFilter) -> dict[str, list[tuple[int, int, str]]]:
+        """The raw turns of each session that satisfy `f` in SQL, as sorted
+        [(t_event, rowid, id)] - session order, the one session_neighbours
+        walks - in one statement per 200 sessions, ids only (hydrate with
+        get_visible, the Python twin of the filter, before use)."""
+        out: dict[str, list[tuple[int, int, str]]] = {s: [] for s in sessions}
+        if not sessions or self._closed:
+            return out
+        fargs: list = []
+        filt = self._filter_where(f, fargs)
+        with self._read() as _c:
+            for i in range(0, len(sessions), 200):
+                chunk = sessions[i:i + 200]
+                sql = (f"SELECT scope_session, t_event, rowid, id FROM records "  # nosec B608
+                       f"WHERE scope_session IN ({','.join('?' * len(chunk))}) AND kind = 'raw_event' AND {filt}")
+                for r in _c.execute(sql, [*chunk, *fargs]):
+                    out[r[0]].append((int(r[1]), int(r[2]), r[3]))
+        for v in out.values():
+            v.sort()
+        return out
+
+    @staticmethod
+    def adjacent(turns: list[tuple[int, int, str]], t_event: int, rowid: int) -> list[tuple[str, int]]:
+        """[(id, rowid)] of the turns right before and right after the point
+        (t_event, rowid) in a session_turns list (radius-1 session_neighbours)."""
+        k = bisect.bisect_left(turns, (t_event, rowid))
+        out = [(turns[k - 1][2], turns[k - 1][1])] if k > 0 else []
+        if k < len(turns) and turns[k][:2] == (t_event, rowid):
+            k += 1
+        if k < len(turns):
+            out.append((turns[k][2], turns[k][1]))
+        return out
+
     def _fold_overflow_locked(self) -> None:
         """Fold the overflow block into the main matrix, dropping main's dead
         rows (O(main)); called only when overflow exceeds OVERFLOW_MAX or the
@@ -2166,6 +2200,26 @@ class NamespaceIndex:
                     rec.namespace = self._ns_hint
                     out[rec.id] = rec
         return [out[i] for i in ids if i in out]
+
+    def get_visible(self, ids: list[str], f: IndexFilter) -> list[MemoryRecord]:
+        """get_many, keeping only the records that satisfy `f` (the Python
+        twin of the SQL filter): an id taken from a record's lineage must not
+        reach a packed context the filter would have kept it out of."""
+        return [r for r in self.get_many(ids) if r.id not in f.exclude_ids and self._passes_filter(r, f)]
+
+    def rowids(self, ids: list[str]) -> dict[str, int]:
+        """{id: rowid} - the ingestion order; session packing orders a
+        session's turns by (t_event, rowid), as session_neighbours does."""
+        out: dict[str, int] = {}
+        if self._closed:
+            return out
+        with self._read() as _con:
+            for i in range(0, len(ids), 500):
+                chunk = ids[i : i + 500]
+                qs = ",".join("?" * len(chunk))
+                for r in _con.execute(f"SELECT id, rowid FROM records WHERE id IN ({qs})", chunk):  # nosec B608
+                    out[r[0]] = int(r[1])
+        return out
 
     def wipe(self) -> None:
         with self._lock:

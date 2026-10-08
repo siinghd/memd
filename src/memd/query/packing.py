@@ -28,6 +28,7 @@ Rules:
 from __future__ import annotations
 
 import datetime as _dt
+import functools
 import re
 from dataclasses import dataclass, field
 from typing import Callable
@@ -329,6 +330,7 @@ _WORD = re.compile(r"[A-Za-z0-9']{4,}")
 _SESSION_FIXED = 1 + len("\n### Session ") + len(":\nSession Date: ") + len("\nSession Content:\n")
 
 
+@functools.lru_cache(maxsize=4096)
 def _session_date(ms: int) -> str:
     """'2023/05/20 (Sat) 02:21' (UTC)."""
     try:
@@ -369,10 +371,13 @@ def _turn_line(r: MemoryRecord, limit: int, focus: str, resolve_dates: bool) -> 
     return _fence(r, f"{who}: {body}")
 
 
-def _memory_line(r: MemoryRecord) -> str:
+def _memory_line(r: MemoryRecord, said_by: MemoryRecord | None = None) -> str:
+    """A memory on its own line; under its source turn it speaks with that
+    turn's voice (an extracted fact's own source is the session's lowest
+    trust tier, not who said it - that still decides the fencing)."""
     status = "" if _valid(r) else ", superseded"
     body = _excerpt(r.content.strip(), ANCHOR_CHARS)
-    return _fence(r, f"[memory {r.kind}{status}, said by the {_speaker(r)}: {body}]")
+    return _fence(r, f"[memory {r.kind}{status}, said by the {_speaker(said_by or r)}: {body}]")
 
 
 def _digits_upto(n: int) -> int:
@@ -533,7 +538,6 @@ def pack_sessions(
         r = it.record
         if r.id in lay.rows:
             continue
-        cand = _packed_item(r, score, it.lanes)
         if r.kind == Kind.RAW_EVENT:
             anchors, note, focus = [r], None, ""
         else:
@@ -541,11 +545,11 @@ def pack_sessions(
             if not anchors:  # nothing to show it under: a line of its own
                 row = _Row(r, pos.get(r.id, 0), _memory_line(r))
                 if lay.add([row], None, budget_tokens):
-                    items.append(cand)
+                    items.append(_packed_item(r, score, it.lanes))
                 else:
                     truncated = True
                 continue
-            note, focus = (anchors[0].id, _memory_line(r)), r.content
+            note, focus = (anchors[0].id, _memory_line(r, said_by=anchors[0])), r.content
         full = [_Row(a, pos.get(a.id, 0), _turn_line(a, ANCHOR_CHARS, focus, resolve_dates))
                 for a in anchors if a.id not in lay.rows]
         # neighbours only add text: if the anchors alone do not fit, neither does the unit
@@ -565,7 +569,7 @@ def pack_sessions(
                         unit.append(_Row(x, pos.get(x.id, 0), _turn_line(x, NEIGHBOUR_CHARS, "", resolve_dates)))
         for rows in ((unit, full) if len(unit) > len(full) else (full,)):
             if lay.add(rows, note, budget_tokens):
-                items.append(cand)
+                items.append(_packed_item(r, score, it.lanes))
                 n_full = len(full)
                 for i, row in enumerate(rows):
                     if row.rec.id != r.id:
