@@ -2,387 +2,517 @@
 
 ## Reporting
 
-Please report suspected vulnerabilities privately via GitHub's "Report a
-vulnerability" (Security -> Advisories) rather than a public issue. Include a
-reproduction if you have one; this project's convention is that a finding is
-confirmed by a runnable probe.
+Report a suspected vulnerability privately, through GitHub's "Report a
+vulnerability" (Security -> Advisories). Do not open a public issue for it.
+If you have a reproduction, include it. The convention of this project is
+that a runnable probe confirms a finding.
 
 ## What the threat model covers
 
-memd's controls (trust tiers and provenance fencing, session taint, injection
-quarantine, per-namespace isolation, a hash-chained audit log, hard delete with
-a physical-purge deadline, per-namespace crypto-shred) are gated by an
-adversarial suite that runs in CI (`make gate`): cross-tenant isolation,
-untrusted-source fencing, injection quarantine, stale-fact-after-update,
-supersedence history integrity, and taint escalation. A change that regresses
-any probe fails the build.
+memd has these controls: trust tiers and provenance fencing, session taint,
+injection quarantine and per-namespace isolation. It also has a hash-chained
+audit log, hard delete with a physical-purge deadline, and per-namespace
+crypto-shred. An
+adversarial suite that runs in CI (continuous integration) gates them
+(`make gate`). The suite covers cross-tenant isolation, untrusted-source
+fencing, injection quarantine, stale-fact-after-update, supersedence history
+integrity, and taint escalation. If a change causes a regression in any
+probe, the build fails.
 
 ## What it does NOT cover - read this before deploying
 
-- **Single writer per namespace.** A namespace is written by the one process
-  holding its lock (or lease); a second process opening it forwards its calls
-  to that process (below) or, with `forwarding="off"`, fails fast with
+- **Single writer per namespace.** Only the one process that holds the lock
+  (or lease) of a namespace writes to it. A second process that opens the
+  namespace forwards its calls to that process (next item). With
+  `forwarding="off"`, the second process fails immediately with
   `NamespaceBusyError`. `MEMD_ALLOW_MULTI_PROCESS=1` disables the check and
-  re-enables silent data loss; it exists for recovery tooling.
-- **The write-forwarding endpoint.** Every process that may write a data root
-  (forwarding is on by default) listens on a TCP port - `127.0.0.1` and an
-  ephemeral port unless `MEMD_FORWARD_HOST` / `MEMD_FORWARD_PORT` say
-  otherwise - and writes its address into the lock files and leases it
-  holds. Whoever can call it runs writes and strong reads - export included -
-  on every namespace that process holds, as that process: it is as powerful
-  as the data directory, and it is not a tenant boundary (a REST server
-  checks API keys before a call reaches the engine; the endpoint trusts its
-  caller like a local caller, source tier and actor included). What guards
-  it is a **secret**: `<data dir>/forward.secret` (on S3, in the
-  `local_dir`), 32 random bytes hex, created on first use with mode 0600 -
-  so the processes that may call are the ones that can read the data
-  directory, which already holds the data and, with the `local` provider,
-  its keys - or `MEMD_FORWARD_SECRET`, which then must be kept like
-  `MEMD_CLUSTER_SECRET`. The file is opened without following a symbolic
-  link and used only if it is a regular file of the process's own user,
-  mode 0600 or narrower: a secret someone else could have planted or read
-  is refused (that process runs with forwarding off and logs why). A connection is authenticated both ways before any
-  call is read: the endpoint sends its id and a nonce, the caller answers
-  with its own nonce and an HMAC-SHA256 under the secret over both (the
-  cluster router's request signature), the endpoint answers with its own
-  HMAC; a caller also checks the endpoint id is the one the lock or lease
-  named, so a process that took over a dead holder's port is not talked to.
-  Every frame after that carries an HMAC-SHA256 under a key derived for the
-  connection from both nonces, over its direction and sequence number: a
-  frame altered, replayed, reordered or reflected closes the connection,
-  and nothing of it runs (`memd_forward_auth_failures_total`). What it does
-  NOT give: **confidentiality** - frames are plain TCP; on loopback only a
-  local root user can read them, but binding `MEMD_FORWARD_HOST` to a
-  network interface sends memory content in clear text across it: keep that
-  network private (a VPN, a private segment). And **availability** against a
-  local process: anyone can open connections (256 at once; an
-  unauthenticated one is dropped after 5 s, before it is read past a 4 KiB
-  hello; each refusal is counted and logged as one line), and a caller that
-  cannot get through waits up to `MEMD_FORWARD_WAIT_S` and fails with
-  nothing applied. A holder applies a
-  forwarded write only while it holds the namespace; a retried call is
-  applied once (request ids, caller-generated record ids).
+  makes silent data loss possible again; it exists for recovery tools.
+
+- **The write-forwarding endpoint.** Every process that can write a data root
+  listens on a TCP port (forwarding is on by default). This is `127.0.0.1`
+  and an ephemeral port, unless `MEMD_FORWARD_HOST` / `MEMD_FORWARD_PORT` set
+  other values. The process writes its address into the lock files and
+  leases that it holds.
+
+    Any caller that can call the endpoint can run writes and strong reads
+    (export included) on every namespace that the process holds, as that
+    process. Thus, the endpoint is as powerful as the data directory, and it
+    is not a tenant boundary. A REST server checks API keys before a call
+    gets to the engine. But the endpoint trusts its caller like a local
+    caller, source tier and actor included.
+
+    A **secret** protects the endpoint: `<data dir>/forward.secret` (on S3,
+    in the `local_dir`), 32 random bytes in hex, created at first use with
+    mode 0600. Thus, only the processes that can read the data directory can
+    call. That directory already holds the data and, with the `local`
+    provider, its keys. Instead of the file, the secret can be
+    `MEMD_FORWARD_SECRET`. Then you must protect it like `MEMD_CLUSTER_SECRET`.
+
+    memd does not follow a symbolic link when it opens the file. It uses the
+    file only if it is a regular file of the process's own user, with mode
+    0600 or narrower. memd refuses a secret that another user could have
+    planted or read. That process then runs with forwarding off and logs the
+    reason.
+
+    memd authenticates each connection in both directions before it reads a
+    call:
+
+    1. The endpoint sends its id and a nonce.
+    2. The caller answers with its own nonce and an HMAC-SHA256 under the
+       secret over both nonces. This HMAC (hash-based message authentication
+       code) is the request signature of the cluster router.
+    3. The endpoint answers with its own HMAC.
+
+    The caller also checks that the endpoint id is the one that the lock or
+    lease named. Thus, a caller does not talk to a process that now uses the
+    port of a dead holder. After the handshake, every frame has an HMAC-SHA256
+    over its direction and sequence number, under a key derived for the
+    connection from both nonces. If a frame is altered, replayed, reordered
+    or reflected, the connection closes, and no part of the frame runs
+    (`memd_forward_auth_failures_total`).
+
+    What the endpoint does NOT give: **confidentiality**. Frames are plain
+    TCP. On loopback, only a local root user can read them. WARNING: If you
+    bind `MEMD_FORWARD_HOST` to a network interface, memd sends memory content
+    in clear text across that network. Keep that network private: use a VPN
+    (virtual private network) or a private segment.
+
+    The endpoint also does NOT give **availability** against a local process.
+    Anyone can open connections (up to 256 at once). memd drops an
+    unauthenticated connection after 5 s, before it reads more than a 4 KiB
+    hello. memd counts each refusal and logs it as one line. A caller that
+    cannot get a connection waits up to `MEMD_FORWARD_WAIT_S`, and then fails
+    with nothing applied.
+
+    A holder applies a forwarded write only while it holds the namespace.
+    memd applies a retried call one time (request ids, caller-generated
+    record ids).
+
 - **At-rest encryption with the default `local` key provider is local-file
   envelope encryption.** It protects the volume and makes crypto-shred
-  possible. It is *not* protection against someone with filesystem read
-  access on the same machine (the root key file sits beside the data). See
-  "Key custody" below for the KMS / Vault providers.
-- **Key custody fails closed.** Restore the keys together with the data they
-  were written with (the keys directory for `local`; the `keys/` objects for
-  a remote provider). A key that is valid but not that data's (another
-  deployment's `keys/` directory or `keys/<ns>.dek` object, a replaced
-  `root.key`), no key at all, or encryption turned off for an encrypted
-  namespace makes the open raise `KeyCustodyError`; nothing is read,
-  truncated or deleted, no key is
-  created, and the namespace opens normally once the right keys are back.
-  The manifest holds a fingerprint of each namespace's data key (an HMAC of
-  a fixed label under the key) to check this before anything is touched; it
-  reveals nothing about the key. A manifest without one (every namespace
-  0.2.0 wrote) is probed: its encrypted objects are tried until one
-  decrypts, and the key is refused only if none does; with encryption off,
-  a namespace none of whose data parses as plaintext is refused. The
-  fingerprint is written only once the key has decrypted something, or when
-  nothing encrypted exists yet. A complete WAL or ops frame that does not
-  read - does not decrypt, or does not parse - is never cut off or folded
-  away, under any key and with encryption on or off: only a frame cut short
-  by its length prefix is a torn tail. Under the proven key a damaged
-  segment is skipped by reads but kept on disk (and the deletes a compaction
-  could not apply to it stay pending until it reads again); a damaged log
-  frame refuses the open - see "Recovering from an unreadable log frame"
-  below. In a namespace already open it refuses every fold, and only that:
-  writes and deletes still succeed (the size-triggered rotate after them
-  is deferred and reported), and export leaves the frame out.
+  possible. It does *not* protect against a person with filesystem read
+  access on the same machine (the root key file is next to the data). For
+  the KMS (Key Management Service) / Vault providers, refer to "Key custody"
+  below.
+
+- **Key custody fails closed.** Restore the keys together with the data that
+  was written with them (the keys directory for `local`; the `keys/` objects
+  for a remote provider). The open raises `KeyCustodyError` in these cases:
+
+    - The key is valid, but it is not the key of that data. Examples: the
+      `keys/` directory or a `keys/<ns>.dek` object of another deployment,
+      or a replaced `root.key`.
+    - There is no key at all.
+    - Encryption is off for an encrypted namespace.
+
+    In these cases, memd does not read, truncate or delete anything, and it
+    creates no key. When the correct keys are back, the namespace opens
+    normally.
+
+    The manifest holds a fingerprint of the data key of each namespace (an
+    HMAC of a fixed label under the key). memd uses it to do this check
+    before it touches anything. The fingerprint tells nothing about the key.
+    memd probes a manifest without a fingerprint (every namespace that 0.2.0
+    wrote). It tries the encrypted objects until one decrypts, and refuses
+    the key only if none does. With encryption off, memd refuses a namespace
+    if none of its data parses as plaintext.
+
+    memd writes the fingerprint only after the key has decrypted something,
+    or if nothing encrypted exists yet. A complete WAL (write-ahead log) or
+    ops frame can fail to read: it does not decrypt, or it does not parse.
+    memd never cuts off or folds away such a frame. This is true under any
+    key, with encryption on or off. Only a frame cut short by its length
+    prefix is a torn tail.
+
+    Under the proven key, reads skip a damaged segment, but memd keeps it on
+    disk. The deletes that a compaction could not apply to it stay pending
+    until it reads again. A damaged log frame refuses the open: refer to
+    "Recovering from an unreadable log frame" below. In a namespace that is
+    already open, a damaged log frame refuses every fold, and only that.
+    Writes and deletes still succeed (memd defers and reports the
+    size-triggered rotate after them), and export leaves the frame out.
+
 - **With the S3 backend and `local` keys, data is remote but KEYS ARE LOCAL.**
-  Crypto-shred works (destroying the local key makes the remote ciphertext
-  inert), but a second node cannot decrypt the bucket - it refuses to open a
-  namespace it has no key for (it used to mint a new one). Back up the local
-  key directory separately and treat it as the crown jewels - losing it is
-  equivalent to shredding every namespace. Cluster mode refuses `local` keys.
-- **Single-writer on S3 is a LEASE, not a distributed lock.** The first writer
-  claims `ns/<ns>/.owner` with a conditional PUT and a second does not get it
-  (it forwards to the first, or gets `NamespaceBusyError`); a lease older than the TTL is reclaimable (by
-  compare-and-swap: one winner) so a crashed node cannot wedge a namespace. A
-  holder that cannot renew for 2/3 of the TTL stops writing, a node taking
-  over a stale lease fences the previous holder's append logs, and every
-  object rewritten in place - the manifest commit above all - is written
-  with compare-and-swap, so a holder frozen between its check and its write
-  fails when it resumes instead of overwriting its successor. What remains
-  open: the audit ledger's rotation can still overwrite a
-  successor's sealed audit segment in that window (the hash chain then fails
-  verification), and clock skew between nodes must stay under TTL/3. Do not
-  run two writers on one namespace and rely on it; the cluster router
-  never does.
-- **The local data directory is trusted.** Derived caches under it (the
-  SQLite index, the tantivy and usearch sidecars) are checksummed or
-  rebuildable against accidental damage, not against someone who can write
-  there: a crafted, checksum-valid usearch file is an adversarial local
-  file. memd bounds what one can do - a graph that crashes the process
-  during its probation is rebuilt at the next open, one whose structure or
-  first answers disagree with SQLite is rebuilt - but does not make usearch
-  safe to load it. Protect the data directory like the key directory.
+  Crypto-shred works: when you destroy the local key, the remote ciphertext
+  becomes inert. But a second node cannot decrypt the bucket. It refuses to
+  open a namespace that it has no key for (older versions minted a new key).
+  WARNING: If you lose the local key directory, the result is the same as a
+  shred of every namespace. Make a separate backup of it. Protect it as your
+  most valuable data. Cluster mode refuses `local` keys.
+
+- **Single-writer on S3 is a LEASE, not a distributed lock.** The first
+  writer claims `ns/<ns>/.owner` with a conditional PUT. A second writer
+  does not get it: it forwards to the first, or gets `NamespaceBusyError`.
+  A lease older than the TTL (time to live) can be claimed again, by
+  compare-and-swap (only one node wins). Thus, a node that crashed cannot
+  block a namespace. A holder that cannot renew for 2/3 of the TTL stops
+  writing. A node that takes a stale lease fences the append logs of the
+  previous holder.
+
+    memd uses compare-and-swap to write every object that it rewrites in
+    place, most of all the manifest commit. Thus, a holder that froze between
+    its check and its write fails when it continues, and does not overwrite
+    its successor. Two limits remain. First, in that window, the rotation of
+    the audit ledger can still overwrite a sealed audit segment of a
+    successor. The hash chain then fails verification. Second, clock skew
+    between nodes must stay under TTL/3.
+
+    Do not run two writers on one namespace and rely on the lease. The
+    cluster router never does this.
+
+- **The local data directory is trusted.** The derived caches in it (the
+  SQLite index, the tantivy and usearch sidecars) have checksums or can be
+  rebuilt. This protects them against accidental damage, not against a
+  person who can write in the directory. A crafted usearch file with a valid
+  checksum is an adversarial local file.
+
+    memd limits what such a file can do. If a graph crashes the process
+    during its probation, memd rebuilds it at the next open. memd also
+    rebuilds a graph if its structure or first answers do not agree with
+    SQLite. But memd does not make usearch safe to load such a file. Protect
+    the data directory as you protect the key directory.
 
 ## Key custody
 
-- **Where the root key lives.** `MEMD_KEY_PROVIDER=local` (default): a file,
-  `<local_dir>/keys/root.key` (0600), on the node. `aws-kms`: in AWS KMS; memd
-  holds only wrapped data keys (`keys/<ns>.dek` in the bucket) and asks KMS to
-  unwrap them. `vault-transit`: in Vault's transit engine, likewise. With a
-  remote provider neither the bucket alone (ciphertext + wrapped keys) nor
-  the provider alone (no data) is enough; an attacker needs both bucket read
-  and `kms:Decrypt` (or the transit `decrypt` policy). Grant the latter only
-  to memd nodes, with the encryption context condition
-  `kms:EncryptionContext:memd:namespace` if you want per-tenant policies.
-- **Binding.** Each wrapped data key is bound to its namespace (KMS encryption
-  context / transit `associated_data`): a wrapped key copied under another
-  namespace's name does not unwrap. A Vault that silently ignores
-  `associated_data` is refused rather than used unbound.
-- **Custody fails closed.** An unreadable `keys/_custody.json` refuses the
-  open on every root (never delete it to get past that - restore it). A
-  namespace with encrypted data is never given a freshly minted key, and a
-  data key that is not its data's is refused before anything is read, on
-  every root and under every provider ("Key custody fails closed" above: the
-  manifest's key fingerprint, or a probe of the data). The two checks are
-  complementary: the custody marker says which PROVIDER wraps the store's
-  data keys and refuses a node configured for another one before it can
-  mint anything; the fingerprint is of the data key itself, so it survives
-  `memd keys migrate` and `memd keys rotate` (both re-wrap the same key) and
-  catches a wrapped key that unwraps fine but is not this data's - another
-  deployment's `keys/<ns>.dek` restored over this one's. A remote provider
-  resolves the key when the namespace opens, and refuses to mint one for a
-  namespace that already has a manifest (`MEMD_KEYS_ALLOW_MINT_EXISTING=1`
-  only for a namespace that was never encrypted). Log frames that are
-  complete but do not read are never truncated as a "torn tail" - the open
-  is refused instead.
-- **Plaintext data keys are in node memory** while a namespace is open (they
-  must be, to encrypt), LRU-bounded to 1024 namespaces per process.
-  Known limitation: a process keeps a namespace's key in that cache after
-  it stops writing the namespace (LRU eviction, a lost lease). If another
-  process - another node - destroys the namespace and creates it again
-  under its name, and this process later opens it as its writer again, the
-  open checks the new data with the cached old key and refuses it
-  (`KeyCustodyError`: fails closed, nothing read or written) until the
-  process restarts or the key leaves the cache. Read replicas are not
-  affected: a replica resolves the key from its record again when it
-  rebuilds for another tenure (a new lineage) and after a custody refusal,
-  and never keeps a key that failed verification.
+- **Where the root key lives.** `MEMD_KEY_PROVIDER=local` (default): in a
+  file on the node, `<local_dir>/keys/root.key` (0600). `aws-kms`: in AWS
+  KMS. memd holds only wrapped data keys (`keys/<ns>.dek` in the bucket) and
+  asks KMS to unwrap them. `vault-transit`: in the transit engine of Vault,
+  in the same way.
+
+    With a remote provider, the bucket alone (ciphertext + wrapped keys) is
+    not sufficient, and the provider alone (no data) is not sufficient. An
+    attacker needs both read access to the bucket and `kms:Decrypt` (or the
+    transit `decrypt` policy). Give that permission only to memd nodes. For
+    per-tenant policies, add the encryption context condition
+    `kms:EncryptionContext:memd:namespace`.
+
+- **Binding.** Each wrapped data key is bound to its namespace (KMS
+  encryption context / transit `associated_data`). If you copy a wrapped key
+  under the name of another namespace, it does not unwrap. If a Vault
+  ignores `associated_data` and gives no error, memd refuses it. memd does
+  not use the key unbound.
+
+- **Custody fails closed.** If `keys/_custody.json` is unreadable, memd
+  refuses the open on every root. WARNING: Never delete this file to get
+  past the refusal. Restore it.
+
+    memd never gives a new key to a namespace with encrypted data. memd
+    refuses a data key that is not the key of its data before it reads
+    anything. This is true on every root and under every provider. (Refer to
+    "Key custody fails closed" above: the key fingerprint of the manifest, or
+    a probe of the data.)
+
+    The two checks are complementary. The custody marker tells which
+    PROVIDER wraps the data keys of the store. It refuses a node that is
+    configured for another provider before that node can mint anything. The
+    fingerprint is of the data key itself, so it survives `memd keys migrate`
+    and `memd keys rotate` (both re-wrap the same key). It also finds a
+    wrapped key that unwraps correctly but is not the key of this data. An
+    example is the `keys/<ns>.dek` of another deployment, restored over the
+    key of this deployment.
+
+    A remote provider resolves the key when the namespace opens. It refuses
+    to mint a key for a namespace that already has a manifest. (Use
+    `MEMD_KEYS_ALLOW_MINT_EXISTING=1` only for a namespace that was never
+    encrypted.) If a log frame is complete but does not read, memd never
+    truncates it as a "torn tail". It refuses the open instead.
+
+- **Plaintext data keys are in node memory** while a namespace is open (this
+  is necessary for encryption). An LRU (least recently used) cache holds
+  them, with a limit of 1024 namespaces per process. Known limitation: a
+  process keeps the key of a namespace in that cache after it stops writing
+  the namespace (LRU eviction, a lost lease).
+
+    Another process (another node) can destroy the namespace and create it
+    again under the same name. Then this process can open it again as its
+    writer. In that case, the open checks the new data with the cached old
+    key and refuses it (`KeyCustodyError`: fails closed, nothing read or
+    written). This continues until the process restarts or the key leaves
+    the cache.
+
+    Read replicas do not have this problem. A replica resolves the key from
+    its record again when it rebuilds for another tenure (a new lineage), and
+    after a custody refusal. It never keeps a key that failed verification.
+
 - **Crypto-shred with a SHARED CMK / transit key** (the normal deployment)
-  deletes the namespace's wrapped key object - including every noncurrent
-  version on a versioned bucket (a versioned bucket whose versions API memd
-  may not use makes the destroy fail loudly). It cannot delete the CMK, which
-  every other namespace needs. So a copy of the wrapped key made BEFORE the
-  shred - a bucket backup, cross-region replication, a snapshot - together
-  with `kms:Decrypt` on the CMK still recovers the data key. Keep backups of
-  the `keys/` prefix under the same retention you promise for erasure, or
-  exclude it from them. For tenants who need the stronger guarantee, give them
-  their OWN key (`MEMD_KMS_KEY_ID=alias/memd-{namespace}` /
-  `MEMD_VAULT_TRANSIT_KEY=memd-{namespace}`) and set
-  `MEMD_KMS_SHRED=schedule-deletion` (or `disable`) / `MEMD_VAULT_SHRED=delete-key`:
-  the shred then also destroys that key, and old copies of the wrapped key
-  are dead. These key-level actions are refused at startup for a shared key.
-  The destroy is recorded in the node's audit ledger with what the provider
-  did.
+  deletes the wrapped key object of the namespace. This includes every
+  noncurrent version on a versioned bucket. (If memd cannot use the versions
+  API of a versioned bucket, the destroy fails with an error.) The shred
+  cannot delete the CMK (customer master key), because every other
+  namespace needs it. Thus, a copy of the wrapped key made BEFORE the shred,
+  together with `kms:Decrypt` on the CMK, still recovers the data key. Such
+  a copy can be a bucket backup, cross-region replication or a snapshot.
+
+    WARNING: Keep backups of the `keys/` prefix under the same retention that
+    you promise for erasure, or do not include the prefix in backups.
+
+    Some tenants need the stronger guarantee. Give them their OWN key
+    (`MEMD_KMS_KEY_ID=alias/memd-{namespace}` /
+    `MEMD_VAULT_TRANSIT_KEY=memd-{namespace}`). Then set
+    `MEMD_KMS_SHRED=schedule-deletion` (or `disable`) / `MEMD_VAULT_SHRED=delete-key`.
+    The shred then also destroys that key, and old copies of the wrapped key
+    become useless. memd refuses these key-level actions at startup for a
+    shared key. memd records the destroy, with what the provider did, in the
+    audit ledger of the node.
+
 - **Migration** (`memd keys migrate`) removes the local key files only after
-  every namespace verified under the new provider; `--keep-local` keeps them,
-  and then crypto-shred does NOT cover those copies until they are removed.
-- **Cluster traffic.** Nodes proxy requests to each other over plain HTTP
-  unless you front them with TLS; `MEMD_CLUSTER_SECRET` authenticates the
-  routing header (HMAC over node, time, client, method and path, 60 s
-  window) but does not encrypt anything. Run the node-to-node network as a
-  private segment. A request without a valid signature is simply routed like
-  any client request.
-- **Audit retention is bounded** (16 sealed segments, 64MB each by default).
-  Past that the oldest is dropped and the hash chain is re-anchored, so
-  `verify()` proves tamper-evidence over the *retained window*.
-  `memd_audit_segments_pruned_total` records the truncation. Compliance tiers
-  needing unbounded history must ship segments off-box before they roll.
+  every namespace is verified under the new provider. `--keep-local` keeps
+  them. Then crypto-shred does NOT cover those copies until you remove them.
+
+- **Cluster traffic.** Nodes proxy requests to each other over plain HTTP,
+  unless you put TLS (Transport Layer Security) in front of them.
+  `MEMD_CLUSTER_SECRET` authenticates the routing header (HMAC over node,
+  time, client, method and path, 60 s window), but it does not encrypt
+  anything. Run the node-to-node network as a private segment. memd routes
+  a request without a valid signature like any client request.
+
+- **Audit retention is bounded** (by default, 16 sealed segments of 64MB
+  each). After that limit, memd drops the oldest segment and re-anchors the
+  hash chain. Thus, `verify()` proves tamper-evidence over the *retained
+  window*. `memd_audit_segments_pruned_total` records the truncation. If a
+  compliance tier needs unbounded history, it must copy the segments off the
+  machine before they roll.
+
 - **`/metrics`, `/v1/metrics/json` and `/v1/status` are namespace-scoped** for
-  a scoped key and unscoped for a `*` key: series labelled with a namespace
-  are served only to that namespace's keys and the operator. Series without a
-  namespace label (the http counters) are visible to every key, so their
-  labels carry nothing a caller chose: the route is one of the server's
-  route templates (`/v1/ns/:ns/memories/:id`) or `other`, and an unknown HTTP
-  method is `OTHER`. A namespace label is always the key's authorized
-  namespace, never one taken from the request path (a denied request's
-  rate-limit rejection counts under the key's own namespace). `MEMD_METRICS_PUBLIC=1` allows
-  unauthenticated scraping - only do that on a trusted network segment.
-- **Interactive docs are off by default** (`MEMD_ENABLE_DOCS=1` to enable):
-  the OpenAPI schema enumerates every route of an otherwise authenticated API.
+  a scoped key and unscoped for a `*` key. memd serves series labelled with a
+  namespace only to the keys of that namespace and to the operator. Series
+  without a namespace label (the http counters) are visible to every key.
+  Thus, their labels contain nothing that a caller chose. The route is one of
+  the route templates of the server (`/v1/ns/:ns/memories/:id`) or `other`,
+  and an unknown HTTP method is `OTHER`.
+
+    A namespace label is always the authorized namespace of the key, never a
+    namespace from the request path. (The rate-limit rejection of a denied
+    request counts under the namespace of the key.) `MEMD_METRICS_PUBLIC=1`
+    allows unauthenticated scraping. WARNING: Use it only on a trusted
+    network segment.
+
+- **Interactive docs are off by default** (`MEMD_ENABLE_DOCS=1` to enable).
+  The OpenAPI schema shows every route of an API that otherwise needs
+  authentication.
+
 - **Trust tiers are advisory to the model, not a sandbox.** Fencing marks
-  untrusted content as data; it cannot force a model to respect that.
-- **With the Jev reranker active, search text leaves the machine.** For every
-  search, the query and the top-30 candidate texts (date, role and the first
-  2,000 characters of each; no ids, scopes or metadata) are sent to
-  TypeSafe's API. `reranker="auto"` (the default) selects Jev only when a
-  TypeSafe key is configured and `typesafe-sdk` is installed; with no key,
-  nothing leaves the machine. A key counts from EITHER source:
-  `TYPESAFE_API_KEY` in the environment, or `typesafe_api_key` in the
-  `Memory(config=...)` dict - so passing the key in config for some other
-  purpose also turns on this egress unless `reranker` is set explicitly. Set
-  `MEMD_RERANKER=none` (or `local`, a cross-encoder that runs in-process) to
-  keep a keyed deployment local. In hosted mode the key is read from the
-  server's environment only; clients never send one.
-- **With an embedding key, record text leaves the machine.** Every
-  record's text (embedded in the background after the write) and every
-  search query are sent to the embeddings API (`embedding_base_url`,
-  OpenAI by default) when the embedder is the OpenAI-compatible one:
-  `embedder="openai"`, or `auto` with an embedding key from EITHER source,
+  untrusted content as data. It cannot force a model to obey that mark.
+
+- **With the Jev reranker active, search text leaves the machine.** For
+  every search, memd sends the query and the top-30 candidate texts to the
+  API of TypeSafe. For each candidate, it sends the date, the role and the
+  first 2,000 characters; it sends no ids, scopes or metadata.
+  `reranker="auto"` (the default) selects Jev only if a TypeSafe key is
+  configured and `typesafe-sdk` is installed. With no key, nothing leaves
+  the machine.
+
+    A key counts from EITHER source: `TYPESAFE_API_KEY` in the environment,
+    or `typesafe_api_key` in the `Memory(config=...)` dict. Thus, if you put
+    the key in config for some other purpose, this egress also starts, unless
+    `reranker` is set explicitly. To keep a deployment with a key local, set
+    `MEMD_RERANKER=none` (or `local`, a cross-encoder that runs in-process).
+    In hosted mode, memd reads the key only from the environment of the
+    server. Clients never send a key.
+
+- **With an embedding key, record text leaves the machine.** The
+  OpenAI-compatible embedder sends the text of every record and every search
+  query to the embeddings API (`embedding_base_url`, OpenAI by default).
+  memd embeds the record text in the background after the write. This
+  embedder is active with `embedder="openai"`,
+  or with `auto` and an embedding key. The key can come from EITHER source:
   `MEMD_EMBEDDING_API_KEY` in the environment or `embedding_api_key` in
   the `Memory(config=...)` dict. Config `embedding_api_key=""` (or
-  `embedder="hash"` / `"fastembed"`) keeps a process with the env var set
-  local.
+  `embedder="hash"` / `"fastembed"`) keeps a process local when the env var
+  is set.
+
 - **With the LLM extractor active, session turns leave the machine.** On
-  `close_session`, the session's raw turns (time, speaker and full text
-  of each, under a turn number made up for the call) are sent to the extraction provider
-  (`extraction_base_url`, OpenAI by default). The LLM extractor is active
-  when an extraction key is configured, from EITHER source:
+  `close_session`, memd sends the raw turns of the session to the extraction
+  provider (`extraction_base_url`, OpenAI by default). For each turn, it
+  sends the time, the speaker and the full text, under a turn number created
+  for the call. The LLM (large language model) extractor is active when an
+  extraction key is configured. The key can come from EITHER source:
   `MEMD_EXTRACTION_API_KEY` in the environment, or `extraction_api_key` in
-  the `Memory(config=...)` dict; config `extraction_api_key=""` keeps a
-  process with the env var set local. With no key, the pattern extractor
-  runs in-process and nothing leaves the machine.
+  the `Memory(config=...)` dict. Config `extraction_api_key=""` keeps a
+  process local when the env var is set. With no key, the pattern extractor
+  runs in-process, and nothing leaves the machine.
+
 - **The derived indexes hold plaintext.** The SQLite index and, with
-  `memd[fast]`, the tantivy index (`<ns>.tantivy/` beside it) contain record
-  text unencrypted, with owner-only permissions. Both are deleted on
-  crypto-shred and are rebuildable from the (encrypted) log.
-  In a multi-node deployment each node keeps its own local copy (the
-  SQLite index with its `-wal`/`-shm`, the tantivy copy, the ANN sidecar)
-  of the namespaces it serves, and a hard delete is scrubbed physically
-  only on the node that owns the namespace when it runs. A node drops its
-  copy of a namespace another node has taken over since it last served it
-  (another tenure's lineage in the manifest, or the namespace is gone):
-  when the namespace is closed after this node lost its lease (if the new
-  owner has already committed its tenure; otherwise at the next sweep), at
-  startup, and every `cache_sweep_s` (300 s; `MEMD_CACHE_SWEEP_S`, `0` = never) for
-  every namespace it does not have open - so text another node
-  hard-deletes leaves this node's disk within that interval of the other
-  node taking the namespace over, typically before the delete itself. It
-  never served that copy. The copy of a namespace this node was the last
-  to serve is kept (its reopen stays warm), and so is one another process
-  has open (processes sharing a `local_dir` serve from the same files).
-  Each sweep reads one manifest per such namespace. A node that is stopped
-  keeps its copies until it starts again: when a node is taken out of
-  service, remove its local cache directory (`local_dir`).
-  On the owning node the purge's scrub waits until no reader holds a
-  snapshot of the index older than it: a process outside memd that keeps a
-  read transaction open on the SQLite file (a backup tool, an ad-hoc
-  `sqlite3` shell) keeps the erased text in the file's WAL for as long as
-  it holds on - memd keeps retrying and logs a warning every 60 s while
-  serving normally (the namespace stays open: the LRU does not close it
-  while its scrub runs). A close in the meantime leaves the scrub to the
-  next open, which finishes it in the background if such a reader still
-  holds on; no index snapshot is published until it is done. Do not attach
-  long-lived readers to the cache files.
+  `memd[fast]`, the tantivy index (`<ns>.tantivy/` next to it) contain record
+  text that is not encrypted, with owner-only permissions. memd deletes both
+  on crypto-shred, and can rebuild both from the (encrypted) log.
+
+    In a multi-node deployment, each node keeps its own local copy of the
+    namespaces that it serves. This copy is the SQLite index with its
+    `-wal`/`-shm`, the tantivy copy and the ANN (approximate nearest
+    neighbor) sidecar. memd
+    scrubs a hard delete physically only on the node that owns the namespace
+    when the scrub runs.
+
+    A node drops its copy of a namespace if another node became its owner
+    after this node last served it. This is the case if the manifest shows
+    the lineage of another tenure, or if the namespace is gone. The node
+    drops the copy at these times:
+
+    - When the namespace closes after this node lost its lease, if the new
+      owner has already committed its tenure. If not, at the next sweep.
+    - At startup.
+    - Every `cache_sweep_s` (300 s; `MEMD_CACHE_SWEEP_S`, `0` = never), for
+      every namespace that the node does not have open. Each sweep reads one
+      manifest for each such namespace.
+
+    Thus, text that another node hard-deletes leaves the disk of this node
+    within that interval after the other node became the owner of the
+    namespace.
+    Usually, this occurs before the delete itself. It never served that copy.
+
+    The node keeps its copy of a namespace if it was the last node to serve
+    it (its reopen stays warm). It also keeps a copy that another process has
+    open (processes that share a `local_dir` serve from the same files). A
+    node that is stopped keeps its copies until it starts again. When you
+    take a node out of service, remove its local cache directory
+    (`local_dir`).
+
+    On the owning node, the scrub of the purge waits until no reader holds a
+    snapshot of the index that is older than the scrub. A process outside
+    memd can keep a read transaction open on the SQLite file (a backup tool,
+    an ad-hoc `sqlite3` shell). Then the erased text stays in the WAL of the
+    file for as long as that process holds the transaction. During that
+    time, memd tries again, logs a warning every 60 s and serves normally.
+    The namespace stays open: the LRU does not close it while its scrub
+    runs.
+
+    If the namespace closes in the meantime, the next open does the scrub.
+    If such a reader still holds its transaction, the next open completes the
+    scrub in the background. memd publishes no index snapshot until the
+    scrub is complete. Do not attach long-lived readers to the cache files.
+
 - **Read replicas keep a plaintext copy too, and are
-  eventually consistent.** A replica (an eventual read on a node that does
-  not hold the namespace's lease, or `Memory(..., read_only=True)`) keeps its
-  own derived cache - SQLite index, tantivy copy, ANN sidecar - under
-  `<cache dir>/replicas/<pid>-<token>/`, for exactly as long as it is open:
-  closing it (LRU eviction, `MEMD_REPLICA_IDLE_S` without reads, shutdown)
-  deletes the files, and a process that died with replicas open has its
-  directory deleted by the next memd process starting on the same cache
-  directory (each process holds an `flock` on its own). On a replica,
-  a hard delete the writer acknowledged is applied by the replica's next
-  refresh - it stops being served within the staleness bound (default 3 x
-  `MEMD_REPLICA_REFRESH_S`, 6 s; a replica older than the bound is not read)
-  - and the replica then scrubs its own files (FTS merge, vacuum, WAL
-  truncation, tantivy and ANN sidecar rebuilt), in the background; that is
-  sooner than the writer's own purge (up to the 72 h deadline). A
-  compaction, a takeover or a new tenure makes the replica delete its files
-  and rebuild from the bucket - whose durable data still holds a
-  hard-deleted record until the writer's purge: a replica built from it
-  (bootstrapped or rebuilt) applies the delete and scrubs its files the same
-  way, and a rebuilt replica serves nothing until it has applied the log
-  tail as well, so a delete it has served is never served again. A
-  destroyed (crypto-shredded) namespace's replica deletes its files and
-  drops the data key it held at its next refresh - and so does one
-  destroyed and created again under its name before that refresh: the
-  rebuild resolves the new incarnation's key from its record (never from a
-  cache), and a key that fails verification is
-  never kept. A replica never writes or deletes an object - no manifest, log
-  part, fence, wrapped key, custody marker, audit entry or snapshot (it is
-  opened over a read-only view of the store and the keys, and every write
-  path refuses on it) - and never mints a data key: it needs the
-  namespace's key exactly like a writer (the same `keys/` directory with
-  `local`, provider access with `aws-kms` / `vault-transit`), and a missing
-  or wrong key is a `KeyCustodyError` (never an empty replica; over the
-  router, the read goes to the writer). Eventual reads are opt-in
-  (`X-Memd-Read-Consistency: eventual`): one may miss a write or still
-  serve a delete acknowledged less than the bound ago. A search a replica
-  serves is audited in the serving node's own ledger (`memd-node.<id>`,
-  action `replica_search`, naming the namespace) - a replica cannot append
-  to the namespace's - and an embedded `read_only` Memory audits nothing.
+  eventually consistent.** memd uses a replica for an eventual read on a
+  node that does not hold the lease of the namespace, and for
+  `Memory(..., read_only=True)`. The replica keeps its own derived cache
+  (SQLite index, tantivy copy, ANN sidecar) under
+  `<cache dir>/replicas/<pid>-<token>/`, for exactly as long as it is open.
+  When the replica closes (LRU eviction, `MEMD_REPLICA_IDLE_S` without
+  reads, shutdown), memd deletes the files. If a process died with replicas
+  open, the next memd process that starts on the same cache directory
+  deletes its directory. Each process holds an `flock` on its own.
+
+    On a replica, the next refresh of the replica applies a hard delete that
+    the writer acknowledged. The replica stops serving the record within the
+    staleness bound (default 3 x `MEMD_REPLICA_REFRESH_S`, 6 s). memd does
+    not read a replica that is older than the bound. Then the replica
+    scrubs its own files in the background (FTS (full-text search) merge,
+    vacuum, WAL truncation, tantivy and ANN sidecar rebuilt). That is sooner
+    than the purge of the writer (up to the 72 h deadline).
+
+    A compaction, a takeover or a new tenure makes the replica delete its
+    files and rebuild from the bucket. The durable data in the bucket still
+    holds a hard-deleted record until the purge of the writer. A replica
+    built from that data (bootstrapped or rebuilt) applies the delete and
+    scrubs its files in the same way. A rebuilt replica serves nothing until
+    it has also applied the log tail. Thus, after a replica has served a
+    delete, it never serves the deleted record again.
+
+    At its next refresh, the replica of a destroyed (crypto-shredded)
+    namespace deletes its files and drops the data key that it held. The same
+    occurs if the namespace was destroyed and created again under its name
+    before that refresh. The rebuild resolves the key of the new incarnation
+    from its record (never from a cache). memd never keeps a key that fails
+    verification.
+
+    A replica never writes or deletes an object: no manifest, log part,
+    fence, wrapped key, custody marker, audit entry or snapshot. memd opens
+    it over a read-only view of the store and the keys, and every write path
+    refuses on it. A replica never mints a data key. It needs the key of the
+    namespace exactly like a writer (the same `keys/` directory with
+    `local`, provider access with `aws-kms` / `vault-transit`). A missing or
+    wrong key is a `KeyCustodyError`, never an empty replica (over the
+    router, the read goes to the writer).
+
+    Eventual reads are opt-in (`X-Memd-Read-Consistency: eventual`). An
+    eventual read can miss a write. It can also still serve a record whose
+    delete was acknowledged less than the bound ago. memd audits a search
+    that a replica serves in the ledger of the serving node
+    (`memd-node.<id>`, action `replica_search`, with the name of the
+    namespace). A replica cannot append to the ledger of the namespace. An
+    embedded `read_only` Memory audits nothing.
 
 - **Hosted mode & billing (`--hosted`, off by default).**
   - *The Stripe webhook is authenticated by its signature only.*
-    `POST /v1/billing/webhook` takes no bearer key; it verifies the
+    `POST /v1/billing/webhook` takes no bearer key: it verifies the
     `Stripe-Signature` HMAC-SHA256 over the raw body with
-    `MEMD_STRIPE_WEBHOOK_SECRET` (constant-time, via
-    `stripe.Webhook.construct_event`) and rejects timestamps outside the
-    tolerance (300 s), so a captured delivery cannot be replayed later; a
-    replay inside the window is a no-op (idempotent by event id). Treat the
-    webhook secret like a password: anyone holding it can forge plan
-    upgrades. Rotate it in the Stripe dashboard if it leaks.
-  - *Live keys are refused.* A `sk_live_`/`rk_live_` key stops hosted mode
-    from starting unless `MEMD_ALLOW_LIVE_BILLING=1` is set - set it only on
-    the production deployment, never in a dev or CI environment.
-  - *API keys are hashed at rest.* Hosted keys live in the admin store
-    (`<data root>/admin/admin.sqlite3`; the directory is 0700 and the
-    database with its `-wal`/`-shm` files 0600) as SHA-256 hashes of a
-    192-bit random secret; the key is shown once at creation. A fast hash is
-    appropriate for secrets of that entropy (there is nothing to brute-force);
-    it would not be for passwords. Revocation takes effect within 5 s in
-    every process (the lookup cache's TTL).
+    `MEMD_STRIPE_WEBHOOK_SECRET` (constant-time, through
+    `stripe.Webhook.construct_event`). It rejects timestamps outside the
+    tolerance (300 s), so nobody can replay a captured delivery later. A
+    replay inside the window has no effect (idempotent by event id).
+    WARNING: Protect the webhook secret like a password: a person who has it
+    can forge plan upgrades. If it leaks, rotate it in the Stripe dashboard.
+  - *Live keys are refused.* A `sk_live_`/`rk_live_` key prevents the start
+    of hosted mode, unless `MEMD_ALLOW_LIVE_BILLING=1` is set. Set it only on
+    the production deployment, never in a development or CI environment.
+  - *API keys are hashed at rest.* Hosted keys are in the admin store
+    (`<data root>/admin/admin.sqlite3`; the directory is 0700, and the
+    database with its `-wal`/`-shm` files is 0600). They are SHA-256 hashes
+    of a 192-bit random secret. memd shows the key one time, when it creates
+    it. A fast hash is correct for secrets of that entropy (there is nothing
+    to brute-force), but it would not be correct for passwords. Revocation
+    has effect within 5 s in every process (the TTL of the lookup cache).
   - *Tenant isolation is enforced twice:* a key is bound to one namespace,
-    and that namespace must belong to the key's org (a namespace can never
-    change org; `_`-prefixed names are reserved and never bound to a
-    tenant; names are matched in full, so a trailing newline is refused).
-    Billing routes act on the key's own org only - the request body cannot
-    name another one. Scopes are exact: `billing` for the billing routes
-    only; `memory` for the data routes and the namespace's `/v1/status`,
-    `/metrics` and `/v1/metrics/json`; `override` grants no route by itself.
+    and that namespace must belong to the org of the key. A namespace can
+    never change org, and names with a `_` prefix are reserved and never
+    bound to a tenant. memd matches names in full, so it refuses a trailing
+    newline. Billing routes operate on the org of the key only; the request
+    body cannot name another org. Scopes are exact: `billing` gives the
+    billing routes only; `memory` gives the data routes and the `/v1/status`,
+    `/metrics` and `/v1/metrics/json` of the namespace. `override` gives no
+    route by itself.
   - *Stripe state is verified, not taken from payloads.* A completed
-    Checkout Session applies only with `mode=subscription`, and the
-    subscription is re-read from Stripe; only `active`/`trialing` grant a
-    plan. An org is bound to a Stripe customer only when it has none and the
-    customer carries the `memd_org_id` metadata memd's checkout wrote - a
-    forged `client_reference_id` (e.g. on a payment link) is logged and
-    ignored. One subscription per org; a duplicate holds metered pushes.
-  - *No secret in logs or the admin store.* Stripe error text (which can
-    echo the API key) is redacted before it is logged or stored - `sk_`/
-    `rk_`/`pk_` keys, `whsec_` secrets, bearer tokens and memd keys - and a
-    filter redacts the Stripe SDK's own log records. `repr()` of the billing
-    configuration carries no secret.
-  - *The admin store is not tenant data.* It holds org names, Stripe customer
-    ids, key hashes and usage counts (no content). It is not encrypted by the
-    namespace envelope keys and is not included in exports; back it up with
-    the data root.
+    Checkout Session applies only with `mode=subscription`, and memd reads
+    the subscription again from Stripe. Only `active`/`trialing` give a
+    plan. memd binds an org to a Stripe customer only if the org has no
+    customer. The customer must also have the `memd_org_id` metadata that
+    the memd checkout wrote. memd logs and ignores a forged `client_reference_id`
+    (for example, on a payment link). Each org has one subscription; a
+    duplicate holds metered pushes.
+  - *No secret in logs or the admin store.* Stripe error text can echo the
+    API key. Before memd logs or stores this text, it redacts these items in
+    it: `sk_`/`rk_`/`pk_` keys, `whsec_` secrets, bearer tokens and memd
+    keys. A filter also redacts the log records of the Stripe SDK (software
+    development kit) itself. `repr()` of the billing configuration contains
+    no secret.
+  - *The admin store is not tenant data.* It holds org names, Stripe
+    customer ids, key hashes and usage counts (no content). The namespace
+    envelope keys do not encrypt it, and exports do not include it. Include
+    it in the backup of the data root.
 
 ## Recovering from an unreadable log frame
 
-An open that refuses raises `KeyCustodyError`, and its message says which
-case it is. Nothing was changed in any of them.
+An open that refuses raises `KeyCustodyError`. Its message tells which case
+it is. In all cases, memd changed nothing.
 
 - *"the key does not match"*, *"none of its data decrypts"*, *"no data
-  key"*: key custody. Restore the `keys/` directory the data was written
-  with (`root.key` and `ns-<namespace>.key` together) and open again with
-  encryption on. Nothing is lost.
-- *"looks encrypted ... opened it with encryption off"*: open with
-  encryption on (the default) and those keys.
+  key"*: key custody. Restore the `keys/` directory that the data was
+  written with (`root.key` and `ns-<namespace>.key` together). Then open
+  again with encryption on. Nothing is lost.
+- *"looks encrypted ... opened it with encryption off"*: open again with
+  encryption on (the default) and with those keys.
 - *"a complete WAL frame (at byte N of ns/<namespace>/wal) is unreadable
   although the data key in hand is the right one: the frame is damaged"*
   (or an `ops` frame; with encryption off, *"(it does not parse)"*): the log
-  is damaged on disk - bit rot, a bad copy, a hand edit. memd will not cut it
-  off, because it may hold acknowledged writes, and everything logged after
-  it is behind it. To recover:
-  1. Stop memd and back up the data root (`store/` and `keys/`; on S3 the
-     `ns/<namespace>/` prefix and the local keys directory).
-  2. If a backup holds the log from before the damage, restoring it is the
-     lossless fix.
-  3. Otherwise remove exactly the frame the message names - its 4-byte
-     length prefix and the payload that prefix announces - and nothing
-     else. Frames are self-contained (each carries its own sequence
-     number), so the ones after it keep their place; only the writes or ops
-     in the damaged frame are lost, and the backup from step 1 still holds
-     its bytes:
+  is damaged on disk (bit rot, a bad copy, a manual edit). memd does not cut
+  off the frame, because it can hold acknowledged writes, and everything
+  logged after it is behind it. To recover:
+  1. Stop memd. Then make a backup of the data root (`store/` and `keys/`;
+     on S3, the `ns/<namespace>/` prefix and the local keys directory).
+  2. If a backup holds the log from before the damage, restore it. This is
+     the fix without loss.
+  3. WARNING: This step loses the writes or ops in the damaged frame (the
+     backup from step 1 still holds its bytes). If you remove an `ops`
+     frame, you lose the deletes that it held. Records that it tombstoned
+     come back. A hard delete in it is undone, so memd serves the purged
+     text again.
+
+     If no such backup exists, remove exactly the frame that the message
+     names: its 4-byte length prefix and the payload that this prefix
+     announces. Remove nothing else. Frames are self-contained (each has its
+     own sequence number), so the frames after it keep their place:
 
      ```python
      p, n = "store/ns/<namespace>/wal", N   # the path and byte from the message
@@ -391,73 +521,84 @@ case it is. Nothing was changed in any of them.
      open(p, "wb").write(b[:n] + b[n + 4 + ln:])
      ```
 
-     On S3 the log is not one object: it is stored as part objects
+     On S3, the log is not one object. memd stores it as part objects
      (`ns/<namespace>/wal.__part-NNN`, plus `wal.__seq`), and byte N counts
-     across the parts in order. Find the part that holds byte N and delete
-     that one part object (every frame in it is lost; the backup from step 1
-     still holds them). Do not re-upload an edited single `wal` object: memd
-     does not read one.
+     across the parts in order. Find the part that holds byte N. WARNING:
+     Every frame in that part is lost when you delete it (the backup from
+     step 1 still holds them). Delete that one part object. Do not upload an edited
+     single `wal` object again: memd does not read one.
 
-     Removing an `ops` frame loses the deletes it held: records it
-     tombstoned come back, and a hard delete in it is undone, so the purged
-     text is served again. After recovering, repeat any delete that was
-     acknowledged around the time of the damage.
-  4. Open again; another damaged frame, if any, is reported the same way.
+     After you recover, do again each delete that was acknowledged at about
+     the time of the damage.
+  4. Open again. If there is another damaged frame, memd reports it in the
+     same way.
 
-While the namespace stays open with a damaged frame (a warm open does not
-read every frame, so it may only show up at the next rotate), it keeps
-serving, and fails closed only where the frame would be lost:
+A namespace can stay open with a damaged frame. A warm open does not read
+every frame, so the damage can show only at the next rotate. In that case,
+the namespace continues to serve, and fails closed only where the frame would
+be lost:
 
-- *Rotate and compaction refuse*, with the message above: each deletes the
-  log it read. Writes and deletes succeed all the same - the rotate or
-  purge compaction they trigger is deferred, not raised: it is logged,
-  counted (`memd_ns_maintenance_failures_total{op}`,
-  `memd_ns_maintenance_failing`), shown as `maintenance` in `stats()` and
-  `status()` (`/v1/status`) and as a count in `/health`
-  (`maintenance_failing`), and retried after a backoff (30 s, doubling to
-  10 min). The logs grow until a fold succeeds, and a due hard delete is not
-  purged until then: alert on `memd_ns_maintenance_failing`.
-- *Export leaves a damaged WAL frame out* and exports everything else -
-  run it before step 1 to have the readable data in hand. A warning names
-  the frame's byte offset, `memd_export_frames_skipped_total` counts it,
-  and the export's audit entry lists it (`skipped_frames`). Over REST every
-  export answers `X-Memd-Export-Skipped-Frames: N` (`0` when it is
-  complete; the NDJSON body holds records only); the Python SDK's
-  `export_jsonl()` sets `last_export_skipped_frames` (and logs a warning
-  when it is not 0), the TypeScript SDK sets `lastExportSkippedFrames`, and
-  embedded `Memory` sets `last_export_skipped_frames` too. A damaged `ops`
-  frame still refuses the export (now with an error status, not a 200
-  stream cut short): leaving out a delete would export the records it
-  deleted, hard-deleted text included.
-- *Every acknowledged delete is applied at once* - to the index and, for a
-  hard delete, to the purge schedule - so `get()` and search stop serving
-  the record whatever the rotate does. (Through 0.3.0 the refused rotate ran
-  first and skipped both; a cache left that way is healed by the first
-  compaction after recovery, which removes anything the log deleted that
-  the index still serves, and applies a supersede or quarantine the index
-  missed - `memd_index_settled_total`.)
+- *Rotate and compaction refuse*, with the message above, because each of
+  them deletes the log that it read. Writes and deletes succeed all the
+  same. memd defers the rotate or purge compaction that they trigger, and
+  does not raise its error. memd logs it, counts it
+  (`memd_ns_maintenance_failures_total{op}`, `memd_ns_maintenance_failing`),
+  and shows it as `maintenance` in `stats()` and `status()` (`/v1/status`)
+  and as a count in `/health` (`maintenance_failing`). memd tries it again
+  after a backoff (30 s, doubled each time, up to 10 min).
 
-A damaged segment never blocks an open: it is skipped by reads, kept by
-compaction (`"unreadable": true` in the manifest,
-`memd_segments_quarantined_total`), and served again once its bytes are
-restored from a backup.
+    The logs grow until a fold succeeds, and memd does not purge a due hard
+    delete until then. Set an alert on `memd_ns_maintenance_failing`.
+
+- *Export leaves a damaged WAL frame out* and exports everything else. Run
+  it before step 1, so that you have the readable data. A warning names the
+  byte offset of the frame, `memd_export_frames_skipped_total` counts it,
+  and the audit entry of the export lists it (`skipped_frames`).
+
+    Over REST, every export answers `X-Memd-Export-Skipped-Frames: N` (`0`
+    when the export is complete; the NDJSON (newline-delimited JSON) body
+    holds records only). The `export_jsonl()` of the Python SDK sets
+    `last_export_skipped_frames` (and logs a warning when it is not 0). The
+    TypeScript SDK sets `lastExportSkippedFrames`, and embedded `Memory` also
+    sets `last_export_skipped_frames`.
+
+    A damaged `ops` frame still refuses the export (now with an error
+    status, not a 200 stream cut short). If memd left out a delete, the
+    export would contain the records that it deleted, hard-deleted text
+    included.
+
+- *Every acknowledged delete is applied at once*, to the index and, for a
+  hard delete, to the purge schedule. Thus, `get()` and search stop serving
+  the record, whatever the rotate does.
+
+    Up to and including 0.3.0, the refused rotate ran first and skipped
+    both. The first compaction after recovery repairs a cache left in that
+    state. It removes anything that the log deleted and that the index still
+    serves. It also applies a supersede or quarantine that the index missed
+    (`memd_index_settled_total`).
+
+A damaged segment never blocks an open. Reads skip it, and compaction keeps
+it (`"unreadable": true` in the manifest, `memd_segments_quarantined_total`).
+When you restore its bytes from a backup, memd serves it again.
 
 ## Hardening checklist for a real deployment
 
-1. Set `MEMD_ADMIN_KEY` to a high-entropy value; never hand it to applications.
-   Mint per-namespace keys with `memd key create --namespace <ns>`.
+1. Set `MEMD_ADMIN_KEY` to a high-entropy value. Never give it to
+   applications. Mint per-namespace keys with
+   `memd key create --namespace <ns>`.
 2. Terminate TLS in front of the process. memd speaks plain HTTP.
-3. Bind to `127.0.0.1` unless something else is enforcing authn at the edge.
-   The same for the write-forwarding endpoint (`MEMD_FORWARD_HOST`, default
-   `127.0.0.1`); keep `forward.secret` in the data directory readable by the
-   service user only (memd creates it 0600), or set `MEMD_FORWARDING=off` on
-   a root only one process ever opens.
-4. Leave `MEMD_ENABLE_DOCS` and `MEMD_METRICS_PUBLIC` unset.
-5. Set `MEMD_NS_RATE_LIMIT_PER_MIN` to a real per-tenant ceiling.
-6. Back up the data root - the object store is the source of truth; the
-   SQLite index beside it is disposable. In hosted mode also back up
-   `admin/admin.sqlite3` (orgs, keys, the usage ledger): it is not
-   rebuildable.
-7. Hosted billing: use an `sk_test_` key until go-live; restrict the
-   webhook endpoint to Stripe's events; keep `MEMD_STRIPE_WEBHOOK_SECRET`
-   and `MEMD_STRIPE_SECRET_KEY` out of images and logs.
+3. Bind to `127.0.0.1`, unless something else enforces authentication
+   (authn) at the edge. Do the same for the write-forwarding endpoint
+   (`MEMD_FORWARD_HOST`, default `127.0.0.1`). Make sure that only the
+   service user can read `forward.secret` in the data directory (memd
+   creates it with mode 0600). As an alternative, set `MEMD_FORWARDING=off` on a root
+   that only one process ever opens.
+4. Do not set `MEMD_ENABLE_DOCS` and `MEMD_METRICS_PUBLIC`.
+5. Set `MEMD_NS_RATE_LIMIT_PER_MIN` to a real per-tenant limit.
+6. Make a backup of the data root. The object store is the source of truth;
+   the SQLite index next to it is disposable. In hosted mode, also make a
+   backup of `admin/admin.sqlite3` (orgs, keys, the usage ledger), because
+   memd cannot rebuild it.
+7. Hosted billing: use an `sk_test_` key until go-live. Restrict the webhook
+   endpoint to the events of Stripe. Keep `MEMD_STRIPE_WEBHOOK_SECRET` and
+   `MEMD_STRIPE_SECRET_KEY` out of images and logs.
