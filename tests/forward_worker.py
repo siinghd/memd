@@ -8,7 +8,9 @@ spec: root, config, namespace, encrypt, tag, n, out (the log), ready / go
 close once it exists), delete_every, hard_every, ryw (check
 read-your-writes after each write), sleep (between writes), hold_s (stay
 open after the last write), events_every (an add_events batch of 3 every
-k writes).
+k writes), lease_lost_ok (a write refused with LeaseLostError - this
+process was frozen past its lease and resumed - is logged as "failed",
+not acked, and the next one goes on).
 
 Every acknowledged operation is appended to `out` as one JSON line with a
 single write(2): what was acked survives this process - or the holder it
@@ -25,6 +27,7 @@ faulthandler.register(signal.SIGUSR1, all_threads=True)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 from memd.engine.memory import Memory  # noqa: E402
+from memd.storage.objectstore import LeaseLostError  # noqa: E402
 
 
 def main() -> None:
@@ -53,7 +56,14 @@ def main() -> None:
         if stop and os.path.exists(stop):
             break
         content = f"{tag} record {i} uniq{tag}x{i}"
-        if events_every and i % events_every == events_every - 1:
+        if spec.get("lease_lost_ok"):
+            try:
+                rid = m.add(content, user_id="u1")[0]
+            except LeaseLostError as ex:
+                log(op="failed", i=i, error=str(ex)[:200])
+                continue
+            log(op="add", id=rid, content=content)
+        elif events_every and i % events_every == events_every - 1:
             batch = [f"{content} part{k}" for k in range(3)]
             ids = m.add_events([{"content": c, "user_id": "u1"} for c in batch])
             for rid, c in zip(ids, batch):

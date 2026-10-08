@@ -648,3 +648,62 @@ except Exception as e:
         assert out.stdout.strip() == "NamespaceBusyError", out.stdout + out.stderr[-2000:]
     finally:
         a.close()
+
+
+@pytest.mark.s3
+def test_s3_frozen_holder_resumes_and_forwards(tmp_path, s3_root):
+    """The holder frozen (SIGSTOP) past its lease: the forwarder's call
+    waiting on it gives up once the lease is stale, takes the namespace
+    over (fencing the frozen holder) and goes on. The holder, resumed, has
+    its own write in flight refused (LeaseLostError, not acked) - and its
+    next ones forwarded to the new writer, though the namespace is its
+    facade's own (pinned)."""
+    root, raw = s3_root
+    ttl = 3.0
+    cfg, per = _s3_config(tmp_path, ttl=ttl)
+    fleet = Fleet(tmp_path, root, cfg, per_worker=per)
+    stop = str(tmp_path / "stop")
+    try:
+        fleet.spawn("A", 10 ** 6, sleep=0.01, stop=stop, lease_lost_ok=True)
+        fleet.wait_ready("A")
+        fleet.go()
+        fleet.spawn("B", 10 ** 6, sleep=0.01, stop=stop, ryw=True)
+        fleet.wait_ready("B")
+        deadline = time.monotonic() + 120
+        while fleet.acked_adds("B") < 20:
+            assert time.monotonic() < deadline, fleet.stderr("B")
+            time.sleep(0.01)
+        a = fleet.procs["A"]
+        os.kill(a.pid, signal.SIGSTOP)
+        t_freeze, frozen_b = time.monotonic(), fleet.acked_adds("B")
+        # the lease goes stale after the TTL; on MinIO a holder frozen in the
+        # middle of a PUT also holds that object's lock for MinIO's ~30 s
+        # timeout, and the takeover's fence waits for it (AWS S3 does not lock)
+        while fleet.acked_adds("B") < frozen_b + 10:
+            assert time.monotonic() - t_freeze < 90, ("the forwarder did not take over", fleet.stderr("B"))
+            time.sleep(0.05)
+        print(f"\nfrozen holder: the forwarder wrote again {time.monotonic() - t_freeze:.1f} s "
+              f"after the freeze (TTL {ttl:.0f} s)")
+        os.kill(a.pid, signal.SIGCONT)
+        deadline = time.monotonic() + 120
+        resumed_a = fleet.acked_adds("A")
+        while fleet.acked_adds("A") < resumed_a + 20:
+            assert time.monotonic() < deadline, fleet.stderr("A")
+            assert a.poll() is None, fleet.stderr("A")
+            time.sleep(0.01)
+        open(stop, "w").close()
+        fleet.finish("A", "B")
+    finally:
+        for p in fleet.procs.values():
+            if p.poll() is None:
+                os.kill(p.pid, signal.SIGCONT)
+        fleet.kill_all()
+    adds, deletes, violations = _acked(fleet, ["A", "B"])
+    assert not violations, violations[:5]
+    assert fleet.log("A")[-2] == {**fleet.log("A")[-2], "op": "done", "holds": False}, \
+        "the resumed holder forwards to the new writer"
+    m = _open_after(root, dict(cfg, local_dir=str(tmp_path / "verify")), encrypt=False)
+    try:
+        _verify(m, adds, deletes, raw)
+    finally:
+        m.close()

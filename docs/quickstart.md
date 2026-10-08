@@ -27,13 +27,14 @@ pip install "memd-engine[mcp,s3]"             # extras: mcp, s3, fast, ann, loca
 
 ## Running it
 
-{% include-markdown "../README-engine.md" start="## Running it" end="## Deployment constraint: ONE process per data root" %}
+{% include-markdown "../README-engine.md" start="## Running it" end="## Several processes on one data root" %}
 
-!!! warning "One process per data root"
-    A data directory belongs to one process at a time: a second one opening
-    the same namespace fails fast with `NamespaceBusyError`, and
-    `uvicorn --workers N` with N > 1 does not work. See
-    [Operations](operations.md#one-process-per-data-root).
+!!! note "Several processes on one data root"
+    A namespace is written by one process at a time. A second process
+    opening it forwards its writes and strong reads to the one holding it,
+    and takes the namespace over when that one goes away
+    (`forwarding="off"` raises `NamespaceBusyError` instead). See
+    [Operations](operations.md#several-processes-on-one-data-root).
 
 ## Next
 
