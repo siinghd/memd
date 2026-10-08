@@ -258,6 +258,13 @@ def test_http_flat_and_explicit_budget(client):
     assert body["tokens_used"] <= 500
 
 
+def test_http_packing_is_case_insensitive(client):
+    _events(client)
+    for value, header in (("FLAT", DEFAULT_HEADER), (" Sessions ", SESSIONS_HEADER)):
+        r = client.post("/v1/ns/acme/search", json={"query": "quarterly report", "user_id": "u1", "packing": value})
+        assert r.status_code == 200 and r.json()["packed_context"].startswith(header), value
+
+
 def test_http_rejects_an_unknown_packing(client):
     r = client.post("/v1/ns/acme/search", json={"query": "q", "packing": "dense"})
     assert r.status_code == 422

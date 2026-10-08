@@ -7,7 +7,7 @@ import os
 import sqlite3
 import time
 from contextlib import asynccontextmanager
-from typing import Any, Literal
+from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.encoders import jsonable_encoder
@@ -18,7 +18,13 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, field_validator
 
 from memd.core.schema import Kind
-from memd.engine.memory import DEFAULT_BUDGET_TOKENS, ForgetPreviewMismatch, Memory, forget_fingerprint
+from memd.engine.memory import (
+    DEFAULT_BUDGET_TOKENS,
+    ForgetPreviewMismatch,
+    Memory,
+    check_packing,
+    forget_fingerprint,
+)
 from memd.metrics import METRICS
 from memd.server.auth import FailureLimiter, KeyStore, Principal, RateLimiter
 from memd.storage.engine import NamespaceBusyError
@@ -127,10 +133,16 @@ class SearchIn(BaseModel):
     agent_id: str | None = None
     org_id: str | None = None
     include_quarantined: bool = False
-    # the packed context's layout; None = the server's `packing` config
-    packing: Literal["sessions", "flat"] | None = None
+    # the packed context's layout, "sessions" or "flat" (any case); None =
+    # the server's `packing` config
+    packing: str | None = Field(default=None, max_length=16)
 
     _ck = field_validator("kinds")(_validate_kinds)
+
+    @field_validator("packing")
+    @classmethod
+    def _cp(cls, v):
+        return None if v is None else check_packing(v)
 
 
 class FindIn(BaseModel):
