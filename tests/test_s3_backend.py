@@ -1,4 +1,4 @@
-"""The engine on a real S3 API (MinIO), not a mock.
+"""The engine on a real S3 API, not a mock.
 
 memd's design has always made object storage the source of truth, but until
 now LocalObjectStore was the only implementation, so every hosted SLO was
@@ -7,11 +7,11 @@ paths - write/recall, restart durability, compaction, cold start from the
 index snapshot, crypto-shred, and the single-writer lease - against a real
 S3 server.
 
-Skipped unless MEMD_TEST_S3_ENDPOINT is set. CI runs MinIO as a service
-container; locally:
+Skipped unless MEMD_TEST_S3_ENDPOINT is set. CI runs RustFS in a container
+(the image is pinned in .github/workflows/ci.yml); locally:
 
-    docker run -d -p 9000:9000 -e MINIO_ROOT_USER=minioadmin \
-      -e MINIO_ROOT_PASSWORD=minioadmin minio/minio server /data
+    docker run -d -p 9000:9000 -e RUSTFS_ACCESS_KEY=minioadmin \
+      -e RUSTFS_SECRET_KEY=minioadmin rustfs/rustfs:1.0.1
     MEMD_TEST_S3_ENDPOINT=http://127.0.0.1:9000 python -m pytest tests/test_s3_backend.py
 """
 import os

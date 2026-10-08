@@ -12,8 +12,8 @@ how many round trips a write and a read cost, and how the engine behaves when
 the source of truth is remote. The absolute latencies are a floor, not a
 forecast.
 
-    docker run -d -p 9000:9000 -e MINIO_ROOT_USER=minioadmin \
-      -e MINIO_ROOT_PASSWORD=minioadmin minio/minio server /data
+    docker run -d -p 9000:9000 -e RUSTFS_ACCESS_KEY=minioadmin \
+      -e RUSTFS_SECRET_KEY=minioadmin rustfs/rustfs:1.0.1
     MEMD_TEST_S3_ENDPOINT=http://127.0.0.1:9000 python bench/s3_bench.py
 """
 from __future__ import annotations

@@ -12,6 +12,11 @@ concurrency:
 
 env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  # The S3 API the S3 tests run against: RustFS, pinned by digest so a retag
+  # upstream cannot change it under CI. MinIO's images (minio/minio,
+  # quay.io/minio/minio) can no longer be pulled. It runs with the tests'
+  # default credentials (MEMD_TEST_S3_KEY / MEMD_TEST_S3_SECRET: minioadmin).
+  S3_IMAGE: rustfs/rustfs:1.0.1@sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c
 
 jobs:
   test:
@@ -43,18 +48,19 @@ jobs:
         run: pip install -e ".[${{ matrix.extras }}]"
       # The whole suite runs against an S3 API too: the s3-marked tests
       # outside the s3 job's files (key custody, cache sweeps, cluster
-      # handoff, the S3 example) skip without an endpoint. A service
-      # container cannot take a command, and MinIO needs one (see the s3 job).
-      - name: Start MinIO
+      # handoff, the S3 example) skip without an endpoint. A plain container,
+      # not a service: a service's image cannot read the workflow's env, so
+      # the pinned image would be written out twice.
+      - name: Start the S3 server
         run: |
-          docker run -d --name minio -p 9000:9000 \
-            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:latest server /data
+          docker run -d --name s3 -p 9000:9000 \
+            -e RUSTFS_ACCESS_KEY=minioadmin -e RUSTFS_SECRET_KEY=minioadmin \
+            "$S3_IMAGE"
           for _ in $(seq 1 60); do
-            if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null; then break; fi
+            if curl -sf http://127.0.0.1:9000/health >/dev/null; then break; fi
             sleep 1
           done
-          curl -sf http://127.0.0.1:9000/minio/health/live
+          curl -sf http://127.0.0.1:9000/health
       - name: Assert the lexical backend under test
         run: |
           python -c "from memd.index.tantivy_lexical import resolve_lexical_backend as r; \
@@ -90,12 +96,12 @@ jobs:
           path: harness-results/
           if-no-files-found: ignore
           retention-days: 14
-      - name: MinIO logs on failure
+      - name: S3 server logs on failure
         if: failure()
-        run: docker logs minio || true
+        run: docker logs s3 || true
 
   s3:
-    name: engine on a real S3 API (MinIO)
+    name: engine on a real S3 API (RustFS)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -106,18 +112,17 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
       - run: pip install -e ".[dev,s3]"
-      # A service container cannot take a command, and MinIO needs one, so it
-      # runs as a plain container instead.
-      - name: Start MinIO
+      # the same server, started the same way as in the test job
+      - name: Start the S3 server
         run: |
-          docker run -d --name minio -p 9000:9000 \
-            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:latest server /data
+          docker run -d --name s3 -p 9000:9000 \
+            -e RUSTFS_ACCESS_KEY=minioadmin -e RUSTFS_SECRET_KEY=minioadmin \
+            "$S3_IMAGE"
           for _ in $(seq 1 60); do
-            if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null; then break; fi
+            if curl -sf http://127.0.0.1:9000/health >/dev/null; then break; fi
             sleep 1
           done
-          curl -sf http://127.0.0.1:9000/minio/health/live
+          curl -sf http://127.0.0.1:9000/health
       # The s3 half skips per-test when the endpoint is unset, so the step can
       # report success having compared nothing. -p no:randomly + a strict
       # skip budget makes "the s3 backend was not actually exercised" a
@@ -165,12 +170,12 @@ jobs:
           path: bench-s3.json
           if-no-files-found: ignore
           retention-days: 30
-      - name: MinIO logs on failure
+      - name: S3 server logs on failure
         if: failure()
-        run: docker logs minio || true
+        run: docker logs s3 || true
       - name: Cleanup
         if: always()
-        run: docker rm -f minio || true
+        run: docker rm -f s3 || true
 
   security:
     name: static security scan

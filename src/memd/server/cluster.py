@@ -50,6 +50,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -125,7 +126,7 @@ class ClusterConfig:
         advertise = advertise or os.environ.get("MEMD_ADVERTISE_URL")
         if not advertise:
             h = host or os.environ.get("MEMD_HOST", "127.0.0.1")
-            if h in ("0.0.0.0", "::"):
+            if _is_wildcard(h):
                 raise ValueError("binding all interfaces: set --advertise / MEMD_ADVERTISE_URL to the "
                                  "address other nodes reach this one at")
             advertise = f"http://{h}:{port or int(os.environ.get('MEMD_PORT', '8700'))}"
@@ -133,6 +134,15 @@ class ClusterConfig:
                    secret=os.environ.get("MEMD_CLUSTER_SECRET", ""),
                    lease_ttl_s=float(os.environ.get("MEMD_LEASE_TTL_S", "60")),
                    route_retry_s=float(os.environ.get("MEMD_ROUTE_RETRY_S", "3")))
+
+
+def _is_wildcard(host: str) -> bool:
+    """True for an unspecified address (0.0.0.0, ::, any spelling of them):
+    bound there, a node has no address other nodes could reach it at."""
+    try:
+        return ipaddress.ip_address(host).is_unspecified
+    except ValueError:      # a hostname
+        return False
 
 
 def node_of(holder: str) -> str | None:

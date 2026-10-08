@@ -11,11 +11,12 @@ make ten-min       # fresh dir -> cross-session recall, the ten-minute story
 ```
 
 All three must pass before a change lands. CI runs exactly these on 3.11 and
-3.12 (against MinIO, so the S3 tests run too), plus bandit, a clean-install
-smoke test, a container smoke test, the TypeScript SDK and the docs build.
+3.12 (against RustFS, an S3 server, so the S3 tests run too), plus bandit, a
+clean-install smoke test, a container smoke test, the TypeScript SDK and the
+docs build.
 
 ```bash
-MEMD_TEST_S3_ENDPOINT=http://127.0.0.1:9000 make test   # with MinIO (see tests/test_s3_backend.py)
+MEMD_TEST_S3_ENDPOINT=http://127.0.0.1:9000 make test   # with an S3 server (see tests/test_s3_backend.py)
 python examples/01_quickstart.py                        # examples/ are run by tests/test_examples.py
 pip install -e ".[docs]" && mkdocs build --strict       # the docs site (mkdocs.yml); mkdocs serve to preview
 ```
