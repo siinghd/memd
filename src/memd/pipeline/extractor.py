@@ -374,7 +374,7 @@ prompt_version={PROMPT_VERSION}"""
         from memd.query.rerank import candidate_from_record
 
         c = candidate_from_record(rec)
-        text = _LINE_BREAKS.sub(lambda _m: "\\n", rec.content)
+        text = LINE_BREAKS.sub(lambda _m: "\\n", rec.content)
         return f"{c['date']} {c['role']}: {text}"
 
     def _complete(self, body: dict) -> dict:
@@ -459,7 +459,9 @@ prompt_version={PROMPT_VERSION}"""
 
 
 # every line boundary str.splitlines() knows (models split on them too)
-_LINE_BREAKS = re.compile(r"\r\n|[\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
+# every boundary str.splitlines() knows: a record's text is written on one
+# line (in the extraction prompt, in a session-packed context)
+LINE_BREAKS = re.compile(r"\r\n|[\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
 _TURN_ID_CHARS = 16  # "[a1b2c3-40] " and the line break, as chunk_chars counts a line
 
 

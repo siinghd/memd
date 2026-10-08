@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from memd.core.schema import Kind, MemoryRecord, Source
+from memd.pipeline.extractor import LINE_BREAKS
 from memd.query.dates import WEEKDAY_ABBR, annotate, utc_date
 from memd.query.fusion import FusedItem, deterministic_order, recency_boost
 
@@ -360,8 +361,15 @@ def _fence(r: MemoryRecord, line: str) -> str:
     return f"{_FENCE_OPEN}\n{_escape(line)}\n{_FENCE_CLOSE}" if _fenced(r) else line
 
 
+def _one_line(text: str) -> str:
+    """A record's text on one line: a line break is written as \\n (as in
+    the extraction prompt), so no text can start a line of its own - a
+    session header, a speaker, a fact, a gap marker."""
+    return LINE_BREAKS.sub(lambda _m: "\\n", text)
+
+
 def _turn_line(r: MemoryRecord, limit: int, focus: str, resolve_dates: bool) -> str:
-    body = _excerpt(r.content.strip(), limit, focus)
+    body = _one_line(_excerpt(r.content.strip(), limit, focus))
     who = _speaker(r)
     if resolve_dates and who == "user":
         try:
@@ -376,7 +384,7 @@ def _memory_line(r: MemoryRecord, said_by: MemoryRecord | None = None) -> str:
     turn's voice (an extracted fact's own source is the session's lowest
     trust tier, not who said it - that still decides the fencing)."""
     status = "" if _valid(r) else ", superseded"
-    body = _excerpt(r.content.strip(), ANCHOR_CHARS)
+    body = _one_line(_excerpt(r.content.strip(), ANCHOR_CHARS))
     return _fence(r, f"[memory {r.kind}{status}, said by the {_speaker(said_by or r)}: {body}]")
 
 
