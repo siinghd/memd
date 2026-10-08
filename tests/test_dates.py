@@ -39,7 +39,8 @@ def test_counts_ago_and_from_now():
     assert ann("an hour or one day ago") == [("one day ago", "= Fri 2023-05-19")]
     assert ann("12 days ago") == [("12 days ago", "= Mon 2023-05-08")]
     assert ann("twelve weeks ago") == [("twelve weeks ago", "= Sat 2023-02-25")]
-    assert ann("Two Weeks Ago") == [("Two Weeks Ago", "= Sat 2023-05-06")]  # any case
+    assert ann("Two weeks ago") == [("Two weeks ago", "= Sat 2023-05-06")]  # any case at a sentence's start
+    assert ann("TWO weeks AGO") == [("TWO weeks AGO", "= Sat 2023-05-06")]
     assert ann("2 week ago") == [("2 week ago", "= Sat 2023-05-06")]  # singular unit
     assert ann("5 days from now") == [("5 days from now", "= Thu 2023-05-25")]
     assert ann("two weeks from now") == [("two weeks from now", "= Sat 2023-06-03")]
@@ -146,11 +147,48 @@ def test_no_false_positives(text):
     assert ann(text) == [], text
 
 
+@pytest.mark.parametrize("text", [
+    "I read USA Today every morning",          # capitalized in mid-sentence: a name
+    "We watched The Tonight Show",
+    "Last Week Tonight with John Oliver",      # every word capitalized: a title
+    "Last Night a DJ Saved My Life",
+    "This Week in Tech podcast",
+    "The Day Before Yesterday",
+    "Tomorrow Never Dies (film)",              # followed by a capitalized word
+    "I watched Next Friday again",
+    "Two Weeks Ago",
+])
+def test_titles_and_names_are_left_alone(text):
+    assert ann(text) == [], text
+
+
+def test_sentence_starts_still_resolve():
+    assert ann("Yesterday I went") == [("Yesterday", "= Fri 2023-05-19")]
+    assert ann("Last week was busy") == [("Last week", "= Mon 2023-05-08 to Sun 2023-05-14")]
+    assert ann("ok. Tomorrow we fly") == [("Tomorrow", "= Sun 2023-05-21")]
+    assert ann('She said: "Today is fine"') == [("Today", "= Sat 2023-05-20")]
+    assert ann("Next Friday we fly") == [("Next Friday", "= Fri 2023-05-26")]  # a title or not: can't tell
+
+
+def test_ranges_are_approximate_spans():
+    assert ann("3-4 days ago") == [("3-4 days ago", "≈ Tue 2023-05-16 to Wed 2023-05-17")]
+    assert ann("2 to 3 weeks ago") == [("2 to 3 weeks ago", "≈ Sat 2023-04-29 to Sat 2023-05-06")]
+    assert ann("two or three days ago") == [("two or three days ago", "≈ Wed 2023-05-17 to Thu 2023-05-18")]
+    assert ann("1–2 weeks from now") == [("1–2 weeks from now", "≈ Sat 2023-05-27 to Sat 2023-06-03")]
+    assert ann("1.5-2 years ago") == []  # a part of a larger number, still
+
+
+def test_suffixes_are_not_the_word():
+    assert ann("today-ish") == [] and ann("tomorrowland") == [] and ann("last years") == []
+
+
 def test_dates_out_of_the_calendar_are_left_alone():
     assert ann("tomorrow", dt.date(9999, 12, 31)) == []
     assert ann("yesterday", dt.date(1, 1, 1)) == []
     assert ann("3 years ago and yesterday", dt.date(2, 1, 1)) == [("yesterday", "= Mon 0001-12-31")]
-    assert ann("next year", dt.date(9999, 6, 1)) == [("next year", "= 10000")]  # a label, not a date
+    assert ann("next year", dt.date(9999, 6, 1)) == []
+    assert ann("last year", dt.date(1, 6, 1)) == []
+    assert ann("next month", dt.date(9999, 12, 1)) == []
 
 
 def test_names_do_not_depend_on_the_locale():

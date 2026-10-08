@@ -9,11 +9,15 @@ Resolved: yesterday / today / tomorrow (and "the day before yesterday",
 "tonight", "this morning", ...), "N days|weeks|months|years ago" and
 "... from now" (N a digit count or one..twelve / a / a few / a couple of),
 "last|this past|next <weekday>", "last|this|next week|weekend|month|year".
-Vague counts ("a few", "a couple of") and month/year shifts are marked
-approximate ("≈" instead of "="). Left alone, because they are durations or
-ambiguous: "in two weeks", "two days later", a bare weekday ("on Saturday"),
-"the last week of June", "the next year", "the last night of the trip", a
-number that is part of a larger one ("1.5 years ago", "1,000 years ago").
+Vague counts ("a few", "a couple of"), ranges ("3-4 days ago": a span of
+dates) and month/year shifts are marked approximate ("≈" instead of "=").
+Left alone, because they are durations, titles or ambiguous: "in two
+weeks", "two days later", a bare weekday ("on Saturday"), "the last week of
+June", "the next year", "the last night of the trip", a number that is part
+of a larger one ("1.5 years ago", "1,000 years ago"), an expression
+capitalized in mid-sentence ("USA Today", "The Tonight Show"), one whose
+every word is capitalized ("Last Week Tonight") or that a capitalized word
+follows ("Tomorrow Never Dies"), and dates outside years 1-9999.
 
 Dates are calendar dates of the turn's UTC timestamp; weekday and month
 names are English whatever the process locale.
@@ -28,21 +32,24 @@ WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", 
 WEEKDAY_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 _MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August",
            "September", "October", "November", "December")
-_NUM = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+_NUMBERS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
         "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "a couple of": 2, "couple of": 2,
         "a couple": 2, "a few": 3, "few": 3}
 _VAGUE = ("a couple of", "couple of", "a couple", "a few", "few")
 # alternation order matters: the longer phrase first ("a couple of" before "a")
-_NUMRE = (r"(\d{1,3}|a couple of|couple of|a couple|a few|few|an|a|one|two|three|four|five|six|seven|eight"
-          r"|nine|ten|eleven|twelve)")
+_NUM = (r"(?:\d{1,3}|a couple of|couple of|a couple|a few|few|an|a|one|two|three|four|five|six|seven|eight"
+        r"|nine|ten|eleven|twelve)")
+# "3 days", or a range "3-4 days" / "3 to 4 days" / "two or three days"
+_COUNT = rf"(?:(?P<lo>{_NUM})\s*(?:-|–|to|or)\s*)?(?P<n>{_NUM})\s+(?P<unit>day|week|month|year)s?"
 _WDRE = "(" + "|".join(WEEKDAYS) + ")"
 # a count must not be the tail of a larger number: "1.5 years ago", "1,000 years ago", "2 1/2 years ago"
-_NOT_PART = r"(?<!\d[.,/])"
+_NOT_PART = r"(?<!\d[.,/\-–])"
 # "the last week of June", "the next year": a span inside a phrase, not the one before/after the turn
 _NOT_THE = r"(?<!the )"
 _NOT_OF = r"(?!\s+of\b)"  # "last week of June" (no "the") is the same phrase
-# "yesterday's meeting": the possessive belongs to the expression (the date goes after it)
-_POSS = r"(?:['’]s\b)?"
+# "yesterday's meeting": the possessive belongs to the expression (the date
+# goes after it); "today-ish" is another word
+_POSS = r"(?:['’]s\b)?(?![-‐]\w)"
 
 
 def fmt_day(d: _dt.date) -> str:
@@ -71,20 +78,29 @@ def _shift(d: _dt.date, n: int, unit: str) -> _dt.date:
     return add_months(d, 12 * n)
 
 
-def _count(m: re.Match) -> tuple[int, str, bool]:
-    raw, unit = m.group(1).lower(), m.group(2).lower()
-    n = int(raw) if raw.isdigit() else _NUM[raw]
-    return n, unit, raw in _VAGUE or unit in ("month", "year")
+def _value(raw: str) -> int:
+    raw = raw.lower()
+    return int(raw) if raw.isdigit() else _NUMBERS[raw]
+
+
+def _counted(m: re.Match, d: _dt.date, sign: int) -> str:
+    """The date N units before (sign -1) or after (+1) d; for a range, the
+    span of dates, earliest first."""
+    unit, n = m.group("unit").lower(), _value(m.group("n"))
+    lo = m.group("lo")
+    approx = (m.group("n").lower() in _VAGUE or unit in ("month", "year") or lo is not None
+              or (lo or "").lower() in _VAGUE)
+    days = sorted({_shift(d, sign * k, unit) for k in ({n} if lo is None else {_value(lo), n})})
+    span = fmt_day(days[0]) if len(days) == 1 else f"{fmt_day(days[0])} to {fmt_day(days[-1])}"
+    return ("≈ " if approx else "= ") + span
 
 
 def _ago(m: re.Match, d: _dt.date) -> str:
-    n, unit, approx = _count(m)
-    return ("≈ " if approx else "= ") + fmt_day(_shift(d, -n, unit))
+    return _counted(m, d, -1)
 
 
 def _from_now(m: re.Match, d: _dt.date) -> str:
-    n, unit, approx = _count(m)
-    return ("≈ " if approx else "= ") + fmt_day(_shift(d, n, unit))
+    return _counted(m, d, 1)
 
 
 def _prev_weekday(m: re.Match, d: _dt.date) -> str:
@@ -111,6 +127,8 @@ def _span(m: re.Match, d: _dt.date) -> str:
     if unit == "month":
         t = add_months(d.replace(day=1), k)
         return f"= {_MONTHS[t.month - 1]} {t.year:04d}"
+    if not 1 <= d.year + k <= 9999:
+        raise ValueError("year out of range")
     return f"= {d.year + k:04d}"
 
 
@@ -128,14 +146,37 @@ _RULES = [
     (re.compile(r"\btomorrow\b" + _POSS, re.I), _fixed(1)),
     (re.compile(r"\b(?:earlier today|today|tonight|this morning|this afternoon|this evening)\b" + _POSS, re.I),
      _fixed(0)),
-    (re.compile(_NOT_PART + r"\b" + _NUMRE + r"\s+(day|week|month|year)s?\s+ago\b", re.I), _ago),
+    (re.compile(_NOT_PART + r"\b" + _COUNT + r"\s+ago\b", re.I), _ago),
     # "N days from now" only: "in N days" / "N days later" are as often
     # durations, or relative to some other event
-    (re.compile(_NOT_PART + r"\b" + _NUMRE + r"\s+(day|week|month|year)s?\s+from now\b", re.I), _from_now),
+    (re.compile(_NOT_PART + r"\b" + _COUNT + r"\s+from now\b", re.I), _from_now),
     (re.compile(_NOT_THE + r"\b(last|this past)\s+" + _WDRE + r"\b" + _POSS + _NOT_OF, re.I), _prev_weekday),
     (re.compile(_NOT_THE + r"\bnext\s+" + _WDRE + r"\b" + _POSS + _NOT_OF, re.I), _next_weekday),
     (re.compile(_NOT_THE + r"\b(last|this|next)\s+(weekend|week|month|year)\b" + _POSS + _NOT_OF, re.I), _span),
 ]
+
+
+_SENTENCE_START = set(".!?:;\"'([{\n“‘«-–—")
+_NEXT_WORD = re.compile(r"\s*([A-Za-z][\w'’]*)")
+_PRONOUN_I = {"I", "I'm", "I’m", "I'll", "I’ll", "I've", "I’ve", "I'd", "I’d"}
+
+
+def _title_like(text: str, start: int, end: int) -> bool:
+    """A capitalized expression that reads as a name or a title rather than
+    a date: capitalized in mid-sentence ("USA Today"), every word
+    capitalized ("Last Week Tonight"; a weekday is always capitalized), or
+    followed by a capitalized word other than "I" ("Tomorrow Never Dies")."""
+    if not text[start].isupper():
+        return False
+    before = text[:start].rstrip()
+    if before and before[-1] not in _SENTENCE_START:
+        return True
+    words = re.findall(r"[A-Za-z]+", text[start:end])[1:]
+    rest = [w for w in words if w.lower() not in WEEKDAYS and w.lower() not in ("s",)]
+    if rest and all(w[0].isupper() for w in rest):
+        return True
+    nxt = _NEXT_WORD.match(text, end)
+    return bool(nxt and nxt.group(1)[0].isupper() and nxt.group(1) not in _PRONOUN_I)
 
 
 def resolve(text: str, day: _dt.date) -> list[tuple[int, int, str]]:
@@ -145,6 +186,8 @@ def resolve(text: str, day: _dt.date) -> list[tuple[int, int, str]]:
     found = []
     for pat, fn in _RULES:
         for m in pat.finditer(text):
+            if _title_like(text, m.start(), m.end()):
+                continue
             try:
                 found.append((m.start(), m.end(), fn(m, day)))
             except (ValueError, OverflowError):  # a date out of the calendar's range: leave it
