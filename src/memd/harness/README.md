@@ -6,8 +6,9 @@ the authority for the quality and cost targets of memd.
 ## Principles (enforced by code, not convention)
 - **Everything is frozen**: the answer and judge models, the prompts, the
   retrieval configs and the dataset revisions are pinned and version-locked.
-  Every result contains `HARNESS_VERSION` (content hash of this directory). A
-  result without a hash is not a valid result.
+  Every result contains `HARNESS_VERSION`, a content hash of every `*.py` file
+  in this directory and its subdirectories. Other files, for example this
+  README, do not change it. A result without a hash is not a valid result.
 - **Quality and cost side by side, always**: every run reports accuracy/recall
   AND $/1K queries, tokens/query, write COGS (cost of goods sold) and p50/p95
   latencies. A quality improvement that makes cost >20% worse fails the gate
