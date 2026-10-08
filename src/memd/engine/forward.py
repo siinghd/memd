@@ -1011,10 +1011,23 @@ class Forwarder:
         Retries - same request id - until `wait_s` passes without a writer
         answering; ForwardingError then (nothing applied), or
         ForwardTimeoutError if a write's attempt may have been applied."""
+        uncertain: list[str] = []      # (a write's) attempts sent that got no answer
+        try:
+            return self._call(ns, op, args, ids, write=write, timeout_s=timeout_s, uncertain=uncertain)
+        except ForwardingError as ex:
+            if not uncertain:
+                raise
+            # "nothing was applied" would be false: an attempt may have been
+            METRICS.inc("memd_forward_calls_total", op=op, outcome="unknown", ns=ns)
+            raise ForwardTimeoutError(
+                f"namespace {ns!r}: an attempt of this write got no answer ({uncertain[-1]}) and "
+                f"no writer can run it again ({ex}); the earlier attempt may have been applied") from ex
+
+    def _call(self, ns: str, op: str, args: dict, ids: list[str] | None, *, write: bool,
+              timeout_s: float | None, uncertain: list[str]):
         rid = uuid.uuid4().hex
         t0 = time.monotonic()
         deadline = t0 + self.cfg.wait_s
-        uncertain = False
         why = ""
         attempt = 0
         while True:
@@ -1038,7 +1051,8 @@ class Forwarder:
                 except _Uncertain as ex:
                     self._forget(ns, ep)
                     why = str(ex)
-                    uncertain = uncertain or write
+                    if write:
+                        uncertain.append(why)
                 else:
                     if isinstance(reply, _StreamReader):
                         return reply

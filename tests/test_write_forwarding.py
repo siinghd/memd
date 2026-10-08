@@ -700,6 +700,41 @@ def test_a_closed_store_refuses_every_late_write(tmp_path):
         b.close()
 
 
+@pytest.mark.parametrize("then", ["no_forwarding", "refused"])
+def test_a_write_that_may_have_been_applied_is_never_reported_as_not_applied(then):
+    """An attempt sent with no answer (the holder died after running it),
+    then the namespace held by a process that does not forward - or one
+    that refuses this process: the call said ForwardingError, "nothing was
+    applied", for a write an earlier attempt may well have applied. It says
+    ForwardTimeoutError (outcome unknown) instead; a read keeps
+    ForwardingError."""
+    import types
+
+    f = fw.Forwarder(types.SimpleNamespace(store=object()), fw.ForwardConfig(wait_s=5.0), "s" * 32, "me")
+    ep = fw.Endpoint("127.0.0.1", 1, "e1", socket.gethostname())
+
+    def run(write: bool):
+        state = {"n": 0}
+
+        def route(ns):
+            state["n"] += 1
+            if state["n"] > 1 and then == "no_forwarding":
+                raise fw.ForwardingError("held by a process that does not accept forwarded calls")
+            return ep
+
+        def call(ep_, req, **kw):
+            if state["n"] == 1:
+                raise fw._Uncertain("the connection closed before an answer")
+            raise fw.ForwardAuthError("refused this process's credentials")
+        f._route, f.client.call = route, call
+        return f.call(NS, "add", {"content": "x"}, ["01JX"], write=write)
+
+    with pytest.raises(fw.ForwardTimeoutError, match="may have been applied"):
+        run(write=True)
+    with pytest.raises(fw.ForwardingError):
+        run(write=False)
+
+
 # ------------------------------------------------------------------ several processes
 
 
