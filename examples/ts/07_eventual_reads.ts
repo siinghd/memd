@@ -1,7 +1,7 @@
-// Eventual reads with @memd/client: consistency "eventual" with a staleness bound, who served each read (lastRead and the X-Memd-* headers), read-your-writes.
+// Eventual reads with memd-engine: consistency "eventual" with a staleness bound, who served each read (lastRead and the X-Memd-* headers), read-your-writes.
 // Run (in examples/ts): python ../local_server.py -- npx tsx 07_eventual_reads.ts   (or point MEMD_URL / MEMD_API_KEY / MEMD_NAMESPACE at a cluster node)
 import assert from "node:assert/strict";
-import { BadRequestError, MemdClient, type FetchLike, type ReadInfo } from "@memd/client";
+import { BadRequestError, MemdClient, type FetchLike, type ReadInfo } from "memd-engine";
 
 const { MEMD_URL, MEMD_API_KEY, MEMD_NAMESPACE = "default" } = process.env;
 if (!MEMD_URL || !MEMD_API_KEY) {

@@ -1,8 +1,8 @@
-// Sessions and facts with @memd/client: capture a conversation, close the session to extract facts, supersede a fact, read its history, time-travel.
+// Sessions and facts with memd-engine: capture a conversation, close the session to extract facts, supersede a fact, read its history, time-travel.
 // Run (in examples/ts): python ../local_server.py -- npx tsx 02_sessions_and_facts.ts   (or set MEMD_URL / MEMD_API_KEY / MEMD_NAMESPACE yourself)
 import assert from "node:assert/strict";
 import { setTimeout as sleep } from "node:timers/promises";
-import { MemdClient, type ChatMessage } from "@memd/client";
+import { MemdClient, type ChatMessage } from "memd-engine";
 
 const { MEMD_URL, MEMD_API_KEY, MEMD_NAMESPACE = "default" } = process.env;
 if (!MEMD_URL || !MEMD_API_KEY) {

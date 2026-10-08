@@ -1,8 +1,8 @@
-// Search options with @memd/client: scope filters, namespaces, kinds, budgets and limits, time (as_of and t_event), the server's reranker.
+// Search options with memd-engine: scope filters, namespaces, kinds, budgets and limits, time (as_of and t_event), the server's reranker.
 // Run (in examples/ts): python ../local_server.py -- npx tsx 03_search_options.ts   (or set MEMD_URL / MEMD_API_KEY / MEMD_NAMESPACE yourself)
 import assert from "node:assert/strict";
 import { setTimeout as sleep } from "node:timers/promises";
-import { KINDS, MemdClient, PermissionDeniedError, type Kind, type SearchResult } from "@memd/client";
+import { KINDS, MemdClient, PermissionDeniedError, type Kind, type SearchResult } from "memd-engine";
 
 const { MEMD_URL, MEMD_API_KEY, MEMD_NAMESPACE = "default" } = process.env;
 if (!MEMD_URL || !MEMD_API_KEY) {

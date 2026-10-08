@@ -106,7 +106,7 @@ More in [`examples/`](examples/README.md).
 - **Python:** `from memd import Memory`, embedded as above; `Memory(api_key=..., base_url=...)` is the same API over REST.
 - **MCP:** `memd serve --mcp` exposes four tools (`memory_search`, `memory_save`, `memory_forget`, `memory_status`) to any MCP client ([setup](examples/mcp/README.md)).
 - **HTTP:** `memd serve --http` serves the REST API on port 8700, with per-namespace API keys (`memd key create --namespace acme`).
-- **TypeScript:** [`sdk-ts/`](sdk-ts/README.md) is `@memd/client`, a typed REST client for Node >= 18, Bun, Deno and edge runtimes (not on npm yet: build it from `sdk-ts/`).
+- **TypeScript:** [`sdk-ts/`](sdk-ts/README.md) is `memd-engine`, a typed REST client for Node >= 18, Bun, Deno and edge runtimes (not on npm yet: build it from `sdk-ts/`).
 
 ## Measured quality
 

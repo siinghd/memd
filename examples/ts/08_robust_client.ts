@@ -1,4 +1,4 @@
-// Robust @memd/client usage: retries and backoff on 503/429, per-attempt timeouts and overall deadlines, writes made safe to retry, typed error handling.
+// Robust memd-engine usage: retries and backoff on 503/429, per-attempt timeouts and overall deadlines, writes made safe to retry, typed error handling.
 // Run (in examples/ts): python ../local_server.py -- npx tsx 08_robust_client.ts   (or set MEMD_URL / MEMD_API_KEY / MEMD_NAMESPACE yourself)
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
@@ -18,7 +18,7 @@ import {
   ValidationError,
   type AddOptions,
   type FetchLike,
-} from "@memd/client";
+} from "memd-engine";
 
 const { MEMD_URL, MEMD_API_KEY, MEMD_NAMESPACE = "default" } = process.env;
 if (!MEMD_URL || !MEMD_API_KEY) {

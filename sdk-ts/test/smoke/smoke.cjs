@@ -1,6 +1,6 @@
 // The CommonJS half of smoke.mjs: require() must resolve dist/index.cjs.
 const assert = require("node:assert/strict");
-const { MemdClient, NotFoundError } = require("@memd/client");
+const { MemdClient, NotFoundError } = require("memd-engine");
 
 (async () => {
   const client = new MemdClient({

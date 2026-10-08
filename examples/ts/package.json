@@ -2,13 +2,13 @@
   "name": "memd-examples-ts",
   "private": true,
   "type": "module",
-  "description": "TypeScript examples for @memd/client, against this repository's sdk-ts build",
+  "description": "TypeScript examples for memd-engine, against this repository's sdk-ts build",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "start": "tsx 01_quickstart.ts"
   },
   "dependencies": {
-    "@memd/client": "file:../../sdk-ts"
+    "memd-engine": "file:../../sdk-ts"
   },
   "devDependencies": {
     "@types/node": "^20.19.43",

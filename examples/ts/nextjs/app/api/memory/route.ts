@@ -8,7 +8,7 @@ import {
   RequestAbortedError,
   ServerError,
   ValidationError,
-} from "@memd/client";
+} from "memd-engine";
 
 // "edge" works as well: the client uses only fetch, and this file no Node-only API
 // (Next.js provides process.env on both runtimes).

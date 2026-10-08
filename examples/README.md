@@ -12,7 +12,7 @@ Node.
 | [`02_sessions_and_facts.py`](02_sessions_and_facts.py) | `observe`, `close_session` fact extraction, supersedence on an entity key, `history`, `as_of` time travel, restart | - |
 | [`03_mcp_server.py`](03_mcp_server.py) + [`mcp/`](mcp/README.md) | `memd serve --mcp` for Claude Code / Claude Desktop: configuration snippets, and a client that calls all four tools | `memd[mcp]` |
 | [`04_http_server_sdk.py`](04_http_server_sdk.py) | `memd serve --http` with the Python `HostedMemory` SDK and `Memory(api_key=...)`; typed errors | - |
-| [`ts/`](#typescript) | the TypeScript SDK `@memd/client` against a server: a quickstart, sessions and facts, search options, an HTTP API and a Next.js route with memory per user, an agent loop, eventual reads, retries and typed errors, export streaming | Node >= 20 |
+| [`ts/`](#typescript) | the TypeScript SDK `memd-engine` against a server: a quickstart, sessions and facts, search options, an HTTP API and a Next.js route with memory per user, an agent loop, eventual reads, retries and typed errors, export streaming | Node >= 20 |
 | [`06_s3_minio.py`](06_s3_minio.py) | an `s3://` data root on MinIO: cold reopen from the bucket, key custody that fails closed, crypto-shred | `memd[s3]`, an S3 API |
 
 ```bash
@@ -37,7 +37,7 @@ identify a server that you run. To start such a server, run
 ## TypeScript
 
 Strict TypeScript with ESM (ECMAScript modules) and Node >= 20, on the
-public API of `@memd/client`, run with `tsx`. The first line of each file
+public API of `memd-engine`, run with `tsx`. The first line of each file
 tells what the file shows. The second line tells how to run it.
 
 ```bash
@@ -65,7 +65,7 @@ npm run typecheck                                  # tsc --noEmit over every exa
 the command that it runs (with `--admin`, also `MEMD_ADMIN_KEY`). To use your
 own server, set these variables. Then run the same commands without the
 script. Outside this repository, use the published package:
-`npm install @memd/client`. `tests/test_examples.py` type-checks and runs all
+`npm install memd-engine`. `tests/test_examples.py` type-checks and runs all
 of these examples if Node and the install are available, and skips them if
 not.
 

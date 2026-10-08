@@ -1,7 +1,7 @@
 // A minimal tool-calling agent loop with memd as its memory: the model calls remember/search tools, every turn is captured. A stub model, so it runs offline.
 // Run (in examples/ts): python ../local_server.py -- npx tsx 06_agent_loop.ts   (or set MEMD_URL / MEMD_API_KEY / MEMD_NAMESPACE yourself)
 import assert from "node:assert/strict";
-import { MemdClient, MemdError } from "@memd/client";
+import { MemdClient, MemdError } from "memd-engine";
 
 const { MEMD_URL, MEMD_API_KEY, MEMD_NAMESPACE = "default" } = process.env;
 if (!MEMD_URL || !MEMD_API_KEY) {

@@ -1,5 +1,5 @@
 {
-  "name": "@memd/client",
+  "name": "memd-engine",
   "version": "0.2.0",
   "description": "Official TypeScript client for the memd REST API: agent memory for Node, Bun, Deno and edge runtimes",
   "license": "Apache-2.0",

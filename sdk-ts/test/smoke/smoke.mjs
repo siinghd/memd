@@ -2,7 +2,7 @@
 // as an ESM consumer would. Plain node, no test runner: CI runs it on every
 // supported Node version, including 18.
 import assert from "node:assert/strict";
-import { KINDS, MemdClient, MemdError, RateLimitError } from "@memd/client";
+import { KINDS, MemdClient, MemdError, RateLimitError } from "memd-engine";
 
 const replies = [
   new Response(JSON.stringify({ detail: "rate limit exceeded" }), { status: 429, headers: { "retry-after": "0" } }),

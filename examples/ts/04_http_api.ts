@@ -13,7 +13,7 @@ import {
   ValidationError,
   type ChatMessage,
   type Kind,
-} from "@memd/client";
+} from "memd-engine";
 
 const { MEMD_URL, MEMD_ADMIN_KEY } = process.env;
 if (!MEMD_URL || !MEMD_ADMIN_KEY) {

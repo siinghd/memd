@@ -1,4 +1,4 @@
-# @memd/client
+# memd-engine
 
 The official TypeScript client for the [memd](../README-engine.md) REST API.
 
@@ -9,7 +9,7 @@ The official TypeScript client for the [memd](../README-engine.md) REST API.
 - Uses the same method names and semantics as the Python SDK (`memd.sdk.HostedMemory`).
 
 ```bash
-npm install @memd/client
+npm install memd-engine
 ```
 
 You need a running server (`memd serve --http`) and a key for your namespace:
@@ -23,7 +23,7 @@ The admin key (`MEMD_ADMIN_KEY`) can reach every namespace. Don't ship it to app
 ## Quickstart: Node
 
 ```ts
-import { MemdClient } from "@memd/client";
+import { MemdClient } from "memd-engine";
 
 const memd = new MemdClient({
   baseUrl: "http://localhost:8700",
@@ -48,7 +48,7 @@ console.log(hits.packed_context); // dated session excerpts, ready to inject
 `app/api/chat/route.ts`. The client has no connection state, so a module-level instance is fine on the Node and Edge runtimes.
 
 ```ts
-import { MemdClient, RateLimitError } from "@memd/client";
+import { MemdClient, RateLimitError } from "memd-engine";
 import OpenAI from "openai";
 
 export const runtime = "edge"; // or "nodejs": the same code works on both
@@ -80,7 +80,7 @@ export async function POST(req: Request) {
 ## Quickstart: Cloudflare Workers
 
 ```ts
-import { MemdClient } from "@memd/client";
+import { MemdClient } from "memd-engine";
 
 interface Env {
   MEMD_URL: string;
@@ -205,7 +205,7 @@ Every failure is a `MemdError` with `status`, `code` and `message`. The message 
 A body without a `code`, such as one from an older server or a proxy, gets the server's default code for its status.
 
 ```ts
-import { PermissionDeniedError, RateLimitError, ValidationError } from "@memd/client";
+import { PermissionDeniedError, RateLimitError, ValidationError } from "memd-engine";
 
 try {
   await memd.search(q, { namespace: "someone-else" });

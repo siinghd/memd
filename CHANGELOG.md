@@ -6,6 +6,22 @@ wrong, how it showed, and the numbers before and after where it has them.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-08
+
+### Changed
+- **The TypeScript SDK is published on npm as `memd-engine`.** This is the
+  same name as the Python package on PyPI. Install it with
+  `npm install memd-engine`. The earlier name `@memd/client` was never
+  published.
+
+### Fixed
+- **The documentation tells the current limits.** The "Limits" section
+  now says what write forwarding does, and gives the result of the LLM
+  extractor evaluation. The quality-evidence item says what was measured
+  and what was not.
+- **A test of read replicas no longer fails on slow machines.** It now
+  waits as long as a slow machine needs for a replica rebuild.
+
 ## [0.5.0] - 2026-10-08
 
 ### Added
@@ -799,7 +815,7 @@ default) -> 0.955 (with the Jev reranker). See [BENCHMARKS.md](BENCHMARKS.md).
 
 
 ### Added
-- **TypeScript SDK `@memd/client`** ([sdk-ts/](sdk-ts/README.md)): a typed
+- **TypeScript SDK `memd-engine`** ([sdk-ts/](sdk-ts/README.md)): a typed
   client for the REST API with zero runtime dependencies, shipped as ESM and
   CJS. It runs on Node >= 18, Bun, Deno and Cloudflare Workers, and its
   methods mirror the Python `HostedMemory`, including `pack`/`observe`.

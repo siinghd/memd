@@ -1,7 +1,7 @@
-// Quickstart for @memd/client: remember, search, get, forget (preview, then confirm) and a hard delete.
+// Quickstart for memd-engine: remember, search, get, forget (preview, then confirm) and a hard delete.
 // Run (in examples/ts): python ../local_server.py -- npx tsx 01_quickstart.ts   (or set MEMD_URL / MEMD_API_KEY / MEMD_NAMESPACE yourself)
 import assert from "node:assert/strict";
-import { MemdClient } from "@memd/client";
+import { MemdClient } from "memd-engine";
 
 const { MEMD_URL, MEMD_API_KEY, MEMD_NAMESPACE = "default" } = process.env;
 if (!MEMD_URL || !MEMD_API_KEY) {

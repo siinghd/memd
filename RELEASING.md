@@ -6,7 +6,7 @@ workflow deploys the docs when you push to the default branch:
 | workflow | publishes | credential |
 |---|---|---|
 | `.github/workflows/release-pypi.yml` | sdist + wheel to PyPI, and a GitHub Release with them | PyPI trusted publishing (OIDC, OpenID Connect) |
-| `.github/workflows/release-npm.yml` | `@memd/client` (sdk-ts) to npm, with provenance | `NPM_TOKEN` secret |
+| `.github/workflows/release-npm.yml` | `memd-engine` (sdk-ts) to npm, with provenance | `NPM_TOKEN` secret |
 | `.github/workflows/docs.yml` | the docs site to GitHub Pages | the workflow's own token |
 
 ## Once, before the first release
@@ -17,9 +17,8 @@ workflow deploys the docs when you push to the default branch:
   PyPI). The import name (`import memd`) and the `memd` command do not
   change. PyPI has a pending trusted publisher for `memd-engine` <-
   `siinghd/memd`, `release-pypi.yml`, environment `pypi`.
-- **The npm scope.** `@memd/client` needs an npm organization `memd`.
-  Create it on npmjs.com, or rename the package in `sdk-ts/package.json`
-  and in its README.
+- **The npm name** is `memd-engine`, without a scope. It is the same name
+  as on PyPI.
 - **The GitHub owner and repository** are `github.com/siinghd/memd`. They
   are set in `pyproject.toml` (`[project.urls]`), `sdk-ts/package.json`
   (`repository`, `homepage`) and `mkdocs.yml` (`repo_url`, `repo_name`,
@@ -69,7 +68,8 @@ reviewers.
 ### 3. npm: the token
 
 1. On npmjs.com, create a granular access token with read and write access
-   to the `@memd` scope (or an automation token).
+   to the `memd-engine` package (or an automation token). The package name
+   on npm is `memd-engine`, the same as on PyPI.
 2. Store the token as the `NPM_TOKEN` secret: in the `npm` environment
    (*Settings → Environments*) or as a repository secret.
 
@@ -113,7 +113,7 @@ branch that changes the docs.
 6. **Verify** from outside the repository. In a new virtualenv, run
    `pip install "<name>==X.Y.Z"` and
    `python -c "import memd; print(memd.__version__)"`. Run
-   `npm view @memd/client version`. Make sure that the docs site shows the
+   `npm view memd-engine version`. Make sure that the docs site shows the
    new changelog.
 
 PyPI never accepts the same file two times. If a publish failed after an

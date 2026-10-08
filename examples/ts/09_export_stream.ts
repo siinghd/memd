@@ -1,4 +1,4 @@
-// Export streaming with @memd/client: stream a namespace to a JSONL file record by record, check the skipped-frames signal, read the file back.
+// Export streaming with memd-engine: stream a namespace to a JSONL file record by record, check the skipped-frames signal, read the file back.
 // Run (in examples/ts): python ../local_server.py -- npx tsx 09_export_stream.ts [OUT.jsonl]   (default: a temp file, removed after)
 import assert from "node:assert/strict";
 import { createReadStream, createWriteStream } from "node:fs";
@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { MemdClient, type EventIn, type MemoryRecord } from "@memd/client";
+import { MemdClient, type EventIn, type MemoryRecord } from "memd-engine";
 
 const { MEMD_URL, MEMD_API_KEY, MEMD_NAMESPACE = "default" } = process.env;
 if (!MEMD_URL || !MEMD_API_KEY) {
