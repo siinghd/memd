@@ -138,11 +138,12 @@ The options, with their defaults:
 
 Per namespace, the object store (a local directory, or an S3-compatible
 bucket) holds a framed **WAL** and ops log, immutable **segments**, and a
-**manifest** that names them. The log rotates into a segment at a session close or when it
-grows past its size or frame limit. **Compaction** folds the segments, the
-log and the ops into one segment: it applies tombstones and supersedence and
-physically purges hard-deleted records. It runs on a maintenance thread, off
-the write path, and on demand with `compact(force=True)`.
+**manifest** that names them. The log rotates into a segment at a session
+close or when it grows past its size or frame limit. **Compaction** folds
+the segments, the log and the ops into one segment: it applies tombstones
+and supersedence and physically purges hard-deleted records. It runs on a
+maintenance thread, off the write path, and on demand with
+`compact(force=True)`.
 
 ## Deleting: soft, hard, forget, shred
 

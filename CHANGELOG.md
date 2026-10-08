@@ -22,6 +22,11 @@ wrong, how it showed, and the numbers before and after where it has them.
   now give the PyPI and npm install, write forwarding, and S3-compatible
   stores (CI uses RustFS). README-engine.md, "Search throughput", tells
   that the default search scales with processes, not with threads.
+- **Install hints name the PyPI package.** Four error messages said
+  `install memd[...]`. On PyPI, `memd` is an unrelated project. They now
+  say `memd-engine[...]`. The error for a busy namespace now names write
+  forwarding. It no longer gives `MEMD_ALLOW_MULTI_PROCESS=1` as the fix:
+  that setting is for recovery tools only.
 
 ## [0.5.1] - 2026-10-08
 
