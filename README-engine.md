@@ -149,9 +149,12 @@ mem.add("we ship on Fridays", user_id="u1")  mem.add("...", user_id="u1")  # run
   hosted session close settles its quota through a callback that cannot run
   in another process.
 
-Concretely: `uvicorn --workers N`, one `memd serve --mcp` per MCP client, or
-a script beside a running server all work on one data root - each namespace
-is written by one of them at a time and the others forward to it. That adds
+Concretely: `uvicorn --workers N` (`MEMD_DATA=./memd-data uvicorn
+memd.cli:create_app_from_env --factory --workers 4`), one `memd serve --mcp`
+per MCP client, or a script beside a running server all work on one data
+root - each namespace is written by one of them at a time and the others
+forward to it (tested: three uvicorn workers, every request served; with
+forwarding off, all but the first fail to start). That adds
 a hop, not write capacity: to scale writes, spread *namespaces* across
 processes, which is what [multi-node serving](#multi-node) does on an
 `s3://` data root. Processes in different network namespaces (two containers

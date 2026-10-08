@@ -379,6 +379,75 @@ print(json.dumps({"served_by": seen}))
         a.close()
 
 
+def _uvicorn_workers(tmp_path, forwarding: str) -> tuple:
+    """`uvicorn --workers 3` on one data root: 80 writes and 80 searches, each
+    on a new connection (spread over the workers). -> (write statuses,
+    searches that found their record, forwarded calls the workers' /metrics
+    count, the workers' log)."""
+    httpx = pytest.importorskip("httpx")
+    pytest.importorskip("uvicorn")
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    key = "admin-key-for-the-workers-test-0001"
+    env = dict(os.environ, MEMD_DATA=str(tmp_path / f"data-{forwarding}"), MEMD_ADMIN_KEY=key,
+               MEMD_EMBEDDER="hash", MEMD_RERANKER="none", MEMD_FORWARDING=forwarding,
+               PYTHONPATH=SRC + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    err = open(tmp_path / f"uvicorn-{forwarding}.err", "w")
+    p = subprocess.Popen([sys.executable, "-m", "uvicorn", "memd.cli:create_app_from_env", "--factory",
+                          "--workers", "3", "--port", str(port), "--log-level", "warning"],
+                         env=env, stdout=err, stderr=err)
+    base, hdr = f"http://127.0.0.1:{port}", {"Authorization": f"Bearer {key}"}
+    try:
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                if httpx.get(base + "/health", timeout=2).status_code == 200:
+                    break
+            except httpx.HTTPError:
+                pass
+            assert time.monotonic() < deadline and p.poll() is None, \
+                (tmp_path / f"uvicorn-{forwarding}.err").read_text()[-2000:]
+            time.sleep(0.1)
+        time.sleep(1.0)       # every worker up
+        codes, found = Counter(), 0
+        for i in range(80):
+            with httpx.Client(base_url=base, headers=hdr, timeout=60) as c:
+                codes[c.post("/v1/ns/acme/memories",
+                             json={"content": f"worker record {i} tag{i}x", "user_id": "u1"}).status_code] += 1
+        for i in range(80):
+            with httpx.Client(base_url=base, headers=hdr, timeout=60) as c:
+                r = c.post("/v1/ns/acme/search", json={"query": f"tag{i}x", "user_id": "u1"})
+                found += r.status_code == 200 and any(f"tag{i}x" in it["content"] for it in r.json()["items"])
+        forwarded = 0.0
+        for _ in range(30):     # each worker's own counters, whichever answers
+            with httpx.Client(base_url=base, headers=hdr, timeout=60) as c:
+                for ln in c.get("/metrics").text.splitlines():
+                    if ln.startswith("memd_forward_calls_total{") and 'outcome="ok"' in ln:
+                        forwarded = max(forwarded, float(ln.rsplit(" ", 1)[1]))
+        return codes, found, forwarded, (tmp_path / f"uvicorn-{forwarding}.err").read_text()
+    finally:
+        p.terminate()
+        try:
+            p.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            p.kill()
+
+
+def test_uvicorn_workers_share_one_data_root(tmp_path):
+    """The deployment the lock used to forbid: `uvicorn --workers N` on one
+    data root. Forwarding off: every worker but the first fails to start
+    (NamespaceBusyError on the server's own namespace). On: all three run,
+    and the ones not holding a namespace forward to the one that does."""
+    _codes, _found, _fwd, log = _uvicorn_workers(tmp_path, "off")
+    assert "NamespaceBusyError" in log
+    codes, found, forwarded, log = _uvicorn_workers(tmp_path, "auto")
+    assert "NamespaceBusyError" not in log and "Traceback" not in log, log[-3000:]
+    assert codes == Counter({201: 80}), codes
+    assert found == 80
+    assert forwarded > 0, "no worker forwarded a call"
+
+
 # ------------------------------------------------------------------ the secret
 
 
