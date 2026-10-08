@@ -45,10 +45,17 @@ Status: alpha (0.3.x). See [what it does not do yet](#limits).
 
 ## Install
 
-memd is not on PyPI yet. Install it from this repository (Python >= 3.11):
+Install from PyPI (Python >= 3.11). The package is `memd-engine`; the
+import name and the command are `memd`:
 
 ```bash
-pip install "memd @ git+https://github.com/siinghd/memd.git"
+pip install memd-engine
+```
+
+or the latest code from this repository:
+
+```bash
+pip install "memd-engine @ git+https://github.com/siinghd/memd.git"
 ```
 
 or from a checkout, with the extras you need:

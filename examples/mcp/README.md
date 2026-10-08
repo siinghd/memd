@@ -6,7 +6,7 @@
 `memory://profile` resources.
 
 ```bash
-pip install "memd[mcp]"
+pip install "memd-engine[mcp]"
 ```
 
 | variable | meaning | default |

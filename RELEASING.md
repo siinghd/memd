@@ -13,11 +13,11 @@ pushes to the default branch:
 
 ### 0. Decisions only the owner can make
 
-- **The PyPI name.** `memd` is taken on PyPI by an unrelated project
-  (checked 2026-10-01); `memd-engine` was free that day. Set
-  `[project].name` in `pyproject.toml` to the chosen name. The import name
-  (`import memd`) and the `memd` command do not change. Then update the
-  install lines (`grep -rn 'pip install memd\|"memd\[' --include=*.md .`).
+- **The PyPI name** is `memd-engine` (`memd` is taken on PyPI by an
+  unrelated project). The import name (`import memd`) and the `memd`
+  command are unchanged. A pending trusted publisher is registered on PyPI
+  for `memd-engine` <- `siinghd/memd`, `release-pypi.yml`, environment
+  `pypi`.
 - **The npm scope.** `@memd/client` needs an npm organization `memd`
   (create it on npmjs.com), or rename the package in `sdk-ts/package.json`
   and its README.

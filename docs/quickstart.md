@@ -3,8 +3,8 @@
 ## Install
 
 ```bash
-pip install memd                       # Python >= 3.11
-pip install "memd[mcp,s3]"             # extras: mcp, s3, fast, ann, local-embeddings, jev
+pip install memd-engine                       # Python >= 3.11
+pip install "memd-engine[mcp,s3]"             # extras: mcp, s3, fast, ann, local-embeddings, jev
 ```
 
 !!! note "Not on PyPI yet"

@@ -1,5 +1,5 @@
 # MCP: start `memd serve --mcp` over stdio and call its four tools the way Claude Code / Claude Desktop does.
-# Run: python examples/03_mcp_server.py [DATA_DIR]   (needs: pip install "memd[mcp]"; host configs in examples/mcp/)
+# Run: python examples/03_mcp_server.py [DATA_DIR]   (needs: pip install "memd-engine[mcp]"; host configs in examples/mcp/)
 import asyncio
 import json
 import os

@@ -3,10 +3,8 @@ name: Release (PyPI)
 # On a version tag (v0.3.2): gate on the suite, build the sdist and wheel,
 # check them, publish to PyPI with trusted publishing (OIDC, no stored
 # token), and attach them to a GitHub Release. Before the first tag, see
-# RELEASING.md: the PyPI project needs a trusted publisher for this
-# workflow and the `pypi` environment, and the distribution name `memd` is
-# already taken on PyPI by another project, so [project].name must change
-# to a free name first.
+# RELEASING.md: the PyPI project (`memd-engine`) publishes through a
+# trusted publisher for this workflow and the `pypi` environment.
 #
 # workflow_dispatch builds and checks everything but publishes nothing.
 

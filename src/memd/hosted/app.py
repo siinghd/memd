@@ -168,7 +168,7 @@ class Hosted:
         self.cfg = billing_config or BillingConfig.from_env()
         if (self.cfg.configured or self.cfg.webhook_secret) and importlib.util.find_spec("stripe") is None:
             raise RuntimeError("hosted billing is configured but the Stripe SDK is missing: "
-                               "pip install 'memd[billing]'")
+                               "pip install 'memd-engine[billing]'")
         self.plans = plans or Plans.from_env()
         self.store = AdminStore.for_data_root(data_dir)
         # the cluster router (memd.server.cluster.Router) when this process

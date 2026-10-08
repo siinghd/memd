@@ -121,7 +121,7 @@ class S3ObjectStore(ObjectStore):
             from botocore.config import Config
         except ImportError as ex:  # pragma: no cover - dependency guard
             raise RuntimeError(
-                "S3ObjectStore needs boto3: pip install 'memd[s3]'") from ex
+                "S3ObjectStore needs boto3: pip install 'memd-engine[s3]'") from ex
 
         self.bucket = bucket
         self.prefix = prefix.strip("/")

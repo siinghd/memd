@@ -229,7 +229,7 @@ class AwsKmsProvider(KeyProvider):
                 import boto3
                 from botocore.config import Config
             except ImportError as ex:  # pragma: no cover - dependency guard
-                raise RuntimeError("the aws-kms key provider needs boto3: pip install 'memd[s3]'") from ex
+                raise RuntimeError("the aws-kms key provider needs boto3: pip install 'memd-engine[s3]'") from ex
             client = boto3.client("kms", region_name=region, endpoint_url=endpoint_url,
                                   config=Config(retries={"max_attempts": 5, "mode": "standard"}))
         self._kms = client

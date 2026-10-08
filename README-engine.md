@@ -95,7 +95,7 @@ built yet.
 ## Object storage as the source of truth (S3 / R2 / MinIO)
 
 ```bash
-pip install "memd[s3]"
+pip install "memd-engine[s3]"
 ```
 ```python
 mem = Memory("s3://my-bucket/memd", config={
@@ -400,7 +400,7 @@ as described above and never import `stripe`. Hosted mode adds tenancy, usage
 metering, plan entitlements and Stripe billing for running memd as a service:
 
 ```bash
-pip install "memd[billing]"                      # the Stripe SDK, imported lazily
+pip install "memd-engine[billing]"                      # the Stripe SDK, imported lazily
 export MEMD_HOSTED=1                             # or: memd serve --http --hosted
 memd org create --name acme                      # -> {"org": "org_..."}; plan "free"
 memd key create --hosted --org org_... --ns acme --scopes memory,billing
@@ -637,14 +637,14 @@ fully functional, honestly degraded, clearly labeled in `stats()`.
 
 | key / env | values | default |
 |---|---|---|
-| `reranker` / `MEMD_RERANKER` | `auto` \| `none` \| `jev` \| `local` | `auto`: Jev when a TypeSafe key is set (`TYPESAFE_API_KEY`, or config `typesafe_api_key`) and `typesafe-sdk` is installed (`pip install "memd[jev]"`), else none |
+| `reranker` / `MEMD_RERANKER` | `auto` \| `none` \| `jev` \| `local` | `auto`: Jev when a TypeSafe key is set (`TYPESAFE_API_KEY`, or config `typesafe_api_key`) and `typesafe-sdk` is installed (`pip install "memd-engine[jev]"`), else none |
 | `jev_model`, `rerank_timeout_s`, `rerank_k` | model pin, deadline, shortlist | `jev-latest`, 1.5s (5s local), 30 |
 | `local_rerank_model` | fastembed cross-encoder | `BAAI/bge-reranker-base` |
 | `pack_mode` / `MEMD_PACK_MODE` | `auto` \| `ranked` \| `gated` | `auto` = ranked with every reranker; `gated` is an experimental opt-in |
 | `rerank_gate` | gated-packing threshold (opt-in mode) | 0.5 |
 | `fuse_vector` / `MEMD_FUSE_VECTOR` | `auto` \| `true` \| `false` | `auto`: fuse unless the embedder is the hash embedder |
-| `lexical_backend` / `MEMD_LEXICAL_BACKEND` | `auto` \| `fts5` \| `tantivy` | `auto`: tantivy when installed (`pip install "memd[fast]"`) |
-| `vector_index` / `MEMD_VECTOR_INDEX` | `auto` \| `flat` \| `usearch` | `auto`: the usearch sidecar (`pip install "memd[ann]"`) for a namespace holding ≥ `ann_min_vectors` vectors, else the exact scan; an explicit `usearch` that cannot be honoured raises |
+| `lexical_backend` / `MEMD_LEXICAL_BACKEND` | `auto` \| `fts5` \| `tantivy` | `auto`: tantivy when installed (`pip install "memd-engine[fast]"`) |
+| `vector_index` / `MEMD_VECTOR_INDEX` | `auto` \| `flat` \| `usearch` | `auto`: the usearch sidecar (`pip install "memd-engine[ann]"`) for a namespace holding ≥ `ann_min_vectors` vectors, else the exact scan; an explicit `usearch` that cannot be honoured raises |
 | `ann_min_vectors`, `ann_overfetch`, `ann_exact_max`, `ann_dtype`, `ann_expansion_search` | auto threshold, candidate over-fetch, exact-answer cutoff, stored precision, HNSW search-depth floor | 20000, 4, 2000, `f16` (or `i8`), 128 (a search for k candidates explores at least k) |
 | `flat_max_vectors` | while the sidecar is loading or rebuilding, a namespace with more vectors than this never loads the exact scan's float32 matrix | 200000 |
 
