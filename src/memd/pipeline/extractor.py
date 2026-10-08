@@ -16,14 +16,18 @@ Providers: LLMExtractor (BYO OpenAI-compatible key) and HeuristicExtractor
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
 from memd.core.schema import MemoryRecord, Source
 
 PROMPT_VERSION = "v1"
+DEFAULT_MAX_TOKENS = 4096   # output tokens per extraction call
+DEFAULT_TIMEOUT_S = 120.0   # the longest one extraction call may take
 
 
 @dataclass
@@ -210,7 +214,8 @@ Rules:
 prompt_version={PROMPT_VERSION}"""
 
     def __init__(self, model: str, api_key: str, base_url: str = "https://api.openai.com/v1",
-                 chunk_records: int = 40, chunk_chars: int = 24_000):
+                 chunk_records: int = 40, chunk_chars: int = 24_000,
+                 max_tokens: int = DEFAULT_MAX_TOKENS, timeout_s: float = DEFAULT_TIMEOUT_S):
         import httpx
 
         self.model = model
@@ -218,8 +223,12 @@ prompt_version={PROMPT_VERSION}"""
         self.base_url = base_url.rstrip("/")
         self.chunk_records = max(1, int(chunk_records))
         self.chunk_chars = max(1000, int(chunk_chars))
+        # output cap per call (0 = none): one uncapped call to a model that
+        # looped ran to 131,072 output tokens and 413 s
+        self.max_tokens = int(max_tokens)
+        self.timeout_s = float(timeout_s)
         self.chunks_sent = 0
-        self._client = httpx.Client(timeout=60)
+        self._client = httpx.Client(timeout=self.timeout_s)
 
     def _chunks(self, records: list[MemoryRecord]):
         """Bounded request chunks: a session can carry up to 1000 rows x
@@ -259,21 +268,35 @@ prompt_version={PROMPT_VERSION}"""
     def _extract_chunk(self, records: list[MemoryRecord]) -> list[ExtractedFact]:
         lines = [f"[{r.id}] {r.content}" for r in records]
         user_msg = "Segment:\n" + "\n".join(lines)
-        resp = self._client.post(
-            f"{self.base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            json={
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": self._SYSTEM_PROMPT},
-                    {"role": "user", "content": user_msg},
-                ],
-                "temperature": 0,
-            },
-        )
-        resp.raise_for_status()
-        text = resp.json()["choices"][0]["message"]["content"]
+        body = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": self._SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            "temperature": 0,
+        }
+        if self.max_tokens:
+            body["max_tokens"] = self.max_tokens
+        text = self._complete(body)["choices"][0]["message"]["content"]
         return self._parse(text, records)
+
+    def _complete(self, body: dict) -> dict:
+        """One provider call, at most timeout_s long. The client's timeout
+        cuts off a provider silent for that long; the deadline cuts off one
+        that keeps the connection alive with whitespace while the model
+        generates (OpenRouter does), since every byte resets a read timeout."""
+        deadline = time.monotonic() + self.timeout_s
+        buf = bytearray()
+        with self._client.stream("POST", f"{self.base_url}/chat/completions",
+                                 headers={"Authorization": f"Bearer {self.api_key}"},
+                                 json=body, timeout=self.timeout_s) as resp:
+            resp.raise_for_status()
+            for part in resp.iter_bytes():
+                buf += part
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"extraction call exceeded {self.timeout_s:g}s")
+        return json.loads(bytes(buf))
 
     def _parse(self, text: str, records: list[MemoryRecord]) -> list[ExtractedFact]:
         try:
@@ -313,5 +336,27 @@ def resolve_extractor(config: dict | None = None) -> Extractor:
             model=extraction_setting(cfg, "extraction_model", "gpt-4o-mini"),
             api_key=api_key,
             base_url=extraction_setting(cfg, "extraction_base_url", "https://api.openai.com/v1"),
+            max_tokens=_max_tokens(extraction_setting(cfg, "extraction_max_tokens", DEFAULT_MAX_TOKENS)),
+            timeout_s=_timeout_s(extraction_setting(cfg, "extraction_timeout_s", DEFAULT_TIMEOUT_S)),
         )
     return HeuristicExtractor()
+
+
+def _max_tokens(v) -> int:
+    try:
+        n = int(str(v).strip())
+    except ValueError:
+        n = -1
+    if n < 0:
+        raise ValueError(f"extraction_max_tokens must be a whole number >= 0 (0 = no cap), got {v!r}")
+    return n
+
+
+def _timeout_s(v) -> float:
+    try:
+        t = float(str(v).strip())
+    except ValueError:
+        t = 0.0
+    if not (t > 0 and math.isfinite(t)):
+        raise ValueError(f"extraction_timeout_s must be a number of seconds > 0, got {v!r}")
+    return t

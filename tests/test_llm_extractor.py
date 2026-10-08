@@ -12,7 +12,8 @@ import pytest
 from memd.core.schema import MemoryRecord, Scope, Source
 from memd.pipeline.extractor import HeuristicExtractor, LLMExtractor, resolve_extractor
 
-_ENV = ("MEMD_EXTRACTION_API_KEY", "MEMD_EXTRACTION_MODEL", "MEMD_EXTRACTION_BASE_URL")
+_ENV = ("MEMD_EXTRACTION_API_KEY", "MEMD_EXTRACTION_MODEL", "MEMD_EXTRACTION_BASE_URL",
+        "MEMD_EXTRACTION_MAX_TOKENS", "MEMD_EXTRACTION_TIMEOUT_S", "MEMD_EXTRACTION_REQUEST_OPTIONS")
 
 
 @pytest.fixture(autouse=True)
@@ -135,3 +136,103 @@ def test_memory_extracts_with_the_env_key(monkeypatch, provider, tmp_path):
         assert len(provider.requests) == 1
     finally:
         m.close()
+
+
+# ------------------------------------------------- 2: bounded provider calls
+
+
+def _llm(provider, **cfg) -> LLMExtractor:
+    ext = resolve_extractor({"extraction_api_key": "k", "extraction_base_url": provider.base_url, **cfg})
+    assert isinstance(ext, LLMExtractor)
+    return ext
+
+
+def test_every_call_caps_its_output_tokens(provider):
+    _llm(provider).extract([_rec("I work at Initech")])
+    assert provider.requests[-1]["body"]["max_tokens"] == 4096
+
+
+def test_the_output_cap_is_configurable(monkeypatch, provider):
+    _llm(provider, extraction_max_tokens=512).extract([_rec("I work at Initech")])
+    assert provider.requests[-1]["body"]["max_tokens"] == 512
+    monkeypatch.setenv("MEMD_EXTRACTION_MAX_TOKENS", "1024")
+    _llm(provider).extract([_rec("I work at Initech")])
+    assert provider.requests[-1]["body"]["max_tokens"] == 1024
+    _llm(provider, extraction_max_tokens=0).extract([_rec("I work at Initech")])
+    assert "max_tokens" not in provider.requests[-1]["body"]  # 0 = no cap
+
+
+@pytest.mark.parametrize("bad", ["lots", "-1", "1.5"])
+def test_a_bad_output_cap_is_refused(monkeypatch, bad):
+    monkeypatch.setenv("MEMD_EXTRACTION_MAX_TOKENS", bad)
+    with pytest.raises(ValueError, match="extraction_max_tokens"):
+        resolve_extractor({"extraction_api_key": "k"})
+
+
+@pytest.mark.parametrize("bad", ["0", "-3", "soon"])
+def test_a_bad_timeout_is_refused(monkeypatch, bad):
+    monkeypatch.setenv("MEMD_EXTRACTION_TIMEOUT_S", bad)
+    with pytest.raises(ValueError, match="extraction_timeout_s"):
+        resolve_extractor({"extraction_api_key": "k"})
+
+
+def _dribble(seconds: float, gap: float = 0.1):
+    """A provider that keeps the connection alive with whitespace (as
+    OpenRouter does while a model generates) and never finishes in time:
+    every byte resets a per-read timeout."""
+    def run(handler):
+        import time as _t
+
+        handler.send_response(200)
+        handler.send_header("Content-Type", "application/json")
+        handler.end_headers()
+        end = _t.monotonic() + seconds
+        try:
+            while _t.monotonic() < end:
+                handler.wfile.write(b"\n")
+                handler.wfile.flush()
+                _t.sleep(gap)
+            handler.wfile.write(json.dumps(_chat("[]")).encode())
+        except OSError:
+            pass  # the client hung up: what the test wants
+    return run
+
+
+def _stall(seconds: float):
+    """A provider that accepts the request and sends nothing."""
+    def run(handler):
+        import time as _t
+
+        _t.sleep(seconds)
+        try:
+            data = json.dumps(_chat("[]")).encode()
+            handler.send_response(200)
+            handler.send_header("Content-Length", str(len(data)))
+            handler.end_headers()
+            handler.wfile.write(data)
+        except OSError:
+            pass
+    return run
+
+
+def test_a_call_kept_alive_past_its_timeout_is_cut_off(provider):
+    import time as _t
+
+    provider.reply = lambda body: _dribble(8.0)
+    ext = _llm(provider, extraction_timeout_s=1)
+    t0 = _t.monotonic()
+    ext.extract([_rec("I work at Initech")])
+    assert _t.monotonic() - t0 < 4, "the per-call timeout must bound a call that keeps sending bytes"
+    assert len(provider.requests) == 1
+
+
+def test_a_silent_provider_is_cut_off(provider, monkeypatch):
+    import time as _t
+
+    provider.reply = lambda body: _stall(6.0)
+    monkeypatch.setenv("MEMD_EXTRACTION_TIMEOUT_S", "1")
+    ext = _llm(provider)
+    t0 = _t.monotonic()
+    ext.extract([_rec("I work at Initech")])
+    assert _t.monotonic() - t0 < 4
+    assert len(provider.requests) == 1
