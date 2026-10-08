@@ -85,6 +85,9 @@ wrong, how it showed, and the numbers before and after where it has them.
   FIRST turn's user, so u2's "works at Globex" superseded u1's "works at
   Initech". Each fact is now consolidated within its own source turn's
   org, agent and user.
+- **TypeScript SDK: `CloseSessionResult` has every field a close returns.**
+  It lacked `raw_skipped` and `facts_capped` (returned since hosted mode)
+  and now carries `raw_failed` and `extraction_errors` too.
 - **A failed extraction call falls back to the pattern extractor, counted
   and reported.** A failed call lost its chunk's facts: an HTTP error or a
   timeout was counted without a reason, a reply without a JSON array
