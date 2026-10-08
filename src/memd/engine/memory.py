@@ -105,8 +105,9 @@ def _source_name(source) -> str | None:
 class _ForwardedAudit:
     """The facade's ledger while another process holds its namespace: the
     entries are buffered here and appended by the holder (forwarded call
-    "audit"), every `flush_every` entries and on flush() / close(). A
-    ledger has one writer, like the namespace."""
+    "audit") - every `flush_every` entries, in the background (an append
+    on a read path never waits for the holder), and on flush() / close().
+    A ledger has one writer, like the namespace."""
 
     MAX_BUFFER = 10_000
 
@@ -116,6 +117,7 @@ class _ForwardedAudit:
         self.flush_every = max(1, int(flush_every))
         self._lock = threading.Lock()
         self._buffer: list[dict] = []
+        self._flushing = False
 
     def append(self, actor: str, action: str, target: str, detail: dict | None = None) -> None:
         d = dict(detail or {})
@@ -125,9 +127,19 @@ class _ForwardedAudit:
             if len(self._buffer) > self.MAX_BUFFER:
                 self._buffer.pop(0)
                 METRICS.inc("memd_audit_entries_dropped_total", ns=self._ns)
-            due = len(self._buffer) >= self.flush_every
+            due = len(self._buffer) >= self.flush_every and not self._flushing
+            if due:
+                self._flushing = True
         if due:
+            threading.Thread(target=self._flush_in_background, daemon=True,
+                             name="memd-forward-audit").start()
+
+    def _flush_in_background(self) -> None:
+        try:
             self.flush()
+        finally:
+            with self._lock:
+                self._flushing = False
 
     def flush(self) -> None:
         with self._lock:
