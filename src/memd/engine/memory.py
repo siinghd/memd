@@ -20,7 +20,6 @@ import queue
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import asdict as _dc_asdict
 from dataclasses import replace as _dc_replace
 from contextlib import ExitStack as _ExitStack
 from dataclasses import dataclass, field
@@ -2774,6 +2773,11 @@ def _search_result(d: dict) -> SearchResult:
     return SearchResult(**d)
 
 
+def _search_dict(res: SearchResult) -> dict:
+    """A search result as it travels back (shallow: nothing is mutated)."""
+    return {**vars(res), "items": [vars(i) for i in res.items]}
+
+
 def _served_export(m: Memory, ns: str, a: dict):
     st = m.export_stream(namespace=ns)
     return _fw._Stream({"skipped": st.skipped, "skipped_frames": st.skipped_frames}, iter(st))
@@ -2795,7 +2799,7 @@ _SERVED: dict[str, Callable[[Memory, str, dict], Any]] = {
     "reembed": lambda m, ns, a: m.reembed(namespace=ns, **a),
     "flush": lambda m, ns, a: m.flush(),
     "audit": lambda m, ns, a: m._append_forwarded_audit(ns, a["entries"]),
-    "search": lambda m, ns, a: _dc_asdict(m.search(namespace=ns, consistency="strong", **a)),
+    "search": lambda m, ns, a: _search_dict(m.search(namespace=ns, consistency="strong", **a)),
     "get": lambda m, ns, a: m.get(namespace=ns, consistency="strong", **a),
     "find_ids": lambda m, ns, a: m.find_ids(namespace=ns, **a),
     "session_raw_count": lambda m, ns, a: m.session_raw_count(namespace=ns, **a),
