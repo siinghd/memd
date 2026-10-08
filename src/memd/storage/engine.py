@@ -603,7 +603,12 @@ _OWNER_LOCK = threading.Lock()
 
 
 class NamespaceBusyError(RuntimeError):
-    """Another OS process already holds this namespace."""
+    """Another OS process already holds this namespace.
+
+    With write forwarding on (the default), a `Memory` sends the call to
+    that process instead. You get this error when forwarding is off, or
+    as `ForwardingError` when no writer accepts the forwarded call. In
+    both cases, memd applied nothing."""
 
 
 class NamespaceClosedError(RuntimeError):
