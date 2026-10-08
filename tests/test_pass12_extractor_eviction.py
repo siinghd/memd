@@ -26,7 +26,7 @@ class TestLLMExtractorChunking:
         ext = LLMExtractor(model="fake", api_key="k",
                            base_url="http://fake.local/v1",
                            chunk_records=chunk_records, chunk_chars=chunk_chars)
-        ext._client = httpx.Client(transport=httpx.MockTransport(handler))
+        ext._transport = httpx.MockTransport(handler)
         return ext
 
     @staticmethod

@@ -19,6 +19,7 @@ import json
 import math
 import os
 import re
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -260,7 +261,10 @@ prompt_version={PROMPT_VERSION}"""
         # merged into every request body last; a None value removes a field
         self.request_options = _request_options(request_options or {})
         self.chunks_sent = 0
-        self._client = httpx.Client(timeout=self.timeout_s)
+        # each call gets its own client (see _complete), sharing one TLS
+        # context; tests swap the transport
+        self._verify = httpx.create_ssl_context()
+        self._transport = None
         self._fallback = HeuristicExtractor()
 
     def _chunks(self, records: list[MemoryRecord]):
@@ -348,21 +352,43 @@ prompt_version={PROMPT_VERSION}"""
         return f"[{rec.id}] {c['date']} {c['role']}: {rec.content}"
 
     def _complete(self, body: dict) -> dict:
-        """One provider call, bounded by timeout_s. The deadline cuts off a
-        call still receiving after timeout_s - a provider that keeps the
-        connection alive with whitespace while the model generates (OpenRouter
-        does) resets a read timeout with every byte - and the client's
-        timeout one that sends nothing for timeout_s."""
-        deadline = time.monotonic() + self.timeout_s
+        """One provider call, bounded as a whole by timeout_s: connecting,
+        sending, the response headers and the body. Read timeouts alone do
+        not bound it - a provider that sends its headers or body a byte at a
+        time (OpenRouter keeps a connection alive with whitespace while the
+        model generates) resets them with every byte. So the call runs on its
+        own thread with its own client: at the deadline the caller gets a
+        timeout and the client is closed, which ends the thread at its next
+        read (a provider silent that long, by the client's own timeout)."""
+        import httpx
+
+        client = httpx.Client(timeout=self.timeout_s, transport=self._transport, verify=self._verify)
+        box: dict = {}
+
+        def call() -> None:
+            try:
+                box["reply"] = self._post(client, body)
+            except BaseException as ex:  # handed to the caller below
+                box["error"] = ex
+
+        t = threading.Thread(target=call, name="memd-extraction-call", daemon=True)
+        t.start()
+        t.join(self.timeout_s)
+        late = t.is_alive()
+        client.close()  # aborts a call still running
+        if late:
+            raise TimeoutError(f"extraction call exceeded {self.timeout_s:g}s")
+        if "error" in box:
+            raise box["error"]
+        return box["reply"]
+
+    def _post(self, client, body: dict) -> dict:
         buf = bytearray()
-        with self._client.stream("POST", f"{self.base_url}/chat/completions",
-                                 headers={"Authorization": f"Bearer {self.api_key}"},
-                                 json=body, timeout=self.timeout_s) as resp:
+        with client.stream("POST", f"{self.base_url}/chat/completions",
+                           headers={"Authorization": f"Bearer {self.api_key}"}, json=body) as resp:
             resp.raise_for_status()
             for part in resp.iter_bytes():
                 buf += part
-                if time.monotonic() > deadline:
-                    raise TimeoutError(f"extraction call exceeded {self.timeout_s:g}s")
         return json.loads(bytes(buf))
 
     def _parse(self, text: str, records: list[MemoryRecord]) -> list[ExtractedFact]:

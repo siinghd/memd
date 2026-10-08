@@ -226,6 +226,39 @@ def test_a_call_kept_alive_past_its_timeout_is_cut_off(provider):
     assert len(provider.requests) == 1
 
 
+def _drip_headers(seconds: float, gap: float = 0.1):
+    """A provider that sends its response headers one byte at a time."""
+    def run(handler):
+        import time as _t
+
+        end = _t.monotonic() + seconds
+        try:
+            handler.wfile.write(b"HTTP/1.1 200 OK\r\nX-Slow: ")
+            while _t.monotonic() < end:
+                handler.wfile.write(b"a")
+                handler.wfile.flush()
+                _t.sleep(gap)
+        except OSError:
+            pass
+    return run
+
+
+def test_a_call_whose_headers_never_finish_is_cut_off(provider):
+    import time as _t
+
+    provider.reply = lambda body: _drip_headers(8.0)
+    ext = _llm(provider, extraction_timeout_s=1)
+    t0 = _t.monotonic()
+    out = ext.extract([_rec("I work at Initech")])
+    assert _t.monotonic() - t0 < 2, "the timeout bounds the whole call, headers included"
+    assert out.errors == ["timeout"]
+    # the abandoned call is aborted, not left running on its thread
+    end = _t.monotonic() + 3
+    while any(t.name == "memd-extraction-call" for t in threading.enumerate()) and _t.monotonic() < end:
+        _t.sleep(0.05)
+    assert not any(t.name == "memd-extraction-call" for t in threading.enumerate())
+
+
 def test_a_silent_provider_is_cut_off(provider, monkeypatch):
     import time as _t
 

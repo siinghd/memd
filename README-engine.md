@@ -652,7 +652,7 @@ an env key off.
 | `extraction_model` / `MEMD_EXTRACTION_MODEL` | model id | `gpt-4o-mini` |
 | `extraction_base_url` / `MEMD_EXTRACTION_BASE_URL` | API base, e.g. `https://openrouter.ai/api/v1` | `https://api.openai.com/v1` |
 | `extraction_max_tokens` / `MEMD_EXTRACTION_MAX_TOKENS` | output-token cap per call, sent as `max_tokens`; `0` sends none | 4096 |
-| `extraction_timeout_s` / `MEMD_EXTRACTION_TIMEOUT_S` | seconds a call may run | 120 |
+| `extraction_timeout_s` / `MEMD_EXTRACTION_TIMEOUT_S` | seconds one call may take, start to finish | 120 |
 | `extraction_request_options` / `MEMD_EXTRACTION_REQUEST_OPTIONS` | a dict (env: a JSON object) merged into every request body last; a `null` value removes a field | none |
 
 - **What the model sees.** A session's raw turns, in chunks of at most 40
@@ -663,11 +663,14 @@ an env key off.
   and to name the turns it came from; a fact takes its scope, actor and
   time from those turns. Facts record the prompt version (`v2`).
 - **Bounded calls.** Every call sends `max_tokens` (an uncapped call to a
-  model that looped once ran to 131,072 output tokens and 413 s). A call
-  still receiving after `extraction_timeout_s` is cut off, and so is one
-  that sends nothing for that long - a provider that keeps the connection
-  alive with whitespace while the model generates (OpenRouter does) no
-  longer holds it open.
+  model that looped once ran to 131,072 output tokens and 413 s). The whole
+  call - connecting, sending, the response headers and body - is cut off
+  at `extraction_timeout_s`, however the provider trickles bytes (OpenRouter
+  keeps a connection alive with whitespace while the model generates; a
+  per-read timeout restarts with every byte). The call runs on its own
+  thread and connection: at the deadline the session close moves on and
+  the connection is closed; the abandoned thread ends at its next read, or
+  after `extraction_timeout_s` more for a provider that has gone silent.
 - **Request options** pass the provider its own settings: OpenRouter
   routing (`{"provider": {"order": ["deepinfra"], "allow_fallbacks":
   false}}`), reasoning off or lower for a reasoning model (`{"reasoning":

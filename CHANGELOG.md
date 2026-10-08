@@ -49,8 +49,10 @@ wrong, how it showed, and the numbers before and after where it has them.
   60 s client timeout did not stop it: it is a per-read timeout, and a
   provider that keeps the connection alive with whitespace while the model
   generates (OpenRouter does) resets it with every byte. Calls now send the
-  cap, and a call still receiving after `extraction_timeout_s`, or silent
-  that long, is cut off.
+  cap, and each call - connecting, sending, the response headers and body -
+  runs on its own thread and connection, cut off at `extraction_timeout_s`
+  (a provider that sent its headers a byte at a time held a call with a
+  1 s timeout for 8 s under a deadline checked only between body reads).
 - **The extractor says who spoke each turn, and when.** Turns were sent as
   `[id] text`: nothing said whether the user or the assistant spoke, so an
   assistant's suggestion read like the user's own statement. And the prompt
