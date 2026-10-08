@@ -5,15 +5,17 @@ from memd import Memory, Kind, Source, Scope, MemoryRecord
 from memd.sdk import HostedMemory, HostedError
 ```
 
-`Memory` is the engine. `Memory(path)` runs it embedded on a directory or an
-`s3://` root; `Memory(api_key=..., base_url=...)` is the same facade over
-the REST API (it delegates to `HostedMemory`), so code moves between the two
-without changes. Every method takes `namespace=` to act on a namespace other
-than the facade's default. `Memory(path, read_only=True)` opens every
-namespace as a read replica that follows its writer (another process);
-`search` and `get` take `consistency="eventual"` and `max_staleness_ms`.
+`Memory` is the engine. `Memory(path)` runs it embedded, on a directory or
+on an `s3://` root. `Memory(api_key=..., base_url=...)` is the same facade
+over the REST API (it sends its calls to `HostedMemory`). Thus, code can move
+between the two without changes.
 
-This page is generated from the docstrings in `src/memd`.
+Every method accepts `namespace=`, to operate on a namespace that is not the
+default namespace of the facade. `Memory(path, read_only=True)` opens every
+namespace as a read replica that follows its writer (another process).
+`search` and `get` accept `consistency="eventual"` and `max_staleness_ms`.
+
+The docs build generates this page from the docstrings in `src/memd`.
 
 ## Memory
 
