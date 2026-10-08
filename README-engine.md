@@ -222,11 +222,11 @@ Point clients (or a plain load balancer) at ANY node:
   working POSIX locks); a networked admin store is the open item for
   multi-host hosted.
 
-To try it on one machine: `docker-compose.yml` runs MinIO, three nodes and
-(with `--profile vault`) a Vault dev server holding the data keys - see the
-comment at its top. `fly.toml` is a Fly.io template (one machine = one node,
-node id and address from the machine; fill in every `CHANGE-ME`; not
-deployed). The image needs `--build-arg MEMD_S3=1` for boto3.
+To try it on one machine: `docker-compose.yml` runs an S3 server (RustFS),
+three nodes and (with `--profile vault`) a Vault dev server holding the data
+keys - see the comment at its top. `fly.toml` is a Fly.io template (one
+machine = one node, node id and address from the machine; fill in every
+`CHANGE-ME`; not deployed). The image needs `--build-arg MEMD_S3=1` for boto3.
 
 Every object memd rewrites in place (the manifest commit above all) is
 written with compare-and-swap, so a node frozen mid-commit and resumed after

@@ -1,4 +1,4 @@
-# memd multi-node on one host: MinIO + 3 memd nodes, optional Vault.
+# memd multi-node on one host: an S3 server (RustFS) + 3 memd nodes, optional Vault.
 #
 # Any node serves any namespace (requests are proxied to the node holding
 # the namespace's writer lease); kill one and its namespaces move within the
@@ -19,7 +19,7 @@
 # MEMD_STATE_DIR (/state) is ONE volume shared by the three containers: the
 # API keys file and, with MEMD_HOSTED=1, the hosted admin SQLite database -
 # which is why this layout is single-host (see README-engine.md "Multi-node").
-# Not a production deployment: MinIO and Vault run with default credentials,
+# Not a production deployment: RustFS and Vault run with default credentials,
 # node-to-node traffic is plain HTTP on the compose network.
 
 x-memd: &memd
@@ -27,16 +27,16 @@ x-memd: &memd
   pull_policy: never             # built once, by memd1
   restart: unless-stopped
   depends_on:
-    minio-init:
+    s3-init:
       condition: service_completed_successfully
     vault-init:
       condition: service_completed_successfully
       required: false          # only with --profile vault
   environment: &memd-env
     MEMD_DATA: s3://memd/cluster
-    MEMD_S3_ENDPOINT: http://minio:9000
-    MEMD_S3_ACCESS_KEY: ${MINIO_ROOT_USER:-memd}
-    MEMD_S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-memd-minio-secret}
+    MEMD_S3_ENDPOINT: http://s3:9000
+    MEMD_S3_ACCESS_KEY: ${S3_ACCESS_KEY:-memd}
+    MEMD_S3_SECRET_KEY: ${S3_SECRET_KEY:-memd-s3-secret}
     MEMD_KEY_PROVIDER: ${MEMD_KEY_PROVIDER:?set MEMD_KEY_PROVIDER to vault-transit or aws-kms}
     # vault-transit (with --profile vault)
     VAULT_ADDR: http://vault:8200
@@ -56,35 +56,35 @@ x-memd: &memd
     MEMD_HOSTED: ${MEMD_HOSTED:-0}
 
 services:
-  minio:
-    image: minio/minio:latest
-    command: server /data --console-address :9001
+  s3:                             # any S3 API with conditional writes will do
+    image: rustfs/rustfs:1.0.1
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-memd}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-memd-minio-secret}
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:-memd}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:-memd-s3-secret}
     volumes:
-      - minio-data:/data
+      - s3-data:/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9000/health"]
       interval: 2s
       timeout: 5s
       retries: 30
     ports:
-      - "127.0.0.1:9001:9001"     # MinIO console
+      - "127.0.0.1:9001:9001"     # RustFS console
 
-  minio-init:                     # the bucket (idempotent)
-    image: minio/minio:latest
+  s3-init:                        # the bucket (idempotent: 200, or 409 when it exists)
+    image: rustfs/rustfs:1.0.1
     depends_on:
-      minio:
+      s3:
         condition: service_healthy
     entrypoint: ["sh", "-c"]
     command:
       - >-
-        mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"
-        && mc mb --ignore-existing local/memd
+        code=$$(curl -s -o /dev/null -w '%{http_code}' -X PUT http://s3:9000/memd
+        --aws-sigv4 aws:amz:us-east-1:s3 --user "$${S3_ACCESS_KEY}:$${S3_SECRET_KEY}")
+        && echo "bucket memd: HTTP $$code" && { [ "$$code" = 200 ] || [ "$$code" = 409 ]; }
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-memd}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-memd-minio-secret}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-memd}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-memd-s3-secret}
 
   vault:
     profiles: ["vault"]
@@ -141,7 +141,7 @@ services:
     ports: ["127.0.0.1:8703:8700"]
 
 volumes:
-  minio-data:
+  s3-data:
   memd-state:
   memd1-data:
   memd2-data:
