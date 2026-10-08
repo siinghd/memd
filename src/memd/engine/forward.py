@@ -697,7 +697,8 @@ def _raise_remote(err: dict):
 class ForwardClient:
     """Authenticated connections to holders, pooled per endpoint."""
 
-    POOL_IDLE = 16
+    POOL_IDLE = 16       # idle connections kept per endpoint...
+    POOL_IDLE_S = 60.0   # ...for this long (the holder closes them after _IDLE_S)
 
     def __init__(self, cfg: ForwardConfig, secret: str, client_id: str):
         self.cfg = cfg
@@ -712,13 +713,13 @@ class ForwardClient:
             self._closed = True
             pool, self._pool = self._pool, {}
         for chans in pool.values():
-            for ch in chans:
+            for _t, ch in chans:
                 ch.close()
 
     def drop(self, ep: Endpoint) -> None:
         with self._lock:
             chans = self._pool.pop((ep.host, ep.port, ep.endpoint_id), [])
-        for ch in chans:
+        for _t, ch in chans:
             ch.close()
 
     def _give(self, key, ch: _Channel) -> None:
@@ -726,14 +727,24 @@ class ForwardClient:
             if not self._closed:
                 chans = self._pool.setdefault(key, [])
                 if len(chans) < self.POOL_IDLE:
-                    chans.append(ch)
+                    chans.append((time.monotonic(), ch))
                     return
         ch.close()
 
     def _take(self, key) -> _Channel | None:
+        stale: list[_Channel] = []
+        got = None
         with self._lock:
-            chans = self._pool.get(key)
-            return chans.pop() if chans else None
+            chans = self._pool.get(key) or []
+            while chans:
+                t, ch = chans.pop()
+                if time.monotonic() - t <= self.POOL_IDLE_S:
+                    got = ch
+                    break
+                stale.append(ch)
+        for ch in stale:
+            ch.close()
+        return got
 
     def _connect(self, ep: Endpoint) -> _Channel:
         try:

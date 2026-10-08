@@ -276,6 +276,30 @@ m.close()
         a.close()
 
 
+def test_a_holder_that_does_not_forward_still_refuses(tmp_path):
+    """A holder with forwarding off (or an older memd) advertises no
+    endpoint: the second process fails fast, as before."""
+    root = str(tmp_path / "d")
+    a = Memory(root, namespace=NS, encrypt=False, forwarding="off")
+    try:
+        out = _child(r'''
+import sys, time
+from memd.engine.memory import Memory
+from memd.storage.engine import NamespaceBusyError
+t0 = time.monotonic()
+try:
+    Memory(sys.argv[1], namespace="shared", encrypt=False)
+    print("OPENED")
+except NamespaceBusyError as e:
+    print(type(e).__name__, round(time.monotonic() - t0, 1))
+''', root)
+        name, took = out.stdout.split()
+        assert name == "ForwardingError", out.stdout + out.stderr[-2000:]
+        assert float(took) < 5, "it waits for nothing"
+    finally:
+        a.close()
+
+
 def test_the_lock_file_names_the_holder_endpoint(tmp_path):
     root = str(tmp_path / "d")
     a = Memory(root, namespace=NS, encrypt=False)
