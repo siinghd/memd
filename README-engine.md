@@ -7,7 +7,7 @@ retrieval, budget-aware packing. Apache-2.0, capability-complete.
 ## Ten-minute story (acceptance-tested by `scripts/ten_minute_test.sh`)
 
 ```bash
-pip install -e .            # Python >= 3.11
+pip install -e ".[local-embeddings]"   # Python >= 3.11; plain `pip install -e .` works too, with hash embeddings
 ```
 
 ```python
@@ -616,9 +616,11 @@ key; the local heuristic extractor is never billed.
   `ann_min_vectors` vectors on, an optional usearch HNSW sidecar) → RRF
   fusion with trust-aware tie-breaks →
   optional rerank of the lexical top-30 → validity filter (current/as_of) →
-  lineage-deduped, budget-cut packing that keeps prefix-stable order
-  (KV-cache friendly), or, as an experimental opt-in, gated evidence packing.
-  The hash embedder's vector lane is not fused (`fuse_vector`, below).
+  lineage-deduped packing into `budget_tokens` (default 12,000): dated
+  session excerpts by default, or a flat list in prefix-stable order
+  (KV-cache friendly), or, as an experimental opt-in, gated evidence packing
+  (see "Packing and the budget", below). The hash embedder's vector lane is
+  not fused (`fuse_vector`, below).
 - **Extraction**: async, batched, re-runnable. BYO OpenAI-compatible
   key for LLM extraction/embeddings; heuristic provider keeps facts working
   with zero keys; local ONNX embeddings via the optional fastembed extra.
@@ -630,8 +632,19 @@ export MEMD_EMBEDDING_API_KEY=...      # optional: real embeddings
 export MEMD_EXTRACTION_API_KEY=...     # optional: LLM fact extraction
 ```
 
-Without them you get deterministic hash embeddings + pattern extraction:
-fully functional, honestly degraded, clearly labeled in `stats()`.
+Without them you get local embeddings when the `local-embeddings` extra is
+installed (`pip install "memd-engine[local-embeddings]"`: BAAI/bge-small-en-v1.5
+on the CPU via fastembed, downloaded on first use, fused with BM25), else
+deterministic hash embeddings; and pattern extraction. Fully functional,
+honestly degraded, clearly labeled in `stats()`; memd logs one warning per
+process when it falls back to the hash embedder for want of the extra. The
+extra is worth installing. On LongMemEval_S session retrieval (153
+questions; lane-level measurements, recall_all@10 = the share of questions
+with every evidence session in the top 10): BM25 alone, which is what
+search ranks by with the hash embedder (its vector lane is not fused),
+0.920; bge-small fused with BM25, 0.975 (+0.056 [+0.021, +0.095]);
+bge-small's lane alone 0.980, and 0.962 vs BM25's 0.827 on multi-session
+questions; the hash vector lane alone, 0.640.
 
 ### Retrieval options (`Memory(config={...})` or the env var)
 
@@ -640,7 +653,9 @@ fully functional, honestly degraded, clearly labeled in `stats()`.
 | `reranker` / `MEMD_RERANKER` | `auto` \| `none` \| `jev` \| `local` | `auto`: Jev when a TypeSafe key is set (`TYPESAFE_API_KEY`, or config `typesafe_api_key`) and `typesafe-sdk` is installed (`pip install "memd-engine[jev]"`), else none |
 | `jev_model`, `rerank_timeout_s`, `rerank_k` | model pin, deadline, shortlist | `jev-latest`, 1.5s (5s local), 30 |
 | `local_rerank_model` | fastembed cross-encoder | `BAAI/bge-reranker-base` |
-| `pack_mode` / `MEMD_PACK_MODE` | `auto` \| `ranked` \| `gated` | `auto` = ranked with every reranker; `gated` is an experimental opt-in |
+| `packing` / `MEMD_PACKING` | `sessions` \| `flat`; per call: `search(packing=...)`, REST `"packing"` | `sessions` |
+| `pack_resolve_dates` / `MEMD_PACK_RESOLVE_DATES` | annotate relative dates in packed user turns ("yesterday [= Fri 2023-05-19]") | `false` |
+| `pack_mode` / `MEMD_PACK_MODE` | `auto` \| `ranked` \| `gated` | `auto` = the `packing` layout with every reranker; `gated` is an experimental opt-in |
 | `rerank_gate` | gated-packing threshold (opt-in mode) | 0.5 |
 | `fuse_vector` / `MEMD_FUSE_VECTOR` | `auto` \| `true` \| `false` | `auto`: fuse unless the embedder is the hash embedder |
 | `lexical_backend` / `MEMD_LEXICAL_BACKEND` | `auto` \| `fts5` \| `tantivy` | `auto`: tantivy when installed (`pip install "memd-engine[fast]"`) |
@@ -665,7 +680,9 @@ fully functional, honestly degraded, clearly labeled in `stats()`.
   trades recall for tokens: in an experiment it matched top-k QA accuracy at 27%
   fewer tokens over a 100-candidate shortlist, but over the product's top-30
   it drops second evidence sessions (LongMemEval_S session recall_all@5
-  0.803 gated vs 0.928 ranked, with Jev). The default packs ranked.
+  0.803 gated vs 0.928 ranked, with Jev). When a reranker ran, it takes
+  precedence over `packing`; the default packs every candidate, in the
+  `packing` layout.
 - **tantivy accelerator.** A derived index next to SQLite, fed in the
   background (every 500ms or 512 changes); FTS5 stays the synchronous source
   of truth, so the write ack is unchanged, and writes not yet indexed are
@@ -735,6 +752,98 @@ fully functional, honestly degraded, clearly labeled in `stats()`.
   copy; larger ones are saved and loaded by usearch directly and pause
   longer). `stats()["vector_index"]["last_gil_hold_ms"]` and
   `memd_vector_index_gil_hold_ms` report it.
+
+### Packing and the budget
+
+A search returns `packed_context`, its candidates packed into
+`budget_tokens` (default **12,000**; 64 to 128,000 over REST and MCP;
+counted by memd's 4-characters-per-token estimate and never exceeded: whole
+lines only, a record is never cut to make it fit).
+Two layouts, chosen by `packing` (config, `MEMD_PACKING`, or per call):
+
+- **`sessions` (default): dated session excerpts.** Candidates are taken in
+  rank order; each retrieved turn brings the turn before and after it in
+  its session, and a fact is shown under the turn it was extracted from
+  (that turn and its neighbours come with it). Sessions are listed oldest
+  first under their date, turns in session order, `[...]` where turns were
+  left out, the speaker on every line (an example follows the list).
+  A unit that does not fit whole is packed as its anchor turn alone, else
+  skipped (a later, smaller one may still fit). The turns it adds pass the
+  same scope, validity and quarantine filter as the search's hits; a `kinds`
+  filter without `raw_event` adds none. A fact with no source turn (an
+  explicit `remember`) gets a line of its own under its date. Lower-trust
+  content (tool / web / import, quarantined) is fenced as data and escaped,
+  as in the flat layout; record and session ids are not rendered (they are
+  in `items`). `items` lists every record shown: the hits in rank order,
+  each followed by the turns it brought (`lanes` `["source"]` or
+  `["neighbour"]`, score 0). Long turns are excerpted, marked "...": a
+  retrieved turn to 4,000 characters (around the fact it carries, if any),
+  a neighbour to 1,000.
+  `pack_resolve_dates=True` also annotates relative dates in user turns
+  ("two weeks ago [= Sat 2023-05-06]", from the turn's own date); it is
+  off by default (below).
+- **`flat`: one `<memory>` element per candidate**, provenance-tagged
+  (`source`, `kind`, `date`, `id`), in rank order, until the budget is spent.
+  This was the default layout before, with a 2,000-token default budget:
+  `search(..., budget_tokens=2000, packing="flat")` (or config
+  `packing="flat"`) brings back the old behaviour. Its order is
+  prefix-stable (KV-cache friendly).
+
+A session-packed context:
+
+```text
+Relevant excerpts from past conversations, retrieved by memory search. Sessions oldest first; [...] = turns omitted.
+
+### Session 1:
+Session Date: 2023/05/20 (Sat) 02:21
+Session Content:
+
+assistant: hi, how can I help?
+user: I prefer jazz. I went to a gig yesterday.
+[memory fact, said by the user: The user prefers jazz]
+assistant: Nice! Which band?
+```
+
+**What it is worth, measured on LongMemEval_S** (end-to-end QA: 160
+questions stratified by type, with multi-session and temporal-reasoning
+over-sampled twice and the results re-weighted to the dataset's type mix;
+one run; reader DeepSeek V4.1 Flash, judge gpt-6-luna-pro with LongMemEval's
+per-type judge prompts; 95% bootstrap CIs):
+
+| context given to the reader | accuracy | multi-session | temporal | reader prompt tokens |
+|---|---|---|---|---|
+| memd's previous defaults: hash embedder, no reranker, 2K flat | 0.779 [0.718, 0.838] | 0.577 | 0.796 | ~2.0K |
+| bge-small + local cross-encoder reranker, 2K flat | 0.789 [0.726, 0.847] | 0.654 | 0.759 | ~2.0K |
+| bge-small + local cross-encoder reranker, 12K flat | 0.823 [0.763, 0.879] | 0.750 | 0.833 | ~10.6K |
+| bge-small + local cross-encoder reranker, **12K sessions** | **0.875 [0.823, 0.920]** | 0.769 | 0.870 | ~10.4K |
+| the whole history (no retrieval) | 0.906 [0.858, 0.949] | 0.904 | 0.944 | ~105K |
+
+The 12K session pack scored +0.095 [+0.034, +0.156] over the previous
+defaults (McNemar p = 0.0015), at a tenth of the whole history's tokens and
+still below it (paired, unweighted: -0.056 [-0.106, -0.006]). Over the 12K flat pack with the same retrieval it scored
++0.052 [-0.010, +0.113]: positive, not significant at this size, and so is
+each step on its own (the embedder and reranker at 2K: +0.009; 2K to 12K:
++0.034). What was not measured: the new defaults on the hash embedder
+without a reranker, end to end. The measured pack had the relative-date
+annotations on; they ship off because a 20-question pilot showed no sign
+that they help (the pack without them scored 0.85 vs 0.75 there; untested
+at power). memd's pack also differs from the measured one in small ways:
+a fact is labelled with its source turn's speaker (the measured pack
+labelled it with the fact's trust tier, usually "assistant"), a fact with
+no source turn is packed instead of dropped, and a budget smaller than the
+header packs nothing. Multi-session questions remain the weakest of the
+large categories, and abstention fell with more context (0.857 to 0.714,
+n = 7).
+
+**Cost.** Up to 6x the tokens of the old default per search, when there
+is that much to pack (`tokens_used` says). Packing itself stays in the low
+milliseconds: on a LongMemEval_S-shaped haystack (50 sessions, 800
+records, ~230K tokens; hash embedder, no reranker) the pack stage took
+~4.6 ms at 12K and ~2.4 ms at 2K (median CPU time; the flat layout ~1 ms),
+and a whole search ~9 ms instead of ~5 ms, on a shared 8-core arm64 host
+under load (load average ~16). The extra time is reading the neighbouring
+turns: one statement for the sessions of the next few hits, ids first,
+rows only for the turns that get packed.
 
 ## Ops
 

@@ -6,6 +6,64 @@ wrong, how it showed, and the numbers before and after where it has them.
 
 ## [Unreleased]
 
+### Changed
+- **Search packs dated session excerpts within 12,000 tokens by default
+  (was a flat list within 2,000).** `search`, `pack`, `POST
+  /v1/ns/{ns}/search`, the MCP `memory_search` tool and both SDKs now
+  default to `budget_tokens=12000` and the `sessions` layout: candidates in
+  rank order, each retrieved turn with the turn before and after it in its
+  session, a fact under the turn it was extracted from, sessions oldest
+  first under their date, the speaker on every line, `[...]` between turns
+  that are not adjacent. Measured on LongMemEval_S end-to-end QA (160
+  stratified questions, one run, reader DeepSeek V4.1 Flash, judge
+  gpt-6-luna-pro, bge-small embeddings and a local cross-encoder reranker):
+  0.875 [0.823, 0.920], against 0.779 [0.718, 0.838] for the previous
+  defaults (hash embedder, no reranker, 2K flat; +0.095, McNemar p =
+  0.0015), 0.823 for the same retrieval packed flat at 12K, and 0.906 for
+  the whole history in the prompt (~105K tokens against ~10K); multi-session
+  0.577 to 0.769, temporal 0.796 to 0.870. The new defaults with the hash
+  embedder and no reranker were not measured end to end. Details and
+  caveats: README-engine.md, "Packing and the budget"; BENCHMARKS.md.
+  **What changes for you:** up to 6x more context tokens per search when
+  there is that much to retrieve (`tokens_used` says how many), and a
+  differently shaped `packed_context`: no `<memory>` tags or record ids in
+  the text, provenance as the speaker of each line, lower-trust content
+  still fenced. `items` now lists every record shown: the hits in rank
+  order, each followed by the turns it brought (`lanes` `["source"]` or
+  `["neighbour"]`, score 0). **To keep the old behaviour:** pass
+  `budget_tokens=2000` and `packing="flat"` per call (REST: `"budget_tokens":
+  2000, "packing": "flat"`; TypeScript: `{ budget_tokens: 2000, packing:
+  "flat" }`), or set `packing="flat"` in the Memory config / `MEMD_PACKING=flat`
+  for the server and MCP processes and pass the budget. Explicit budgets are
+  honoured as before. `pack_mode="gated"` still takes precedence when a
+  reranker ran. The session pack adds a few milliseconds of packing per
+  search (see README-engine.md).
+- **The hash-embedder fallback says so.** When `embedder="auto"` falls back
+  to the hash embedder because the `local-embeddings` extra (fastembed) is
+  not installed, memd logs one warning per process naming the extra. With
+  it, "auto" was already BAAI/bge-small-en-v1.5 fused with BM25; on
+  LongMemEval_S session retrieval (lane level, 153 questions) that put every
+  evidence session in the top 10 for 0.975 of questions, against 0.920 for
+  BM25 alone, which is what search ranks by with the hash embedder. The
+  install instructions now lead with `pip install "memd-engine[local-embeddings]"`.
+
+### Added
+- `packing="sessions" | "flat"`: per call on `search` / `pack` (Python,
+  REST `SearchIn.packing`, TypeScript `SearchIn.packing`), and as a default
+  in the Memory config (`packing`) or `MEMD_PACKING`. `stats()` reports
+  `packing` and `pack_resolve_dates`.
+- `pack_resolve_dates` / `MEMD_PACK_RESOLVE_DATES` (off by default):
+  session packing annotates relative time expressions in user turns with
+  the date they refer to, counted from the turn's own date ("two weeks ago
+  [= Sat 2023-05-06]"; `memd.query.dates`). It resolves yesterday / today /
+  tomorrow, "N days|weeks|months|years ago" and "... from now", "last /
+  this past / next <weekday>", "last / this / next week|weekend|month|year",
+  marks vague counts and month or year shifts approximate, and leaves
+  durations ("in two weeks"), bare weekdays, phrases ("the last week of
+  June") and parts of larger numbers ("1.5 years ago") alone. Off because
+  the measurement above had it on and a 20-question pilot showed no sign
+  that it helps.
+
 ## [0.4.0] - 2026-10-01
 
 ### Added

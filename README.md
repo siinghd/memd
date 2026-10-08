@@ -14,10 +14,10 @@ Status: alpha (0.3.x). See [what it does not do yet](#limits).
 ## Features
 
 - **Embedded, zero keys.** No database to provision, no server, no account.
-  Without API keys memd runs on deterministic hash embeddings (or local ONNX
-  embeddings with `memd[local-embeddings]`) and pattern-based fact
-  extraction, and `stats()` says which. Bring an OpenAI-compatible key for
-  real embeddings or LLM fact extraction.
+  Without API keys memd runs on local ONNX embeddings (BAAI/bge-small-en-v1.5
+  with the `local-embeddings` extra) or, without the extra, deterministic hash
+  embeddings, and on pattern-based fact extraction; `stats()` says which.
+  Bring an OpenAI-compatible key for API embeddings or LLM fact extraction.
 - **No model call on the write path.** A write is acknowledged once it is
   durably appended to the namespace's log; embedding happens in the
   background, and the record is searchable by BM25 as soon as the call
@@ -32,10 +32,12 @@ Status: alpha (0.3.x). See [what it does not do yet](#limits).
   agent > tool > web > import). Untrusted content is fenced as data in the
   packed context, explicit saves inherit a session's taint, and bursts of
   writes or repeated near-identical content are quarantined.
-- **Hybrid retrieval.** A rules-based planner fans out over BM25 (SQLite
-  FTS5, optionally accelerated by tantivy), entity, time and vector lanes,
-  fuses them with reciprocal rank fusion, optionally reranks, and packs the
-  result into a token budget in a stable order.
+- **Hybrid retrieval, packed as evidence.** A rules-based planner fans out
+  over BM25 (SQLite FTS5, optionally accelerated by tantivy), entity, time
+  and vector lanes, fuses them with reciprocal rank fusion, optionally
+  reranks, and packs the result into a token budget (12,000 by default) as
+  dated excerpts of past sessions: each hit with the turns around it, a fact
+  under the turn it came from, the speaker on every line.
 - **Deletion that holds.** Hard delete with a physical-purge deadline,
   forget-by-query with a preview, per-namespace crypto-shred, and a
   hash-chained audit log.
@@ -49,20 +51,30 @@ Install from PyPI (Python >= 3.11). The package is `memd-engine`; the
 import name and the command are `memd`:
 
 ```bash
-pip install memd-engine
+pip install "memd-engine[local-embeddings]"
 ```
 
-or the latest code from this repository:
+The `local-embeddings` extra runs BAAI/bge-small-en-v1.5 on the CPU
+(fastembed; the model downloads on first use), fused with BM25, and it
+materially improves recall: on LongMemEval_S session retrieval, 97.5% of
+questions had every evidence session in the top 10 (recall_all@10 0.975)
+against 92.0% with BM25 alone, which is what memd ranks by without the extra
+(lane-level measurements, 153 questions; the hash embedder's own vector lane
+scores 0.640 and is not used for ranking). Plain `pip install memd-engine`
+works too, offline and with no model: hash embeddings, and one log line
+saying so.
+
+The latest code from this repository:
 
 ```bash
-pip install "memd-engine @ git+https://github.com/siinghd/memd.git"
+pip install "memd-engine[local-embeddings] @ git+https://github.com/siinghd/memd.git"
 ```
 
 or from a checkout, with the extras you need:
 
 ```bash
 git clone https://github.com/siinghd/memd.git && cd memd
-pip install -e ".[mcp,s3]"     # extras: mcp, s3, fast, ann, local-embeddings, jev, billing
+pip install -e ".[local-embeddings,mcp,s3]"   # extras: local-embeddings, mcp, s3, fast, ann, jev, billing
 ```
 
 ## Quickstart
@@ -76,7 +88,7 @@ mem.remember("The user prefers dark mode", user_id="u1", entity_keys=["user.them
 
 hits = mem.search("how do we deploy?", user_id="u1", budget_tokens=500)
 print(hits.items[0].content)   # We deploy with `make ship`, never CI
-print(hits.packed_context)     # provenance-tagged, ready to put in a prompt
+print(hits.packed_context)     # dated session excerpts, ready to put in a prompt
 mem.close()
 ```
 
@@ -103,10 +115,20 @@ Session retrieval on LongMemEval_S through the public `Memory.search`
 | v0.2.0, zero-key default (hash embedder, no reranker) | 0.866 ± 0.017 | 0.835 | ~16 ms |
 | v0.2.0 + Jev reranker (`TYPESAFE_API_KEY` set) | 0.955 ± 0.026 | 0.928 | ~1 s (network) |
 
-This is retrieval quality on one public dataset. The end-to-end QA numbers
-are preliminary and the one-time held-out 500-question run has not been
-done; how these were measured and what they do not show is in
-[BENCHMARKS.md](BENCHMARKS.md).
+End-to-end QA on LongMemEval_S (160 questions stratified by type, one run;
+reader DeepSeek V4.1 Flash, judge gpt-6-luna-pro): with bge-small embeddings
+and a local cross-encoder reranker, a 12K-token context packed as session
+excerpts (the layout and budget search now defaults to) scored 0.875
+[0.823, 0.920], against 0.779 [0.718, 0.838] for the previous defaults (hash
+embedder, no reranker, 2K tokens, flat) and 0.906 for the whole history in
+the prompt (~105K tokens against ~10K). The same retrieval packed flat at
+12K scored 0.823. The new defaults without the embedder and reranker were
+not measured end to end.
+
+These are results on one public dataset, with one reader and one judge, and
+the one-time held-out 500-question run has not been done; the setup and what
+they do not show are in [README-engine.md](README-engine.md#packing-and-the-budget)
+and [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Limits
 

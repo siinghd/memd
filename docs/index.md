@@ -14,8 +14,9 @@ print(mem.search("how do we deploy?", user_id="u1").packed_context)
 
 - **A library, not a deployment.** `Memory("./my-data")` owns a directory.
   No database to provision, no server to run, no account or API key: without
-  keys memd runs on deterministic hash embeddings (or local ONNX embeddings
-  with `memd[local-embeddings]`) and pattern-based fact extraction, and
+  keys memd runs on local ONNX embeddings (`memd-engine[local-embeddings]`,
+  recommended: it materially improves recall) or, without the extra,
+  deterministic hash embeddings, and on pattern-based fact extraction;
   `stats()` says which.
 - **One engine behind every door.** The Python API, the REST server, the MCP
   server and the TypeScript SDK all reach the same engine with the same
