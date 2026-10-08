@@ -675,25 +675,34 @@ def test_holder_closing_hands_the_namespace_over(tmp_path):
     other forwards to that one."""
     root = str(tmp_path / "d")
     fleet = Fleet(tmp_path, root, PURGE)
-    stop = str(tmp_path / "stop-A")
+    stop_a, stop_bc = str(tmp_path / "stop-A"), str(tmp_path / "stop-BC")
     try:
-        fleet.spawn("A", 10 ** 6, sleep=0.01, stop=stop)
+        fleet.spawn("A", 10 ** 6, sleep=0.01, stop=stop_a)
         fleet.wait_ready("A")
         for t in ("B", "C"):
-            fleet.spawn(t, 150, ryw=True, sleep=0.004, delete_every=6, hard_every=12)
+            fleet.spawn(t, 10 ** 6, ryw=True, sleep=0.004, delete_every=6, hard_every=12, stop=stop_bc)
         fleet.wait_ready("B", "C")
         fleet.go()
         deadline = time.monotonic() + 120
         while fleet.acked_adds("B") < 25 or fleet.acked_adds("C") < 25:
             assert time.monotonic() < deadline, (fleet.stderr("B"), fleet.stderr("C"))
             time.sleep(0.01)
-        open(stop, "w").close()                     # A closes, mid-stream
-        fleet.finish("A", "B", "C")
+        open(stop_a, "w").close()                   # A flushes and closes, mid-stream
+        fleet.finish("A")
+        t_closed = fleet.log("A")[-1]["t"]
+        after = {t: fleet.acked_adds(t) for t in ("B", "C")}
+        while any(fleet.acked_adds(t) < after[t] + 20 for t in ("B", "C")):
+            assert time.monotonic() < deadline, (fleet.stderr("B"), fleet.stderr("C"))
+            time.sleep(0.01)
+        open(stop_bc, "w").close()
+        fleet.finish("B", "C")
     finally:
         fleet.kill_all()
     adds, deletes, violations = _acked(fleet, ["A", "B", "C"])
     assert not violations, violations[:5]
-    assert fleet.log("A")[0]["holds"] is True
+    assert fleet.log("A")[0]["holds"] is True and fleet.log("A")[-1]["op"] == "closed"
+    assert all(any(e["op"] == "add" and e["t"] > t_closed for e in fleet.log(t)) for t in ("B", "C")), \
+        "both went on writing after the holder closed"
     assert any(fleet.log(t)[-2]["holds"] for t in ("B", "C")), "a forwarder took the namespace over"
     m = _open_after(root, PURGE, encrypt=False)
     try:
