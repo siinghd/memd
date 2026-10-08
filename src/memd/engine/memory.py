@@ -776,7 +776,14 @@ class Memory:
         self._fwd_ready = threading.Event()
         fwd_secret = holder = None
         if fcfg.enabled and not read_only and not os.environ.get("MEMD_ALLOW_MULTI_PROCESS"):
-            fwd_secret = _fw.load_secret(fcfg, path)
+            try:
+                fwd_secret = _fw.load_secret(fcfg, path)
+            except OSError as ex:
+                # (a data directory shared with another user, whose secret
+                # this one cannot read): without it, as with forwarding off
+                _log.warning("memd: write forwarding is off for this process: the forwarding "
+                             "secret cannot be read or created (%s)", ex)
+        if fwd_secret is not None:
             holder = getattr(store, "lease_holder", None)
             if not holder:
                 self._fwd_server = _fw.ForwardServer(fcfg, fwd_secret, self._serve_forwarded)

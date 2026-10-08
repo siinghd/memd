@@ -135,9 +135,11 @@ mem.add("we ship on Fridays", user_id="u1")  mem.add("...", user_id="u1")  # run
   in the `local_dir`), or `forward_secret` / `MEMD_FORWARD_SECRET` - which
   processes on an `s3://` root with different `local_dir`s need. Both sides
   prove the secret, and every frame after that is integrity-protected;
-  nothing is encrypted ([SECURITY.md](SECURITY.md)). A process without it is
-  refused (`ForwardAuthError`, at open when the facade's own namespace is
-  the busy one).
+  nothing is encrypted ([SECURITY.md](SECURITY.md)). A process with another
+  secret is refused (`ForwardAuthError`, at open when the facade's own
+  namespace is the busy one); one that cannot read or create the file (a
+  data directory shared with another user) runs with forwarding off, and
+  says so in its log.
 - **Off.** `Memory(path, forwarding="off")` (config `forwarding`,
   `MEMD_FORWARDING=off`) keeps the old behaviour: a busy namespace raises
   `NamespaceBusyError`. A holder with forwarding off - or an older memd -
