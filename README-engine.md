@@ -901,10 +901,10 @@ an env key off.
 - **Privacy: with the LLM extractor active, every closed session's raw
   turns are sent to the extraction provider** (see SECURITY.md).
 - **Measured.** On 30 LongMemEval_S questions, the LLM extractor gave no
-  measurable accuracy gain: 0.667 against 0.700 for the pattern extractor
-  (difference -0.033, 95% CI [-0.167, +0.067]). It also made a session
-  close slower (1.5 s against 0.08 s at the median). A larger evaluation is
-  necessary before we recommend it.
+  measurable accuracy gain. It scored 0.667, and the pattern extractor
+  0.700 (difference -0.033, 95% CI [-0.167, +0.067]). It also made a
+  session close slower (1.5 s against 0.08 s at the median). A larger
+  evaluation is necessary before we recommend it.
 
 ### Retrieval options (`Memory(config={...})` or the env var)
 
