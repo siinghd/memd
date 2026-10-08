@@ -6,17 +6,20 @@ workflow deploys the docs when you push to the default branch:
 | workflow | publishes | credential |
 |---|---|---|
 | `.github/workflows/release-pypi.yml` | sdist + wheel to PyPI, and a GitHub Release with them | PyPI trusted publishing (OIDC, OpenID Connect) |
-| `.github/workflows/release-npm.yml` | `memd-engine` (sdk-ts) to npm, with provenance | trusted publishing (OIDC), environment `npm` |
+| `.github/workflows/release-npm.yml` | `memd-engine` (sdk-ts) to npm, with provenance, as a staged version that the owner approves | trusted publishing (OIDC), environment `npm` |
 | `.github/workflows/docs.yml` | the docs site to GitHub Pages | the workflow's own token |
 
-## Once, before the first release
+## One-time setup
 
-### 0. Decisions only the owner can make
+This setup is complete for `siinghd/memd`. Do these steps again only if the
+repository moves, or for a fork that publishes its own packages.
+
+### 0. Names and URLs
 
 - **The PyPI name** is `memd-engine` (an unrelated project has `memd` on
   PyPI). The import name (`import memd`) and the `memd` command do not
-  change. PyPI has a pending trusted publisher for `memd-engine` <-
-  `siinghd/memd`, `release-pypi.yml`, environment `pypi`.
+  change. PyPI has a trusted publisher for `memd-engine`: `siinghd/memd`,
+  workflow `release-pypi.yml`, environment `pypi`.
 - **The npm name** is `memd-engine`, without a scope. It is the same name
   as on PyPI.
 - **The GitHub owner and repository** are `github.com/siinghd/memd`. They
@@ -25,10 +28,10 @@ workflow deploys the docs when you push to the default branch:
   `site_url`). npm provenance fails if `repository.url` in
   `sdk-ts/package.json` is not the repository that the workflow runs in. If
   the repository moves, update all three files.
-- **The docs URL.** GitHub Pages serves `https://<owner>.github.io/<repo>/`.
-  A custom domain needs a `docs/CNAME` file and a DNS (Domain Name System)
-  record. Set `site_url` in `mkdocs.yml`. Add a `Documentation` entry to
-  `[project.urls]`.
+- **The docs URL** is `https://siinghd.github.io/memd/` (GitHub Pages). It
+  is `site_url` in `mkdocs.yml` and `Documentation` in `[project.urls]`. A
+  custom domain needs a `docs/CNAME` file and a DNS (Domain Name System)
+  record.
 
 ### 1. Create the repository and push
 
@@ -41,18 +44,15 @@ git push -u origin master
 git push origin --tags
 ```
 
-If you push the six existing tags in one push, no workflow starts. GitHub
-creates no push events when you push more than three tags at once. That is
-the result that you want. The tagged commits up to `v0.3.2` are older than
-these workflows (they contain the old `release.yml`). Thus, the first release
-that `release-pypi.yml` publishes is the first tag that you make after this
-branch is merged.
+GitHub creates no push events when you push more than three tags at once.
+Thus, this push does not publish the existing tags again.
 
 ### 2. PyPI: a trusted publisher
 
-On pypi.org, open *Your account → Publishing → Add a new pending
-publisher*. The project does not exist yet; the first upload creates it.
-Enter these values:
+On pypi.org, add a trusted publisher. For a project that does not exist
+yet, open *Your account → Publishing → Add a new pending publisher*. The
+first upload then creates the project. For an existing project, open the
+*Publishing* settings of the project. Enter these values:
 
 | field | value |
 |---|---|
@@ -78,6 +78,10 @@ is stored in the repository.
 npm cannot publish the first version of a package with OIDC. The first
 version (0.2.0) was published with a token, and that token was then
 revoked.
+
+The package also uses npm staged publishing. A version that the workflow
+publishes does not go live at once. It waits on npmjs.com until the owner
+approves it.
 
 ### 4. GitHub Pages
 
@@ -111,7 +115,9 @@ branch that changes the docs.
    git push origin master vX.Y.Z
    ```
 5. **Watch** *Release (PyPI)* and *Release (npm)*. If the `pypi`
-   environment has reviewers, approve it.
+   environment has reviewers, approve it. If the workflow published a new
+   SDK version, approve the staged version on npmjs.com. Until you approve
+   it, npm does not serve it.
 6. **Verify** from outside the repository. In a new virtualenv, run
    `pip install "<name>==X.Y.Z"` and
    `python -c "import memd; print(memd.__version__)"`. Run
