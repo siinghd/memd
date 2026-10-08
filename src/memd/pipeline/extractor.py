@@ -215,7 +215,8 @@ prompt_version={PROMPT_VERSION}"""
 
     def __init__(self, model: str, api_key: str, base_url: str = "https://api.openai.com/v1",
                  chunk_records: int = 40, chunk_chars: int = 24_000,
-                 max_tokens: int = DEFAULT_MAX_TOKENS, timeout_s: float = DEFAULT_TIMEOUT_S):
+                 max_tokens: int = DEFAULT_MAX_TOKENS, timeout_s: float = DEFAULT_TIMEOUT_S,
+                 request_options: dict | None = None):
         import httpx
 
         self.model = model
@@ -227,6 +228,8 @@ prompt_version={PROMPT_VERSION}"""
         # looped ran to 131,072 output tokens and 413 s
         self.max_tokens = int(max_tokens)
         self.timeout_s = float(timeout_s)
+        # merged into every request body last; a None value removes a field
+        self.request_options = _request_options(request_options or {})
         self.chunks_sent = 0
         self._client = httpx.Client(timeout=self.timeout_s)
 
@@ -278,6 +281,11 @@ prompt_version={PROMPT_VERSION}"""
         }
         if self.max_tokens:
             body["max_tokens"] = self.max_tokens
+        for k, v in self.request_options.items():
+            if v is None:
+                body.pop(k, None)
+            else:
+                body[k] = v
         text = self._complete(body)["choices"][0]["message"]["content"]
         return self._parse(text, records)
 
@@ -338,6 +346,7 @@ def resolve_extractor(config: dict | None = None) -> Extractor:
             base_url=extraction_setting(cfg, "extraction_base_url", "https://api.openai.com/v1"),
             max_tokens=_max_tokens(extraction_setting(cfg, "extraction_max_tokens", DEFAULT_MAX_TOKENS)),
             timeout_s=_timeout_s(extraction_setting(cfg, "extraction_timeout_s", DEFAULT_TIMEOUT_S)),
+            request_options=_request_options(extraction_setting(cfg, "extraction_request_options", {})),
         )
     return HeuristicExtractor()
 
@@ -350,6 +359,27 @@ def _max_tokens(v) -> int:
     if n < 0:
         raise ValueError(f"extraction_max_tokens must be a whole number >= 0 (0 = no cap), got {v!r}")
     return n
+
+
+# the extractor's own fields: its prompt, its model setting, and a whole
+# JSON reply it can parse
+_RESERVED_OPTIONS = ("model", "messages", "stream")
+
+
+def _request_options(v) -> dict:
+    """A dict, or (from the env) a JSON object."""
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except ValueError as ex:
+            raise ValueError(f"extraction_request_options is not valid JSON: {ex}") from None
+    if not isinstance(v, dict):
+        raise ValueError(f"extraction_request_options must be a JSON object, got {type(v).__name__}")
+    bad = [k for k in _RESERVED_OPTIONS if k in v]
+    if bad:
+        raise ValueError(f"extraction_request_options cannot set {bad} "
+                         "(use extraction_model for the model)")
+    return dict(v)
 
 
 def _timeout_s(v) -> float:

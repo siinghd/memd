@@ -236,3 +236,43 @@ def test_a_silent_provider_is_cut_off(provider, monkeypatch):
     ext.extract([_rec("I work at Initech")])
     assert _t.monotonic() - t0 < 4
     assert len(provider.requests) == 1
+
+
+# ------------------------------------------------- 3: request options
+
+
+def test_request_options_are_merged_into_the_request(provider):
+    opts = {"provider": {"order": ["deepinfra"], "allow_fallbacks": False},
+            "reasoning": {"enabled": False}, "temperature": 0.2}
+    _llm(provider, extraction_request_options=opts).extract([_rec("I work at Initech")])
+    body = provider.requests[-1]["body"]
+    assert body["provider"] == {"order": ["deepinfra"], "allow_fallbacks": False}
+    assert body["reasoning"] == {"enabled": False}
+    assert body["temperature"] == 0.2
+    assert body["max_tokens"] == 4096 and body["model"] == "gpt-4o-mini"
+
+
+def test_request_options_from_env_json_and_config_wins(monkeypatch, provider):
+    monkeypatch.setenv("MEMD_EXTRACTION_REQUEST_OPTIONS", '{"reasoning": {"effort": "low"}}')
+    _llm(provider).extract([_rec("I work at Initech")])
+    assert provider.requests[-1]["body"]["reasoning"] == {"effort": "low"}
+    _llm(provider, extraction_request_options={"top_p": 0.5}).extract([_rec("I work at Initech")])
+    body = provider.requests[-1]["body"]
+    assert body["top_p"] == 0.5 and "reasoning" not in body
+
+
+def test_a_null_option_removes_the_field(provider):
+    # e.g. a model that takes max_completion_tokens and rejects temperature
+    opts = {"temperature": None, "max_tokens": None, "max_completion_tokens": 2048}
+    _llm(provider, extraction_request_options=opts).extract([_rec("I work at Initech")])
+    body = provider.requests[-1]["body"]
+    assert "temperature" not in body and "max_tokens" not in body
+    assert body["max_completion_tokens"] == 2048
+
+
+@pytest.mark.parametrize("bad", ['{"reasoning": ', '["not", "an", "object"]',
+                                 '{"messages": []}', '{"model": "x"}', '{"stream": true}'])
+def test_bad_request_options_are_refused(monkeypatch, bad):
+    monkeypatch.setenv("MEMD_EXTRACTION_REQUEST_OPTIONS", bad)
+    with pytest.raises(ValueError, match="extraction_request_options"):
+        resolve_extractor({"extraction_api_key": "k"})
