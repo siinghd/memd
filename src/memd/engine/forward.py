@@ -348,6 +348,15 @@ def _jdefault(o):
     raise TypeError(f"{type(o).__name__} cannot be forwarded")
 
 
+def _json_object(body: bytes) -> dict | None:
+    """A frame's JSON object, or None (not JSON, or not an object)."""
+    try:
+        got = json.loads(body)
+    except ValueError:
+        return None
+    return got if isinstance(got, dict) else None
+
+
 def _hmac(key: bytes, *parts: bytes) -> bytes:
     return hmac.new(key, b"".join(parts), hashlib.sha256).digest()
 
@@ -563,12 +572,12 @@ class ForwardServer:
             conn.settimeout(_IDLE_S)
             while True:
                 kind, body = ch.recv()
-                if kind != _REQUEST:
+                req = _json_object(body) if kind == _REQUEST else None
+                if req is None:
                     return
-                self._handle(ch, json.loads(body))
-        except _AuthFailed:
-            METRICS.inc("memd_forward_auth_failures_total",
-                        help="forwarded connections refused: bad credentials or a tampered frame")
+                self._handle(ch, req)
+        except _AuthFailed as ex:
+            self._refused(ch, str(ex))
         except (OSError, ConnectionError, ValueError):
             pass                            # the caller went away (or sent garbage)
         except Exception:  # noqa: BLE001 - one connection never takes the endpoint down
@@ -583,18 +592,31 @@ class ForwardServer:
         nonce = secrets.token_hex(16)
         ch.send(_HELLO, _jdump({"v": PROTOCOL, "id": self.endpoint_id, "nonce": nonce}))
         kind, body = ch.recv(_MAX_HELLO)
-        msg = json.loads(body) if kind == _HELLO else {}
+        msg = _json_object(body) if kind == _HELLO else None
+        if msg is None:
+            self._refused(ch, "a malformed handshake")
+            return False
         client, cnonce, proof = str(msg.get("client", ""))[:128], str(msg.get("cnonce", ""))[:64], \
             str(msg.get("proof", ""))
         cproof, sproof, key = _keys(self.secret, self.endpoint_id, nonce, client, cnonce)
         if len(cnonce) < 16 or not hmac.compare_digest(proof, cproof):
-            METRICS.inc("memd_forward_auth_failures_total",
-                        help="forwarded connections refused: bad credentials or a tampered frame")
+            self._refused(ch, "credentials that do not prove the secret")
             ch.send(_HELLO, _jdump({"ok": False, "error": "auth"}))
             return False
         ch.send(_HELLO, _jdump({"ok": True, "proof": sproof}))
         ch.key = key
         return True
+
+    @staticmethod
+    def _refused(ch: _Channel, why: str) -> None:
+        """One line and one count per refused connection - never a traceback."""
+        METRICS.inc("memd_forward_auth_failures_total",
+                    help="forwarded connections refused: bad credentials or a tampered frame")
+        try:
+            peer = "%s:%s" % ch.sock.getpeername()[:2]
+        except OSError:
+            peer = "?"
+        _log.warning("memd forward: refused a connection from %s: %s", peer, why)
 
     # ------------------------------------------------------------ calls
 
@@ -751,7 +773,7 @@ class _StreamReader:
                 if kind == _DATA:
                     yield from body.splitlines(keepends=True)
                     continue
-                trailer = json.loads(body) if kind == _END else {}
+                trailer = (_json_object(body) if kind == _END else None) or {}
                 if not trailer.get("ok"):
                     _raise_remote(trailer.get("error") or {"message": "stream ended abnormally"})
                 ok = True
@@ -847,7 +869,7 @@ class ForwardClient:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             sock.settimeout(max(5.0, self.cfg.connect_timeout_s * 2))
             kind, body = ch.recv(_MAX_HELLO)
-            hello = json.loads(body) if kind == _HELLO else {}
+            hello = (_json_object(body) if kind == _HELLO else None) or {}
             if hello.get("id") != ep.endpoint_id:
                 raise _Unreachable(f"another process answers at {ep.host}:{ep.port} "
                                    "(the namespace's holder is gone)")
@@ -856,7 +878,7 @@ class ForwardClient:
             ch.send(_HELLO, _jdump({"v": PROTOCOL, "client": self.client_id, "cnonce": cnonce,
                                     "proof": cproof}))
             kind, body = ch.recv(_MAX_HELLO)
-            ack = json.loads(body) if kind == _HELLO else {}
+            ack = (_json_object(body) if kind == _HELLO else None) or {}
         except _Unreachable:
             ch.close()
             raise
@@ -910,10 +932,9 @@ class ForwardClient:
             ch.close()
             raise _Uncertain(f"no answer from {ep.host}:{ep.port} ({ex})") from None
         if kind == _STREAM:
-            return _StreamReader(self, key, ch, json.loads(data), max(5.0, timeout_s))
-        try:
-            reply = json.loads(data)
-        except ValueError:
+            return _StreamReader(self, key, ch, _json_object(data) or {}, max(5.0, timeout_s))
+        reply = _json_object(data)
+        if reply is None:
             ch.close()
             raise _Uncertain("unreadable answer") from None
         self._give(key, ch)

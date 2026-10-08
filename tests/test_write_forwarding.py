@@ -574,6 +574,33 @@ def test_an_untrustworthy_secret_file_is_refused(tmp_path, how, caplog):
         fw.load_secret(fw.ForwardConfig(), str(root))
 
 
+def test_a_malformed_handshake_is_refused_with_one_line(tmp_path, caplog):
+    """A hello that is JSON but not an object raised AttributeError in the
+    handshake: a full traceback per connection (a log flood anyone on the
+    host could cause), and not counted as a refused connection."""
+    root = str(tmp_path / "d")
+    a = Memory(root, namespace=NS, encrypt=False)
+    try:
+        ep, client = _holder_client(a, root)
+        client.close()
+        fails = _counter("memd_forward_auth_failures_total")
+        with caplog.at_level("WARNING", logger="memd"):
+            for body in (b"[]", b"not json", b'"a string"'):
+                with socket.create_connection((ep.host, ep.port), timeout=5) as s:
+                    ch = fw._Channel(s, b"c")
+                    ch.recv(4096)
+                    ch.send(fw._HELLO, body)
+                    with pytest.raises((ConnectionError, OSError)):
+                        while True:
+                            ch.recv(4096)
+            time.sleep(0.2)
+        assert _counter("memd_forward_auth_failures_total") == fails + 3
+        assert "Traceback" not in caplog.text and "AttributeError" not in caplog.text
+        assert caplog.text.count("refused a connection") == 3
+    finally:
+        a.close()
+
+
 # ------------------------------------------------------------------ idempotency
 
 
