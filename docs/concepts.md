@@ -136,9 +136,9 @@ The options, with their defaults:
 
 ## Storage and compaction
 
-Per namespace, the object store (a local directory, or S3/R2/MinIO) holds a
-framed **WAL** and ops log, immutable **segments**, and a **manifest** that
-names them. The log rotates into a segment at a session close or when it
+Per namespace, the object store (a local directory, or an S3-compatible
+bucket) holds a framed **WAL** and ops log, immutable **segments**, and a
+**manifest** that names them. The log rotates into a segment at a session close or when it
 grows past its size or frame limit. **Compaction** folds the segments, the
 log and the ops into one segment: it applies tombstones and supersedence and
 physically purges hard-deleted records. It runs on a maintenance thread, off

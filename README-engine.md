@@ -7,7 +7,7 @@ retrieval, budget-aware packing. Apache-2.0, capability-complete.
 ## Ten-minute story (acceptance-tested by `scripts/ten_minute_test.sh`)
 
 ```bash
-pip install -e ".[local-embeddings]"   # Python >= 3.11. `pip install -e .` also works, with hash embeddings.
+pip install "memd-engine[local-embeddings]"   # Python >= 3.11. Without the extra, memd uses hash embeddings.
 ```
 
 ```python
@@ -63,13 +63,14 @@ of an otherwise authenticated API). Set `MEMD_ENABLE_DOCS=1` for development.
 
 ### 4. Docker
 ```bash
-docker build -t memd/memd:0.2.0 .
-docker run -d -p 8700:8700 -e MEMD_ADMIN_KEY=... -v memddata:/data memd/memd:0.2.0 serve --http
+docker build -t memd/memd .
+docker run -d -p 8700:8700 -e MEMD_ADMIN_KEY=... -v memddata:/data memd/memd serve --http
 ```
 The default image does not include the Stripe SDK (~26 MB installed; only
 hosted billing uses it). For `serve --http --hosted` with billing, build the
-variant: `docker build --build-arg MEMD_BILLING=1 -t memd/memd:0.2.0-hosted .`
-(the build fails if the billing install does).
+variant: `docker build --build-arg MEMD_BILLING=1 -t memd/memd:hosted .`
+(the build fails if the billing install does). For `s3://` data roots and
+the `aws-kms` key provider, add `--build-arg MEMD_S3=1` (boto3).
 The image runs as **uid 10001**, so a *named volume* (above) works but a
 **bind mount does not** unless you either pass `--user "$(id -u):$(id -g)"` or
 `chown 10001` the host directory. Both are verified; pick one deliberately.
@@ -195,7 +196,7 @@ compaction retried on a NEW holder (the first one died after running it)
 runs again - a session close's consolidation drops the facts the first run
 already wrote; a delete retried that way answers `False` (the first attempt
 deleted it); and an export cut off mid-stream raises and is not resumed.
-Several writers inside one namespace (several logs) are not built.
+memd has no mode with several writers in one namespace (several logs).
 
 **Measured** (`bench/forward_bench.py`: a holder process and this one on
 one 8-core machine, loopback TCP, hash embedder, no reranker, encryption on;
@@ -239,7 +240,22 @@ its timeout (AWS S3 does not lock).
 | `forward_max_inflight` / `MEMD_FORWARD_MAX_INFLIGHT` | 64 | forwarded calls a holder runs at once |
 | `forward_queue_wait_s` / `MEMD_FORWARD_QUEUE_WAIT_S` | 10 | how long a forwarded call waits for one of them before the holder answers "overloaded" (its caller retries) |
 
-## Object storage as the source of truth (S3 / R2 / MinIO)
+### Search throughput: more processes, not more threads
+
+The default search (a 12K session pack) is CPU work in Python. In one
+process, more threads do not give more searches per second, because of the
+GIL. Retrieval alone (a 2K flat pack) scales with threads, because SQLite
+releases the GIL. To serve more default searches, run more processes:
+
+- `uvicorn --workers N`, or more processes on one data root (they forward
+  to the writer of each namespace, as above);
+- read replicas, for eventual reads ([read replicas](#read-replicas-eventual-reads));
+- more nodes on an `s3://` root ([multi-node](#multi-node)).
+
+## Object storage as the source of truth (S3-compatible stores)
+
+memd runs on AWS S3, Cloudflare R2 and other S3-compatible stores with
+conditional writes. CI runs the S3 tests against RustFS.
 
 ```bash
 pip install "memd-engine[s3]"
@@ -368,8 +384,8 @@ Point clients (or a plain load balancer) at ANY node:
 - **Hosted billing** works through the router: a request is authenticated and
   metered by the node that executes it, once. The admin database is SQLite in
   `MEMD_STATE_DIR`, so a hosted fleet runs on one host (or a volume with
-  working POSIX locks); a networked admin store is the open item for
-  multi-host hosted.
+  working POSIX locks). memd has no networked admin store for hosted mode
+  on several hosts.
 
 To try it on one machine: `docker-compose.yml` runs an S3 server (RustFS),
 three nodes and (with `--profile vault`) a Vault dev server holding the data
@@ -386,8 +402,8 @@ SIGKILLed → next write acked after 3.6-3.8 s (bound: TTL + ε); SIGTERM →
 0.03-1.1 s; frozen past its TTL → 4.8-6.2 s, with no acked write lost in any
 case. On MinIO a node frozen in the middle of a lease write holds that
 object's lock for MinIO's ~30 s timeout, and its takeover waits for it
-(observed in 2 of 14 frozen runs; AWS S3 does not lock). Not built yet:
-multiple writers inside one namespace.
+(observed in 2 of 14 frozen runs; AWS S3 does not lock). memd has no
+mode with several writers in one namespace.
 
 ### Read replicas (eventual reads)
 
@@ -884,6 +900,11 @@ an env key off.
   `memd_extraction_items_malformed_total{model}`; its other facts are kept.
 - **Privacy: with the LLM extractor active, every closed session's raw
   turns are sent to the extraction provider** (see SECURITY.md).
+- **Measured.** On 30 LongMemEval_S questions, the LLM extractor gave no
+  measurable accuracy gain: 0.667 against 0.700 for the pattern extractor
+  (difference -0.033, 95% CI [-0.167, +0.067]). It also made a session
+  close slower (1.5 s against 0.08 s at the median). A larger evaluation is
+  necessary before we recommend it.
 
 ### Retrieval options (`Memory(config={...})` or the env var)
 
@@ -1167,15 +1188,28 @@ python -m memd.harness.run --suite all --gate    # quality+cost gate
 python bench/lme_gate.py                         # real-data gate: LongMemEval_S, 60 q (nightly)
 python bench/lexical_bench.py                    # FTS5 vs tantivy, filtered, 10K-150K records
 python bench/ann_bench.py                        # vector lane: usearch vs exact, 50K-1M vectors
+python bench/forward_bench.py                    # write forwarding: holder vs forwarded calls
+MEMD_TEST_S3_ENDPOINT=... python bench/replica_bench.py   # read replicas: lag and read throughput (an S3 API)
 memd export --out backup.jsonl                   # anti-lock-in, symmetric
+memd import memd --export backup.jsonl           # restore a memd export
 memd import mem0 --export mem0.json              # migration path
+memd keys status --data ./memd-data              # data-key custody: provider, each namespace's key
 memd migrate --report ./memd-data                # store-format upgrade: preview / what it did (JSON)
 memd key create --ns acme [--pin-user u1]        # scoped API keys
 ```
 
-SLOs measured on this machine (see `bench/slo_bench.py`): durable write ack
-p99 ≈ 7ms (target ≤10ms embedded); warm retrieval p50 ≈ 12ms / p99 ≈ 52ms
-(targets ≤20/≤100ms); cold restart + first query ≈ 44ms.
+The SLO targets of `bench/slo_bench.py`, with the values measured on one
+machine:
+
+- Durable write ack: the target is p99 ≤ 10 ms (embedded). Measured: p99
+  ≈ 7 ms.
+- Warm retrieval with a 2K flat pack: the target is p50 ≤ 20 ms and p99 ≤
+  100 ms. Measured: p50 ≈ 12 ms, p99 ≈ 52 ms.
+- Warm search with the defaults (12K session pack): the target is p50 ≤
+  40 ms and p99 ≤ 150 ms. Measured: p50 25 ms on a loaded host (see
+  "Packing and the budget").
+- Cold restart and first query: the target is p90 ≤ 1.5 s. Measured: ≈
+  44 ms.
 
 The eval harness stamps its version hash into every result file — a result
 without a hash doesn't exist.
