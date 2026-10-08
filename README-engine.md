@@ -839,9 +839,9 @@ n = 7).
 is that much to pack (`tokens_used` says). Packing itself stays in the low
 milliseconds: on a LongMemEval_S-shaped haystack (50 sessions, 800
 records, ~230K tokens; hash embedder, no reranker) the pack stage took
-~4.6 ms at 12K and ~2.4 ms at 2K (median CPU time; the flat layout ~1 ms),
-and a whole search ~9 ms instead of ~5 ms, on a shared 8-core arm64 host
-under load (load average ~16). The extra time is reading the neighbouring
+~4.2 ms at 12K and ~2.2 ms at 2K (median; the flat layout ~1 ms), and a
+whole search ~8.3 ms instead of ~4.8 ms, on a shared 8-core arm64 host
+under load (load average ~6). The extra time is reading the neighbouring
 turns: one statement for the sessions of the next few hits, ids first,
 rows only for the turns that get packed.
 
