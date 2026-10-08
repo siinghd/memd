@@ -19,6 +19,7 @@ The S3 variants need MEMD_TEST_S3_ENDPOINT (MinIO); skipped otherwise.
 """
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -619,6 +620,58 @@ print(json.dumps({"acked": acked, "errors": errors}))
         assert all(contents[c] == 1 for _rid, c in r["acked"])
     finally:
         a.close()
+
+
+def test_a_retry_never_brings_back_a_hard_deleted_record(tmp_path):
+    """A forwarded write applied, its reply lost; the record then hard-deleted
+    - its index row goes at once; then the write's automatic retry (the same
+    record ids) arrives. It found no row and wrote the record again: an
+    acknowledged hard delete undone. A namespace remembers the ids it
+    hard-deleted - the holder that deleted them, and one that took the
+    namespace over and replayed the log, its index cache gone or not."""
+    from memd.core.schema import ulid_new
+    from memd.engine.memory import _serving_forwarded
+
+    root = str(tmp_path / "d")
+
+    def retry_add(m: Memory, rid: str, content: str) -> list:
+        with _serving_forwarded([rid]):         # as the holder runs a forwarded call
+            return m.add(content, user_id="u1", namespace=NS)
+
+    def retry_events(m: Memory, ids: list, contents: list) -> list:
+        with _serving_forwarded(ids):
+            return m.add_events([{"content": c, "user_id": "u1"} for c in contents], namespace=NS)
+
+    def contents(m: Memory) -> Counter:
+        return Counter(json.loads(ln)["content"] for ln in m.export_jsonl(namespace=NS).splitlines())
+
+    a = Memory(root, namespace=NS, encrypt=False, forwarding="off")
+    rid, batch = ulid_new(), [ulid_new() for _ in range(3)]
+    texts = [f"erase batch {k}" for k in range(3)]
+    try:
+        assert retry_add(a, rid, "erase me for good") == [rid]
+        assert retry_events(a, batch, texts) == batch
+        a.delete(rid, hard=True)
+        a.delete(batch[1], hard=True)           # not the batch's first record
+        assert retry_add(a, rid, "erase me for good") == [rid]
+        assert retry_events(a, batch, texts) == batch
+        c = contents(a)
+        assert c["erase me for good"] == 0 and c["erase batch 1"] == 0
+        assert c["erase batch 0"] == c["erase batch 2"] == 1
+    finally:
+        a.close()
+    for wipe in (False, True):
+        if wipe:                                # a holder without the index cache
+            shutil.rmtree(os.path.join(root, "store", "_cache"))
+        b = Memory(root, namespace=NS, encrypt=False, forwarding="off")
+        try:
+            assert retry_add(b, rid, "erase me for good") == [rid]
+            assert retry_events(b, batch, texts) == batch
+            c = contents(b)
+            assert c["erase me for good"] == 0 and c["erase batch 1"] == 0, f"wiped cache: {wipe}"
+            assert b.get(rid, namespace=NS) is None
+        finally:
+            b.close()
 
 
 # ------------------------------------------------------------------ several processes

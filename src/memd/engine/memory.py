@@ -985,10 +985,13 @@ class Memory:
 
     @staticmethod
     def _applied(ns, ids: list[str] | None) -> bool:
-        """A forwarded write's records are in the namespace already: an
-        earlier attempt of the same call was applied - by this process, or
-        by a holder before it, whose log this one replayed."""
-        return bool(ids) and ns.index.get_by_id(ids[0], include_deleted=True) is not None
+        """A forwarded write's records were written to the namespace already
+        - any of them: a batch is one append - by an earlier attempt of the
+        same call, in this process or in a holder before it, whose log this
+        one replayed. A record deleted since counts, a hard-deleted one too
+        (its row is gone, its id is remembered: NamespaceIndex.known_ids):
+        a retry must not bring back what was deleted after the write."""
+        return bool(ids) and bool(ns.index.known_ids(ids))
 
     def _serve_forwarded(self, op: str, ns: str, args: dict, ids: list[str] | None):
         """ForwardServer handler: run a call another process forwarded -

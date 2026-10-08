@@ -166,15 +166,21 @@ gets `ForwardingError` at once. `MEMD_ALLOW_MULTI_PROCESS=1` disables the
 lock (and forwarding) and re-enables the data loss; it exists for recovery
 tooling, not for serving.
 
+A record deleted between a write and that write's retry stays deleted: the
+holder runs the write only if none of its record ids was ever written to
+the namespace - a soft-deleted record keeps its row, and a hard delete,
+whose row goes at once, leaves its id in the index for a day (replayed from
+the log by a holder that takes the namespace over). The one exception: a
+record hard-deleted, purged and then its namespace's index rebuilt from the
+bucket alone (a holder without that index's cache taking over after the
+purge), all before the retry arrives - its id is then gone with the purge.
+
 Not covered by the exactly-once rule: a session close, a destroy or a
 compaction retried on a NEW holder (the first one died after running it)
 runs again - a session close's consolidation drops the facts the first run
 already wrote; a delete retried that way answers `False` (the first attempt
-deleted it); an export cut off mid-stream raises and is not resumed; and a
-record whose creating call was retried after it had been hard-deleted and
-purged in between is written again (its id was never acknowledged to
-anyone, so nothing else could have deleted it - except `forget()`, by
-query). Several writers inside one namespace (several logs) are not built.
+deleted it); and an export cut off mid-stream raises and is not resumed.
+Several writers inside one namespace (several logs) are not built.
 
 **Measured** (`bench/forward_bench.py`: a holder process and this one on
 one 8-core machine, loopback TCP, hash embedder, no reranker, encryption on;
