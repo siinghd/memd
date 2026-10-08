@@ -369,6 +369,9 @@ def _one_line(text: str) -> str:
     """A record's text on one line: a line break is written as \\n (as in
     the extraction prompt), so no text can start a line of its own - a
     session header, a speaker, a fact, a gap marker."""
+    parts = text.splitlines()  # the same boundaries, in C: most texts have none
+    if len(parts) == 1 and parts[0] == text or not text:
+        return text
     return LINE_BREAKS.sub(lambda _m: "\\n", text)
 
 
@@ -595,6 +598,13 @@ def pack_sessions(
         if r.id in lay.rows:
             continue
         if r.kind == Kind.RAW_EVENT:
+            # a turn longer than the room left cannot fit even alone: skip it
+            # before building its line (it adds at least its speaker and text
+            # - or the excerpt's length - less one gap marker it may replace)
+            least = 1 + len(_speaker(r)) + 2 + min(len(r.content.strip()), ANCHOR_CHARS) - (1 + len(_GAP))
+            if r.id not in lay.rows and tokens_for_chars(lay.length + least) > budget_tokens:
+                truncated = True
+                continue
             anchors, note, focus = [r], None, ""
         else:
             anchors = sources.get(r.id) or []
