@@ -1341,7 +1341,9 @@ def test_a_replicas_key_provider_calls_have_short_timeouts(tmp_path, kms_server,
 
 def test_concurrent_reads_during_refreshes_and_rebuilds(be):
     lead = be.leader()
-    rep = be.replica(replica_refresh_s=0.05)
+    # a slow CI runner can take longer than the default 1 s wait for a
+    # rebuild: this test checks what reads see, not how fast they get it
+    rep = be.replica(replica_refresh_s=0.05, replica_refresh_wait_ms=30_000)
     stop = threading.Event()
     errors = []
 
