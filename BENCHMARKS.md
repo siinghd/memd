@@ -135,6 +135,45 @@ type mix.
 - On a 19-question subset, EmbeddingGemma 2 gave the same result as bge-small (recall_all@10 1.000 for both;
   no measurable difference). It used 2.4-4.6x the CPU time for each text.
 
+## End-to-end QA: all 500 questions (previous defaults)
+
+This run used all 500 questions of LongMemEval_S. memd used the previous
+defaults: a 2,000-token flat pack, the hash embedder and no reranker. The
+reader was `deepseek/deepseek-v4.1-flash` (one provider, Relace). The judge
+was `openai/gpt-6-luna-pro` with the official per-type judge prompts. The
+95% intervals are bootstrap intervals.
+
+| context given to the reader | accuracy [95% CI] | input tokens per question | cost per question |
+|---|---|---|---|
+| memd, previous defaults (2K flat) | 0.772 [0.736, 0.808] | 2,031 | $0.00099 |
+| the whole history | 0.916 [0.890, 0.940] | 104,764 | $0.00231 |
+| no context (control, 50 questions) | 0.10 [0.02, 0.18] | 128 | $0.00092 |
+
+- The whole history is better by +0.144 [+0.106, +0.182] on the same
+  questions (McNemar p = 6e-13).
+- Most of the difference is in two question types: multi-session (0.537
+  against 0.884) and temporal reasoning (0.780 against 0.953).
+- The control shows that the judge does not accept answers without
+  evidence.
+- This result caused the session packing and the 12K default (the section
+  above). The current defaults are not measured on all 500 questions yet.
+
+## LLM fact extraction
+
+This run compared the pattern extractor (the default) with the LLM
+extractor, on a stratified sample of 30 questions. The extractor model, the
+reader and the judge are the same as in the 500-question run.
+
+| extractor | accuracy | session close, median | extraction cost per question |
+|---|---|---|---|
+| pattern (default) | 0.700 | 0.08 s | $0 |
+| LLM | 0.667 | 1.5 s | $0.017 |
+
+- The difference is -0.033 [-0.167, +0.067]. The sample is small: it rules
+  out a gain larger than about +0.07, not small effects.
+- The LLM extractor writes more facts (284 against 40 per question), but
+  the default search result changes very little.
+
 ## End-to-end QA (preliminary)
 
 Stratified 120-question sample (all 6 question types + abstention). Reader `openai/gpt-6-luna`, judge
