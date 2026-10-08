@@ -285,6 +285,13 @@ def _loopback(host: str) -> bool:
 # ---------------------------------------------------------------- framing
 
 
+def _shutdown(sock: socket.socket) -> None:
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
 def _jdump(obj) -> bytes:
     return json.dumps(obj, separators=(",", ":"), default=_jdefault).encode()
 
@@ -493,10 +500,16 @@ class ForwardServer:
 
     def _serve_conn(self, conn: socket.socket) -> None:
         ch = _Channel(conn, b"s")
+        # the whole handshake, however slowly its bytes come, within 5 s
+        cut = threading.Timer(max(5.0, self.cfg.connect_timeout_s * 2), _shutdown, args=(conn,))
+        cut.daemon = True
         try:
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             conn.settimeout(max(5.0, self.cfg.connect_timeout_s * 2))
-            if not self._handshake(ch):
+            cut.start()
+            ok = self._handshake(ch)
+            cut.cancel()
+            if not ok:
                 return
             conn.settimeout(_IDLE_S)
             while True:
@@ -512,6 +525,7 @@ class ForwardServer:
         except Exception:  # noqa: BLE001 - one connection never takes the endpoint down
             _log.exception("memd forward: connection failed")
         finally:
+            cut.cancel()
             with self._lock:
                 self._conns.discard(conn)
             ch.close()
