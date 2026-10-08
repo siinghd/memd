@@ -2,7 +2,7 @@
 
 Small, runnable scripts against memd's public APIs. Each one checks its own
 results and exits non-zero if memd misbehaves; `tests/test_examples.py` runs
-the Python ones in CI.
+them in CI (the TypeScript ones in the sdk-ts workflow, which has Node).
 
 | file | shows | needs |
 |---|---|---|
@@ -10,7 +10,7 @@ the Python ones in CI.
 | [`02_sessions_and_facts.py`](02_sessions_and_facts.py) | `observe`, `close_session` fact extraction, supersedence on an entity key, `history`, `as_of` time travel, restart | - |
 | [`03_mcp_server.py`](03_mcp_server.py) + [`mcp/`](mcp/README.md) | `memd serve --mcp` for Claude Code / Claude Desktop: config snippets, and a client calling all four tools | `memd[mcp]` |
 | [`04_http_server_sdk.py`](04_http_server_sdk.py) | `memd serve --http` with the Python `HostedMemory` SDK and `Memory(api_key=...)`; typed errors | - |
-| [`ts/`](#typescript) | the TypeScript SDK `@memd/client` against a server: a quickstart in TypeScript and in plain JavaScript | Node >= 20 |
+| [`ts/`](#typescript) | the TypeScript SDK `@memd/client` against a server: a quickstart, sessions and facts, search options, an HTTP API and a Next.js route with memory per user, an agent loop, eventual reads, retries and typed errors, export streaming | Node >= 20 |
 | [`06_s3_minio.py`](06_s3_minio.py) | an `s3://` data root on MinIO: cold reopen from the bucket, key custody failing closed, crypto-shred | `memd[s3]`, an S3 API |
 
 ```bash
@@ -34,6 +34,10 @@ point at one you run (`memd serve --http`, then
 
 ## TypeScript
 
+Strict TypeScript (ESM, Node >= 20) over the public API of `@memd/client`,
+run with `tsx`. Each file's first line says what it shows and the second
+how to run it.
+
 ```bash
 (cd sdk-ts && npm ci && npm run build)   # the examples install the SDK from ../../sdk-ts
 cd examples/ts && npm install
@@ -56,11 +60,12 @@ npm run typecheck                                  # tsc --noEmit over every exa
 | [`quickstart.mjs`](ts/quickstart.mjs) | the same client from plain JavaScript: `pack` / `observe` around an LLM call, typed errors |
 
 `local_server.py` passes `MEMD_URL`, `MEMD_API_KEY` and `MEMD_NAMESPACE` to
-the command it runs; against your own server, set them and run the same
-commands without it. Outside this repository, depend on the published
-package instead: `npm install @memd/client`. `tests/test_examples.py`
-type-checks and runs every one of them when Node and the install are
-there.
+the command it runs (with `--admin`, `MEMD_ADMIN_KEY` too); against your
+own server, set them and run the same commands without it. Outside this
+repository, depend on the published package instead:
+`npm install @memd/client`. `tests/test_examples.py` type-checks and runs
+every one of them when Node and the install are there, and skips them
+otherwise.
 
 ## S3 (MinIO)
 
