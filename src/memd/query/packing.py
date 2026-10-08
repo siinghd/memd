@@ -30,6 +30,7 @@ Rules:
 """
 from __future__ import annotations
 
+import bisect
 import datetime as _dt
 import functools
 import re
@@ -124,10 +125,10 @@ def _fenced(r: MemoryRecord) -> bool:
     return r.provenance.source in UNTRUSTED_SOURCES or bool(r.meta.get("quarantined"))
 
 
-def _packed_item(r: MemoryRecord, score: float, lanes: list[str]) -> PackedItem:
+def _packed_item(r: MemoryRecord, score: float, lanes: list[str], content: str | None = None) -> PackedItem:
     return PackedItem(
         id=r.id,
-        content=r.content,
+        content=r.content if content is None else content,
         kind=r.kind,
         source=r.provenance.source.name.lower(),
         actor_id=r.provenance.actor_id,
@@ -371,8 +372,8 @@ def _one_line(text: str) -> str:
     return LINE_BREAKS.sub(lambda _m: "\\n", text)
 
 
-def _turn_line(r: MemoryRecord, limit: int, focus: str, resolve_dates: bool) -> str:
-    body = _one_line(_excerpt(r.content.strip(), limit, focus))
+def _turn_line(r: MemoryRecord, shown: str, resolve_dates: bool) -> str:
+    body = _one_line(shown)
     who = _speaker(r)
     if resolve_dates and who == "user":
         try:
@@ -389,6 +390,11 @@ def _memory_line(r: MemoryRecord, said_by: MemoryRecord | None = None) -> str:
     status = "" if _valid(r) else ", superseded"
     body = _one_line(_excerpt(r.content.strip(), ANCHOR_CHARS))
     return _fence(r, f"[memory {r.kind}{status}, said by the {_speaker(said_by or r)}: {body}]")
+
+
+def _turn_row(r: MemoryRecord, pos: int, limit: int, focus: str, resolve_dates: bool) -> "_Row":
+    shown = _excerpt(r.content.strip(), limit, focus)
+    return _Row(r, pos, _turn_line(r, shown, resolve_dates), shown=shown)
 
 
 def _digits_upto(n: int) -> int:
@@ -408,6 +414,7 @@ class _Row:
     rec: MemoryRecord
     pos: int
     line: str
+    shown: str = ""  # the record's text as the line shows it (an excerpt of a long one)
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -417,12 +424,14 @@ class _Row:
 
 class _Layout:
     """The session-packed text, grown one unit at a time, and its exact
-    length: a unit is checked against the budget by re-measuring only the
-    sessions it touches, never by re-rendering the whole text."""
+    length: a unit is checked against the budget by working out what its
+    rows change where they go (the gap markers around them, the session
+    numbers), never by re-rendering - or re-reading a whole session."""
 
     def __init__(self, header: str):
         self.header = header
-        self.groups: dict[tuple[str, str], list[_Row]] = {}
+        self.groups: dict[tuple[str, str], list[_Row]] = {}   # rows in session order
+        self.gkeys: dict[tuple[str, str], list[tuple]] = {}   # their sort keys, for bisection
         self.glen: dict[tuple[str, str], int] = {}
         self.rows: dict[str, _Row] = {}
         self.after: dict[str, str] = {}  # turn id -> the next visible turn of its session, when known
@@ -431,76 +440,87 @@ class _Layout:
     def link(self, anchor: MemoryRecord, nbs: list[MemoryRecord], positions: dict[str, int]) -> bool:
         """Record what a neighbour fetch says about adjacency (radius 1: the
         turn right before and right after the anchor). Two turns already
-        packed can turn out adjacent: their session is re-measured at once.
+        packed side by side can turn out adjacent: their gap marker goes.
         True if anything was learnt (a measure() taken before is stale)."""
         k = (anchor.time.t_event, positions.get(anchor.id, 0), anchor.id)
-        learnt, changed = False, set()
+        learnt = False
         for x in nbs:
             a, b = (x.id, anchor.id) if (x.time.t_event, positions.get(x.id, 0), x.id) < k else (anchor.id, x.id)
-            if self.after.get(a) != b:
-                self.after[a] = b
-                learnt = True
-                if a in self.rows and b in self.rows:
-                    changed.add(_session_key(self.rows[a].rec))
-        for g in changed:
-            n = self._group_len(self.groups[g])
-            self.length += n - self.glen[g]
-            self.glen[g] = n
+            if self.after.get(a) == b:
+                continue
+            ra, rb = self.rows.get(a), self.rows.get(b)
+            gap_before = ra is not None and rb is not None and self._consecutive(ra, rb) and not self._adjacent(ra, rb)
+            self.after[a] = b
+            learnt = True
+            if gap_before:
+                g = _session_key(ra.rec)
+                self.glen[g] -= 1 + len(_GAP)
+                self.length -= 1 + len(_GAP)
         return learnt
+
+    def _consecutive(self, a: _Row, b: _Row) -> bool:
+        g = _session_key(a.rec)
+        if g != _session_key(b.rec):
+            return False
+        i = bisect.bisect_left(self.gkeys[g], a.key)
+        rows = self.groups[g]
+        return i + 1 < len(rows) and rows[i + 1] is b
 
     def _adjacent(self, a: _Row, b: _Row) -> bool:
         """No "[...]" between them: nothing was written between them, or a
         neighbour lookup said one follows the other in their session."""
         return b.pos == a.pos + 1 or self.after.get(a.rec.id) == b.rec.id
 
-    def _group_len(self, rows: list[_Row], extra: tuple[str, str] | None = None) -> int:
-        n = _SESSION_FIXED + len(_session_date(rows[0].rec.time.t_event))
-        prev = None
-        for r in rows:
-            if prev is not None and not self._adjacent(prev, r):
-                n += 1 + len(_GAP)
-            n += 1 + len(r.line) + sum(1 + len(x) for x in r.notes)
-            if extra is not None and extra[0] == r.rec.id:
-                n += 1 + len(extra[1])
-            prev = r
-        return n
+    def _gap(self, a: _Row | None, b: _Row | None) -> int:
+        return 0 if a is None or b is None or self._adjacent(a, b) else 1 + len(_GAP)
 
     def measure(self, new_rows: list[_Row], note: tuple[str, str] | None):
         """(the text's length with the rows - and the note: (turn id, line)
-        shown under that turn - added, the sessions that changes)."""
-        touched: dict[tuple[str, str], list[_Row]] = {}
+        shown under that turn - added, and per session touched: its rows,
+        their keys, its length)."""
+        touched: dict[tuple[str, str], list] = {}
+        length = self.length
         for r in new_rows:
-            k = _session_key(r.rec)
-            if k not in touched:
-                touched[k] = list(self.groups.get(k, ()))
-            touched[k].append(r)
+            g = _session_key(r.rec)
+            if g not in touched:
+                touched[g] = [list(self.groups.get(g, ())), list(self.gkeys.get(g, ())), self.glen.get(g, 0)]
+            rows, keys, n = touched[g]
+            if not rows:  # a new session: its header
+                n = _SESSION_FIXED + len(_session_date(r.rec.time.t_event))
+            i = bisect.bisect_left(keys, r.key)
+            p, nx = (rows[i - 1] if i > 0 else None), (rows[i] if i < len(rows) else None)
+            n += self._gap(p, r) + self._gap(r, nx) - self._gap(p, nx)
+            n += 1 + len(r.line) + sum(1 + len(x) for x in r.notes)
+            if i == 0 and nx is not None:  # a new first turn dates the session
+                n += len(_session_date(r.rec.time.t_event)) - len(_session_date(nx.rec.time.t_event))
+            rows.insert(i, r)
+            keys.insert(i, r.key)
+            touched[g][2] = n
         if note is not None:
             host = self.rows.get(note[0]) or next(r for r in new_rows if r.rec.id == note[0])
-            k = _session_key(host.rec)
-            if k not in touched:
-                touched[k] = list(self.groups[k])
-        n_groups = len(self.groups) + sum(1 for k in touched if k not in self.groups)
-        length = self.length + _digits_upto(n_groups) - _digits_upto(len(self.groups))
-        lens = {}
-        for k, rows in touched.items():
-            rows.sort(key=lambda r: r.key)
-            lens[k] = self._group_len(rows, note)
-            length += lens[k] - self.glen.get(k, 0)
-        return length, touched, lens
+            g = _session_key(host.rec)
+            if g not in touched:
+                touched[g] = [self.groups[g], self.gkeys[g], self.glen[g]]
+            touched[g][2] += 1 + len(note[1])
+        n_groups = len(self.groups) + sum(1 for g in touched if g not in self.groups)
+        length += _digits_upto(n_groups) - _digits_upto(len(self.groups))
+        for g, (_rows, _keys, n) in touched.items():
+            length += n - self.glen.get(g, 0)
+        return length, touched
 
     def add(self, new_rows: list[_Row], note: tuple[str, str] | None, budget_tokens: int,
             measured=None) -> bool:
         """Add the rows (and the note) if the whole text then stays within
         the budget (`measured`: their measure(), when already taken)."""
-        length, touched, lens = measured or self.measure(new_rows, note)
+        length, touched = measured or self.measure(new_rows, note)
         if tokens_for_chars(length) > budget_tokens:
             return False
         for r in new_rows:
             self.rows[r.rec.id] = r
         if note is not None:
             self.rows[note[0]].notes.append(note[1])
-        self.groups.update(touched)
-        self.glen.update(lens)
+        for g, (rows, keys, n) in touched.items():
+            self.groups[g], self.gkeys[g], self.glen[g] = rows, keys, n
         self.length = length
         return True
 
@@ -567,15 +587,16 @@ def pack_sessions(
             anchors, note, focus = [r], None, ""
         else:
             anchors = sources.get(r.id) or []
+            shown = _excerpt(r.content.strip(), ANCHOR_CHARS)
             if not anchors:  # nothing to show it under: a line of its own
-                row = _Row(r, pos.get(r.id, 0), _memory_line(r))
+                row = _Row(r, pos.get(r.id, 0), _memory_line(r), shown=shown)
                 if lay.add([row], None, budget_tokens):
-                    items.append(_packed_item(r, score, it.lanes))
+                    items.append(_packed_item(r, score, it.lanes, shown))
                 else:
                     truncated = True
                 continue
             note, focus = (anchors[0].id, _memory_line(r, said_by=anchors[0])), r.content
-        full = [_Row(a, pos.get(a.id, 0), _turn_line(a, ANCHOR_CHARS, focus, resolve_dates))
+        full = [_turn_row(a, pos.get(a.id, 0), ANCHOR_CHARS, focus, resolve_dates)
                 for a in anchors if a.id not in lay.rows]
         # neighbours only add text: if the anchors alone do not fit, neither does the unit
         alone = lay.measure(full, note)
@@ -593,15 +614,19 @@ def pack_sessions(
                 for x in nb.get(a.id, []):
                     if x.id not in seen and x.id not in lay.rows and x.id not in demoted:
                         seen.add(x.id)
-                        unit.append(_Row(x, pos.get(x.id, 0), _turn_line(x, NEIGHBOUR_CHARS, "", resolve_dates)))
+                        unit.append(_turn_row(x, pos.get(x.id, 0), NEIGHBOUR_CHARS, "", resolve_dates))
         for rows in ((unit, full) if len(unit) > len(full) else (full,)):
             if lay.add(rows, note, budget_tokens, alone if rows is full else None):
-                items.append(_packed_item(r, score, it.lanes))
+                # every item carries the text as shown: a long turn's excerpt
+                if note is not None:
+                    items.append(_packed_item(r, score, it.lanes, shown))
                 n_full = len(full)
                 for i, row in enumerate(rows):
-                    if row.rec.id != r.id:
+                    if row.rec.id == r.id:
+                        items.append(_packed_item(r, score, it.lanes, row.shown))
+                    else:
                         lanes = ["source"] if note is not None and i < n_full else ["neighbour"]
-                        items.append(_packed_item(row.rec, 0.0, lanes))
+                        items.append(_packed_item(row.rec, 0.0, lanes, row.shown))
                 break
         else:
             truncated = True

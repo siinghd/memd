@@ -1793,16 +1793,16 @@ class Memory:
         positions = ns.index.rowids(list(known))
         neighbours = None
         if expand:
-            # a unit's neighbours are looked up when it is packed, together
-            # with the next anchors' in rank order, 4 then 8, 16, ... at a
-            # time: a small budget reads little, a big one few statements;
-            # rows already in hand (candidates, sources) are never read again
+            # a unit's neighbours are looked up when it is packed (two index
+            # seeks per anchor), together with the next anchors' in rank
+            # order, 4 then 8, 16, ... at a time, and their rows read in one
+            # statement per batch; rows already in hand (candidates, sources)
+            # are never read again
             anchors = list(dict.fromkeys(
                 a.id for _, it in ranked
                 for a in ([it.record] if it.record.kind == Kind.RAW_EVENT else sources.get(it.record.id, []))
                 if a.id in positions))
             at = {a: i for i, a in enumerate(anchors)}
-            turns: dict[str, list[tuple[int, int, str]]] = {}
             adj: dict[str, list[tuple[str, int]]] = {}
             tried: set[str] = set()
             batch = [_NEIGHBOUR_READ_AHEAD]
@@ -1813,12 +1813,10 @@ class Memory:
                     ahead = [known[a] for a in dict.fromkeys([*ids, *anchors[k:k + batch[0]]])
                              if a in known and a in positions and a not in adj]
                     batch[0] = min(batch[0] * 2, 64)
-                    need = sorted({a.scope.session for a in ahead if a.scope.session} - set(turns))
-                    if need:
-                        turns.update(ns.index.session_turns(need, filt))
+                    adj.update(ns.index.adjacent_turns(
+                        [(a.id, a.scope.session, a.time.t_event, positions[a.id]) for a in ahead], filt))
                     for a in ahead:
-                        adj[a.id] = (ns.index.adjacent(turns[a.scope.session], a.time.t_event, positions[a.id])
-                                     if a.scope.session else [])
+                        adj.setdefault(a.id, [])
                     fresh = list(dict.fromkeys(x for a in ahead for x, _ in adj[a.id]
                                                if x not in known and x not in tried))
                     if fresh:

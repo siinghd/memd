@@ -188,6 +188,23 @@ def test_anchor_is_cut_to_a_window_around_the_fact():
     assert len(line) == len("user: ") + ANCHOR_CHARS + 6
 
 
+def test_items_carry_the_excerpts_the_text_shows():
+    """a long turn is excerpted in the text; its item carries that excerpt,
+    not the whole turn (the response stays proportional to the budget)"""
+    long = "filler " * 1000 + "the saxophonist was called Miles " + "padding " * 1000
+    w = World([rec("t0", "z" * 3000, source="agent"), rec("t", long),
+               rec("f", "the user knows a saxophonist", kind="fact", lineage=["t"]),
+               rec("t2", "y" * 3000, source="agent")])
+    out = w.pack(["f"], 10_000)
+    by = {i.id: i for i in out.items}
+    assert set(by) == {"f", "t", "t0", "t2"}
+    assert len(by["t"].content) == ANCHOR_CHARS + 6 and "saxophonist was called Miles" in by["t"].content
+    assert len(by["t0"].content) == NEIGHBOUR_CHARS + 3 and len(by["t2"].content) == NEIGHBOUR_CHARS + 3
+    for it in out.items:
+        assert it.content in out.text
+    assert sum(len(i.content) for i in out.items) <= len(out.text)
+
+
 # ------------------------------------------------------------ product cases
 
 def test_a_fact_without_a_source_turn_is_still_packed():

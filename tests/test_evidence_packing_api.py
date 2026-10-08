@@ -311,7 +311,7 @@ def test_session_packing_cost_stays_small(tmp_path):
         assert best["sessions"] - best["flat"] < 25, best
 
 
-def test_session_turns_agree_with_session_neighbours(tmp_path):
+def test_adjacent_turns_agree_with_session_neighbours(tmp_path):
     """the index lookups session packing uses give the same radius-1
     neighbours as session_neighbours: interleaved sessions, tied timestamps,
     two users on one session id, every scope"""
@@ -331,11 +331,11 @@ def test_session_turns_agree_with_session_neighbours(tmp_path):
         for f in (IndexFilter(scope=Scope(user="u1")), IndexFilter(scope=Scope(user="u2")), IndexFilter()):
             recs = ix.get_visible([r[0] for r in rows], f)
             pos = ix.rowids([r.id for r in recs])
-            turns = ix.session_turns(sorted({r.scope.session for r in recs}), f)
+            adj = ix.adjacent_turns([(r.id, r.scope.session, r.time.t_event, pos[r.id]) for r in recs], f)
             nb, npos = ix.session_neighbours([r.id for r in recs], f, radius=1)
             for r in recs:
                 want = [(x.id, npos[x.id]) for x in nb.get(r.id, [])]
-                assert ix.adjacent(turns[r.scope.session], r.time.t_event, pos[r.id]) == want
+                assert adj.get(r.id, []) == want
 
 
 def test_replaced_evidence_does_not_return_as_a_neighbour(tmp_path):
@@ -358,3 +358,28 @@ def test_replaced_evidence_does_not_return_as_a_neighbour(tmp_path):
         assert "I live in Paris" not in flat
         assert "I live in Paris" not in sess and "I live in Berlin now" in sess
         assert "user: hello there\n[...]\nassistant: nice, Paris is lovely" in sess  # the gap says a turn is left out
+
+
+def test_response_size_follows_the_budget(tmp_path, client):
+    """1 MB turns: the REST search response stays within a few times the
+    budget's characters, and the MCP payload carries the text once"""
+    import json
+
+    from memd.server.mcp_server import search_payload
+
+    big = ("lorem ipsum dolor sit amet " * 40000)[:1_000_000]
+    with _mem(tmp_path, "big") as m:
+        for s in range(5):
+            m.add_events([{"content": big, "role": "assistant", "user_id": "u1", "session_id": f"s{s}",
+                           "t_event": T0 + s * 10},
+                          {"content": f"what about the pelican number {s}", "user_id": "u1", "session_id": f"s{s}",
+                           "t_event": T0 + s * 10 + 1},
+                          {"content": big, "role": "assistant", "user_id": "u1", "session_id": f"s{s}",
+                           "t_event": T0 + s * 10 + 2}])
+        for packing, budget in (("sessions", 2000), ("sessions", 12_000), ("flat", 2000)):
+            r = m.search("pelican number", user_id="u1", packing=packing, budget_tokens=budget)
+            rest = json.dumps({"packed_context": r.packed_context, "items": [i.__dict__ for i in r.items]})
+            assert len(rest) <= 2 * 4 * budget + 400 * len(r.items), (packing, budget, len(rest))
+            mcp = json.dumps(search_payload(r))
+            assert len(mcp) <= len(json.dumps(r.packed_context)) + 400 * len(r.items) + 200
+            assert all("content" not in i for i in search_payload(r)["items"])

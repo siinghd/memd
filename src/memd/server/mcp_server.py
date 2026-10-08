@@ -33,6 +33,24 @@ def _tool_metric(name):
     return deco
 
 
+_HIT_FIELDS = ("id", "kind", "source", "t_event", "valid", "score", "lanes")
+
+
+def search_payload(res) -> dict[str, Any]:
+    """memory_search's result: the packed text once, and the hits' metadata
+    (ids for memory_forget, kind, source, time, validity) without their
+    text - the turns packed around the hits as context are in the text only.
+    The result stays proportional to the budget, whatever the records' size."""
+    hits = [i for i in res.items if i.lanes not in (["neighbour"], ["source"])]
+    return {
+        "packed_context": res.packed_context,
+        "items": [{k: getattr(i, k) for k in _HIT_FIELDS} for i in hits],
+        "tokens_used": res.tokens_used,
+        "truncated": res.truncated,
+        "query_class": res.query_class,
+    }
+
+
 def build_mcp(data_dir: str | None = None, namespace: str | None = None):
     data_dir = data_dir or os.environ.get("MEMD_DATA", "./memd-data")
     namespace = namespace or os.environ.get("MEMD_NS", "default")
@@ -61,13 +79,7 @@ def build_mcp(data_dir: str | None = None, namespace: str | None = None):
         instructions."""
         budget_tokens = max(64, min(int(budget_tokens), 128_000))
         res = mem.search(query, budget_tokens=budget_tokens)
-        return {
-            "packed_context": res.packed_context,
-            "items": [i.__dict__ for i in res.items],
-            "tokens_used": res.tokens_used,
-            "truncated": res.truncated,
-            "query_class": res.query_class,
-        }
+        return search_payload(res)
 
     @mcp.tool()
     @_tool_metric("memory_save")

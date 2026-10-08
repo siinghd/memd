@@ -264,7 +264,11 @@ class NamespaceIndex:
             -- composite above cannot serve (its leading columns are
             -- unconstrained), so every segment close scanned the whole
             -- namespace instead of one session's rows
-            CREATE INDEX IF NOT EXISTS ix_rec_session ON records(scope_session, kind);
+            -- (t_event, then rowid: every index ends with it) orders a
+            -- session's turns, so a turn's neighbours are an index seek, not
+            -- a read of the whole session; it replaced (scope_session, kind)
+            DROP INDEX IF EXISTS ix_rec_session;
+            CREATE INDEX IF NOT EXISTS ix_rec_session_t ON records(scope_session, kind, t_event);
             CREATE INDEX IF NOT EXISTS ix_rec_valid ON records(invalidated_at, deleted);
             CREATE TABLE IF NOT EXISTS vectors(
               id TEXT PRIMARY KEY REFERENCES records(id) ON DELETE CASCADE,
@@ -1421,42 +1425,38 @@ class NamespaceIndex:
                 out[rid] = got
         return out, positions
 
-    def session_turns(self, sessions: list[str], f: IndexFilter) -> dict[str, list[tuple[int, int, str]]]:
-        """The raw turns of each session that satisfy `f` in SQL, as sorted
-        [(t_event, rowid, id)] - the session order session_neighbours walks -
-        in one statement per 200 sessions, ids only (hydrate with
-        get_visible, the Python twin of the filter, before use)."""
-        out: dict[str, list[tuple[int, int, str]]] = {s: [] for s in sessions}
-        if not sessions or self._closed:
+    def adjacent_turns(self, anchors: list[tuple[str, str | None, int, int]],
+                       f: IndexFilter) -> dict[str, list[tuple[str, int]]]:
+        """For each anchor (id, session, t_event, rowid): the raw turn right
+        before it and right after it in its session, in (t_event, rowid)
+        order, as [(id, rowid)] - session_neighbours at radius 1 for a caller
+        that already holds the anchors: two index seeks each (ix_rec_session_t;
+        a session of any length costs the same), ids only (hydrate with
+        get_visible, the Python twin of the filter, before use). Every turn
+        satisfies `f` in SQL."""
+        out: dict[str, list[tuple[str, int]]] = {}
+        todo = [a for a in anchors if a[1] is not None]
+        if not todo or self._closed:
             return out
         fargs: list = []
         filt = self._filter_where(f, fargs)
+        # INDEXED BY: with no table statistics the planner may take another
+        # index (kind, validity) - a walk over every raw turn in the namespace
+        base = ("SELECT id, rowid FROM records INDEXED BY ix_rec_session_t "  # nosec B608
+                "WHERE scope_session = ? AND kind = 'raw_event' AND t_event {cmp}= ? "
+                f"AND (t_event {{cmp}} ? OR rowid {{cmp}} ?) AND {filt} "
+                "ORDER BY t_event {order}, rowid {order} LIMIT 1")
+        prev, nxt = base.format(cmp="<", order="DESC"), base.format(cmp=">", order="ASC")
         with self._read() as _c:
             cur = _c.cursor()
             cur.row_factory = None  # plain tuples: these rows are never read by name
-            for i in range(0, len(sessions), 200):
-                chunk = sessions[i:i + 200]
-                # INDEXED BY: with no table statistics the planner takes the
-                # one-column kind index for an IN list of sessions - a scan
-                # of every raw turn in the namespace
-                sql = (f"SELECT scope_session, t_event, rowid, id FROM records INDEXED BY ix_rec_session "  # nosec B608
-                       f"WHERE scope_session IN ({','.join('?' * len(chunk))}) AND kind = 'raw_event' AND {filt}")
-                for sess, t, rowid, rid in cur.execute(sql, [*chunk, *fargs]):
-                    out[sess].append((int(t), int(rowid), rid))
-        for v in out.values():
-            v.sort()
-        return out
-
-    @staticmethod
-    def adjacent(turns: list[tuple[int, int, str]], t_event: int, rowid: int) -> list[tuple[str, int]]:
-        """[(id, rowid)] of the turns right before and right after the point
-        (t_event, rowid) in a session_turns list (radius-1 session_neighbours)."""
-        k = bisect.bisect_left(turns, (t_event, rowid))
-        out = [(turns[k - 1][2], turns[k - 1][1])] if k > 0 else []
-        if k < len(turns) and turns[k][:2] == (t_event, rowid):
-            k += 1
-        if k < len(turns):
-            out.append((turns[k][2], turns[k][1]))
+            for aid, sess, t, rowid in todo:
+                got = []
+                for sql in (prev, nxt):
+                    r = cur.execute(sql, [sess, t, t, rowid, *fargs]).fetchone()
+                    if r is not None:
+                        got.append((r[0], int(r[1])))
+                out[aid] = got
         return out
 
     def _fold_overflow_locked(self) -> None:
