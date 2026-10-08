@@ -307,6 +307,15 @@ class FastEmbedEmbedder(Embedder):
         return np.array(vecs, dtype=np.float32)
 
 
+def config_or_env(cfg: dict, key: str, default=None):
+    """cfg[key], else env MEMD_<KEY>, else `default`. A config value that is
+    not None wins - so config {"embedding_api_key": ""} turns an env key off."""
+    if cfg.get(key) is not None:
+        return cfg[key]
+    env = os.environ.get(f"MEMD_{key.upper()}")
+    return env if env is not None else default
+
+
 def requested_embedder(config: dict | None = None) -> str:
     """The embedder asked for: config["embedder"], else env MEMD_EMBEDDER,
     else "auto". Unknown values raise rather than silently meaning "auto"."""
@@ -333,14 +342,15 @@ def _note_hash_fallback() -> None:
 def resolve_embedder(config: dict | None = None) -> Embedder:
     cfg = config or {}
     choice = requested_embedder(cfg)
+    api_key = config_or_env(cfg, "embedding_api_key")
     emb: Embedder
-    if choice == "openai" or (choice == "auto" and cfg.get("embedding_api_key")):
-        if not cfg.get("embedding_api_key"):
-            raise ValueError("embedder 'openai' requires config['embedding_api_key']")
+    if choice == "openai" or (choice == "auto" and api_key):
+        if not api_key:
+            raise ValueError("embedder 'openai' requires config['embedding_api_key'] or MEMD_EMBEDDING_API_KEY")
         emb = OpenAICompatibleEmbedder(
-            model=cfg.get("embedding_model", "text-embedding-3-small"),
-            api_key=cfg["embedding_api_key"],
-            base_url=cfg.get("embedding_base_url", "https://api.openai.com/v1"),
+            model=config_or_env(cfg, "embedding_model", "text-embedding-3-small"),
+            api_key=api_key,
+            base_url=config_or_env(cfg, "embedding_base_url", "https://api.openai.com/v1"),
         )
     elif choice == "fastembed" or (choice == "auto" and fastembed_available()):
         if not fastembed_available():

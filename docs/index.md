@@ -37,8 +37,9 @@ print(mem.search("how do we deploy?", user_id="u1").packed_context)
 
 Honest limits:
 
-- **One writer per namespace.** A second process on the same namespace fails
-  fast with `NamespaceBusyError`; scale by spreading namespaces across
+- **One writer per namespace.** A second process on the same namespace
+  forwards its writes (and strong reads) to the process holding it - a hop,
+  not more write capacity; scale writes by spreading namespaces across
   processes. Several writers inside one namespace are not built; reads can
   scale out with read replicas, which serve eventually consistent reads
   (opt-in, within a staleness bound).

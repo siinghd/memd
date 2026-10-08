@@ -27,10 +27,13 @@ mem.add("...", namespace="globex")            # every method takes namespace=
 
 Names match `[A-Za-z0-9][A-Za-z0-9_.-]{0,127}`; `_`-prefixed names are
 reserved. A namespace has **one writer at a time**: a file lock on a local
-root, a lease object on an `s3://` root. That is the scaling rule too: spread
-namespaces across processes (see [multi-node](operations.md#multi-node); reads of
-one namespace can also be served by read replicas that follow its writer), never
-processes across one namespace.
+root, a lease object on an `s3://` root. Another process using the namespace
+forwards its writes to that writer ([several processes on one data
+root](operations.md#several-processes-on-one-data-root)). That is the scaling
+rule too: spread namespaces across processes (see
+[multi-node](operations.md#multi-node); reads of one namespace can also be
+served by read replicas that follow its writer), never processes across one
+namespace.
 
 ## Scopes
 
@@ -68,6 +71,14 @@ turns go through the extractor (pattern-based by default, an LLM with
 `MEMD_EXTRACTION_API_KEY`), the facts are consolidated against what is
 already known, and the log rotates into a segment. Extraction is re-runnable
 because the raw lane is kept.
+
+The LLM extractor sees each turn's speaker and time, so a fact is
+attributed to who said it. A call that fails (provider error, timeout, an
+empty, cut-off, oversized or malformed reply) is never retried: that
+chunk's turns go through the pattern extractor instead, and
+`close_session` returns `extraction_errors` and `raw_failed`. The options:
+
+{% include-markdown "../README-engine.md" start="### Extraction options (`Memory(config={...})` or the env var)" end="- **What the model sees.**" %}
 
 **Supersedence.** A fact written on an entity key
 (`remember(..., entity_keys=["user.editor"])`) is consolidated against the

@@ -307,7 +307,11 @@ class Metering:
         stored = writes
         if extraction:
             if self.our_key_extraction():
-                usage[EXTRACTIONS_OUR_KEY] = int(extraction.get("raw_considered") or 0)
+                # the turns the LLM extracted. Those of a failed call went
+                # through the local pattern extractor and are not metered,
+                # though the provider may still have billed the call itself
+                usage[EXTRACTIONS_OUR_KEY] = max(0, int(extraction.get("raw_considered") or 0)
+                                                 - int(extraction.get("raw_failed") or 0))
             stored += int(extraction.get("facts_written") or 0)
         with self._stored_lock if stored else _NULL_LOCK:
             # the live count moves BEFORE the reservation is released: an

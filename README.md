@@ -133,10 +133,12 @@ and [BENCHMARKS.md](BENCHMARKS.md).
 ## Limits
 
 - **One writer per namespace.** A second process opening the same namespace
-  fails fast with `NamespaceBusyError`; scale by spreading namespaces across
-  processes. Several writers inside one namespace are not built; reads can
-  scale out with read replicas, which serve eventually consistent reads
-  (opt-in, within a staleness bound).
+  forwards its writes and strong reads to the process holding it, and takes
+  the namespace over when that process goes away - one writer at a time,
+  so forwarding adds a hop, not write capacity: scale writes by spreading
+  namespaces across processes. Several writers inside one namespace are not
+  built; reads can scale out with read replicas, which serve eventually
+  consistent reads (opt-in, within a staleness bound).
 - **Fact extraction is pattern-based by default.** An LLM extractor is
   available with your own key; it has not been evaluated.
 - **Alpha software.** What changed in each release is in the

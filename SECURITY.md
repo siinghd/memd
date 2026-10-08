@@ -19,10 +19,49 @@ any probe fails the build.
 
 ## What it does NOT cover - read this before deploying
 
-- **Single writer per data root.** A second process opening the same namespace
-  fails fast with `NamespaceBusyError`. `uvicorn --workers N` with N>1 and two
-  containers on one volume do not work. `MEMD_ALLOW_MULTI_PROCESS=1` disables
-  the check and re-enables silent data loss; it exists for recovery tooling.
+- **Single writer per namespace.** A namespace is written by the one process
+  holding its lock (or lease); a second process opening it forwards its calls
+  to that process (below) or, with `forwarding="off"`, fails fast with
+  `NamespaceBusyError`. `MEMD_ALLOW_MULTI_PROCESS=1` disables the check and
+  re-enables silent data loss; it exists for recovery tooling.
+- **The write-forwarding endpoint.** Every process that may write a data root
+  (forwarding is on by default) listens on a TCP port - `127.0.0.1` and an
+  ephemeral port unless `MEMD_FORWARD_HOST` / `MEMD_FORWARD_PORT` say
+  otherwise - and writes its address into the lock files and leases it
+  holds. Whoever can call it runs writes and strong reads - export included -
+  on every namespace that process holds, as that process: it is as powerful
+  as the data directory, and it is not a tenant boundary (a REST server
+  checks API keys before a call reaches the engine; the endpoint trusts its
+  caller like a local caller, source tier and actor included). What guards
+  it is a **secret**: `<data dir>/forward.secret` (on S3, in the
+  `local_dir`), 32 random bytes hex, created on first use with mode 0600 -
+  so the processes that may call are the ones that can read the data
+  directory, which already holds the data and, with the `local` provider,
+  its keys - or `MEMD_FORWARD_SECRET`, which then must be kept like
+  `MEMD_CLUSTER_SECRET`. The file is opened without following a symbolic
+  link and used only if it is a regular file of the process's own user,
+  mode 0600 or narrower: a secret someone else could have planted or read
+  is refused (that process runs with forwarding off and logs why). A connection is authenticated both ways before any
+  call is read: the endpoint sends its id and a nonce, the caller answers
+  with its own nonce and an HMAC-SHA256 under the secret over both (the
+  cluster router's request signature), the endpoint answers with its own
+  HMAC; a caller also checks the endpoint id is the one the lock or lease
+  named, so a process that took over a dead holder's port is not talked to.
+  Every frame after that carries an HMAC-SHA256 under a key derived for the
+  connection from both nonces, over its direction and sequence number: a
+  frame altered, replayed, reordered or reflected closes the connection,
+  and nothing of it runs (`memd_forward_auth_failures_total`). What it does
+  NOT give: **confidentiality** - frames are plain TCP; on loopback only a
+  local root user can read them, but binding `MEMD_FORWARD_HOST` to a
+  network interface sends memory content in clear text across it: keep that
+  network private (a VPN, a private segment). And **availability** against a
+  local process: anyone can open connections (256 at once; an
+  unauthenticated one is dropped after 5 s, before it is read past a 4 KiB
+  hello; each refusal is counted and logged as one line), and a caller that
+  cannot get through waits up to `MEMD_FORWARD_WAIT_S` and fails with
+  nothing applied. A holder applies a
+  forwarded write only while it holds the namespace; a retried call is
+  applied once (request ids, caller-generated record ids).
 - **At-rest encryption with the default `local` key provider is local-file
   envelope encryption.** It protects the volume and makes crypto-shred
   possible. It is *not* protection against someone with filesystem read
@@ -60,8 +99,8 @@ any probe fails the build.
   key directory separately and treat it as the crown jewels - losing it is
   equivalent to shredding every namespace. Cluster mode refuses `local` keys.
 - **Single-writer on S3 is a LEASE, not a distributed lock.** The first writer
-  claims `ns/<ns>/.owner` with a conditional PUT and a second gets
-  `NamespaceBusyError`; a lease older than the TTL is reclaimable (by
+  claims `ns/<ns>/.owner` with a conditional PUT and a second does not get it
+  (it forwards to the first, or gets `NamespaceBusyError`); a lease older than the TTL is reclaimable (by
   compare-and-swap: one winner) so a crashed node cannot wedge a namespace. A
   holder that cannot renew for 2/3 of the TTL stops writing, a node taking
   over a stale lease fences the previous holder's append logs, and every
@@ -182,6 +221,24 @@ any probe fails the build.
   `MEMD_RERANKER=none` (or `local`, a cross-encoder that runs in-process) to
   keep a keyed deployment local. In hosted mode the key is read from the
   server's environment only; clients never send one.
+- **With an embedding key, record text leaves the machine.** Every
+  record's text (embedded in the background after the write) and every
+  search query are sent to the embeddings API (`embedding_base_url`,
+  OpenAI by default) when the embedder is the OpenAI-compatible one:
+  `embedder="openai"`, or `auto` with an embedding key from EITHER source,
+  `MEMD_EMBEDDING_API_KEY` in the environment or `embedding_api_key` in
+  the `Memory(config=...)` dict. Config `embedding_api_key=""` (or
+  `embedder="hash"` / `"fastembed"`) keeps a process with the env var set
+  local.
+- **With the LLM extractor active, session turns leave the machine.** On
+  `close_session`, the session's raw turns (time, speaker and full text
+  of each, under a turn number made up for the call) are sent to the extraction provider
+  (`extraction_base_url`, OpenAI by default). The LLM extractor is active
+  when an extraction key is configured, from EITHER source:
+  `MEMD_EXTRACTION_API_KEY` in the environment, or `extraction_api_key` in
+  the `Memory(config=...)` dict; config `extraction_api_key=""` keeps a
+  process with the env var set local. With no key, the pattern extractor
+  runs in-process and nothing leaves the machine.
 - **The derived indexes hold plaintext.** The SQLite index and, with
   `memd[fast]`, the tantivy index (`<ns>.tantivy/` beside it) contain record
   text unencrypted, with owner-only permissions. Both are deleted on
@@ -391,6 +448,10 @@ restored from a backup.
    Mint per-namespace keys with `memd key create --namespace <ns>`.
 2. Terminate TLS in front of the process. memd speaks plain HTTP.
 3. Bind to `127.0.0.1` unless something else is enforcing authn at the edge.
+   The same for the write-forwarding endpoint (`MEMD_FORWARD_HOST`, default
+   `127.0.0.1`); keep `forward.secret` in the data directory readable by the
+   service user only (memd creates it 0600), or set `MEMD_FORWARDING=off` on
+   a root only one process ever opens.
 4. Leave `MEMD_ENABLE_DOCS` and `MEMD_METRICS_PUBLIC` unset.
 5. Set `MEMD_NS_RATE_LIMIT_PER_MIN` to a real per-tenant ceiling.
 6. Back up the data root - the object store is the source of truth; the

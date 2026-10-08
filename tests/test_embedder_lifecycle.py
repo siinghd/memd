@@ -416,3 +416,19 @@ def test_flush_warns_and_counts_when_the_embed_drain_times_out(tmp_path, caplog)
     finally:
         gated.gate.set()
         m.close()
+
+
+def test_the_embedding_key_model_and_base_url_come_from_env(monkeypatch):
+    monkeypatch.delenv("MEMD_EMBEDDER", raising=False)
+    monkeypatch.setenv("MEMD_EMBEDDING_API_KEY", "sk-env")
+    monkeypatch.setenv("MEMD_EMBEDDING_MODEL", "env-embed")
+    monkeypatch.setenv("MEMD_EMBEDDING_BASE_URL", "http://embed.local/v1")
+    emb = resolve_embedder({})
+    assert (emb.kind, emb.api_key, emb.model, emb.base_url) == ("openai", "sk-env", "env-embed", "http://embed.local/v1")
+    assert resolve_embedder({"embedder": "openai"}).api_key == "sk-env"
+    # config wins; an empty config key turns the env key off
+    emb = resolve_embedder({"embedding_api_key": "sk-cfg", "embedding_model": "cfg-embed"})
+    assert (emb.api_key, emb.model) == ("sk-cfg", "cfg-embed")
+    assert resolve_embedder({"embedding_api_key": "", "embedder": "hash"}).kind == "hash"
+    monkeypatch.setattr(embedder_mod, "fastembed_available", lambda: False)
+    assert resolve_embedder({"embedding_api_key": ""}).kind == "hash"

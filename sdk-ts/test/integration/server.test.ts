@@ -30,6 +30,10 @@ const PY_ENV: NodeJS.ProcessEnv = {
   PYTHONPATH: [REPO_SRC, process.env.PYTHONPATH].filter(Boolean).join(delimiter),
   // deterministic and light: no model download, no ONNX runtime in memory
   MEMD_EMBEDDER: process.env.MEMD_EMBEDDER || "hash",
+  // a developer's provider keys never make the test server send data out
+  MEMD_EXTRACTION_API_KEY: "",
+  MEMD_EMBEDDING_API_KEY: "",
+  TYPESAFE_API_KEY: "",
 };
 
 function memdImportable(): boolean {
@@ -252,6 +256,11 @@ describe.skipIf(!AVAILABLE)("against a real memd server", () => {
     const closed = await a.closeSession(sid);
     expect(closed.raw_considered).toBe(3);
     expect(typeof closed.segment).toBe("string");
+    // the pattern extractor: no quota, no provider call to fail
+    expect(closed.raw_skipped).toBe(0);
+    expect(closed.raw_failed).toBe(0);
+    expect(closed.facts_capped).toBe(0);
+    expect(closed.extraction_errors).toBe(0);
   });
 
   it("forget previews, then deletes exactly the preview on confirm", async () => {

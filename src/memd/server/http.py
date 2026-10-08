@@ -327,7 +327,12 @@ def create_app(
     heavy_limiter = RateLimiter(max_buckets=1000)
     node = None
     if cluster is None:
-        engine = Memory(data_dir)
+        # Another process on this data root (a second `memd serve`, an
+        # embedded Memory, an MCP server) may hold a namespace: its calls are
+        # forwarded there (memd.engine.forward). Not in hosted mode: a session
+        # close's facts quota is settled by a callable of this process's
+        # metering, which cannot run in another process.
+        engine = Memory(data_dir, forwarding="off" if is_hosted else None)
     else:
         from memd.server.cluster import Cluster
         from memd.storage.crypto import resolve_key_provider_name
@@ -350,7 +355,9 @@ def create_app(
         deadline = time.monotonic() + cluster.lease_ttl_s + 5
         while True:
             try:
-                engine = Memory(data_dir, namespace=cluster.node_namespace,
+                # (nodes route requests between themselves: the cluster
+                # router, not embedded forwarding)
+                engine = Memory(data_dir, namespace=cluster.node_namespace, forwarding="off",
                                 config={"lease_holder": cluster.holder,
                                         "lease_ttl_s": cluster.lease_ttl_s, "local_dir": local_dir})
                 break
