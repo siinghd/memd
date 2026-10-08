@@ -49,6 +49,7 @@ npm run typecheck                                  # tsc --noEmit over every exa
 | [`03_search_options.ts`](ts/03_search_options.ts) | scope filters (`user_id`, `agent_id`, ...), per-call `namespace`, `kinds`, `budget_tokens` and `truncated`, `findIds`, `as_of` and a `t_event` window, the server's reranker |
 | [`04_http_api.ts`](ts/04_http_api.ts) | a `node:http` API giving an agent memory per user, one namespace each (the operator key stays on the server): input validation, memd errors mapped to HTTP statuses, cancellation, account deletion by crypto-shred. Run under `local_server.py --admin` |
 | [`05_nextjs_route.ts`](ts/05_nextjs_route.ts) + [`nextjs/app/api/memory/route.ts`](ts/nextjs/app/api/memory/route.ts) | a Next.js App Router route handler (`GET` / `POST` / `DELETE`) on standard `Request` / `Response`: one namespace, a `user_id` scope per user, validation, `req.signal`; the driver calls it without Next.js |
+| [`06_agent_loop.ts`](ts/06_agent_loop.ts) | a tool-calling agent loop (OpenAI-style function calling) whose `remember_fact` / `search_memory` tools are memd, every turn captured with `observe`, recall across sessions; a stub model stands in for the LLM so it runs offline |
 | [`quickstart.mjs`](ts/quickstart.mjs) | the same client from plain JavaScript: `pack` / `observe` around an LLM call, typed errors |
 
 `local_server.py` passes `MEMD_URL`, `MEMD_API_KEY` and `MEMD_NAMESPACE` to
