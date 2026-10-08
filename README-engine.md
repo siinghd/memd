@@ -641,6 +641,13 @@ export MEMD_EXTRACTION_API_KEY=...     # optional: LLM fact extraction
 Without them you get deterministic hash embeddings + pattern extraction:
 fully functional, honestly degraded, clearly labeled in `stats()`.
 
+Embeddings: `embedding_api_key` / `MEMD_EMBEDDING_API_KEY` (set = an
+OpenAI-compatible embeddings API when `embedder` is `auto` or `openai`),
+`embedding_model` / `MEMD_EMBEDDING_MODEL` (`text-embedding-3-small`),
+`embedding_base_url` / `MEMD_EMBEDDING_BASE_URL`
+(`https://api.openai.com/v1`); as below, a config value wins over the env
+var, and config `embedding_api_key=""` turns an env key off.
+
 ### Extraction options (`Memory(config={...})` or the env var)
 
 A config value wins over the env var; config `extraction_api_key=""` turns

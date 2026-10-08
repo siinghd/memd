@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import re
 import secrets
 import threading
@@ -487,28 +486,23 @@ def _failure_reason(exc: BaseException) -> str:
     return "error"
 
 
-def extraction_setting(cfg: dict, key: str, default=None):
-    """config[key], else env MEMD_<KEY>, else `default`. A config value that
-    is not None wins - so config {"extraction_api_key": ""} turns an env key
-    off."""
-    if cfg.get(key) is not None:
-        return cfg[key]
-    env = os.environ.get(f"MEMD_{key.upper()}")
-    return env if env is not None else default
-
-
 def resolve_extractor(config: dict | None = None) -> Extractor:
+    """Settings come from config, else MEMD_<SETTING> in the environment (a
+    config value that is not None wins: extraction_api_key="" turns an env
+    key off)."""
+    from memd.pipeline.embedder import config_or_env
+
     cfg = config or {}
-    api_key = extraction_setting(cfg, "extraction_api_key")
+    api_key = config_or_env(cfg, "extraction_api_key")
     if api_key:
         return LLMExtractor(
-            model=extraction_setting(cfg, "extraction_model", "gpt-4o-mini"),
+            model=config_or_env(cfg, "extraction_model", "gpt-4o-mini"),
             api_key=api_key,
-            base_url=extraction_setting(cfg, "extraction_base_url", "https://api.openai.com/v1"),
-            max_tokens=_max_tokens(extraction_setting(cfg, "extraction_max_tokens", DEFAULT_MAX_TOKENS)),
-            timeout_s=_timeout_s(extraction_setting(cfg, "extraction_timeout_s", DEFAULT_TIMEOUT_S)),
-            request_options=extraction_setting(cfg, "extraction_request_options"),
-            max_response_bytes=_positive_int("extraction_max_response_bytes", extraction_setting(
+            base_url=config_or_env(cfg, "extraction_base_url", "https://api.openai.com/v1"),
+            max_tokens=_max_tokens(config_or_env(cfg, "extraction_max_tokens", DEFAULT_MAX_TOKENS)),
+            timeout_s=_timeout_s(config_or_env(cfg, "extraction_timeout_s", DEFAULT_TIMEOUT_S)),
+            request_options=config_or_env(cfg, "extraction_request_options"),
+            max_response_bytes=_positive_int("extraction_max_response_bytes", config_or_env(
                 cfg, "extraction_max_response_bytes", DEFAULT_MAX_RESPONSE_BYTES)),
         )
     return HeuristicExtractor()

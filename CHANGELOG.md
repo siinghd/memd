@@ -47,6 +47,15 @@ wrong, how it showed, and the numbers before and after where it has them.
   those of a failed call that the pattern extractor took over. A close now
   returns `raw_failed` (those turns; all of them when the extractor raised)
   and the meter records `raw_considered - raw_failed`.
+- **`MEMD_EMBEDDING_API_KEY` selects the OpenAI-compatible embedder.** It
+  was documented next to `MEMD_EXTRACTION_API_KEY` and, like it, read by
+  nothing. `MEMD_EMBEDDING_API_KEY`, `MEMD_EMBEDDING_MODEL` and
+  `MEMD_EMBEDDING_BASE_URL` are now read, config winning (config
+  `embedding_api_key=""` turns an env key off). **Upgrade note: with the
+  variable set and `embedder` left at `auto`, record text and queries are
+  sent to the embeddings provider, and a namespace embedded with another
+  model is re-embedded in the background when it opens** (vector
+  self-heal; SECURITY.md).
 - **An extraction call is bounded.** No `max_tokens` was sent: one call to
   a model that looped ran to 131,072 output tokens (413 s, $0.157). The
   60 s client timeout did not stop it: it is a per-read timeout, and a

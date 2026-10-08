@@ -182,6 +182,15 @@ any probe fails the build.
   `MEMD_RERANKER=none` (or `local`, a cross-encoder that runs in-process) to
   keep a keyed deployment local. In hosted mode the key is read from the
   server's environment only; clients never send one.
+- **With an embedding key, record text leaves the machine.** Every
+  record's text (embedded in the background after the write) and every
+  search query are sent to the embeddings API (`embedding_base_url`,
+  OpenAI by default) when the embedder is the OpenAI-compatible one:
+  `embedder="openai"`, or `auto` with an embedding key from EITHER source,
+  `MEMD_EMBEDDING_API_KEY` in the environment or `embedding_api_key` in
+  the `Memory(config=...)` dict. Config `embedding_api_key=""` (or
+  `embedder="hash"` / `"fastembed"`) keeps a process with the env var set
+  local.
 - **With the LLM extractor active, session turns leave the machine.** On
   `close_session`, the session's raw turns (time, speaker and full text
   of each, under a turn number made up for the call) are sent to the extraction provider
