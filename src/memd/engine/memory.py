@@ -1593,9 +1593,10 @@ class Memory:
         finished, how many of the n extracted facts may be written. The raw
         lane is never touched by either.
 
-        `extraction_errors` counts the extraction calls that failed: the LLM
-        extractor's turns of a failed call go through the pattern extractor
-        instead; an extractor that raised outright counts 1 and adds none."""
+        `extraction_errors` counts the extraction calls that failed and
+        `raw_failed` their turns: the LLM extractor's turns of a failed call
+        go through the pattern extractor instead; an extractor that raised
+        outright counts 1 call, all its turns, and adds no facts."""
         impl = self._hosted()
         if impl is not None:
             return impl.close_session(session_id, user_id=user_id, namespace=namespace)
@@ -1613,6 +1614,7 @@ class Memory:
             # provider calls that failed (LLM extractor): their turns went
             # through the pattern extractor instead - reported, not silent
             extraction_errors = list(getattr(extracted, "errors", None) or [])
+            raw_failed = int(getattr(extracted, "failed_records", 0) or 0)
             if extraction_errors:
                 self._audit_for(ns.namespace).append(
                     actor="system", action="extraction_degraded", target=session_id,
@@ -1626,6 +1628,7 @@ class Memory:
                               target=session_id, detail={"error": str(ex)[:200]})
             extracted = []
             extraction_errors = ["error"]
+            raw_failed = len(to_extract)
         facts_capped = 0
         if callable(max_facts):
             max_facts = max_facts(len(extracted))
@@ -1657,6 +1660,7 @@ class Memory:
             "segment": seg_name,
             "raw_considered": len(to_extract),
             "raw_skipped": len(seg_records) - len(to_extract),
+            "raw_failed": raw_failed,
             "facts_extracted": len(extracted),
             "extraction_errors": len(extraction_errors),
             "facts_capped": facts_capped,

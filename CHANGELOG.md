@@ -19,8 +19,8 @@ wrong, how it showed, and the numbers before and after where it has them.
   rejects `max_tokens`). `model`, `messages` and `stream` are refused, as
   are invalid values, when the extractor is built. Table and examples:
   README-engine.md, "Extraction options".
-- `close_session` returns `extraction_errors`: the extraction calls that
-  failed (see Fixed).
+- `close_session` returns `extraction_errors` and `raw_failed`: the
+  extraction calls that failed and their turns (see Fixed).
 
 ### Fixed
 - **`MEMD_EXTRACTION_API_KEY` turns LLM extraction on.** It was documented
@@ -31,7 +31,19 @@ wrong, how it showed, and the numbers before and after where it has them.
   settings above) are read from the environment; a config value wins, and
   config `extraction_api_key=""` turns an env key off. **Upgrade note: a
   process with `MEMD_EXTRACTION_API_KEY` set now sends each closed
-  session's raw turns to the extraction provider** (SECURITY.md).
+  session's raw turns to the extraction provider** (SECURITY.md). **In
+  hosted mode that is extraction on our key**: the server builds its engine
+  from the environment, so with the variable set every session close is
+  metered as `extractions_our_key`, the free plan's hard cap (10K turns a
+  month) applies - turns past the remaining allowance stay raw-only
+  (`raw_skipped`) - and a close with no allowance left answers 402.
+  Before, a hosted server with the variable set extracted with the pattern
+  extractor and metered nothing.
+- **`extractions_our_key` counts only the turns the LLM extracted.** It
+  counted every turn the extractor was handed (`raw_considered`), including
+  those of a failed call that the pattern extractor took over. A close now
+  returns `raw_failed` (those turns; all of them when the extractor raised)
+  and the meter records `raw_considered - raw_failed`.
 - **An extraction call is bounded.** No `max_tokens` was sent: one call to
   a model that looped ran to 131,072 output tokens (413 s, $0.157). The
   60 s client timeout did not stop it: it is a per-read timeout, and a

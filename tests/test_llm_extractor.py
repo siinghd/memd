@@ -436,6 +436,55 @@ def test_close_session_reports_an_extractor_that_raised(tmp_path):
         m.add("probe", session_id="s1", user_id="u1")
         with mock.patch.object(m.extractor, "extract", side_effect=RuntimeError("boom")):
             res = m.close_session("s1")
-        assert res["extraction_errors"] == 1 and res["facts_extracted"] == 0
+        assert res["extraction_errors"] == 1 and res["raw_failed"] == 1 and res["facts_extracted"] == 0
     finally:
         m.close()
+
+
+# ------------------------------------------------- hosted: extraction on the operator's key
+
+
+@pytest.fixture()
+def hosted_llm(monkeypatch, provider, tmp_path):
+    """A hosted server whose extraction key comes from the environment, as a
+    deployment sets it (the server builds its engine with no config)."""
+    from tests.test_hosted_tenancy import Hosted
+
+    monkeypatch.setenv("MEMD_EXTRACTION_API_KEY", "sk-operator")
+    monkeypatch.setenv("MEMD_EXTRACTION_BASE_URL", provider.base_url)
+    h = Hosted(tmp_path)
+    assert isinstance(h.engine.extractor, LLMExtractor)
+    yield h
+    h.close()
+
+
+def _close(h, org: str, turns: list[str]):
+    from memd.hosted.store import period_of
+    import time as _t
+
+    c = h.client(org, "acme")
+    c.post("/v1/ns/acme/events", json={"events": [{"content": t, "session_id": "s1", "user_id": "u1"}
+                                                  for t in turns]})
+    r = c.post("/v1/ns/acme/sessions/s1/close")
+    return r, h.store.rollup(org, "extractions_our_key", period_of(_t.time()))
+
+
+def test_hosted_meters_the_turns_the_llm_extracted(hosted_llm, provider):
+    r, metered = _close(hosted_llm, hosted_llm.org("acme"), ["I work at Initech", "I live in Oslo"])
+    assert r.status_code == 200 and len(provider.requests) == 1
+    assert metered == r.json()["raw_considered"] == 2
+
+
+def test_hosted_never_meters_turns_the_pattern_extractor_took_over(hosted_llm, provider):
+    hosted_llm.engine.extractor.chunk_records = 1
+
+    def reply(body):
+        if "Oslo" in body["messages"][1]["content"]:
+            return 500, {"error": "provider down"}
+        return _chat("[]")
+
+    provider.reply = reply
+    r, metered = _close(hosted_llm, hosted_llm.org("acme"), ["I work at Initech", "I live in Oslo"])
+    body = r.json()
+    assert body["raw_considered"] == 2 and body["extraction_errors"] == 1 and body["raw_failed"] == 1
+    assert metered == 1, "only the turn the LLM extracted is metered"

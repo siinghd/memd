@@ -462,10 +462,17 @@ alone. A session close is a write: at the memories cap it answers 402. While
 its extractor runs it holds room for one memory only - writes alongside it
 are not starved - and once the facts are extracted it reserves exactly
 min(facts extracted, remaining headroom); anything beyond is not written
-(`facts_capped` in the response). With extraction on our key under a
-hard cap, the session's raw records are extracted up to the remaining
-allowance and the rest stay raw-only - searchable, never extracted
-(`raw_skipped`); with no allowance left the close answers 402. After
+(`facts_capped` in the response). **Extraction runs on our key when the
+server's environment has `MEMD_EXTRACTION_API_KEY`** (a hosted server
+builds its engine from the environment, never from a client): then every
+session close is metered as `extractions_our_key`, one unit per raw turn
+the LLM extracted - the turns of a call that failed went through the local
+pattern extractor (`raw_failed` in the response) and are not counted.
+Under a hard cap (the free plan's 10K a month), the session's raw records
+are extracted up to the remaining allowance and the rest stay raw-only -
+searchable, never extracted (`raw_skipped`); with no allowance left the
+close answers 402 (the pattern extractor does not take over). Without the
+key, extraction runs locally, is never metered and never refuses. After
 `invoice.payment_failed` the org has a 7-day grace period
 (`MEMD_BILLING_GRACE_DAYS`); after it the org is **read-only**: writes and
 session extraction answer `402 {"code": "payment_required"}`, searches, reads
@@ -584,7 +591,8 @@ time - never memory content, queries or user ids. What reaches Stripe is the
 customer id, the meter's event name, a number and a timestamp; the org's
 name goes into the Stripe customer record once, at first checkout.
 `extractions_our_key` counts only when extraction runs on the operator's LLM
-key; the local heuristic extractor is never billed.
+key (`MEMD_EXTRACTION_API_KEY` in the server's environment), and only the
+turns the LLM extracted; the local pattern extractor is never billed.
 
 ## Doors (one engine)
 
@@ -678,8 +686,8 @@ an env key off.
   `memd_extraction_chunks_failed_total{model, reason}` (`http_status`,
   `transport`, `timeout`, `truncated`, `empty`, `malformed`), and
   `close_session` returns `extraction_errors` (the number of failed calls)
-  and audits `extraction_degraded` with the reasons. The raw turns are
-  stored either way.
+  and `raw_failed` (their turns), and audits `extraction_degraded` with the
+  reasons. The raw turns are stored either way.
 - **Privacy: with the LLM extractor active, every closed session's raw
   turns are sent to the extraction provider** (see SECURITY.md).
 

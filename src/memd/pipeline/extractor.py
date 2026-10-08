@@ -39,12 +39,14 @@ class ExtractedFact:
 
 class Extraction(list):
     """The facts of one extract() call, plus `errors`: the reason of each
-    provider call that failed (its turns went through the pattern
-    extractor instead). An extractor that returns a plain list had none."""
+    provider call that failed, and `failed_records`: the turns of those
+    calls (they went through the pattern extractor instead). An extractor
+    that returns a plain list had none."""
 
     def __init__(self, facts=(), errors=()):
         super().__init__(facts)
         self.errors: list[str] = list(errors)
+        self.failed_records = 0
 
 
 class ExtractionError(Exception):
@@ -295,6 +297,7 @@ prompt_version={PROMPT_VERSION}"""
             except Exception as ex:
                 reason = _failure_reason(ex)
                 out.errors.append(reason)
+                out.failed_records += len(chunk)
                 METRICS.inc("memd_extraction_chunks_failed_total", model=self.model, reason=reason,
                             help="extraction calls that failed (their turns went through the pattern extractor)")
                 out.extend(self._fallback.extract(chunk))
