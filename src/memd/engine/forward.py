@@ -175,6 +175,7 @@ class ForwardConfig:
             wait_s=float(pick("forward_wait_s", "MEMD_FORWARD_WAIT_S", wait_default)),
             timeout_s=float(pick("forward_timeout_s", "MEMD_FORWARD_TIMEOUT_S", 300.0)),
             max_inflight=int(pick("forward_max_inflight", "MEMD_FORWARD_MAX_INFLIGHT", 64)),
+            queue_wait_s=float(pick("forward_queue_wait_s", "MEMD_FORWARD_QUEUE_WAIT_S", 10.0)),
             check_s=0.0 if lease_ttl_s is None else max(0.5, float(lease_ttl_s) / 3.0),
         )
         if out.secret is not None and len(out.secret) < 16:

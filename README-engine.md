@@ -185,6 +185,7 @@ FORWARD_MEASUREMENTS
 | `forward_wait_s` / `MEMD_FORWARD_WAIT_S` | 30 (S3: lease TTL + 15) | how long a call looks for a writer that answers |
 | `forward_timeout_s` / `MEMD_FORWARD_TIMEOUT_S` | 300 | how long one attempt waits for its answer |
 | `forward_max_inflight` / `MEMD_FORWARD_MAX_INFLIGHT` | 64 | forwarded calls a holder runs at once |
+| `forward_queue_wait_s` / `MEMD_FORWARD_QUEUE_WAIT_S` | 10 | how long a forwarded call waits for one of them before the holder answers "overloaded" (its caller retries) |
 
 ## Object storage as the source of truth (S3 / R2 / MinIO)
 

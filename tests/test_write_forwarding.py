@@ -472,6 +472,45 @@ def test_a_retried_write_is_applied_once(tmp_path):
         a.close()
 
 
+def test_an_overloaded_holder_pushes_back_and_nothing_is_lost(tmp_path):
+    """A holder running one forwarded call at a time, which waits 1 ms for a
+    slot: most concurrent calls are answered "overloaded" - not run - and
+    their callers retry until each is applied, once."""
+    root = str(tmp_path / "d")
+    a = Memory(root, namespace=NS, encrypt=False,
+               config={"forward_max_inflight": 1, "forward_queue_wait_s": 0.001,
+                       "rate_max_writes": 10 ** 9})
+    try:
+        refused = sum(e["value"] for e in METRICS.snapshot()["counters"].get("memd_forward_refused_total", [])
+                      if e["labels"].get("reason") == "overloaded")
+        out = _child(r'''
+import json, sys, threading
+from memd.engine.memory import Memory
+b = Memory(sys.argv[1], namespace="shared", encrypt=False)
+acked, errors = [], []
+def run(k):
+    for i in range(25):
+        try:
+            acked.append((b.add(f"pushed back {k}-{i}", user_id="u1")[0], f"pushed back {k}-{i}"))
+        except Exception as e:
+            errors.append(repr(e))
+ts = [threading.Thread(target=run, args=(k,)) for k in range(8)]
+[t.start() for t in ts]; [t.join() for t in ts]
+b.close()
+print(json.dumps({"acked": acked, "errors": errors}))
+''', root)
+        assert out.returncode == 0, out.stderr[-3000:]
+        r = json.loads(out.stdout.strip().splitlines()[-1])
+        assert not r["errors"] and len(r["acked"]) == 200
+        now = sum(e["value"] for e in METRICS.snapshot()["counters"].get("memd_forward_refused_total", [])
+                  if e["labels"].get("reason") == "overloaded")
+        assert now > refused, "the holder never pushed back"
+        contents = Counter(json.loads(ln)["content"] for ln in a.export_jsonl().splitlines())
+        assert all(contents[c] == 1 for _rid, c in r["acked"])
+    finally:
+        a.close()
+
+
 # ------------------------------------------------------------------ several processes
 
 
