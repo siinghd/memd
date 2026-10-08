@@ -112,7 +112,8 @@ wrong, how it showed, and the numbers before and after where it has them.
     between turns that are not adjacent;
   - starts each turn's line with its speaker, and writes each record on one
     line (a line break in a record's text becomes `\n`, so a record cannot
-    add a false session header, speaker or fact);
+    add a false session header, speaker or fact), and escapes a fence tag in
+    trusted text;
   - does not bring back a turn that a newer fact replaced.
 
   Measurement on LongMemEval_S end-to-end QA (160 stratified questions, one

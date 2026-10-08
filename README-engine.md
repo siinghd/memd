@@ -1022,7 +1022,8 @@ The `packing` setting selects one of two layouts. Set it in the config, in
   `\n`. Thus a record cannot add a line of its own, for example a false
   session header, speaker or fact.
 - Lower-trust content (tool, web, import, quarantined) shows in an
-  `untrusted-data` fence, escaped, as in the flat layout.
+  `untrusted-data` fence, escaped, as in the flat layout. memd also escapes
+  a fence tag in other text. Thus each fence in the text is a real one.
 - The text does not contain record ids or session ids. The ids are in
   `items`.
 - memd does not show a turn that a newer fact replaced (the source of a
