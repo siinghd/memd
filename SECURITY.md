@@ -38,7 +38,10 @@ any probe fails the build.
   so the processes that may call are the ones that can read the data
   directory, which already holds the data and, with the `local` provider,
   its keys - or `MEMD_FORWARD_SECRET`, which then must be kept like
-  `MEMD_CLUSTER_SECRET`. A connection is authenticated both ways before any
+  `MEMD_CLUSTER_SECRET`. The file is opened without following a symbolic
+  link and used only if it is a regular file of the process's own user,
+  mode 0600 or narrower: a secret someone else could have planted or read
+  is refused (that process runs with forwarding off and logs why). A connection is authenticated both ways before any
   call is read: the endpoint sends its id and a nonce, the caller answers
   with its own nonce and an HMAC-SHA256 under the secret over both (the
   cluster router's request signature), the endpoint answers with its own
@@ -54,8 +57,9 @@ any probe fails the build.
   network private (a VPN, a private segment). And **availability** against a
   local process: anyone can open connections (256 at once; an
   unauthenticated one is dropped after 5 s, before it is read past a 4 KiB
-  hello), and a caller that cannot get through waits up to
-  `MEMD_FORWARD_WAIT_S` and fails with nothing applied. A holder applies a
+  hello; each refusal is counted and logged as one line), and a caller that
+  cannot get through waits up to `MEMD_FORWARD_WAIT_S` and fails with
+  nothing applied. A holder applies a
   forwarded write only while it holds the namespace; a retried call is
   applied once (request ids, caller-generated record ids).
 - **At-rest encryption with the default `local` key provider is local-file
