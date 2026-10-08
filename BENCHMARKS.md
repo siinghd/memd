@@ -1,8 +1,10 @@
-# memd benchmarks (v0.2.0)
+# memd benchmarks
 
-All numbers below come from logged, pre-registered experiments kept in a separate research repository (not bundled here)
-(`experiments/NNN-*`, each with a PLAN written before running, a negative control, 3 disjoint question
-folds, and a hostile review). Nothing here is from memd's own synthetic suite.
+All numbers below come from logged experiments in a separate research repository (not bundled here). Each
+experiment had a written plan before the run. Nothing here is from memd's own synthetic suite. The
+retrieval-quality rows also have a negative control, 3 disjoint question folds and an independent review. Each
+later section tells its own limits: some of them are one sample, with no fold split and no independent review.
+Each table names the release or the configuration that was measured.
 
 ## Data and harness
 
@@ -28,7 +30,7 @@ Random-order and wrong-query controls score ndcg@5 ≤ 0.13 in every experiment.
 At `_M` scale (120 dev questions, ~5K turns per user), v0.1.0 search collapsed to ndcg@5 0.41 (its lexical lane
 re-ranked an unordered 320-row window by term coverage without IDF). A bm25()-ranked lane on the same index (the lane v0.2.0 ships) scores 0.88 (exp 006, lane-level measurement).
 
-## Lexical index scale (optional `memd[fast]` = tantivy accelerator)
+## Lexical index scale (optional `memd-engine[fast]` = tantivy accelerator)
 
 Filtered, user-scoped search through `Memory.search`, 200 real questions over real LongMemEval turns:
 
@@ -42,7 +44,7 @@ The single-record write ack is unchanged (FTS5 remains the synchronous source of
 derived accelerator). The 60-question real-data gate scores 0.874 (tantivy) vs 0.867 (FTS5). Measured on a
 loaded, shared 8-core host (`bench/lexical_bench.py`).
 
-## Vector index scale (optional `memd[ann]` = usearch sidecar)
+## Vector index scale (optional `memd-engine[ann]` = usearch sidecar)
 
 The vector lane as `Memory.search` calls it (user-scoped filter over 8 users, limit = the planner's
 `candidate_k`), 200 queries, 384-d vectors; recall@10 against the lane's exact answer
@@ -145,9 +147,9 @@ Stratified 120-question sample (all 6 question types + abstention). Reader `open
 | + Jev rerank, top-k | 0.783 ± 0.014 | 3.1K | 018 |
 | + Jev probability-gated packing (100-candidate shortlist) | 0.792 ± 0.014 | 2.3K | 018 |
 
-Not yet run (blocked on API credits): the full-context reference and the wrong-context control for this
-sample, and the one-time held-out 500-question run. Multi-session aggregation ("how many X…") is the weakest
-category (0.55 with Jev vs ~0.9 with the full history on an earlier sample).
+Not run for this sample: the full-context reference and the wrong-context control. Multi-session
+aggregation ("how many X…") is the weakest category (0.55 with Jev vs ~0.9 with the full history on an earlier
+sample).
 
 ## How this compares
 

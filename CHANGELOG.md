@@ -10,6 +10,18 @@ wrong, how it showed, and the numbers before and after where it has them.
 - **npm releases use trusted publishing (OIDC).** The release workflow no
   longer uses an npm token. A manual run of the workflow from the default
   branch can also publish a new SDK version. The TypeScript SDK is 0.2.1.
+  npm staged publishing is on: a new SDK version waits on npmjs.com until
+  the owner approves it (RELEASING.md).
+
+### Fixed
+- **The documentation matches 0.5.1.** The README, the docs site, the
+  examples and the SDK guide had old statements. They said that the
+  TypeScript SDK is not on npm, and that memd is not on PyPI. They said
+  that a second MCP process on one data directory fails, and that the
+  held-out 500-question run is not done. They gave old image tags. They
+  now give the PyPI and npm install, write forwarding, and S3-compatible
+  stores (CI uses RustFS). README-engine.md, "Search throughput", tells
+  that the default search scales with processes, not with threads.
 
 ## [0.5.1] - 2026-10-08
 
