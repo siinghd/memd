@@ -417,18 +417,30 @@ class _Layout:
         self.after: dict[str, str] = {}  # turn id -> the next visible turn of its session, when known
         self.length = len(header)
 
-    def link(self, anchor: MemoryRecord, nbs: list[MemoryRecord], positions: dict[str, int]) -> None:
+    def link(self, anchor: MemoryRecord, nbs: list[MemoryRecord], positions: dict[str, int]) -> bool:
         """Record what a neighbour fetch says about adjacency (radius 1: the
-        turn right before and right after the anchor)."""
+        turn right before and right after the anchor). Two turns already
+        packed can turn out adjacent: their session is re-measured at once.
+        True if anything was learnt (a measure() taken before is stale)."""
         k = (anchor.time.t_event, positions.get(anchor.id, 0), anchor.id)
+        learnt, changed = False, set()
         for x in nbs:
-            if (x.time.t_event, positions.get(x.id, 0), x.id) < k:
-                self.after[x.id] = anchor.id
-            else:
-                self.after[anchor.id] = x.id
+            a, b = (x.id, anchor.id) if (x.time.t_event, positions.get(x.id, 0), x.id) < k else (anchor.id, x.id)
+            if self.after.get(a) != b:
+                self.after[a] = b
+                learnt = True
+                if a in self.rows and b in self.rows:
+                    changed.add(_session_key(self.rows[a].rec))
+        for g in changed:
+            n = self._group_len(self.groups[g])
+            self.length += n - self.glen[g]
+            self.glen[g] = n
+        return learnt
 
     def _adjacent(self, a: _Row, b: _Row) -> bool:
-        return (b.pos == a.pos + 1 and a.rec.kind == b.rec.kind == Kind.RAW_EVENT) or self.after.get(a.rec.id) == b.rec.id
+        """No "[...]" between them: nothing was written between them, or a
+        neighbour lookup said one follows the other in their session."""
+        return b.pos == a.pos + 1 or self.after.get(a.rec.id) == b.rec.id
 
     def _group_len(self, rows: list[_Row], extra: tuple[str, str] | None = None) -> int:
         n = _SESSION_FIXED + len(_session_date(rows[0].rec.time.t_event))
@@ -506,7 +518,7 @@ def pack_sessions(
     sources: dict[str, list[MemoryRecord]],
     positions: dict[str, int],
     neighbours: Neighbours | None = None,
-    budget_tokens: int = 2000,
+    budget_tokens: int,
     query_class: str = "",
     resolve_dates: bool = False,
 ) -> PackedContext:
@@ -562,7 +574,8 @@ def pack_sessions(
             pos.update(npos)
             seen = {a.id for a in anchors}
             for a in anchors:
-                lay.link(a, nb.get(a.id, []), pos)
+                if lay.link(a, nb.get(a.id, []), pos):
+                    alone = None  # measured before adjacency was learnt
                 for x in nb.get(a.id, []):
                     if x.id not in seen and x.id not in lay.rows:
                         seen.add(x.id)

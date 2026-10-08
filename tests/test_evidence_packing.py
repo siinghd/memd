@@ -341,6 +341,45 @@ def test_budget_is_never_exceeded_and_lines_are_whole(seed):
                     assert body in out.text, (seed, budget, it.id)
 
 
+@pytest.fixture()
+def tracked(monkeypatch):
+    """(tracked length, rendered length) of every pack: the budget check
+    runs on the tracked one, so they must agree exactly"""
+    from memd.query import packing
+
+    seen = []
+    orig = packing._Layout.render
+
+    def render(self):
+        text = orig(self)
+        seen.append((self.length, len(text)))
+        return text
+    monkeypatch.setattr(packing._Layout, "render", render)
+    return seen
+
+
+def test_late_adjacency_keeps_the_length_exact(tracked):
+    """b and c come in as neighbours of different hits (adjacency unknown,
+    rowids apart: "[...]" between them); a fact whose second source is b
+    then reveals they are adjacent - in a session the unit does not touch"""
+    recs = [rec("a", "alpha", session="S1"), rec("b", "bravo", source="agent", session="S1"),
+            rec("c", "charlie", session="S1"), rec("d", "delta", source="agent", session="S1"),
+            rec("e", "echo", session="S2"), rec("f", "fact", kind="fact", session="S2", lineage=["e", "b"])]
+    w = World(recs, {"a": 10, "b": 20, "c": 30, "d": 40, "e": 50, "f": 60})
+    out = w.pack(["a", "d", "f"], 10_000)
+    assert "assistant: bravo\nuser: charlie" in out.text  # no "[...]": they are adjacent
+    assert tracked and all(t == r for t, r in tracked), tracked
+
+
+def test_tracked_length_is_exact_on_random_worlds(tracked):
+    rng = random.Random(11)
+    for _ in range(200):
+        w, pool = _random_world(rng)
+        for b in (64, 500, 3000, 20_000):
+            w.pack(pool, b, dates=rng.random() < 0.5)
+    assert all(t == r for t, r in tracked)
+
+
 def test_neighbours_are_fetched_only_for_units_that_can_fit():
     recs = [rec(f"t{i}", "z" * 2000, session=f"S{i}") for i in range(20)]
     w = World(recs)
