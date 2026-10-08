@@ -61,6 +61,43 @@ def test_auto_keeps_the_old_order(monkeypatch):
     assert resolve_embedder({"embedding_api_key": "k"}).kind == "openai"
 
 
+def test_auto_with_fastembed_is_bge_small_fused_with_bm25(monkeypatch):
+    """with the local-embeddings extra, "auto" is BAAI/bge-small-en-v1.5 and
+    its vector lane is fused with BM25; the hash embedder's is not"""
+    from memd.engine.memory import resolve_fuse_vector
+
+    monkeypatch.delenv("MEMD_EMBEDDER", raising=False)
+    monkeypatch.delenv("MEMD_FUSE_VECTOR", raising=False)
+    monkeypatch.setattr(embedder_mod, "fastembed_available", lambda: True)
+    emb = resolve_embedder({})
+    assert emb.kind == "fastembed" and emb.name == "BAAI/bge-small-en-v1.5"
+    assert resolve_fuse_vector({}, emb) is True
+    monkeypatch.setattr(embedder_mod, "fastembed_available", lambda: False)
+    assert resolve_fuse_vector({}, resolve_embedder({})) is False
+
+
+def test_auto_falling_back_to_hash_says_so_once(monkeypatch, caplog):
+    monkeypatch.delenv("MEMD_EMBEDDER", raising=False)
+    monkeypatch.setattr(embedder_mod, "fastembed_available", lambda: False)
+    monkeypatch.setattr(embedder_mod, "_hash_fallback_noted", False)
+    with caplog.at_level(logging.WARNING, logger="memd.pipeline.embedder"):
+        assert resolve_embedder({}).kind == "hash"
+        assert resolve_embedder({}).kind == "hash"
+    notes = [r.getMessage() for r in caplog.records if r.name == "memd.pipeline.embedder"]
+    assert len(notes) == 1
+    assert 'pip install "memd-engine[local-embeddings]"' in notes[0] and "fastembed" in notes[0]
+
+
+@pytest.mark.parametrize("cfg", [{"embedder": "hash"}, {"embedding_api_key": "k"}])
+def test_no_fallback_note_when_hash_is_chosen_or_not_used(monkeypatch, caplog, cfg):
+    monkeypatch.delenv("MEMD_EMBEDDER", raising=False)
+    monkeypatch.setattr(embedder_mod, "fastembed_available", lambda: False)
+    monkeypatch.setattr(embedder_mod, "_hash_fallback_noted", False)
+    with caplog.at_level(logging.WARNING, logger="memd.pipeline.embedder"):
+        resolve_embedder(cfg)
+    assert not [r for r in caplog.records if r.name == "memd.pipeline.embedder"]
+
+
 def test_unknown_embedder_raises():
     with pytest.raises(ValueError, match="unknown embedder"):
         resolve_embedder({"embedder": "word2vec"})
