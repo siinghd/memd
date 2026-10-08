@@ -674,6 +674,32 @@ def test_a_retry_never_brings_back_a_hard_deleted_record(tmp_path):
             b.close()
 
 
+def test_a_closed_store_refuses_every_late_write(tmp_path):
+    """A forwarded call stalled past its holder's close drain went on after
+    the close released the namespace's lock - and the closed store reopened
+    its log for it: a write after the next writer took the namespace over.
+    A closed store refuses every write (retryable: nothing was applied)."""
+    from memd.core.schema import MemoryRecord
+    from memd.storage.engine import NamespaceClosedError
+
+    root = str(tmp_path / "d")
+    a = Memory(root, namespace=NS, encrypt=False, forwarding="off")
+    store = a.engine.namespace(NS)
+    a.add("before the close", user_id="u1")
+    a.close()
+    late = MemoryRecord.create(namespace=NS, kind="raw_event", content="a write after the close")
+    with pytest.raises(NamespaceClosedError):
+        store.append([late])
+    with pytest.raises(NamespaceClosedError):
+        store.append_ops([{"op": "tombstone", "id": late.id, "at": 1}])
+    assert fw._error_payload(NamespaceClosedError("closed"))["code"] == "not_owner"
+    b = Memory(root, namespace=NS, encrypt=False, forwarding="off")
+    try:
+        assert [json.loads(ln)["content"] for ln in b.export_jsonl().splitlines()] == ["before the close"]
+    finally:
+        b.close()
+
+
 # ------------------------------------------------------------------ several processes
 
 

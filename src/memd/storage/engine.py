@@ -606,6 +606,11 @@ class NamespaceBusyError(RuntimeError):
     """Another OS process already holds this namespace."""
 
 
+class NamespaceClosedError(RuntimeError):
+    """A write to a namespace store that was closed (or evicted) meanwhile:
+    refused before anything was written. Open the namespace again."""
+
+
 def owner_lock_path(root: str, ns: str) -> str:
     """The lock file a process holds while it writes `ns` on a local data
     root (`root` is the LocalObjectStore's root)."""
@@ -3260,8 +3265,8 @@ class NamespaceStore:
     def _ensure_open(self) -> None:
         if self._closed:
             if getattr(self, "_evicted", False):
-                raise RuntimeError(
-                    f"namespace {self.namespace!r} was evicted from the open cache; "
+                raise NamespaceClosedError(
+                    f"namespace {self.namespace!r} was closed (or evicted from the open cache); "
                     "re-resolve it via the engine")
             raise RuntimeError(f"namespace {self.namespace!r} destroyed")
 
@@ -3446,6 +3451,7 @@ class NamespaceStore:
         if not ops:
             return
         with self._lock:
+            self._ensure_open()
             frames = []
             for op in ops:
                 self.manifest.seq += 1
@@ -4133,6 +4139,14 @@ class NamespaceStore:
         return st
 
     def close(self) -> None:
+        with self._lock:
+            if not self._closed:
+                # closed - not destroyed - from here on: a caller still
+                # holding this store (a forwarded call that outlived the
+                # close's drain) gets NamespaceClosedError, never a log
+                # reopened after the namespace's lock was released
+                self._closed = True
+                self._evicted = True
         if not self._lost and self.lease_lost():
             self._lost = True   # fenced: another node reclaimed the lease
         if self._lost:

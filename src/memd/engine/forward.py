@@ -56,7 +56,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 
 from memd.metrics import METRICS
-from memd.storage.engine import NamespaceBusyError, owner_lock_path, read_owner_lock
+from memd.storage.engine import NamespaceBusyError, NamespaceClosedError, owner_lock_path, read_owner_lock
 
 _log = logging.getLogger(__name__)
 
@@ -399,7 +399,7 @@ class _Stream:
 def _error_payload(ex: BaseException) -> dict:
     from memd.storage.objectstore import LeaseLostError
 
-    if isinstance(ex, (NamespaceBusyError, LeaseLostError)):
+    if isinstance(ex, (NamespaceBusyError, LeaseLostError, NamespaceClosedError)):
         # this process does not hold the namespace (any more): nothing was
         # applied, the caller finds the writer again
         return {"code": "not_owner", "retry": True, "message": str(ex)[:500]}
