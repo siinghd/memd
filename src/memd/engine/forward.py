@@ -262,6 +262,16 @@ def parse_holder(holder: str | None) -> Endpoint | None:
         return None
 
 
+def _unspecified(host: str) -> bool:
+    """A bind address meaning every interface: not one others can connect to."""
+    if not host:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_unspecified
+    except ValueError:
+        return False
+
+
 def _loopback(host: str) -> bool:
     if host == "localhost":
         return True
@@ -405,7 +415,7 @@ class ForwardServer:
         port = self._sock.getsockname()[1]
         if cfg.advertise:
             address = str(cfg.advertise)
-        elif cfg.host in ("", "0.0.0.0", "::"):
+        elif _unspecified(cfg.host):
             self._sock.close()
             raise ValueError("forward_host binds every interface: set forward_advertise / "
                              "MEMD_FORWARD_ADVERTISE to the host:port other processes reach this one at")
