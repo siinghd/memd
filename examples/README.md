@@ -45,6 +45,7 @@ npm run typecheck                                  # tsc --noEmit over every exa
 | file | shows |
 |---|---|
 | [`01_quickstart.ts`](ts/01_quickstart.ts) | `remember`, `search`, `get`, `forget` (preview, then confirm), hard `delete` |
+| [`02_sessions_and_facts.ts`](ts/02_sessions_and_facts.ts) | a conversation session (`observe`), `closeSession` fact extraction, recall in the next session, supersedence on an entity key, `history`, `as_of` |
 | [`quickstart.mjs`](ts/quickstart.mjs) | the same client from plain JavaScript: `pack` / `observe` around an LLM call, typed errors |
 
 `local_server.py` passes `MEMD_URL`, `MEMD_API_KEY` and `MEMD_NAMESPACE` to
