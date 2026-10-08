@@ -636,11 +636,11 @@ def _sigkill_holder(tmp_path, root: str, config: dict, *, per_worker=None, encry
         while fleet.acked_adds("B") < 25 or fleet.acked_adds("C") < 25:
             assert time.monotonic() < deadline, (fleet.stderr("B"), fleet.stderr("C"))
             time.sleep(0.01)
-        t_kill = time.monotonic()
+        t_kill = time.time()
         fleet.procs["A"].kill()                     # SIGKILL, mid-stream
         fleet.procs["A"].wait()
         fleet.finish("B", "C")
-        took = time.monotonic() - t_kill
+        took = time.time() - t_kill
     finally:
         fleet.kill_all()
     adds, deletes, violations = _acked(fleet, ["A", "B", "C"])
@@ -650,8 +650,9 @@ def _sigkill_holder(tmp_path, root: str, config: dict, *, per_worker=None, encry
     # taken it from that one when it closed)
     assert any(d["op"] == "done" and d["holds"] for d in done.values()), done
     assert fleet.acked_adds("B") == fleet.acked_adds("C") == 120
-    print(f"\nSIGKILL failover: B and C finished {took:.1f} s after the kill; "
-          f"{len(adds)} acked writes, {len(deletes)} acked deletes")
+    first = min(e["t"] for t in ("B", "C") for e in fleet.log(t) if e["op"] == "add" and e["t"] > t_kill)
+    print(f"\nSIGKILL failover: the first write acked {first - t_kill:.2f} s after the kill; "
+          f"B and C finished {took:.1f} s after it; {len(adds)} acked writes, {len(deletes)} acked deletes")
     return adds, deletes
 
 
