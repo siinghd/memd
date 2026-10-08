@@ -1148,7 +1148,10 @@ What the numbers do not show:
 
 - memd finds the neighbours of a turn with two seeks on the
   `ix_rec_session_t` index (`scope_session`, `kind`, `t_event`). Thus the
-  cost does not increase with the length of a session. The first open of
+  cost does not increase with the length of a session. Turns that share
+  one timestamp (for example, a session imported with one date) are also
+  found by a seek: a 20,000-turn session with one timestamp has a median
+  default search of 21 ms. The first open of
   an existing namespace builds this index (0.1 s for 50,000 records).
 - The SLO bench has two retrieval targets. Retrieval with a 2K flat pack
   must have a median of 20 ms or less (measured: 18 ms on this host). A

@@ -82,3 +82,34 @@ def test_session_packing_cost_does_not_grow_with_the_session(big):
     finally:
         tracemalloc.stop()
     assert peak < 8 * 2 ** 20, peak  # ~0.5 MB; the whole-session read held every turn id
+
+
+def test_neighbours_of_turns_that_share_one_timestamp_are_the_adjacent_rows(tmp_path):
+    # a session imported with one date per session: every turn has the same
+    # t_event. The neighbours are then the rowid-adjacent turns, and each is
+    # found by a seek on (session, kind, t_event, rowid), not a walk over the
+    # turns that share the timestamp.
+    m = Memory(str(tmp_path / "d"), config={"embedder": "hash", "rate_max_writes": 10**9})
+    try:
+        evs = [{"role": "user", "content": f"turn {i}", "t_event": T0,
+                "session_id": "same", "user_id": "u"} for i in range(3000)]
+        for i in range(0, len(evs), 1000):
+            m.add_events(evs[i:i + 1000])
+        m.flush()
+        ix = m.ns.index
+        with ix._read() as c:
+            rows = c.execute("SELECT id, rowid FROM records WHERE scope_session = 'same' "
+                             "AND kind = 'raw_event' ORDER BY rowid").fetchall()
+        mid = rows[1500]
+        got = ix.adjacent_turns([(mid[0], "same", T0, mid[1])], IndexFilter())
+        assert [r for _, r in got[mid[0]]] == [rows[1499][1], rows[1501][1]]
+        args: list = []
+        filt = ix._filter_where(IndexFilter(), args)
+        with ix._read() as c:
+            plan = " ".join(str(r[-1]) for r in c.execute(
+                "EXPLAIN QUERY PLAN SELECT id, rowid FROM records INDEXED BY ix_rec_session_t "
+                "WHERE scope_session = ? AND kind = 'raw_event' AND t_event = ? "
+                f"AND rowid < ? AND {filt} ORDER BY rowid DESC LIMIT 1", ["same", T0, mid[1], *args]))
+        assert "rowid<?" in plan.replace(" ", "") and "TEMP B-TREE" not in plan, plan
+    finally:
+        m.close()

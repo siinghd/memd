@@ -1442,18 +1442,29 @@ class NamespaceIndex:
         filt = self._filter_where(f, fargs)
         # INDEXED BY: with no table statistics the planner may take another
         # index (kind, validity) - a walk over every raw turn in the namespace
-        base = ("SELECT id, rowid FROM records INDEXED BY ix_rec_session_t "  # nosec B608
-                "WHERE scope_session = ? AND kind = 'raw_event' AND t_event {cmp}= ? "
-                f"AND (t_event {{cmp}} ? OR rowid {{cmp}} ?) AND {filt} "
-                "ORDER BY t_event {order}, rowid {order} LIMIT 1")
-        prev, nxt = base.format(cmp="<", order="DESC"), base.format(cmp=">", order="ASC")
+        # Two seeks per direction. A combined "t_event <= ? AND (t_event < ?
+        # OR rowid < ?)" range seeks on t_event only and then walks every turn
+        # that shares the anchor's timestamp (a session imported with one date
+        # per session has thousands). The index ends in the rowid, so a turn
+        # with the SAME t_event is one seek on (session, kind, t_event, rowid);
+        # only when there is none, the strictly earlier/later t_event is.
+        same = ("SELECT id, rowid FROM records INDEXED BY ix_rec_session_t "  # nosec B608
+                "WHERE scope_session = ? AND kind = 'raw_event' AND t_event = ? "
+                f"AND rowid {{cmp}} ? AND {filt} ORDER BY rowid {{order}} LIMIT 1")
+        other = ("SELECT id, rowid FROM records INDEXED BY ix_rec_session_t "  # nosec B608
+                 "WHERE scope_session = ? AND kind = 'raw_event' AND t_event {cmp} ? "
+                 f"AND {filt} ORDER BY t_event {{order}}, rowid {{order}} LIMIT 1")
+        steps = [(same.format(cmp=c, order=o), other.format(cmp=c, order=o))
+                 for c, o in (("<", "DESC"), (">", "ASC"))]
         with self._read() as _c:
             cur = _c.cursor()
             cur.row_factory = None  # plain tuples: these rows are never read by name
             for aid, sess, t, rowid in todo:
                 got = []
-                for sql in (prev, nxt):
-                    r = cur.execute(sql, [sess, t, t, rowid, *fargs]).fetchone()
+                for same_sql, other_sql in steps:
+                    r = cur.execute(same_sql, [sess, t, rowid, *fargs]).fetchone()
+                    if r is None:
+                        r = cur.execute(other_sql, [sess, t, *fargs]).fetchone()
                     if r is not None:
                         got.append((r[0], int(r[1])))
                 out[aid] = got
