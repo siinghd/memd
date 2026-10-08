@@ -336,3 +336,25 @@ def test_session_turns_agree_with_session_neighbours(tmp_path):
             for r in recs:
                 want = [(x.id, npos[x.id]) for x in nb.get(r.id, [])]
                 assert ix.adjacent(turns[r.scope.session], r.time.t_event, pos[r.id]) == want
+
+
+def test_replaced_evidence_does_not_return_as_a_neighbour(tmp_path):
+    """a turn demoted by a newer fact (its old value superseded) is left out
+    of the session layout, as the flat layout leaves it out"""
+    with _mem(tmp_path) as m:
+        m.add_events([{"content": "hello there", "user_id": "u1", "session_id": "s1", "t_event": T0},
+                      {"content": "I live in Paris", "user_id": "u1", "session_id": "s1", "t_event": T0 + 1},
+                      {"content": "nice, Paris is lovely", "role": "assistant", "user_id": "u1",
+                       "session_id": "s1", "t_event": T0 + 2}])
+        m.close_session("s1", user_id="u1")
+        m.add_events([{"content": "I live in Berlin now", "user_id": "u1", "session_id": "s2",
+                       "t_event": T0 + 86_400_000},
+                      {"content": "ok, Berlin", "role": "assistant", "user_id": "u1", "session_id": "s2",
+                       "t_event": T0 + 86_400_001}])
+        m.close_session("s2", user_id="u1")
+        q = "where does the user live, Paris or Berlin? hello"
+        flat = m.search(q, user_id="u1", packing="flat").packed_context
+        sess = m.search(q, user_id="u1").packed_context
+        assert "I live in Paris" not in flat
+        assert "I live in Paris" not in sess and "I live in Berlin now" in sess
+        assert "user: hello there\n[...]\nassistant: nice, Paris is lovely" in sess  # the gap says a turn is left out

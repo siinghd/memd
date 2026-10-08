@@ -8,8 +8,11 @@ Two layouts of the same ranked candidates (Memory config `packing`):
     candidate, in rank order
 
 Rules:
-  - dedupe by lineage: never pack a fact AND the raw record it was extracted
-    from (evidence counted once)
+  - evidence counted once: the flat layout never packs a fact AND the raw
+    record it was extracted from; the session layout shows the fact under
+    that record, never the record twice. Raw records demoted by a newer
+    fact (fact.meta.demotes: the source of a superseded value) are packed
+    in neither layout, as a hit or as a neighbour
   - order by relevance x recency x trust on the exact score, recency
     measured against as_of or the newest candidate (never the wall clock),
     ties broken by t_event then a content hash - identical data always packs
@@ -549,6 +552,9 @@ def pack_sessions(
     ("yesterday [= Fri 2023-05-19]"). Record and session ids are never
     rendered; untrusted content is fenced as data, as in the flat layout."""
     header = SESSIONS_HEADER_DATES if resolve_dates else SESSIONS_HEADER
+    # a turn a candidate fact demotes (the source of the value it replaced)
+    # is not brought back as a neighbour; rank_for_packing left it out as a hit
+    _lineage, demoted = _lineage_sets(it.record for _, it in ranked)
     lay = _Layout(header)
     items: list[PackedItem] = []
     truncated = False
@@ -585,7 +591,7 @@ def pack_sessions(
                 if lay.link(a, nb.get(a.id, []), pos):
                     alone = None  # measured before adjacency was learnt
                 for x in nb.get(a.id, []):
-                    if x.id not in seen and x.id not in lay.rows:
+                    if x.id not in seen and x.id not in lay.rows and x.id not in demoted:
                         seen.add(x.id)
                         unit.append(_Row(x, pos.get(x.id, 0), _turn_line(x, NEIGHBOUR_CHARS, "", resolve_dates)))
         for rows in ((unit, full) if len(unit) > len(full) else (full,)):
