@@ -1387,8 +1387,8 @@ class NamespaceIndex:
 
     def session_turns(self, sessions: list[str], f: IndexFilter) -> dict[str, list[tuple[int, int, str]]]:
         """The raw turns of each session that satisfy `f` in SQL, as sorted
-        [(t_event, rowid, id)] - session order, the one session_neighbours
-        walks - in one statement per 200 sessions, ids only (hydrate with
+        [(t_event, rowid, id)] - the session order session_neighbours walks -
+        in one statement per 200 sessions, ids only (hydrate with
         get_visible, the Python twin of the filter, before use)."""
         out: dict[str, list[tuple[int, int, str]]] = {s: [] for s in sessions}
         if not sessions or self._closed:
@@ -1396,12 +1396,17 @@ class NamespaceIndex:
         fargs: list = []
         filt = self._filter_where(f, fargs)
         with self._read() as _c:
+            cur = _c.cursor()
+            cur.row_factory = None  # plain tuples: these rows are never read by name
             for i in range(0, len(sessions), 200):
                 chunk = sessions[i:i + 200]
-                sql = (f"SELECT scope_session, t_event, rowid, id FROM records "  # nosec B608
+                # INDEXED BY: with no table statistics the planner takes the
+                # one-column kind index for an IN list of sessions - a scan
+                # of every raw turn in the namespace
+                sql = (f"SELECT scope_session, t_event, rowid, id FROM records INDEXED BY ix_rec_session "  # nosec B608
                        f"WHERE scope_session IN ({','.join('?' * len(chunk))}) AND kind = 'raw_event' AND {filt}")
-                for r in _c.execute(sql, [*chunk, *fargs]):
-                    out[r[0]].append((int(r[1]), int(r[2]), r[3]))
+                for sess, t, rowid, rid in cur.execute(sql, [*chunk, *fargs]):
+                    out[sess].append((int(t), int(rowid), rid))
         for v in out.values():
             v.sort()
         return out

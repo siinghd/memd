@@ -309,3 +309,30 @@ def test_session_packing_cost_stays_small(tmp_path):
                 ts.append(time.perf_counter() - t0)
             best[packing] = min(ts) * 1000
         assert best["sessions"] - best["flat"] < 25, best
+
+
+def test_session_turns_agree_with_session_neighbours(tmp_path):
+    """the index lookups session packing uses give the same radius-1
+    neighbours as session_neighbours: interleaved sessions, tied timestamps,
+    two users on one session id, every scope"""
+    import random
+
+    from memd.core.schema import Scope
+    from memd.index.sqlite_index import IndexFilter
+
+    rng = random.Random(0)
+    with _mem(tmp_path) as m:
+        m.add_events([{"content": f"turn {i}", "user_id": rng.choice(["u1", "u1", "u2"]),
+                       "session_id": f"s{rng.randint(0, 7)}", "t_event": T0 + rng.randint(0, 30) * 1000,
+                       "role": rng.choice(["user", "assistant"])} for i in range(300)])
+        ix = m.ns.index
+        with ix._read() as c:
+            rows = [tuple(r) for r in c.execute("SELECT id FROM records ORDER BY rowid").fetchall()]
+        for f in (IndexFilter(scope=Scope(user="u1")), IndexFilter(scope=Scope(user="u2")), IndexFilter()):
+            recs = ix.get_visible([r[0] for r in rows], f)
+            pos = ix.rowids([r.id for r in recs])
+            turns = ix.session_turns(sorted({r.scope.session for r in recs}), f)
+            nb, npos = ix.session_neighbours([r.id for r in recs], f, radius=1)
+            for r in recs:
+                want = [(x.id, npos[x.id]) for x in nb.get(r.id, [])]
+                assert ix.adjacent(turns[r.scope.session], r.time.t_event, pos[r.id]) == want

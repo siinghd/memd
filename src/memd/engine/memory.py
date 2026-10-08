@@ -634,8 +634,9 @@ def resolve_pack_resolve_dates(config: dict | None) -> bool:
 
 
 MAX_QUERY_CHARS = 64 * 1024  # embedder-cost guard for engine-side queries
-# session packing reads the neighbouring turns of this many anchors per statement
-_NEIGHBOUR_READ_AHEAD = 16
+# session packing reads the neighbouring turns of this many anchors in its
+# first statement (doubling with each further one)
+_NEIGHBOUR_READ_AHEAD = 4
 # find_ids: a vector-only candidate must beat the median of the sweep's
 # vector sample by this much (see Memory._vector_only_floor); the median is
 # only trusted once the sample has a few points in it
@@ -1513,9 +1514,9 @@ class Memory:
         neighbours = None
         if expand:
             # a unit's neighbours are looked up when it is packed, together
-            # with the next few anchors' in rank order: a small budget reads
-            # little, a big one few statements; rows already in hand
-            # (candidates, sources) are never read again
+            # with the next anchors' in rank order, 4 then 8, 16, ... at a
+            # time: a small budget reads little, a big one few statements;
+            # rows already in hand (candidates, sources) are never read again
             anchors = list(dict.fromkeys(
                 a.id for _, it in ranked
                 for a in ([it.record] if it.record.kind == Kind.RAW_EVENT else sources.get(it.record.id, []))
@@ -1524,12 +1525,14 @@ class Memory:
             turns: dict[str, list[tuple[int, int, str]]] = {}
             adj: dict[str, list[tuple[str, int]]] = {}
             tried: set[str] = set()
+            batch = [_NEIGHBOUR_READ_AHEAD]
 
             def neighbours(ids: list[str]):
                 if any(i not in adj for i in ids):
                     k = min((at[i] for i in ids if i in at), default=len(anchors))
-                    ahead = [known[a] for a in dict.fromkeys([*ids, *anchors[k:k + _NEIGHBOUR_READ_AHEAD]])
+                    ahead = [known[a] for a in dict.fromkeys([*ids, *anchors[k:k + batch[0]]])
                              if a in known and a in positions and a not in adj]
+                    batch[0] = min(batch[0] * 2, 64)
                     need = sorted({a.scope.session for a in ahead if a.scope.session} - set(turns))
                     if need:
                         turns.update(ns.index.session_turns(need, filt))

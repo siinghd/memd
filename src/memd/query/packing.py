@@ -465,12 +465,11 @@ class _Layout:
             length += lens[k] - self.glen.get(k, 0)
         return length, touched, lens
 
-    def fits(self, new_rows: list[_Row], note: tuple[str, str] | None, budget_tokens: int) -> bool:
-        return tokens_for_chars(self.measure(new_rows, note)[0]) <= budget_tokens
-
-    def add(self, new_rows: list[_Row], note: tuple[str, str] | None, budget_tokens: int) -> bool:
-        """Add the rows (and the note) if the whole text then stays within the budget."""
-        length, touched, lens = self.measure(new_rows, note)
+    def add(self, new_rows: list[_Row], note: tuple[str, str] | None, budget_tokens: int,
+            measured=None) -> bool:
+        """Add the rows (and the note) if the whole text then stays within
+        the budget (`measured`: their measure(), when already taken)."""
+        length, touched, lens = measured or self.measure(new_rows, note)
         if tokens_for_chars(length) > budget_tokens:
             return False
         for r in new_rows:
@@ -553,7 +552,8 @@ def pack_sessions(
         full = [_Row(a, pos.get(a.id, 0), _turn_line(a, ANCHOR_CHARS, focus, resolve_dates))
                 for a in anchors if a.id not in lay.rows]
         # neighbours only add text: if the anchors alone do not fit, neither does the unit
-        if not lay.fits(full, note, budget_tokens):
+        alone = lay.measure(full, note)
+        if tokens_for_chars(alone[0]) > budget_tokens:
             truncated = True
             continue
         unit = list(full)
@@ -568,7 +568,7 @@ def pack_sessions(
                         seen.add(x.id)
                         unit.append(_Row(x, pos.get(x.id, 0), _turn_line(x, NEIGHBOUR_CHARS, "", resolve_dates)))
         for rows in ((unit, full) if len(unit) > len(full) else (full,)):
-            if lay.add(rows, note, budget_tokens):
+            if lay.add(rows, note, budget_tokens, alone if rows is full else None):
                 items.append(_packed_item(r, score, it.lanes))
                 n_full = len(full)
                 for i, row in enumerate(rows):
