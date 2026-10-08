@@ -650,9 +650,11 @@ def _sigkill_holder(tmp_path, root: str, config: dict, *, per_worker=None, encry
     # taken it from that one when it closed)
     assert any(d["op"] == "done" and d["holds"] for d in done.values()), done
     assert fleet.acked_adds("B") == fleet.acked_adds("C") == 120
-    first = min(e["t"] for t in ("B", "C") for e in fleet.log(t) if e["op"] == "add" and e["t"] > t_kill)
-    print(f"\nSIGKILL failover: the first write acked {first - t_kill:.2f} s after the kill; "
-          f"B and C finished {took:.1f} s after it; {len(adds)} acked writes, {len(deletes)} acked deletes")
+    # the failover stall: the longest pause in the forwarders' acks around the kill
+    ts = sorted(e["t"] for t in ("B", "C") for e in fleet.log(t) if e["op"] == "add")
+    stall = max(b - a for a, b in zip(ts, ts[1:]) if b > t_kill and a < t_kill + 60)
+    print(f"\nSIGKILL failover: acks paused {stall:.2f} s around the kill; B and C finished "
+          f"{took:.1f} s after it; {len(adds)} acked writes, {len(deletes)} acked deletes")
     return adds, deletes
 
 
