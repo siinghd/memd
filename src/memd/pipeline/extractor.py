@@ -422,16 +422,36 @@ prompt_version={PROMPT_VERSION}"""
         # chunk, which is what the session-wide default would pick
         default_lineage = [next((r.id for r in records if self._speaker(r) == "user"), records[0].id)]
         out = []
+        malformed = 0
         for item in arr:
-            if not isinstance(item, dict):
+            # one bad item is dropped and counted; the reply's other facts stay
+            content = item.get("content") if isinstance(item, dict) else None
+            ekeys = _str_list(item.get("entity_keys")) if isinstance(item, dict) else None
+            lin = _str_list(item.get("lineage")) if isinstance(item, dict) else None
+            if not isinstance(content, str) or not content.strip() or ekeys is None or lin is None:
+                malformed += 1
                 continue
-            content = str(item.get("content", "")).strip()
-            if not content:
-                continue
-            ekeys = [normalize_entity_key(k) for k in item.get("entity_keys", []) if k]
-            lin = [x for x in item.get("lineage") or [] if x in id_set]
-            out.append(ExtractedFact(content=content, entity_keys=ekeys, lineage=lin or default_lineage))
+            ekeys = [normalize_entity_key(k) for k in ekeys if k.strip()]
+            lin = [x for x in lin if x in id_set]
+            out.append(ExtractedFact(content=content.strip(), entity_keys=ekeys, lineage=lin or default_lineage))
+        if malformed:
+            from memd.metrics import METRICS
+
+            METRICS.inc("memd_extraction_items_malformed_total", malformed, model=self.model,
+                        help="items of an extraction reply dropped as malformed (the reply's other facts kept)")
         return out
+
+
+def _str_list(v) -> list[str] | None:
+    """A reply's list-of-strings field: null is empty, one string is one
+    entry; anything else is None (malformed)."""
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [v]
+    if isinstance(v, list) and all(isinstance(x, str) for x in v):
+        return v
+    return None
 
 
 def _failure_reason(exc: BaseException) -> str:

@@ -77,7 +77,11 @@ wrong, how it showed, and the numbers before and after where it has them.
   `memd_extraction_chunks_failed_total{model, reason}`, never retried, and
   its turns go through the pattern extractor instead; `close_session`
   returns `extraction_errors` and audits `extraction_degraded` with the
-  reasons. The raw lane was never affected.
+  reasons. The raw lane was never affected. Within a reply, one malformed
+  item (a `lineage` of 5, `entity_keys` of `[123]`) failed the whole call;
+  it is now dropped and counted (`memd_extraction_items_malformed_total`)
+  and the reply's other facts are kept; `entity_keys` or `lineage` given as
+  one string is one entry, not its characters.
 
 ## [0.4.0] - 2026-10-01
 

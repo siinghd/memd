@@ -694,7 +694,10 @@ an env key off.
   `transport`, `timeout`, `truncated`, `empty`, `oversize`, `malformed`), and
   `close_session` returns `extraction_errors` (the number of failed calls)
   and `raw_failed` (their turns), and audits `extraction_degraded` with the
-  reasons. The raw turns are stored either way.
+  reasons. The raw turns are stored either way. Within a reply that parses,
+  a malformed item (no text, or `entity_keys` / `lineage` not a string or a
+  list of strings) is dropped and counted as
+  `memd_extraction_items_malformed_total{model}`; its other facts are kept.
 - **Privacy: with the LLM extractor active, every closed session's raw
   turns are sent to the extraction provider** (see SECURITY.md).
 

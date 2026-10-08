@@ -593,3 +593,33 @@ def test_a_fact_without_valid_lineage_is_traced_to_its_own_chunk(provider, linea
     # chunk 1 = r1, r2; chunk 2 = r3, r4 (its first user turn); chunk 3 = r5
     # (no user turn: its first turn)
     assert [f.lineage for f in out] == [["r1"], ["r4"], ["r5"]]
+
+
+def _malformed_items() -> float:
+    from memd.metrics import METRICS
+
+    return sum(x["value"] for x in METRICS.snapshot()["counters"].get("memd_extraction_items_malformed_total", []))
+
+
+def test_one_bad_item_never_fails_the_call(provider):
+    items = [
+        {"content": "u1 works at Initech", "entity_keys": ["user.employer"], "lineage": ["r1"]},
+        {"content": "bad lineage", "lineage": 5},
+        {"content": "bad keys", "entity_keys": [123]},
+        {"content": "bad lineage item", "lineage": [{"id": "r1"}]},
+        {"content": {"text": "not a string"}},
+        "not an object",
+        {"content": "   "},
+        {"content": "a string key", "entity_keys": "user.pref.editor", "lineage": "r1"},
+        {"content": "null fields", "entity_keys": None, "lineage": None},
+    ]
+    provider.reply = lambda body: _chat(json.dumps(items))
+    before = _malformed_items()
+    out = _llm(provider).extract([_rec("I work at Initech", "r1")])
+    assert out.errors == [], "the call succeeded: its valid facts are kept, no fallback"
+    assert [(f.content, f.entity_keys, f.lineage) for f in out] == [
+        ("u1 works at Initech", ["user.employer"], ["r1"]),
+        ("a string key", ["user.pref.editor"], ["r1"]),
+        ("null fields", [], ["r1"]),
+    ]
+    assert _malformed_items() == before + 6
