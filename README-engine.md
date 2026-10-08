@@ -33,7 +33,7 @@ recall works (`scripts/ten_minute_test.sh` proves it from a fresh directory).
 ### 1. Embedded (a library, no server)
 Nothing to start. `Memory("./my-data")` opens the directory; see the snippet
 above. Other processes may open it too: each namespace is written by one of
-them at a time ([several processes on one data root](#several-processes-on-one-data-root)).
+them at a time (see "Several processes on one data root" below).
 
 ### 2. REST server
 ```bash
