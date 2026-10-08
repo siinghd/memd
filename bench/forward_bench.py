@@ -111,8 +111,9 @@ def main() -> None:
         root = os.path.join(tmp, "data")
     results = {}
     try:
-        # 1. this process holds the namespace
-        mem = Memory(root, namespace=NS, config=dict(cfg, local_dir=os.path.join(tmp, "local-a")))
+        # 1. this process holds the namespace (S3: with the local dir - and
+        # the data key - the holder process uses next)
+        mem = Memory(root, namespace=NS, config=dict(cfg, local_dir=os.path.join(tmp, "local-h")))
         results["local"] = row(mem, args.n, args.seconds, "local")
         mem.close()
         # 2. another process holds it; this one forwards
