@@ -39,8 +39,10 @@ def bench_writes(mem: Memory, n: int = 500) -> dict:
 TOPICS = ["standup", "refactor", "deploy", "cache", "auth", "lint"]
 
 
-def bench_retrieval(mem: Memory, queries: int = 200, corpus_n: int = 3000) -> dict:
-    """Warm retrieval: the NAMESPACE is warm, not the query.
+def bench_retrieval(mem: Memory, queries: int = 200, corpus_n: int = 3000, **search_kw) -> dict:
+    """Warm retrieval: the NAMESPACE is warm, not the query. `search_kw`:
+    the search's budget and layout; none = the defaults a caller gets
+    (12,000 tokens, session packing), which the SLO is graded on.
 
     Two measurement defects fixed here, both of which made this gate grade
     something other than retrieval:
@@ -63,13 +65,13 @@ def bench_retrieval(mem: Memory, queries: int = 200, corpus_n: int = 3000) -> di
         n = (i * step) % corpus_n
         q = f"{TOPICS[i % len(TOPICS)]} session discussed follow ups number {n}"
         t0 = time.monotonic()
-        mem.search(q, user_id="bench", budget_tokens=2000)
+        mem.search(q, user_id="bench", **search_kw)
         lat.append((time.monotonic() - t0) * 1000)
     hits = []
     warm_q = f"{TOPICS[0]} session discussed follow ups number 0"
     for _ in range(50):
         t0 = time.monotonic()
-        mem.search(warm_q, user_id="bench", budget_tokens=2000)
+        mem.search(warm_q, user_id="bench", **search_kw)
         hits.append((time.monotonic() - t0) * 1000)
     return {"n": queries, "p50": round(pctl(lat, .5), 3), "p95": round(pctl(lat, .95), 3),
             "p99": round(pctl(lat, .99), 3),
@@ -110,6 +112,8 @@ def main() -> None:
 
         w = bench_writes(mem, args.writes)
         r = bench_retrieval(mem, args.queries, corpus_n=args.events)
+        # the previous defaults, for comparison (not graded)
+        r_old = bench_retrieval(mem, args.queries, corpus_n=args.events, budget_tokens=2000, packing="flat")
 
         # read-your-writes: search immediately after add, no flush allowed
         mem.add("the secret deployment codeword is zanzibar", session_id="ryw", user_id="bench")
@@ -124,6 +128,7 @@ def main() -> None:
             "slo_targets": {"write_p99_ms": 10, "retrieve_p50_ms": 20, "retrieve_p99_ms": 100},
             "write_ack": w,
             "retrieval": r,
+            "retrieval_2k_flat": r_old,
             "read_your_writes": {"found": True, "latency_ms": round(ryw_ms, 3)},
             "cold_open": c,
             "pass": {

@@ -540,6 +540,17 @@ class _Layout:
         return "\n".join(out)
 
 
+def _upper_bound(lay: _Layout, rows: list[_Row], note: tuple[str, str] | None) -> int:
+    """At least what adding `rows` (and the note) can add to the text: each
+    row its line and notes plus two gap markers, each new session a header
+    and a wider number."""
+    n = sum(1 + len(r.line) + sum(1 + len(x) for x in r.notes) + 2 * (1 + len(_GAP)) for r in rows)
+    if note is not None:
+        n += 1 + len(note[1])
+    new = len({_session_key(r.rec) for r in rows} - set(lay.groups))
+    return n + new * (_SESSION_FIXED + len(_NO_DATE) + len(str(len(lay.groups) + new)))
+
+
 Neighbours = Callable[[list[str]], "tuple[dict[str, list[MemoryRecord]], dict[str, int]]"]
 
 
@@ -598,11 +609,15 @@ def pack_sessions(
             note, focus = (anchors[0].id, _memory_line(r, said_by=anchors[0])), r.content
         full = [_turn_row(a, pos.get(a.id, 0), ANCHOR_CHARS, focus, resolve_dates)
                 for a in anchors if a.id not in lay.rows]
-        # neighbours only add text: if the anchors alone do not fit, neither does the unit
-        alone = lay.measure(full, note)
-        if tokens_for_chars(alone[0]) > budget_tokens:
-            truncated = True
-            continue
+        # neighbours only add text: if the anchors alone do not fit, neither
+        # does the unit (and its neighbours are never read). Measured exactly
+        # only when an upper bound on what they add leaves the budget in doubt.
+        alone = None
+        if tokens_for_chars(lay.length + _upper_bound(lay, full, note)) > budget_tokens:
+            alone = lay.measure(full, note)
+            if tokens_for_chars(alone[0]) > budget_tokens:
+                truncated = True
+                continue
         unit = list(full)
         if neighbours is not None:
             nb, npos = neighbours([a.id for a in anchors])
