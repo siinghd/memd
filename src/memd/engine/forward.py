@@ -436,6 +436,14 @@ class ForwardServer:
         self._conns: set[socket.socket] = set()
         self._inflight = 0
         self._slots = threading.BoundedSemaphore(max(1, int(cfg.max_inflight)))
+        # Calls run on these threads, never on a connection's own: a thread
+        # that reads an index keeps a SQLite connection of its own until the
+        # index closes, so a thread per connection kept two descriptors per
+        # connection for good. At most max_inflight, created as needed, reused.
+        from concurrent.futures import ThreadPoolExecutor
+
+        self._pool = ThreadPoolExecutor(max_workers=max(1, int(cfg.max_inflight)),
+                                        thread_name_prefix="memd-forward-call")
         self._done: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
         self._running: dict[str, threading.Event] = {}
         self._closing = False
@@ -470,6 +478,7 @@ class ForwardServer:
                 pass
         if self._thread is not None and self._thread is not threading.current_thread():
             self._thread.join(timeout=5)
+        self._pool.shutdown(wait=False)
 
     # ------------------------------------------------------------ connections
 
@@ -628,7 +637,13 @@ class ForwardServer:
         t0 = time.monotonic()
         streaming = False
         try:
-            out = self.handler(op, str(req.get("ns") or ""), req.get("args") or {}, req.get("ids"))
+            try:
+                fut = self._pool.submit(self.handler, op, str(req.get("ns") or ""),
+                                        req.get("args") or {}, req.get("ids"))
+            except RuntimeError:            # shut down meanwhile: closing
+                return {"ok": False, "error": {"code": "not_owner", "retry": True,
+                                               "message": "the holder is closing"}}
+            out = fut.result()
             if isinstance(out, _Stream):
                 streaming = True        # _send_stream ends it
                 return out

@@ -507,6 +507,46 @@ except NamespaceBusyError as e:
         a.close()
 
 
+# ------------------------------------------------------------------ resources
+
+
+def _holder_client(a: Memory, root: str):
+    ep = fw.parse_holder(read_owner_lock(owner_lock_path(a.engine.store.root, NS)))
+    secret = open(os.path.join(root, fw.SECRET_FILE)).read().strip()
+    return ep, fw.ForwardClient(fw.ForwardConfig(), secret, "tester")
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="counts /proc/self/fd")
+def test_reconnecting_callers_do_not_leak_the_holders_descriptors(tmp_path):
+    """Every new forwarded connection ran its calls on a thread of its own,
+    and every thread reading an index keeps a SQLite connection of its own
+    until the index closes: two descriptors per connection, for good - a
+    long-lived forwarder reconnecting after its pool's idle expiry ran the
+    holder out of descriptors. Calls run on a bounded pool of reused threads."""
+    root = str(tmp_path / "d")
+    a = Memory(root, namespace=NS, encrypt=False)
+    try:
+        rid = a.add("read me again and again", user_id="u1")[0]
+        ep, client = _holder_client(a, root)
+        req = {"op": "get", "ns": NS, "args": {"record_id": rid}, "ids": None}
+
+        def reconnecting_calls(n: int) -> None:
+            for _ in range(n):
+                got = client.call(ep, dict(req, rid=uuid.uuid4().hex), timeout_s=10)
+                assert got["ok"] and got["result"]["id"] == rid
+                client.drop(ep)                     # the next call connects again
+            time.sleep(0.3)                         # their connection threads end
+
+        reconnecting_calls(10)
+        before = len(os.listdir("/proc/self/fd"))
+        reconnecting_calls(150)
+        grew = len(os.listdir("/proc/self/fd")) - before
+        client.close()
+        assert grew < 10, f"the holder kept {grew} more descriptors after 150 reconnects"
+    finally:
+        a.close()
+
+
 # ------------------------------------------------------------------ idempotency
 
 
