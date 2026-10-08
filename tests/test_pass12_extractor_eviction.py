@@ -11,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from memd.core.schema import MemoryRecord, Scope, Source
-from memd.pipeline.extractor import LLMExtractor
+from memd.pipeline.extractor import HeuristicExtractor, LLMExtractor
 from memd.storage.engine import StorageEngine
 
 
@@ -82,7 +82,10 @@ class TestLLMExtractorChunking:
                 {"message": {"content": "prose without json ]"}}]})
 
         ext = self._extractor(handler)
-        assert ext.extract([_rec(1)]) == []
+        out = ext.extract([_rec(1)])
+        # counted, and the chunk's turns go through the pattern extractor
+        assert out.errors == ["malformed"]
+        assert [f.content for f in out] == [f.content for f in HeuristicExtractor().extract([_rec(1)])]
 
 
 class TestEvictedStoreFailFast:

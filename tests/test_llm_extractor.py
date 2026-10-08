@@ -333,3 +333,109 @@ def test_observed_turns_reach_the_prompt_with_their_roles(provider, tmp_path):
         assert prov["extractor"]["prompt_version"] == "v2"
     finally:
         m.close()
+
+
+# ------------------------------------------------- 5: failures degrade, visibly
+
+
+def _failed(reason: str) -> float:
+    from memd.metrics import METRICS
+
+    return sum(x["value"] for x in METRICS.snapshot()["counters"].get("memd_extraction_chunks_failed_total", [])
+               if x["labels"].get("reason") == reason)
+
+
+_NAMED = "my name is Ada Lovelace"  # the pattern extractor finds a user.name fact
+
+
+def _pattern_facts(out) -> list[list[str]]:
+    return [f.entity_keys for f in out if "Ada Lovelace" in f.content]
+
+
+@pytest.mark.parametrize("reply, reason", [
+    # a reasoning model that spent its output on reasoning: no content at all
+    (_chat("", reasoning="The user said their name is Ada..."), "empty"),
+    (_chat(None, reasoning="..."), "empty"),
+    # the output cap hit mid-answer: the JSON is cut off
+    (_chat('[{"content": "u1 is called Ada", "entity_k', finish_reason="length"), "truncated"),
+    (_chat("", finish_reason="length", reasoning="... (4096 tokens)"), "truncated"),
+    (_chat("Sure! Here are the facts: none really."), "malformed"),
+    ({"error": {"message": "no choices"}}, "malformed"),
+    ((500, {"error": "provider down"}), "http_status"),
+    ((429, {"error": "rate limited"}), "http_status"),
+])
+def test_a_failed_call_is_counted_never_retried_and_falls_back(provider, reply, reason):
+    provider.reply = lambda body: reply
+    before = _failed(reason)
+    out = _llm(provider).extract([_rec(_NAMED)])
+    assert len(provider.requests) == 1, "one call per chunk: a failure is never retried"
+    assert _failed(reason) == before + 1
+    assert out.errors == [reason]
+    assert _pattern_facts(out) == [["user.name"]] and len(out) == 1, "the pattern extractor took over"
+
+
+def test_a_timed_out_call_falls_back(provider):
+    provider.reply = lambda body: _dribble(8.0)
+    before = _failed("timeout")
+    out = _llm(provider, extraction_timeout_s=1).extract([_rec(_NAMED)])
+    assert _failed("timeout") == before + 1
+    assert out.errors == ["timeout"] and len(out) == 1
+
+
+def test_an_unreachable_provider_falls_back():
+    before = _failed("transport")
+    ext = resolve_extractor({"extraction_api_key": "k", "extraction_base_url": "http://127.0.0.1:9/v1"})
+    out = ext.extract([_rec(_NAMED)])
+    assert _failed("transport") == before + 1
+    assert out.errors == ["transport"] and len(out) == 1
+
+
+def test_only_the_failed_chunk_falls_back(provider):
+    def reply(body):
+        if "[r2]" in body["messages"][1]["content"]:
+            return 500, {"error": "provider down"}
+        return _chat(json.dumps([{"content": "llm fact", "entity_keys": ["fact.general"], "lineage": ["r1"]}]))
+
+    provider.reply = reply
+    ext = resolve_extractor({"extraction_api_key": "k", "extraction_base_url": provider.base_url})
+    ext.chunk_records = 1
+    out = ext.extract([_rec("I work at Initech", "r1"), _rec(_NAMED, "r2")])
+    assert [f.content for f in out if f.lineage == ["r1"]] == ["llm fact"]
+    assert _pattern_facts(out) == [["user.name"]] and len(out) == 2
+    assert out.errors == ["http_status"]
+
+
+def test_close_session_reports_failed_extraction_calls(provider, tmp_path):
+    from memd.engine.memory import Memory
+
+    provider.reply = lambda body: _chat("", reasoning="...")
+    m = Memory(str(tmp_path / "d"), config={"extraction_api_key": "k", "extraction_base_url": provider.base_url})
+    try:
+        m.add(_NAMED, session_id="s1", user_id="u1")
+        res = m.close_session("s1")
+        assert res["extraction_errors"] == 1
+        assert res["facts_written"] == 1, "the pattern extractor's fact is written"
+        m.add("I work at Initech", session_id="s2", user_id="u1")
+        provider.reply = lambda body: _chat("[]")
+        assert m.close_session("s2")["extraction_errors"] == 0
+        m.flush()
+        events = [e for e in m.audit.read() if e["action"] == "extraction_degraded"]
+        assert len(events) == 1 and events[0]["target"] == "s1"
+        assert events[0]["detail"]["reasons"] == ["empty"]
+    finally:
+        m.close()
+
+
+def test_close_session_reports_an_extractor_that_raised(tmp_path):
+    from unittest import mock
+
+    from memd.engine.memory import Memory
+
+    m = Memory(str(tmp_path / "d"))
+    try:
+        m.add("probe", session_id="s1", user_id="u1")
+        with mock.patch.object(m.extractor, "extract", side_effect=RuntimeError("boom")):
+            res = m.close_session("s1")
+        assert res["extraction_errors"] == 1 and res["facts_extracted"] == 0
+    finally:
+        m.close()

@@ -27,7 +27,7 @@ from memd.core.schema import MemoryRecord, Source
 
 PROMPT_VERSION = "v2"
 DEFAULT_MAX_TOKENS = 4096   # output tokens per extraction call
-DEFAULT_TIMEOUT_S = 120.0   # the longest one extraction call may take
+DEFAULT_TIMEOUT_S = 120.0   # an extraction call is cut off after this (LLMExtractor._complete)
 
 
 @dataclass
@@ -35,6 +35,24 @@ class ExtractedFact:
     content: str
     entity_keys: list[str] = field(default_factory=list)
     lineage: list[str] = field(default_factory=list)
+
+
+class Extraction(list):
+    """The facts of one extract() call, plus `errors`: the reason of each
+    provider call that failed (its turns went through the pattern
+    extractor instead). An extractor that returns a plain list had none."""
+
+    def __init__(self, facts=(), errors=()):
+        super().__init__(facts)
+        self.errors: list[str] = list(errors)
+
+
+class ExtractionError(Exception):
+    """A provider reply with no usable facts; `reason` is a metric label."""
+
+    def __init__(self, reason: str, detail: str = ""):
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason = reason
 
 
 def normalize_entity_key(key: str) -> str:
@@ -225,7 +243,7 @@ prompt_version={PROMPT_VERSION}"""
     def __init__(self, model: str, api_key: str, base_url: str = "https://api.openai.com/v1",
                  chunk_records: int = 40, chunk_chars: int = 24_000,
                  max_tokens: int = DEFAULT_MAX_TOKENS, timeout_s: float = DEFAULT_TIMEOUT_S,
-                 request_options: dict | None = None):
+                 request_options: dict | str | None = None):
         import httpx
 
         self.model = model
@@ -241,6 +259,7 @@ prompt_version={PROMPT_VERSION}"""
         self.request_options = _request_options(request_options or {})
         self.chunks_sent = 0
         self._client = httpx.Client(timeout=self.timeout_s)
+        self._fallback = HeuristicExtractor()
 
     def _chunks(self, records: list[MemoryRecord]):
         """Bounded request chunks: a session can carry up to 1000 rows x
@@ -259,22 +278,26 @@ prompt_version={PROMPT_VERSION}"""
         if buf:
             yield buf
 
-    def extract(self, records: list[MemoryRecord]) -> list[ExtractedFact]:
+    def extract(self, records: list[MemoryRecord]) -> Extraction:
         """Chunked extraction with per-chunk failure isolation: one bad
-        chunk (provider hiccup, malformed output) degrades THIS chunk only -
-        previously a single failure discarded every fact of the session."""
+        chunk (provider error, timeout, an empty, cut-off or malformed
+        reply) degrades THIS chunk only. Its turns go through the pattern
+        extractor instead - previously its facts were dropped, a malformed
+        reply without even a count - and the failure is counted by reason
+        and listed in the result's `errors`. A call is never retried."""
         from memd.metrics import METRICS
 
-        if not records:
-            return []
-        out: list[ExtractedFact] = []
+        out = Extraction()
         for chunk in self._chunks(records):
             self.chunks_sent += 1
             try:
                 out.extend(self._extract_chunk(chunk))
-            except Exception:
-                METRICS.inc("memd_extraction_chunks_failed_total", model=self.model,
-                            help="extraction chunks lost to provider errors")
+            except Exception as ex:
+                reason = _failure_reason(ex)
+                out.errors.append(reason)
+                METRICS.inc("memd_extraction_chunks_failed_total", model=self.model, reason=reason,
+                            help="extraction calls that failed (their turns went through the pattern extractor)")
+                out.extend(self._fallback.extract(chunk))
         return out
 
     def _extract_chunk(self, records: list[MemoryRecord]) -> list[ExtractedFact]:
@@ -295,7 +318,21 @@ prompt_version={PROMPT_VERSION}"""
                 body.pop(k, None)
             else:
                 body[k] = v
-        text = self._complete(body)["choices"][0]["message"]["content"]
+        reply = self._complete(body)
+        try:
+            choice = reply["choices"][0]
+            text = choice["message"].get("content")
+        except (KeyError, IndexError, TypeError, AttributeError):
+            raise ExtractionError("malformed", "no choices[0].message in the reply") from None
+        if choice.get("finish_reason") == "length":
+            # the output cap hit mid-answer, or a reasoning model spent it
+            # all on reasoning: whatever JSON there is is cut off
+            raise ExtractionError("truncated", f"the reply reached max_tokens ({self.max_tokens})")
+        if text is None or (isinstance(text, str) and not text.strip()):
+            # a reasoning model can answer with its reasoning only
+            raise ExtractionError("empty", "the reply has no content")
+        if not isinstance(text, str):
+            raise ExtractionError("malformed", f"content is a {type(text).__name__}")
         return self._parse(text, records)
 
     @staticmethod
@@ -308,10 +345,11 @@ prompt_version={PROMPT_VERSION}"""
         return f"[{rec.id}] {c['date']} {c['role']}: {rec.content}"
 
     def _complete(self, body: dict) -> dict:
-        """One provider call, at most timeout_s long. The client's timeout
-        cuts off a provider silent for that long; the deadline cuts off one
-        that keeps the connection alive with whitespace while the model
-        generates (OpenRouter does), since every byte resets a read timeout."""
+        """One provider call, bounded by timeout_s. The deadline cuts off a
+        call still receiving after timeout_s - a provider that keeps the
+        connection alive with whitespace while the model generates (OpenRouter
+        does) resets a read timeout with every byte - and the client's
+        timeout one that sends nothing for timeout_s."""
         deadline = time.monotonic() + self.timeout_s
         buf = bytearray()
         with self._client.stream("POST", f"{self.base_url}/chat/completions",
@@ -328,8 +366,8 @@ prompt_version={PROMPT_VERSION}"""
         try:
             start, end = text.find("["), text.rfind("]")
             arr = json.loads(text[start : end + 1])
-        except Exception:
-            return []
+        except ValueError:
+            raise ExtractionError("malformed", "no JSON array in the reply") from None
         id_set = {r.id for r in records}
         out = []
         for item in arr:
@@ -342,6 +380,23 @@ prompt_version={PROMPT_VERSION}"""
             lin = [x for x in item.get("lineage", []) if x in id_set]
             out.append(ExtractedFact(content=content, entity_keys=ekeys, lineage=lin))
         return out
+
+
+def _failure_reason(exc: BaseException) -> str:
+    """Bounded label set for memd_extraction_chunks_failed_total{reason}."""
+    import httpx
+
+    if isinstance(exc, ExtractionError):
+        return exc.reason
+    if isinstance(exc, (TimeoutError, httpx.TimeoutException)):
+        return "timeout"
+    if isinstance(exc, httpx.HTTPStatusError):
+        return "http_status"
+    if isinstance(exc, httpx.TransportError):
+        return "transport"
+    if isinstance(exc, ValueError):
+        return "malformed"  # the reply body is not JSON
+    return "error"
 
 
 def extraction_setting(cfg: dict, key: str, default=None):
@@ -364,7 +419,7 @@ def resolve_extractor(config: dict | None = None) -> Extractor:
             base_url=extraction_setting(cfg, "extraction_base_url", "https://api.openai.com/v1"),
             max_tokens=_max_tokens(extraction_setting(cfg, "extraction_max_tokens", DEFAULT_MAX_TOKENS)),
             timeout_s=_timeout_s(extraction_setting(cfg, "extraction_timeout_s", DEFAULT_TIMEOUT_S)),
-            request_options=_request_options(extraction_setting(cfg, "extraction_request_options", {})),
+            request_options=extraction_setting(cfg, "extraction_request_options"),
         )
     return HeuristicExtractor()
 

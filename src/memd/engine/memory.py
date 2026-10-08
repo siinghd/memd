@@ -1591,7 +1591,11 @@ class Memory:
         `raw_skipped`), and at most `max_facts` facts are written
         (`facts_capped`); a callable `max_facts` is asked, once extraction
         finished, how many of the n extracted facts may be written. The raw
-        lane is never touched by either."""
+        lane is never touched by either.
+
+        `extraction_errors` counts the extraction calls that failed: the LLM
+        extractor's turns of a failed call go through the pattern extractor
+        instead; an extractor that raised outright counts 1 and adds none."""
         impl = self._hosted()
         if impl is not None:
             return impl.close_session(session_id, user_id=user_id, namespace=namespace)
@@ -1606,6 +1610,13 @@ class Memory:
         to_extract = seg_records if extract_limit is None else seg_records[:max(0, int(extract_limit))]
         try:
             extracted = self.extractor.extract(to_extract) if to_extract else []
+            # provider calls that failed (LLM extractor): their turns went
+            # through the pattern extractor instead - reported, not silent
+            extraction_errors = list(getattr(extracted, "errors", None) or [])
+            if extraction_errors:
+                self._audit_for(ns.namespace).append(
+                    actor="system", action="extraction_degraded", target=session_id,
+                    detail={"failed_calls": len(extraction_errors), "reasons": sorted(set(extraction_errors))})
         except Exception as ex:
             # extraction is a REBUILDABLE derived index (raw lane is truth):
             # an extractor outage must never block the session boundary or
@@ -1614,6 +1625,7 @@ class Memory:
             self._audit_for(ns.namespace).append(actor="system", action="extraction_failed",
                               target=session_id, detail={"error": str(ex)[:200]})
             extracted = []
+            extraction_errors = ["error"]
         facts_capped = 0
         if callable(max_facts):
             max_facts = max_facts(len(extracted))
@@ -1646,6 +1658,7 @@ class Memory:
             "raw_considered": len(to_extract),
             "raw_skipped": len(seg_records) - len(to_extract),
             "facts_extracted": len(extracted),
+            "extraction_errors": len(extraction_errors),
             "facts_capped": facts_capped,
             "facts_written": facts_written,
             "superseded": len(consolidation.superseded_pairs),
