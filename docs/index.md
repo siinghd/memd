@@ -37,14 +37,22 @@ print(mem.search("how do we deploy?", user_id="u1").packed_context)
 
 Honest limits:
 
-- **One writer per namespace.** A second process on the same namespace
-  forwards its writes (and strong reads) to the process holding it - a hop,
-  not more write capacity; scale writes by spreading namespaces across
-  processes. Several writers inside one namespace are not built; reads can
-  scale out with read replicas, which serve eventually consistent reads
-  (opt-in, within a staleness bound).
-- **Fact extraction is pattern-based by default.** An LLM extractor is
-  available with your own key; it has not been evaluated.
+- **Many processes can use one namespace. One of them writes.** Each
+  process can open the same namespace and write to it. One process (the
+  holder) writes the log. The other processes send their writes and their
+  strong reads to the holder automatically. If the holder stops, another
+  process becomes the holder. Thus, the write capacity of one namespace is
+  the capacity of one process. To get more write capacity, use more
+  namespaces (for example, one namespace for each user or agent). To get
+  more read capacity, use read replicas (opt-in eventual reads, with a
+  staleness limit). memd does not let several processes write one
+  namespace's log at the same time.
+- **Fact extraction uses patterns by default.** An optional LLM extractor
+  uses your own API key. On 30 LongMemEval_S questions it gave no
+  measurable accuracy gain: 0.667 against 0.700 for the pattern extractor
+  (difference -0.033, 95% CI [-0.167, +0.067]). It also makes a session
+  close slower (1.5 s against 0.08 s at the median). A larger evaluation
+  is necessary before we recommend it.
 - **The quality evidence is retrieval on one public dataset.** The
   end-to-end QA numbers are preliminary, and the one-time held-out
   500-question run has not been done ([Benchmarks](benchmarks.md)).
