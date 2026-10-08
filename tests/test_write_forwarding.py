@@ -183,7 +183,8 @@ def _local_raw(root: str):
 
 
 def _open_after(root: str, config: dict, **kw) -> Memory:
-    """The verifier: every worker is gone; a due purge runs at open."""
+    """The namespace opened to check it, once every worker is gone (a due
+    purge runs at open)."""
     time.sleep(0.1)    # past every hard delete's deadline
     m = Memory(root, namespace=NS, config=dict(config, forwarding="off"), **kw)
     m.flush()
