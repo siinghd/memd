@@ -276,3 +276,60 @@ def test_bad_request_options_are_refused(monkeypatch, bad):
     monkeypatch.setenv("MEMD_EXTRACTION_REQUEST_OPTIONS", bad)
     with pytest.raises(ValueError, match="extraction_request_options"):
         resolve_extractor({"extraction_api_key": "k"})
+
+
+# ------------------------------------------------- 4: who said what, and when
+
+_T = 1773480600000  # 2026-03-14T09:30:00Z
+
+
+def _prompt(req) -> tuple[str, str]:
+    system, user = req["body"]["messages"]
+    assert system["role"] == "system" and user["role"] == "user"
+    return system["content"], user["content"]
+
+
+def test_the_prompt_says_who_spoke_and_when(provider):
+    _llm(provider).extract([_rec("I moved to Berlin last week", "r1", "user", _T),
+                            _rec("You should try living in Lisbon", "r2", "assistant", _T + 60_000)])
+    system, user = _prompt(provider.requests[-1])
+    assert "[r1] 2026-03-14T09:30+00:00 user: I moved to Berlin last week" in user
+    assert "[r2] 2026-03-14T09:31+00:00 assistant: You should try living in Lisbon" in user
+    # the instructions explain the speakers, ask for the source turns, and
+    # are a new prompt version
+    assert "assistant" in system and "lineage" in system
+    assert "prompt_version=v2" in system
+
+
+def test_facts_keep_the_turns_they_came_from(provider):
+    provider.reply = lambda body: _chat(json.dumps([
+        {"content": "u1 moved to Berlin", "entity_keys": ["user.city"], "lineage": ["r1", "nope"]}]))
+    (fact,) = _llm(provider).extract([_rec("I moved to Berlin", "r1"),
+                                      _rec("Berlin is lovely", "r2", "assistant")])
+    assert fact.lineage == ["r1"]  # an id not in the chunk is dropped
+
+
+def test_observed_turns_reach_the_prompt_with_their_roles(provider, tmp_path):
+    from memd.engine.memory import Memory
+
+    provider.reply = lambda body: _chat(json.dumps([
+        {"content": "u1 lives in Oslo", "entity_keys": ["user.city"],
+         "lineage": [l[1:].split("]")[0] for l in body["messages"][1]["content"].splitlines()
+                     if " user: " in l]}]))
+    m = Memory(str(tmp_path / "d"), config={"extraction_api_key": "k", "extraction_base_url": provider.base_url})
+    try:
+        # the session opens with an assistant turn: a fact attributed to the
+        # session's first turn instead of its own would be the assistant's
+        m.observe([{"role": "assistant", "content": "Where do you live?"},
+                   {"role": "user", "content": "I live in Oslo"}], "Noted, Oslo it is",
+                  user_id="u1", session_id="s1")
+        assert m.close_session("s1")["facts_written"] == 1
+        _, user = _prompt(provider.requests[-1])
+        assert " user: I live in Oslo" in user
+        assert " assistant: Noted, Oslo it is" in user
+        (fact,) = [i for i in m.search("Oslo", user_id="u1").items if i.kind == "fact"]
+        prov = m.get(fact.id)["provenance"]
+        assert prov["actor_id"].startswith("user:"), "the fact is the user's, not the assistant's"
+        assert prov["extractor"]["prompt_version"] == "v2"
+    finally:
+        m.close()

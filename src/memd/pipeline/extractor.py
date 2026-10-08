@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 
 from memd.core.schema import MemoryRecord, Source
 
-PROMPT_VERSION = "v1"
+PROMPT_VERSION = "v2"
 DEFAULT_MAX_TOKENS = 4096   # output tokens per extraction call
 DEFAULT_TIMEOUT_S = 120.0   # the longest one extraction call may take
 
@@ -203,12 +203,21 @@ class LLMExtractor(Extractor):
     Batched per segment; prompt pinned by PROMPT_VERSION."""
 
     name = "llm"
+    prompt_version = PROMPT_VERSION
 
+    # v2: each turn says who spoke and when, and facts name the turns they
+    # came from (lineage) - v1 sent bare text, so an assistant's suggestion
+    # read like the user's statement and every fact was attributed to the
+    # session's first turn
     _SYSTEM_PROMPT = f"""You extract durable memories from agent conversation segments.
-Return ONLY a JSON array. Each item: {{"content": "<standalone third-person fact>", "entity_keys": ["<dot.separated.key>"]}}.
+Each turn is one line: [<turn id>] <time, UTC> <speaker>: <text>. The speaker is user (the person), assistant (the AI agent), or system/tool.
+Return ONLY a JSON array. Each item: {{"content": "<standalone third-person fact>", "entity_keys": ["<dot.separated.key>"], "lineage": ["<turn id>"]}}.
 Rules:
 - Only stable, reusable facts (identity, preferences, procedures, environment, decisions). No chit-chat.
+- Attribute each fact to who said it. What the user says about themselves is a fact about the user; what the assistant says or suggests is not, unless the user confirms it.
+- Resolve relative dates ("yesterday", "next week") against the turn's time.
 - entity_keys are short normalized keys like user.employer, repo.build_cmd, user.pref.editor.
+- lineage lists the ids of the turns the fact comes from.
 - One fact per distinct assertion; keep the original wording when possible.
 - If nothing qualifies, return [].
 prompt_version={PROMPT_VERSION}"""
@@ -269,7 +278,7 @@ prompt_version={PROMPT_VERSION}"""
         return out
 
     def _extract_chunk(self, records: list[MemoryRecord]) -> list[ExtractedFact]:
-        lines = [f"[{r.id}] {r.content}" for r in records]
+        lines = [self._turn_line(r) for r in records]
         user_msg = "Segment:\n" + "\n".join(lines)
         body = {
             "model": self.model,
@@ -288,6 +297,15 @@ prompt_version={PROMPT_VERSION}"""
                 body[k] = v
         text = self._complete(body)["choices"][0]["message"]["content"]
         return self._parse(text, records)
+
+    @staticmethod
+    def _turn_line(rec: MemoryRecord) -> str:
+        """[id] time speaker: text - when and who as the reranker sees a
+        record (role from the writer's actor id, else the source tier)."""
+        from memd.query.rerank import candidate_from_record
+
+        c = candidate_from_record(rec)
+        return f"[{rec.id}] {c['date']} {c['role']}: {rec.content}"
 
     def _complete(self, body: dict) -> dict:
         """One provider call, at most timeout_s long. The client's timeout
