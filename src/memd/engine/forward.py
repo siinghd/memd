@@ -48,6 +48,7 @@ import random
 import secrets
 import select
 import socket
+import stat
 import struct
 import threading
 import time
@@ -183,19 +184,52 @@ class ForwardConfig:
         return out
 
 
+class ForwardSecretError(PermissionError):
+    """The forwarding secret file is not one this process may trust: a
+    symbolic link, not a regular file, another user's, or open to others."""
+
+
+def _read_secret(path: str) -> bytes | None:
+    """The secret file's content - None when there is none - read without
+    following a symbolic link, and only from a regular file of this
+    process's user that nobody else may read or write (0600 or narrower)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return None
+    except OSError as ex:
+        if os.path.islink(path):
+            raise ForwardSecretError(
+                f"the forwarding secret {path} is a symbolic link: refused") from ex
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ForwardSecretError(f"the forwarding secret {path} is not a regular file: refused")
+        uid = os.getuid() if hasattr(os, "getuid") else st.st_uid
+        if st.st_uid != uid:
+            raise ForwardSecretError(
+                f"the forwarding secret {path} belongs to uid {st.st_uid}, not to this process's "
+                f"user (uid {uid}): refused")
+        if st.st_mode & 0o077:
+            raise ForwardSecretError(
+                f"the forwarding secret {path} has mode {stat.S_IMODE(st.st_mode):04o}: other users "
+                "may read or write it - refused (it must be 0600)")
+        return os.read(fd, 4096).strip()
+    finally:
+        os.close(fd)
+
+
 def load_secret(cfg: ForwardConfig, data_dir: str) -> str:
     """The forwarding secret: the configured one, else `<data_dir>/
-    forward.secret` - created on first use (mode 0600), so every process
-    that can read the data directory shares it."""
+    forward.secret` - created on first use (mode 0600), so every process of
+    the user that can read the data directory shares it. ForwardSecretError
+    when the file is not one to trust (see _read_secret)."""
     if cfg.secret:
         return cfg.secret
     path = os.path.join(data_dir, SECRET_FILE)
     for _ in range(100):
-        try:
-            with open(path, "rb") as f:
-                got = f.read().strip()
-        except FileNotFoundError:
-            got = None
+        got = _read_secret(path)
         if got is not None:
             if len(got) >= 32:
                 return got.decode("ascii", errors="replace")
@@ -218,8 +252,14 @@ def load_secret(cfg: ForwardConfig, data_dir: str) -> str:
             # no hard links here: an exclusive create (a reader may see it
             # empty for a moment - the loop above waits for that)
             try:
-                os.rename(tmp, path) if not os.path.exists(path) else None
-            except OSError:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                             | getattr(os, "O_NOFOLLOW", 0), 0o600)
+                try:
+                    os.write(fd, secrets.token_hex(32).encode())
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except FileExistsError:
                 pass
         finally:
             try:

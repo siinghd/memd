@@ -548,6 +548,32 @@ def test_reconnecting_callers_do_not_leak_the_holders_descriptors(tmp_path):
         a.close()
 
 
+@pytest.mark.parametrize("how", ["symlink", "readable by others"])
+def test_an_untrustworthy_secret_file_is_refused(tmp_path, how, caplog):
+    """The secret was read through a symbolic link, from a file of any
+    owner and mode: whoever could plant one there chose the secret. Such a
+    file is refused - the process runs with forwarding off, and says why."""
+    root = tmp_path / "d"
+    root.mkdir()
+    planted = tmp_path / "planted"
+    planted.write_text("x" * 64)
+    os.chmod(planted, 0o600)
+    if how == "symlink":
+        os.symlink(planted, root / fw.SECRET_FILE)
+    else:
+        os.link(planted, root / fw.SECRET_FILE)
+        os.chmod(planted, 0o644)
+    with caplog.at_level("WARNING", logger="memd"):
+        m = Memory(str(root), namespace=NS, encrypt=False)
+    try:
+        assert m._fwd is None and m._fwd_server is None, "forwarding ran on a planted secret"
+        assert "refused" in caplog.text and fw.SECRET_FILE in caplog.text
+    finally:
+        m.close()
+    with pytest.raises(fw.ForwardSecretError):
+        fw.load_secret(fw.ForwardConfig(), str(root))
+
+
 # ------------------------------------------------------------------ idempotency
 
 
