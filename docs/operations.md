@@ -4,9 +4,9 @@ Running memd as a server, on object storage, across nodes, and getting it
 back after something went wrong. The sections below are the engine README
 and [SECURITY.md](security.md), included here so they cannot drift.
 
-## One process per data root
+## Several processes on one data root
 
-{% include-markdown "../README-engine.md" start="## Deployment constraint: ONE process per data root" end="## Object storage as the source of truth (S3 / R2 / MinIO)" %}
+{% include-markdown "../README-engine.md" start="## Several processes on one data root" end="## Object storage as the source of truth (S3 / R2 / MinIO)" %}
 
 ## Object storage (S3 / R2 / MinIO)
 

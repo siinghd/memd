@@ -40,6 +40,8 @@ from memd.storage.engine import NamespaceBusyError, NamespaceStore  # noqa: E402
 # --------------------------------------------------------------- single writer
 
 def test_second_process_is_refused_not_silently_destructive(tmp_path):
+    """With forwarding off. (With it on - the default - the second process
+    forwards its writes to this one: tests/test_write_forwarding.py.)"""
     root = str(tmp_path / "d")
     m = Memory(root, encrypt=False, namespace="shared")
     try:
@@ -47,7 +49,7 @@ def test_second_process_is_refused_not_silently_destructive(tmp_path):
             "import sys; sys.path.insert(0, %r)\n"
             "from memd.engine.memory import Memory\n"
             "try:\n"
-            "    Memory(%r, encrypt=False, namespace='shared')\n"
+            "    Memory(%r, encrypt=False, namespace='shared', forwarding='off')\n"
             "    print('OPENED')\n"
             "except Exception as e:\n"
             "    print(type(e).__name__)\n"

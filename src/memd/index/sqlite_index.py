@@ -288,6 +288,11 @@ class NamespaceIndex:
               PRIMARY KEY(src, dst, link_type)
             );
             CREATE INDEX IF NOT EXISTS ix_links_dst ON links(dst);
+            -- ids whose rows a hard delete removed (ids only, kept a day):
+            -- a write retried with the same record ids after its record was
+            -- hard-deleted is recognised, not written again (known_ids)
+            CREATE TABLE IF NOT EXISTS hard_deleted(id TEXT PRIMARY KEY, at INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS ix_hard_deleted_at ON hard_deleted(at);
             -- EXTERNAL-CONTENT fts5: the index reads content from `records`
             -- instead of storing its own copy. The previous plain fts5 kept a
             -- second full copy of every record's text - measured at 10.27MB
@@ -1002,12 +1007,42 @@ class NamespaceIndex:
             gone = self._rowids_of(self._con, [record_id]) if self.ann is not None else []
             cur = self._con.execute("DELETE FROM records WHERE id=?", (record_id,))
             self._hard_delete_rows(self._con, record_id)
+            self._note_hard_deleted(self._con, [record_id])
             self._bump_vec_wm_locked(self._con)
             queued = self._vec_note_locked(self._con, [], removed_rowids=gone, removed_ids=[record_id])
             self._con.commit()
             self._invalidate_stats()
         self._ann_apply(queued)
         return cur.rowcount > 0
+
+    # how long a hard-deleted id is remembered (known_ids): far past any
+    # retry of the write that created it
+    HARD_DELETED_KEEP_MS = 24 * 3600 * 1000
+
+    def _note_hard_deleted(self, c: sqlite3.Connection, ids: list[str]) -> None:
+        now = now_ms()
+        c.executemany("INSERT OR REPLACE INTO hard_deleted(id, at) VALUES(?, ?)", [(i, now) for i in ids])
+        # expire old entries at most once a minute: a bulk hard delete calls
+        # this once per record, and the range delete (indexed on `at`) need
+        # not run for each
+        if now - getattr(self, "_hard_deleted_swept", 0) >= 60_000:
+            self._hard_deleted_swept = now
+            c.execute("DELETE FROM hard_deleted WHERE at < ?", (now - self.HARD_DELETED_KEEP_MS,))
+
+    def known_ids(self, ids: list[str]) -> set[str]:
+        """Which of `ids` this namespace has written: a record row, deleted
+        or not, or an id whose row a hard delete removed (remembered
+        HARD_DELETED_KEEP_MS). A forwarded write retried with the same
+        record ids is recognised by it (Memory._applied)."""
+        out: set[str] = set()
+        ids = [i for i in ids if i]
+        with self._read() as c:
+            for k in range(0, len(ids), 500):
+                chunk = ids[k:k + 500]
+                marks = ",".join("?" * len(chunk))
+                for table in ("records", "hard_deleted"):
+                    out.update(r[0] for r in c.execute(f"SELECT id FROM {table} WHERE id IN ({marks})", chunk))
+        return out
 
     @staticmethod
     def _hard_delete_rows(c: sqlite3.Connection, record_id: str) -> None:
@@ -1081,6 +1116,7 @@ class NamespaceIndex:
                     elif kind == "hard_delete":
                         c.execute("DELETE FROM records WHERE id=?", (rid,))
                         self._hard_delete_rows(c, rid)
+                        self._note_hard_deleted(c, [rid])
                 self._bump_vec_wm_locked(c)
                 queued = self._vec_note_locked(
                     c, sorted({op.get("id") or op.get("old") for op in ops

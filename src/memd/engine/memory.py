@@ -27,7 +27,8 @@ from typing import Any, Callable
 
 import numpy as np
 
-from memd.core.schema import ExtractorInfo, Kind, MemoryRecord, Scope, Source, now_ms
+from memd.core.schema import ExtractorInfo, Kind, MemoryRecord, Scope, Source, now_ms, ulid_new
+from memd.engine import forward as _fw
 from memd.index.ann_usearch import requested_vector_index, resolve_vector_index, vector_index_config
 from memd.index.sqlite_index import IndexFilter
 from memd.index.tantivy_lexical import (
@@ -52,7 +53,7 @@ from memd.query.rerank import (
 )
 from memd.storage.audit import AuditLog, BufferedAuditLog
 from memd.storage.crypto import envelope_from_config
-from memd.storage.engine import StorageEngine
+from memd.storage.engine import NamespaceBusyError, StorageEngine
 from memd.storage.objectstore import LocalObjectStore, ReadOnlyError, count_io
 
 _log = logging.getLogger(__name__)
@@ -62,6 +63,110 @@ HARD_DELETE_PURGE_MS = 72 * 3600 * 1000  # default physical-purge window for har
 # the embed worker's / maintenance jobs' name for a namespace's READ REPLICA
 # in a writer process (a cluster node serves both): "#" is never in a name
 _REPLICA_TAG = "#replica"
+
+# The record ids of a call this thread runs for ANOTHER process (see
+# Memory._serve_forwarded); unset when the thread runs its own calls.
+_SERVING = threading.local()
+_NOT_SERVING = object()
+
+
+@contextlib.contextmanager
+def _serving_forwarded(ids):
+    prev = getattr(_SERVING, "ids", _NOT_SERVING)
+    _SERVING.ids = ids
+    try:
+        yield
+    finally:
+        _SERVING.ids = prev
+
+
+class _Run:
+    """Where a call runs (Memory._forward): here (`here`; `ids`: the record
+    ids to create it with, when it was - or was tried to be - forwarded), or
+    in the namespace's writer in another process, which answered `result`."""
+
+    __slots__ = ("here", "result", "ids")
+
+    def __init__(self, here: bool, result: Any = None, ids: list[str] | None = None):
+        self.here, self.result, self.ids = here, result, ids
+
+
+_HERE = _Run(True)
+
+
+def _source_name(source) -> str | None:
+    """A source as it travels to another process (Source is an IntEnum: by
+    name, never by number)."""
+    if source is None:
+        return None
+    return source.name if isinstance(source, Source) else str(source)
+
+
+class _ForwardedAudit:
+    """The facade's ledger while another process holds its namespace: the
+    entries are buffered here and appended by the holder (forwarded call
+    "audit") - every `flush_every` entries, in the background (an append
+    on a read path never waits for the holder), and on flush() / close().
+    A ledger has one writer, like the namespace."""
+
+    MAX_BUFFER = 10_000
+
+    def __init__(self, mem: "Memory", namespace: str, flush_every: int):
+        self._mem = mem
+        self._ns = namespace
+        self.flush_every = max(1, int(flush_every))
+        self._lock = threading.Lock()
+        self._buffer: list[dict] = []
+        self._flushing = False
+
+    def append(self, actor: str, action: str, target: str, detail: dict | None = None) -> None:
+        d = dict(detail or {})
+        d.setdefault("at_ms", now_ms())
+        with self._lock:
+            self._buffer.append({"actor": actor, "action": action, "target": target, "detail": d})
+            if len(self._buffer) > self.MAX_BUFFER:
+                self._buffer.pop(0)
+                METRICS.inc("memd_audit_entries_dropped_total", ns=self._ns)
+            due = len(self._buffer) >= self.flush_every and not self._flushing
+            if due:
+                self._flushing = True
+        if due:
+            threading.Thread(target=self._flush_in_background, daemon=True,
+                             name="memd-forward-audit").start()
+
+    def _flush_in_background(self) -> None:
+        try:
+            self.flush()
+        finally:
+            with self._lock:
+                self._flushing = False
+
+    def flush(self) -> None:
+        with self._lock:
+            entries, self._buffer = self._buffer, []
+        if not entries:
+            return
+        try:
+            self._mem._append_forwarded_audit(self._ns, entries)
+        except Exception as ex:  # noqa: BLE001 - kept for the next flush
+            METRICS.inc("memd_audit_flush_failures_total", ns=self._ns)
+            _log.warning("memd: the audit entries for %r could not be sent to its writer (%s); "
+                         "kept for the next flush", self._ns, ex)
+            with self._lock:
+                self._buffer[:0] = entries
+
+    def drain_into(self, ledger) -> None:
+        """This process took the namespace: its own ledger takes the rest."""
+        with self._lock:
+            entries, self._buffer = self._buffer, []
+        for e in entries:
+            ledger.append(actor=e["actor"], action=e["action"], target=e["target"], detail=e["detail"])
+
+    def read(self) -> list:
+        return []
+
+    def verify(self) -> bool:
+        return True
 
 
 def _opt_float(cfg: dict, key: str) -> float | None:
@@ -594,6 +699,12 @@ class Memory:
     # method then delegates to it so "one engine, three doors" holds at the
     # facade level too (not just via HostedMemory directly)
     _impl: Any = None
+    # write forwarding (memd.engine.forward): the router to namespaces
+    # another process holds, this process's endpoint, and the facade's
+    # ledger while another process holds its namespace
+    _fwd: "_fw.Forwarder | None" = None
+    _fwd_server: "_fw.ForwardServer | None" = None
+    _fwd_audit: "_ForwardedAudit | None" = None
 
     def _hosted(self) -> Any:
         return self.__dict__.get("_impl")
@@ -609,12 +720,20 @@ class Memory:
         encrypt: bool = True,
         transport: Any = None,
         read_only: bool = False,
+        forwarding: str | None = None,
     ):
         """`read_only` (or config `read_only`): open every namespace as a
         READ REPLICA - no lease, nothing written or deleted
         in the store or the keys, every mutating call refused with
         ReadOnlyError; reads follow the namespace's writer within
-        `replica_refresh_s` (default 2 s)."""
+        `replica_refresh_s` (default 2 s).
+
+        `forwarding` (or config `forwarding`, MEMD_FORWARDING): "auto" (the
+        default) - a namespace another process on the data root holds has
+        its writes and strong reads run by that process (see
+        memd.engine.forward), and the next forwarded call takes it over
+        when that process goes away; "off" - such a namespace raises
+        NamespaceBusyError, as before forwarding existed."""
         cfg = dict(config or {})
         if api_key:
             from memd.sdk.client import HostedMemory
@@ -660,6 +779,27 @@ class Memory:
         remote = store is not None
         if store is None:
             store = LocalObjectStore(os.path.join(path, "store"))
+        # Write forwarding: this process's endpoint is up - and its address
+        # is what it writes into the locks and leases it takes - before it
+        # opens any namespace. A configured lease holder (a cluster node)
+        # advertises no endpoint: the cluster router routes between nodes.
+        fcfg = _fw.ForwardConfig.from_config(
+            cfg, forwarding, lease_ttl_s=getattr(store, "lease_ttl_s", None) if remote else None)
+        self._fwd_ready = threading.Event()
+        fwd_secret = holder = None
+        if fcfg.enabled and not read_only and not os.environ.get("MEMD_ALLOW_MULTI_PROCESS"):
+            try:
+                fwd_secret = _fw.load_secret(fcfg, path)
+            except OSError as ex:
+                # (a data directory shared with another user, whose secret
+                # this one cannot read): without it, as with forwarding off
+                _log.warning("memd: write forwarding is off for this process: the forwarding "
+                             "secret cannot be read or created (%s)", ex)
+        if fwd_secret is not None:
+            holder = getattr(store, "lease_holder", None)
+            if not holder:
+                self._fwd_server = _fw.ForwardServer(fcfg, fwd_secret, self._serve_forwarded)
+                holder = store.lease_holder = self._fwd_server.holder
         # Key custody: who holds the root key. `local` (default) keeps it in a file
         # under <path>/keys exactly as before; a remote provider (aws-kms,
         # vault-transit) keeps wrapped data keys as objects in `store`, so any
@@ -715,11 +855,21 @@ class Memory:
         self.engine.audit_hook = self._audit_engine_event
         self.engine.close_hook = self._namespace_closing
         self.engine.replica_hook = self._replica_event
-        self.ns = self.engine.namespace(namespace)
         # the facade holds a direct reference to this store for its lifetime:
         # pin it so LRU churn of other namespaces can't close it underneath us
         self.engine.pin_namespace(namespace)
-        self.audit = self._audit_for(namespace)  # facade default, never evicted
+        if fwd_secret is not None:
+            self._fwd = _fw.Forwarder(self.engine, fcfg, fwd_secret, holder)
+            self._fwd_audit = _ForwardedAudit(self, namespace, self._audit_flush_every)
+            if self._fwd_server is not None:
+                self._fwd_server.start()
+        try:
+            # None: another process holds it - this facade's calls on it are
+            # forwarded there, until the holder goes away and one takes it
+            self.ns: Any = self._open_facade_namespace(namespace)
+        except BaseException:
+            self._stop_forwarding()
+            raise
         self.embedder: Embedder = resolve_embedder(cfg)
         self.fuse_vector: bool = resolve_fuse_vector(cfg, self.embedder)
         reranker = resolve_reranker(cfg)
@@ -754,7 +904,8 @@ class Memory:
         # at once - is scheduled as the namespace opens, not left on disk
         # until the next write there happens to check the deadline
         self.engine.open_hook = lambda _name, store: self._enforce_purge_deadlines(store)
-        self._enforce_purge_deadlines(self.ns)
+        if self.ns is not None:
+            self._enforce_purge_deadlines(self.ns)
         self._embed_max_chars = int(cfg.get("embed_max_chars", DEFAULT_EMBED_MAX_CHARS))
         self._embed_worker = _EmbedWorker(
             self.embedder,
@@ -763,7 +914,9 @@ class Memory:
             max_queue=int(cfg.get("embed_max_queue", 5_000)),
             max_chars=self._embed_max_chars,
         )
-        self.audit.append(actor="system", action="open", target=namespace, detail={"embedder": self.embedder.name})
+        if self.ns is not None:
+            self.audit.append(actor="system", action="open", target=namespace,
+                              detail={"embedder": self.embedder.name})
         # which embedder is active decides retrieval AND forget() semantics,
         # and "auto" depends on what happens to be installed: say it once
         _log.info("memd: opened namespace %r with embedder %s (kind=%s, requested=%s)",
@@ -782,7 +935,96 @@ class Memory:
             # ~1s to import - either would eat the first search's deadline
             threading.Thread(target=self._load_reranker, daemon=True, name="memd-rerank-load").start()
         self._vector_selfheal = bool(cfg.get("vector_selfheal", True))
-        self._report_vector_health(self.ns)
+        if self.ns is not None:
+            self._report_vector_health(self.ns)
+        self._fwd_ready.set()
+
+    # ------------------------------------------------------------ forwarding
+
+    def _open_facade_namespace(self, name: str):
+        """The facade's own namespace, opened here - or None when another
+        process holds it and forwarding is on (raises when forwarding to
+        that process cannot work: see Forwarder.probe)."""
+        try:
+            return self.engine.namespace(name)
+        except NamespaceBusyError:
+            if self._fwd is None:
+                raise
+        return self.engine.namespace(name) if self._fwd.probe(name) else None
+
+    def _stop_forwarding(self) -> None:
+        if self._fwd_server is not None:
+            self._fwd_server.stop(drain_s=float(getattr(self, "_embed_close_drain_s", 30.0)))
+        if self._fwd is not None:
+            self._fwd.close()
+
+    def _forward(self, namespace: str | None, op: str, args: Any = None, n_ids: int = 0, *,
+                 write: bool = True) -> _Run:
+        """Where a call on `namespace` runs: here when this process holds
+        it (or takes it now - its lock or lease was free), else in the
+        process that holds it, whose answer comes back as the result.
+        `args` (a dict, or a callable building it) is the call as it
+        travels; `n_ids`: how many records it creates - their ids are
+        generated here, so that every retry of it creates the same records
+        and a repeat is recognised (Memory._applied). A call this thread
+        runs for another process always runs here."""
+        ids = getattr(_SERVING, "ids", _NOT_SERVING)
+        if ids is not _NOT_SERVING:
+            return _Run(True, None, ids if n_ids else None)
+        fwd = self._fwd
+        if fwd is None:
+            return _HERE
+        name = namespace or self.namespace_name
+        if self.engine.holds(name):
+            return _HERE
+        ids = [ulid_new() for _ in range(n_ids)] if n_ids else None
+        out = fwd.call(name, op, args() if callable(args) else dict(args or {}), ids, write=write)
+        if out is _fw.LOCAL:
+            return _Run(True, None, ids)
+        return _Run(False, out)
+
+    @staticmethod
+    def _applied(ns, ids: list[str] | None) -> bool:
+        """A forwarded write's records were written to the namespace already
+        - any of them: a batch is one append - by an earlier attempt of the
+        same call, in this process or in a holder before it, whose log this
+        one replayed. A record deleted since counts, a hard-deleted one too
+        (its row is gone, its id is remembered: NamespaceIndex.known_ids):
+        a retry must not bring back what was deleted after the write."""
+        return bool(ids) and bool(ns.index.known_ids(ids))
+
+    def _serve_forwarded(self, op: str, ns: str, args: dict, ids: list[str] | None):
+        """ForwardServer handler: run a call another process forwarded -
+        only on a namespace this process holds (NamespaceBusyError: not
+        the writer, nothing applied; the caller finds the writer again)."""
+        if not self._fwd_ready.wait(10.0):
+            raise _fw.ForwardNotReady("the namespace's writer is still opening")
+        if not self.engine.holds(ns):
+            raise NamespaceBusyError(f"namespace {ns!r} is not held by this process")
+        fn = _SERVED.get(op)
+        if fn is None:
+            raise ValueError(f"unknown forwarded call {op!r}")
+        with _serving_forwarded(ids):
+            return fn(self, ns, args)
+
+    def _append_forwarded_audit(self, ns_name: str, entries: list[dict]) -> None:
+        run = self._forward(ns_name, "audit", {"entries": entries})
+        if run.here:
+            ledger = self._audit_for(ns_name)
+            for e in entries:
+                ledger.append(actor=e["actor"], action=e["action"], target=e["target"], detail=e["detail"])
+
+    @property
+    def audit(self):
+        """The facade's own ledger - its namespace's. While another process
+        holds that namespace, its entries are appended by that process."""
+        fa = self._fwd_audit
+        if fa is None or self.engine.holds(self.namespace_name):
+            ledger = self._audit_for(self.namespace_name)
+            if fa is not None and fa._buffer:
+                fa.drain_into(ledger)
+            return ledger
+        return fa
 
     # ------------------------------------------------------------------ writes
 
@@ -813,7 +1055,15 @@ class Memory:
         self._writable("add")
         _guard_input(content, meta)
         _guard_kind(kind)
+        run = self._forward(namespace, "add", lambda: dict(
+            content=content, session_id=session_id, user_id=user_id, agent_id=agent_id,
+            org_id=org_id, role=role, kind=kind, source=_source_name(source), actor_id=actor_id,
+            t_event=t_event, meta=meta), n_ids=1)
+        if not run.here:
+            return run.result
         ns = self._ns_for(namespace)
+        if self._applied(ns, run.ids):
+            return list(run.ids)
         src = self._resolve_source(source, role)
         org_id, agent_id = org_id or None, agent_id or None
         user_id, session_id = user_id or None, session_id or None
@@ -828,6 +1078,7 @@ class Memory:
             session_id=session_id,
             t_event=t_event,
             meta=meta or {},
+            record_id=run.ids[0] if run.ids else None,
         )
         verdicts = self.quarantine.check([rec])
         v = verdicts[rec.id]
@@ -864,12 +1115,19 @@ class Memory:
         if impl is not None:
             return impl.add_events(events, namespace=namespace)
         self._writable("add_events")
-        ns = self._ns_for(namespace)
         if len(events) > MAX_BATCH_EVENTS:
             raise ValueError(f"batch exceeds {MAX_BATCH_EVENTS} events; split the call")
+        run = self._forward(namespace, "add_events", lambda: {"events": [
+            dict(e, source=_source_name(e["source"])) if isinstance(e, dict) and "source" in e else e
+            for e in events]}, n_ids=len(events))
+        if not run.here:
+            return run.result
+        ns = self._ns_for(namespace)
+        if self._applied(ns, run.ids):
+            return list(run.ids)
         records: list[MemoryRecord] = []
         taint_updates: list[tuple[str, int]] = []
-        for e in events:
+        for i, e in enumerate(events):
             _guard_input(e["content"], e.get("meta"))
             _guard_kind(e.get("kind", Kind.RAW_EVENT))
             src = self._resolve_source(e.get("source"), e.get("role", "user"))
@@ -888,6 +1146,7 @@ class Memory:
                 session_id=session_id,
                 t_event=e.get("t_event"),
                 meta=e.get("meta") or {},
+                record_id=run.ids[i] if run.ids else None,
             )
             records.append(rec)
             if session_id:
@@ -948,7 +1207,15 @@ class Memory:
         self._writable("remember")
         _guard_input(content, None)
         _guard_kind(kind)
+        run = self._forward(namespace, "remember", lambda: dict(
+            content=content, kind=kind, entity_keys=entity_keys, session_id=session_id,
+            user_id=user_id, agent_id=agent_id, org_id=org_id, source=_source_name(source),
+            actor_id=actor_id, t_event=t_event, valid_from=valid_from), n_ids=1)
+        if not run.here:
+            return run.result
         ns = self._ns_for(namespace)
+        if self._applied(ns, run.ids):
+            return run.ids[0]
         src = source if isinstance(source, Source) else Source.parse(source)
         if session_id:
             cap = self._taint(session_id).min_tier
@@ -968,6 +1235,7 @@ class Memory:
             entity_keys=ekeys,
             t_event=t_event,
             valid_from=valid_from,
+            record_id=run.ids[0] if run.ids else None,
         )
         # consolidate BEFORE the durable append so demotion metadata is atomic
         pairs = self._consolidate_explicit(ns, rec)
@@ -1106,7 +1374,7 @@ class Memory:
         dropped when it no longer does (writing them would be a write without
         the lease) - and the ledger object goes: the next tenure reloads the
         tail another node may have extended. Cached searches go stale too."""
-        if ns_name == self.namespace_name:
+        if ns_name == self.namespace_name and not lost:
             return   # the facade's pinned namespace is never evicted
         with self._audit_lock:
             log = self._audits.pop(ns_name, None)
@@ -1128,6 +1396,8 @@ class Memory:
                                         detail=detail)
 
     def _flush_all_audits(self) -> None:
+        if self._fwd_audit is not None and self._fwd_audit._buffer:
+            self.audit.flush()     # the holder's, or (taken over since) this process's
         with self._audit_lock:
             logs = list(self._audits.values())
         for lg in logs:
@@ -1181,6 +1451,13 @@ class Memory:
                                namespace=namespace, consistency=consistency,
                                max_staleness_ms=max_staleness_ms)
         t0 = time.monotonic()
+        if (consistency or ("eventual" if self.read_only else "strong")) == "strong":
+            run = self._forward(namespace, "search", lambda: dict(
+                query=query, user_id=user_id, session_id=session_id, agent_id=agent_id,
+                org_id=org_id, budget_tokens=budget_tokens, as_of=as_of, kinds=kinds,
+                include_quarantined=include_quarantined, rerank=rerank), write=False)
+            if not run.here:
+                return _search_result(run.result)
         ns_idx, info = self._reader(namespace, consistency, max_staleness_ms)
         with self._serving(ns_idx, info):
             return self._search(ns_idx, info, t0, query, user_id=user_id, session_id=session_id,
@@ -1483,6 +1760,13 @@ class Memory:
             if read_info is not None:
                 read_info.update(impl.last_read or {"served_by": "leader"})
             return got
+        if (consistency or ("eventual" if self.read_only else "strong")) == "strong":
+            run = self._forward(namespace, "get", lambda: dict(
+                record_id=record_id, history=history, include_deleted=include_deleted), write=False)
+            if not run.here:
+                if read_info is not None:
+                    read_info.update({"served_by": "leader"})
+                return run.result
         ns, info = self._reader(namespace, consistency, max_staleness_ms)
         with self._serving(ns, info):
             if read_info is not None:
@@ -1568,6 +1852,10 @@ class Memory:
     def session_raw_count(self, session_id: str, *, user_id: str | None = None,
                           namespace: str | None = None) -> int:
         """How many raw records close_session() would hand the extractor."""
+        run = self._forward(namespace, "session_raw_count",
+                            lambda: dict(session_id=session_id, user_id=user_id), write=False)
+        if not run.here:
+            return run.result
         ns = self._ns_for(namespace)
         with self._serving(ns):
             return ns.index.count_session_raw(session_id, user_id=user_id)
@@ -1601,6 +1889,17 @@ class Memory:
         if impl is not None:
             return impl.close_session(session_id, user_id=user_id, namespace=namespace)
         self._writable("close_session")
+
+        def args() -> dict:
+            if callable(max_facts):
+                raise _fw.ForwardingError(
+                    "close_session: a callable max_facts runs only where the namespace's writer "
+                    "runs, and that is another process")
+            return dict(session_id=session_id, user_id=user_id, extract_limit=extract_limit,
+                        max_facts=max_facts)
+        run = self._forward(namespace, "close_session", args)
+        if not run.here:
+            return run.result
         ns = self._ns_for(namespace)
         self._embed_worker.drain(timeout_s=60)
         # durable boundary: commit index + audit before folding the segment
@@ -1807,6 +2106,9 @@ class Memory:
         if impl is not None:
             return impl.delete(record_id, hard=hard, namespace=namespace)
         self._writable("delete")
+        run = self._forward(namespace, "delete", lambda: dict(record_id=record_id, hard=hard, actor=actor))
+        if not run.here:
+            return run.result
         ns = self._ns_for(namespace)
         ns.append_op({"op": "tombstone", "id": record_id, "at": now_ms()})
         ok = ns.index.tombstone(record_id, now_ms())
@@ -1845,6 +2147,9 @@ class Memory:
         ids = [rid for rid in record_ids if rid]
         if not ids:
             return 0
+        run = self._forward(namespace, "delete_many", lambda: dict(record_ids=ids, hard=hard, actor=actor))
+        if not run.here:
+            return run.result
         ns = self._ns_for(namespace)
         now = now_ms()
         ops: list[dict] = [{"op": "tombstone", "id": rid, "at": now} for rid in ids]
@@ -1958,6 +2263,11 @@ class Memory:
                                  kinds=kinds, namespace=namespace)
         if len(query) > MAX_QUERY_CHARS:
             raise ValueError(f"query exceeds {MAX_QUERY_CHARS} char cap")
+        run = self._forward(namespace, "find_ids", lambda: dict(
+            query=query, user_id=user_id, session_id=session_id, agent_id=agent_id,
+            org_id=org_id, as_of=as_of, kinds=kinds), write=False)
+        if not run.here:
+            return run.result
         ns = self._ns_for(namespace)
         with self._serving(ns):
             return self._find_ids(ns, query, user_id=user_id, session_id=session_id,
@@ -2068,13 +2378,19 @@ class Memory:
             raise ForgetPreviewMismatch(
                 f"the query now matches {len(ids)} record(s), not the previewed set: "
                 "preview again and confirm that")
-        # one durable batch for the whole sweep (delete_many), not an
-        # fsync-per-id loop
+        self._forget_ids(ids, self._audit_target_for_query(query), actor, namespace)
+        return ids
+
+    def _forget_ids(self, ids: list[str], target: str, actor: str, namespace: str | None) -> None:
+        """forget()'s deletion, in the namespace's writer: one durable batch
+        for the whole sweep (delete_many), not an fsync-per-id loop, and the
+        forget entry of its ledger."""
+        run = self._forward(namespace, "forget_ids", lambda: dict(ids=ids, target=target, actor=actor))
+        if not run.here:
+            return
         self.delete_many(ids, actor=actor, namespace=namespace)
         self._audit_for(self._ns_for(namespace).namespace).append(
-            actor=actor, action="forget",
-            target=self._audit_target_for_query(query), detail={"deleted": len(ids)})
-        return ids
+            actor=actor, action="forget", target=target, detail={"deleted": len(ids)})
 
     def has_namespace(self, namespace: str) -> bool:
         """True if `namespace` exists; never creates it."""
@@ -2095,6 +2411,10 @@ class Memory:
             return impl.destroy_namespace(namespace=namespace)
         self._writable("destroy_namespace")
         name = namespace or self.namespace_name
+        run = self._forward(name, "destroy_namespace", lambda: dict(actor=actor))
+        if not run.here:
+            self._bump_epoch(name)
+            return run.result
         ns_store = self._ns_for(name)
         # block new ops + serialize against in-flight exports/reads before
         # shredding (an export racing destroy would otherwise recreate the
@@ -2124,7 +2444,6 @@ class Memory:
                 self._shredded.popitem(last=False)
         if name == self.namespace_name:
             self.ns = self.engine.namespace(name)
-            self.audit = self._audit_for(name)
         METRICS.inc("memd_destroys_total", ns=name)
         # destroy is an ADMINISTRATIVE act on the engine, so it lands in the
         # facade's own ledger - never in the ledger of the namespace just
@@ -2155,6 +2474,9 @@ class Memory:
             self.last_export_skipped_frames = n
             return ExportStream(iter([blob]), [], skipped=n)
         name = namespace or self.namespace_name
+        run = self._forward(name, "export", write=False)
+        if not run.here:
+            return self._forwarded_export(run.result)
         t0 = time.monotonic()
         nstore = self.engine.namespace(name)
         recs, skipped = nstore.export_records()
@@ -2183,6 +2505,9 @@ class Memory:
             self.last_export_skipped_frames = int(getattr(impl, "last_export_skipped_frames", 0) or 0)
             return data
         name = namespace or self.namespace_name
+        run = self._forward(name, "export", write=False)
+        if not run.here:
+            return b"".join(self._forwarded_export(run.result))
         t0 = time.monotonic()
         nstore = self.engine.namespace(name)
         recs, skipped = nstore.export_records()
@@ -2190,6 +2515,13 @@ class Memory:
         data = b"".join(nstore.export_line(rec) for rec in recs)
         self._exported(name, t0, skipped, bytes=len(data), records=len(recs))
         return data
+
+    def _forwarded_export(self, reader) -> "ExportStream":
+        """An export the namespace's writer in another process streams
+        (memd.engine.forward._StreamReader): metered and audited there."""
+        frames = list(reader.meta.get("skipped_frames") or [])
+        self.last_export_skipped_frames = int(reader.meta.get("skipped") or len(frames))
+        return ExportStream(iter(reader), frames, skipped=self.last_export_skipped_frames)
 
     def _exported(self, name: str, t0: float, skipped: list[dict], **detail) -> None:
         """Meter and audit one export. Its audit detail lists the unreadable
@@ -2208,6 +2540,9 @@ class Memory:
         if impl is not None:
             return impl.compact(force=force, namespace=namespace)
         self._writable("compact")
+        run = self._forward(namespace, "compact", lambda: dict(force=force))
+        if not run.here:
+            return run.result
         ns = self._ns_for(namespace)
         ns.index.flush()
         self._audit_for(ns.namespace).flush()
@@ -2225,6 +2560,9 @@ class Memory:
         impl = self._hosted()
         if impl is not None:
             return impl.stats(namespace=namespace)
+        run = self._forward(namespace, "stats", write=False)
+        if not run.here:
+            return run.result
         ns = self._ns_for(namespace)
         st = ns.stats()
         st["namespace"] = ns.namespace
@@ -2299,7 +2637,12 @@ class Memory:
             # read never sees a replica mid-rebuild (or one that failed one)
             return self.engine.reader(namespace or self.namespace_name, wrap_errors=False)[0]
         if namespace is None or namespace == self.namespace_name:
-            return self.ns
+            ns = self.ns
+            if ns is None or ns._closed:
+                # another process held it (forwarding) or this one lost it
+                # since: the engine's open store - which takes it here
+                ns = self.ns = self.engine.namespace(self.namespace_name)
+            return ns
         store = self.engine.namespace(namespace)
         if namespace in self._shredded:
             # materialized again: it legitimately exists, so stop tombstoning it
@@ -2353,6 +2696,9 @@ class Memory:
         impl = self._hosted()
         if impl is not None:
             raise RuntimeError("reembed is embedded-only (no REST surface)")
+        run = self._forward(namespace, "reembed", lambda: dict(batch_size=batch_size))
+        if not run.here:
+            return run.result
         return self._reembed_store(self._ns_for(namespace))
 
     def _reembed_store(self, ns, batch_size: int = 256) -> dict:
@@ -2412,23 +2758,40 @@ class Memory:
                          "the vector lane is incomplete until the embed worker catches up",
                          left, budget)
         self._maint.drain(timeout_s=60)
-        with self._holding(self.ns):
-            self.ns.index.flush()
-        lex = self.ns.index.lexical
-        if lex is not None:
-            # the tantivy accelerator is derived and serves its tail from
-            # FTS5 meanwhile, so this is about speed, not visibility
-            lex.drain(timeout_s=self._lexical_flush_drain_s)
-        ann = self.ns.index.ann
-        if ann is not None:
-            # likewise the ANN sidecar (the exact scan serves while it builds)
-            ann.drain(timeout_s=self._vector_flush_drain_s)
+        ns = self.ns if self.ns is not None and not self.ns._closed else None
+        if ns is not None:
+            with self._holding(ns):
+                ns.index.flush()
+            lex = ns.index.lexical
+            if lex is not None:
+                # the tantivy accelerator is derived and serves its tail from
+                # FTS5 meanwhile, so this is about speed, not visibility
+                lex.drain(timeout_s=self._lexical_flush_drain_s)
+            ann = ns.index.ann
+            if ann is not None:
+                # likewise the ANN sidecar (the exact scan serves while it builds)
+                ann.drain(timeout_s=self._vector_flush_drain_s)
         self._flush_all_audits()
+        if self._fwd is not None and getattr(_SERVING, "ids", _NOT_SERVING) is _NOT_SERVING:
+            # the namespaces this process wrote through their writers in
+            # other processes: theirs to flush (their vector lane, purges)
+            for name in self._fwd.take_written():
+                try:
+                    self._forward(name, "flush", write=False)
+                except Exception as ex:  # noqa: BLE001 - one writer gone must not fail the rest
+                    _log.warning("memd: flush of %r in its writer failed (%s)", name, ex)
 
     def close(self) -> None:
         impl = self._hosted()
         if impl is not None:
             return impl.close()
+        # first: forwarded calls already running finish while this process
+        # still holds their namespaces; new ones are answered "not the
+        # writer" and their callers take the namespaces once released below
+        if self._fwd_server is not None:
+            self._fwd_server.stop(drain_s=float(self._embed_close_drain_s))
+        if self._fwd_audit is not None:
+            self._fwd_audit.flush()
         if getattr(self, "_metrics_dumper", None):
             self._metrics_dumper.stop()
         # bounded drain before stopping: a clean close should not silently
@@ -2441,11 +2804,60 @@ class Memory:
         self._maint.stop(drain_timeout_s=float(self._embed_close_drain_s))
         if self.rerank is not None:
             self.rerank.close()
-        with self._holding(self.ns):
-            self.ns.index.flush()
+        ns = self.ns
+        if ns is not None and not ns._closed:
+            with self._holding(ns):
+                ns.index.flush()
         self._flush_all_audits()
-        self.ns.close()
+        if ns is not None:
+            ns.close()
         self.engine.close()
+        if self._fwd is not None:
+            self._fwd.close()
         # a clean close collects what a crash orphaned (segment_gc /
         # snapshot_gc entries): make those entries durable too
         self._flush_all_audits()
+
+
+# ---------------------------------------------------------------- forwarding
+
+
+def _search_result(d: dict) -> SearchResult:
+    d = dict(d)
+    d["items"] = [SearchHit(**i) for i in d.get("items") or []]
+    return SearchResult(**d)
+
+
+def _search_dict(res: SearchResult) -> dict:
+    """A search result as it travels back (shallow: nothing is mutated)."""
+    return {**vars(res), "items": [vars(i) for i in res.items]}
+
+
+def _served_export(m: Memory, ns: str, a: dict):
+    st = m.export_stream(namespace=ns)
+    return _fw._Stream({"skipped": st.skipped, "skipped_frames": st.skipped_frames}, iter(st))
+
+
+# what a forwarded call runs in the holder (Memory._serve_forwarded): the
+# same public methods a local call runs, on the namespace it names
+_SERVED: dict[str, Callable[[Memory, str, dict], Any]] = {
+    "ping": lambda m, ns, a: {"holds": True},
+    "add": lambda m, ns, a: m.add(namespace=ns, **a),
+    "add_events": lambda m, ns, a: m.add_events(a["events"], namespace=ns),
+    "remember": lambda m, ns, a: m.remember(namespace=ns, **a),
+    "close_session": lambda m, ns, a: m.close_session(namespace=ns, **a),
+    "delete": lambda m, ns, a: m.delete(namespace=ns, **a),
+    "delete_many": lambda m, ns, a: m.delete_many(namespace=ns, **a),
+    "forget_ids": lambda m, ns, a: m._forget_ids(a["ids"], a["target"], a["actor"], ns),
+    "destroy_namespace": lambda m, ns, a: m.destroy_namespace(namespace=ns, **a),
+    "compact": lambda m, ns, a: m.compact(namespace=ns, **a),
+    "reembed": lambda m, ns, a: m.reembed(namespace=ns, **a),
+    "flush": lambda m, ns, a: m.flush(),
+    "audit": lambda m, ns, a: m._append_forwarded_audit(ns, a["entries"]),
+    "search": lambda m, ns, a: _search_dict(m.search(namespace=ns, consistency="strong", **a)),
+    "get": lambda m, ns, a: m.get(namespace=ns, consistency="strong", **a),
+    "find_ids": lambda m, ns, a: m.find_ids(namespace=ns, **a),
+    "session_raw_count": lambda m, ns, a: m.session_raw_count(namespace=ns, **a),
+    "stats": lambda m, ns, a: m.stats(namespace=ns),
+    "export": _served_export,
+}
