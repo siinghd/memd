@@ -1,5 +1,10 @@
 # memd
 
+[![PyPI](https://img.shields.io/pypi/v/memd-engine?label=PyPI)](https://pypi.org/project/memd-engine/)
+[![npm](https://img.shields.io/npm/v/memd-engine?label=npm)](https://www.npmjs.com/package/memd-engine)
+[![CI](https://github.com/siinghd/memd/actions/workflows/ci.yml/badge.svg)](https://github.com/siinghd/memd/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+
 **The SQLite of agent memory.** memd is an embedded-first memory engine for
 AI agents: one process, zero external services. Raw + fact lanes, bitemporal
 supersedence, provenance and trust tiers, hybrid retrieval and budget-aware
@@ -9,7 +14,8 @@ packing, in a library that owns a directory. Apache-2.0.
 mem = Memory("./my-data")    # a directory, not a service
 ```
 
-Status: alpha (0.3.x). See [what it does not do yet](#limits).
+Status: alpha. The badges above show the current release. The
+[limits](#limits) section tells what memd does not do yet.
 
 ## Features
 
