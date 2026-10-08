@@ -1,13 +1,19 @@
-"""Write forwarding: what a write costs when another process holds its
-namespace, against the same write made by the holder itself.
+"""Write forwarding: what a call costs when another process holds its
+namespace, against the same call made by the holder itself.
 
-One holder process opens the namespace and serves forwarded calls; this
-process then writes - first as the holder (the holder process is not
-started yet), then as a forwarder to it. Per row: the write ack latency of
-one writer thread (p50/p90/p99), and the throughput of 1/4/8 writer
-threads. Plus a strong search through forwarding against a local one.
+Setup: a corpus namespace of --corpus records. Then two phases, each
+writing into a fresh namespace of its own (so both write into namespaces
+of the same size) and reading the same corpus:
 
-    python bench/forward_bench.py [--n 2000] [--s3]     # --s3: MEMD_TEST_S3_ENDPOINT (MinIO)
+  1. local      - this process holds both namespaces;
+  2. forwarded  - a holder process holds both, and this process forwards
+                  every call to it.
+
+Per phase: the write ack latency of one writer thread (p50/p90/p99), the
+throughput of 1/4/8 writer threads, a strong get of an existing record and
+a strong search of the corpus (distinct queries: no cache hits).
+
+    python bench/forward_bench.py [--n 2000] [--seconds 5] [--s3]   # --s3: MEMD_TEST_S3_ENDPOINT
 
 Everything runs on one machine: the forwarded hop is loopback TCP.
 """
@@ -28,16 +34,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from memd.engine.memory import Memory  # noqa: E402
 
-NS = "bench"
+CORPUS = "corpus"
 TEXT = "benchmark write event {i} with realistic payload text about deploys and caches"
 
 HOLDER = r"""
 import json, sys
 sys.path.insert(0, sys.argv[3])
 from memd.engine.memory import Memory
-m = Memory(sys.argv[1], namespace="bench", config=json.loads(sys.argv[2]))
+m = Memory(sys.argv[1], namespace=sys.argv[4], config=json.loads(sys.argv[2]))
+m.stats(namespace="corpus")      # holds the corpus too
 print("ready", flush=True)
-sys.stdin.read()          # until the bench closes our stdin
+sys.stdin.read()                 # until the bench closes our stdin
 m.close()
 """
 
@@ -47,24 +54,23 @@ def pctl(xs: list[float], p: float) -> float:
     return xs[min(int(p * (len(xs) - 1)), len(xs) - 1)]
 
 
-def latency(mem: Memory, n: int, tag: str) -> dict:
+def timed(fn, n: int) -> list[float]:
     lat = []
     for i in range(n):
         t0 = time.perf_counter()
-        mem.add(TEXT.format(i=f"{tag}-{i}"), user_id="bench", namespace=NS)
+        fn(i)
         lat.append((time.perf_counter() - t0) * 1000)
-    return {"p50": round(pctl(lat, .5), 2), "p90": round(pctl(lat, .9), 2),
-            "p99": round(pctl(lat, .99), 2)}
+    return lat
 
 
-def throughput(mem: Memory, threads: int, seconds: float, tag: str) -> float:
+def throughput(mem: Memory, ns: str, threads: int, seconds: float, tag: str) -> float:
     stop = time.monotonic() + seconds
     counts = [0] * threads
 
     def run(k: int) -> None:
         i = 0
         while time.monotonic() < stop:
-            mem.add(TEXT.format(i=f"{tag}-{k}-{i}"), user_id="bench", namespace=NS)
+            mem.add(TEXT.format(i=f"{tag}-{k}-{i}"), user_id="bench", namespace=ns)
             i += 1
         counts[k] = i
     ts = [threading.Thread(target=run, args=(k,)) for k in range(threads)]
@@ -76,26 +82,23 @@ def throughput(mem: Memory, threads: int, seconds: float, tag: str) -> float:
     return round(sum(counts) / (time.monotonic() - t0), 1)
 
 
-def search_latency(mem: Memory, n: int) -> dict:
-    lat = []
-    for i in range(n):
-        t0 = time.perf_counter()
-        mem.search(f"deploys caches {i}", user_id="bench", namespace=NS)   # distinct: no cache hit
-        lat.append((time.perf_counter() - t0) * 1000)
-    return {"p50": round(pctl(lat, .5), 2), "p99": round(pctl(lat, .99), 2)}
-
-
-def row(mem: Memory, n: int, seconds: float, tag: str) -> dict:
-    out = {"write_ms": latency(mem, n, tag)}
+def phase(mem: Memory, ns: str, n: int, seconds: float, corpus_ids: list[str]) -> dict:
+    w = timed(lambda i: mem.add(TEXT.format(i=f"{ns}-{i}"), user_id="bench", namespace=ns), n)
+    out = {"write_ms": {"p50": round(pctl(w, .5), 2), "p90": round(pctl(w, .9), 2),
+                        "p99": round(pctl(w, .99), 2)}}
     for t in (1, 4, 8):
-        out[f"writes_per_s_{t}"] = throughput(mem, t, seconds, f"{tag}-t{t}")
-    out["search_ms"] = search_latency(mem, min(n, 300))
+        out[f"writes_per_s_{t}"] = throughput(mem, ns, t, seconds, f"{ns}-t{t}")
+    g = timed(lambda i: mem.get(corpus_ids[i % len(corpus_ids)], namespace=CORPUS), min(n, 1000))
+    out["get_ms"] = {"p50": round(pctl(g, .5), 2), "p99": round(pctl(g, .99), 2)}
+    s = timed(lambda i: mem.search(f"deploys caches {i}", user_id="bench", namespace=CORPUS), 300)
+    out["search_ms"] = {"p50": round(pctl(s, .5), 2), "p99": round(pctl(s, .99), 2)}
     return out
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=2000)
+    ap.add_argument("--corpus", type=int, default=2000)
     ap.add_argument("--seconds", type=float, default=5.0)
     ap.add_argument("--s3", action="store_true")
     args = ap.parse_args()
@@ -109,22 +112,23 @@ def main() -> None:
                    s3_region="us-east-1", forward_secret="forward-bench-shared-secret-0001")
     else:
         root = os.path.join(tmp, "data")
+    # the holder's local dir (and, on S3, its data keys) is the one the
+    # local phase writes with; the forwarding process has its own
+    held = dict(cfg, local_dir=os.path.join(tmp, "local-h"))
     results = {}
     try:
-        # 1. this process holds the namespace (S3: with the local dir - and
-        # the data key - the holder process uses next)
-        mem = Memory(root, namespace=NS, config=dict(cfg, local_dir=os.path.join(tmp, "local-h")))
-        results["local"] = row(mem, args.n, args.seconds, "local")
+        mem = Memory(root, namespace=CORPUS, config=held)
+        ids = [mem.add(TEXT.format(i=f"corpus-{i}"), user_id="bench")[0] for i in range(args.corpus)]
+        mem.flush()
+        results["local"] = phase(mem, "w-local", args.n, args.seconds, ids)
         mem.close()
-        # 2. another process holds it; this one forwards
         src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
-        holder = subprocess.Popen(
-            [sys.executable, "-c", HOLDER, root, json.dumps(dict(cfg, local_dir=os.path.join(tmp, "local-h"))),
-             src], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        holder = subprocess.Popen([sys.executable, "-c", HOLDER, root, json.dumps(held), src, "w-fwd"],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         assert holder.stdout.readline().strip() == "ready"
-        mem = Memory(root, namespace=NS, config=dict(cfg, local_dir=os.path.join(tmp, "local-b")))
-        assert mem.ns is None, "the holder process should hold the namespace"
-        results["forwarded"] = row(mem, args.n, args.seconds, "fwd")
+        mem = Memory(root, namespace="w-fwd", config=dict(cfg, local_dir=os.path.join(tmp, "local-b")))
+        assert mem.ns is None and not mem.engine.holds(CORPUS), "the holder process should hold both"
+        results["forwarded"] = phase(mem, "w-fwd", args.n, args.seconds, ids)
         mem.close()
         holder.stdin.close()
         holder.wait(timeout=60)

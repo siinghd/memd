@@ -176,7 +176,35 @@ purged in between is written again (its id was never acknowledged to
 anyone, so nothing else could have deleted it - except `forget()`, by
 query). Several writers inside one namespace (several logs) are not built.
 
-FORWARD_MEASUREMENTS
+**Measured** (`bench/forward_bench.py`: a holder process and this one on
+one 8-core machine, loopback TCP, hash embedder, no reranker, encryption on;
+each phase writes into a fresh namespace and reads one corpus of 2,000
+records; the mean of two runs):
+
+| | write ack p50 / p90 / p99 | writes/s, 1 / 4 / 8 threads | strong get p50 | strong search p50 / p99 |
+|---|---|---|---|---|
+| local root, the holder itself | 3.0 / 4.3 / 7.2 ms | 295 / 585 / 597 | 0.05 ms | 15.2 / 20.1 ms |
+| local root, forwarded | 3.9 / 5.7 / 12.1 ms | 228 / 448 / 462 | 0.66 ms | 17.0 / 23.0 ms |
+| S3 (MinIO on loopback), the holder itself | 9.5 / 11.8 / 30.3 ms | 59 / 58 / 72 | 0.05 ms | 15.0 / 34.7 ms |
+| S3 (MinIO on loopback), forwarded | 10.4 / 13.3 / 30.9 ms | 51 / 57 / 95 | 0.69 ms | 17.7 / 62 ms |
+
+A forwarded call costs one round trip plus its encoding: about 0.6 ms (a
+strong `get`, nothing else to do), about 1 ms on a write - the holder also
+checks the call's record ids against the namespace - and 1.5-3 ms on a
+search, whose packed result travels back. On a local root a forwarding
+process writes at ~77% of the holder's own throughput, at 1, 4 or 8 threads;
+on S3, where the append itself is the cost, ~86% with one thread. (The
+forwarded 8-thread S3 row is
+above the local one in both runs: S3 appends are one conditional PUT each,
+and the holder's own threads queue on them differently; it is not a gain to
+plan on.) Failover, measured by the multi-process tests (a holder writing,
+two processes forwarding, the holder killed with SIGKILL): the forwarders'
+acknowledgements paused 0.7-1.1 s on a local root (the lock frees at once;
+the pause is the new writer opening the namespace) and 3.0-3.2 s on S3 with
+a 3 s lease TTL; no acknowledged write lost or duplicated in any run. A
+holder frozen past its lease (SIGSTOP) was taken over after 3.8 s - or ~31 s
+when it froze in the middle of a PUT, whose object MinIO keeps locked until
+its timeout (AWS S3 does not lock).
 
 | setting | default | |
 |---|---|---|
