@@ -69,6 +69,14 @@ turns go through the extractor (pattern-based by default, an LLM with
 already known, and the log rotates into a segment. Extraction is re-runnable
 because the raw lane is kept.
 
+The LLM extractor sees each turn's speaker and time, so a fact is
+attributed to who said it. A call that fails (provider error, timeout, an
+empty, cut-off or malformed reply) is never retried: that chunk's turns go
+through the pattern extractor instead, and `close_session` returns
+`extraction_errors`. The options:
+
+{% include-markdown "../README-engine.md" start="### Extraction options (`Memory(config={...})` or the env var)" end="- **What the model sees.**" %}
+
 **Supersedence.** A fact written on an entity key
 (`remember(..., entity_keys=["user.editor"])`) is consolidated against the
 current facts on that key for the same org, agent and user: a near-duplicate

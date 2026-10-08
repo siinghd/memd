@@ -633,6 +633,56 @@ export MEMD_EXTRACTION_API_KEY=...     # optional: LLM fact extraction
 Without them you get deterministic hash embeddings + pattern extraction:
 fully functional, honestly degraded, clearly labeled in `stats()`.
 
+### Extraction options (`Memory(config={...})` or the env var)
+
+A config value wins over the env var; config `extraction_api_key=""` turns
+an env key off.
+
+| key / env | values | default |
+|---|---|---|
+| `extraction_api_key` / `MEMD_EXTRACTION_API_KEY` | a key for an OpenAI-compatible chat completions API; set = the LLM extractor | unset: the pattern extractor |
+| `extraction_model` / `MEMD_EXTRACTION_MODEL` | model id | `gpt-4o-mini` |
+| `extraction_base_url` / `MEMD_EXTRACTION_BASE_URL` | API base, e.g. `https://openrouter.ai/api/v1` | `https://api.openai.com/v1` |
+| `extraction_max_tokens` / `MEMD_EXTRACTION_MAX_TOKENS` | output-token cap per call, sent as `max_tokens`; `0` sends none | 4096 |
+| `extraction_timeout_s` / `MEMD_EXTRACTION_TIMEOUT_S` | seconds a call may run | 120 |
+| `extraction_request_options` / `MEMD_EXTRACTION_REQUEST_OPTIONS` | a dict (env: a JSON object) merged into every request body last; a `null` value removes a field | none |
+
+- **What the model sees.** A session's raw turns, in chunks of at most 40
+  turns / 24,000 characters, one line per turn: `[id] <time, UTC>
+  <speaker>: text`, the speaker being `user`, `assistant`, `system` or
+  `tool` (from the writer's `role`). The model is told to attribute each
+  fact to who said it (an assistant's suggestion is not the user's fact)
+  and to name the turns it came from; a fact takes its scope, actor and
+  time from those turns. Facts record the prompt version (`v2`).
+- **Bounded calls.** Every call sends `max_tokens` (an uncapped call to a
+  model that looped once ran to 131,072 output tokens and 413 s). A call
+  still receiving after `extraction_timeout_s` is cut off, and so is one
+  that sends nothing for that long - a provider that keeps the connection
+  alive with whitespace while the model generates (OpenRouter does) no
+  longer holds it open.
+- **Request options** pass the provider its own settings: OpenRouter
+  routing (`{"provider": {"order": ["deepinfra"], "allow_fallbacks":
+  false}}`), reasoning off or lower for a reasoning model (`{"reasoning":
+  {"enabled": false}}`, `{"reasoning": {"effort": "low"}}`), sampling
+  (`{"temperature": 0.2}`), or `{"max_tokens": null,
+  "max_completion_tokens": 4096, "temperature": null}` for a model that
+  rejects `max_tokens` and `temperature`. `model`, `messages` and `stream`
+  are the extractor's own and are refused, as are invalid JSON and a
+  non-object.
+- **Failures degrade to the pattern extractor.** A failed call - an HTTP
+  error, the provider unreachable, the timeout, a reply cut off at the cap
+  (`finish_reason: "length"`), an empty reply (a reasoning model that
+  answered with its reasoning only) or one without a JSON array - is never
+  retried: that chunk's turns go through the pattern extractor instead, the
+  failure is counted as
+  `memd_extraction_chunks_failed_total{model, reason}` (`http_status`,
+  `transport`, `timeout`, `truncated`, `empty`, `malformed`), and
+  `close_session` returns `extraction_errors` (the number of failed calls)
+  and audits `extraction_degraded` with the reasons. The raw turns are
+  stored either way.
+- **Privacy: with the LLM extractor active, every closed session's raw
+  turns are sent to the extraction provider** (see SECURITY.md).
+
 ### Retrieval options (`Memory(config={...})` or the env var)
 
 | key / env | values | default |

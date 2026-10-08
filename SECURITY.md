@@ -182,6 +182,15 @@ any probe fails the build.
   `MEMD_RERANKER=none` (or `local`, a cross-encoder that runs in-process) to
   keep a keyed deployment local. In hosted mode the key is read from the
   server's environment only; clients never send one.
+- **With the LLM extractor active, session turns leave the machine.** On
+  `close_session`, the session's raw turns (id, time, speaker and full
+  text of each) are sent to the extraction provider
+  (`extraction_base_url`, OpenAI by default). The LLM extractor is active
+  when an extraction key is configured, from EITHER source:
+  `MEMD_EXTRACTION_API_KEY` in the environment, or `extraction_api_key` in
+  the `Memory(config=...)` dict; config `extraction_api_key=""` keeps a
+  process with the env var set local. With no key, the pattern extractor
+  runs in-process and nothing leaves the machine.
 - **The derived indexes hold plaintext.** The SQLite index and, with
   `memd[fast]`, the tantivy index (`<ns>.tantivy/` beside it) contain record
   text unencrypted, with owner-only permissions. Both are deleted on
