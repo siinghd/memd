@@ -107,10 +107,10 @@ over **lanes**, fused by reciprocal rank fusion:
 
 | lane | what it ranks | notes |
 |---|---|---|
-| **bm25** | lexical match, SQLite FTS5 | `memd[fast]` adds a tantivy accelerator; FTS5 stays the source of truth |
+| **bm25** | lexical match, SQLite FTS5 | `memd-engine[fast]` adds a tantivy accelerator; FTS5 stays the source of truth |
 | **entity** | records whose entity keys match terms of the query | |
 | **time** | the newest records | only for queries with recency intent ("latest", "yesterday") |
-| **vector** | embedding similarity | an exact scan by default; with `memd[ann]`, a usearch HNSW sidecar from `ann_min_vectors` (20,000) vectors on. Not fused with the hash embedder (`fuse_vector`) |
+| **vector** | embedding similarity | an exact scan by default; with `memd-engine[ann]`, a usearch HNSW sidecar from `ann_min_vectors` (20,000) vectors on. Not fused with the hash embedder (`fuse_vector`) |
 
 An optional **reranker** (Jev with a TypeSafe key, or a local cross-encoder)
 reorders the top 30 of the bm25 lane (plus the vector lane with a real

@@ -378,7 +378,7 @@ def resolve_reranker(config: dict | None = None) -> Reranker | None:
     if choice == "jev":
         if not typesafe_available():
             raise ImportError("reranker 'jev' was requested but `typesafe-sdk` is not importable; "
-                              "install the optional extra (memd[jev]) or choose reranker='none'")
+                              "install the optional extra (memd-engine[jev]) or choose reranker='none'")
         key = _typesafe_key(cfg)
         if not key:
             raise ValueError("reranker 'jev' requires TYPESAFE_API_KEY in the environment")
@@ -388,7 +388,7 @@ def resolve_reranker(config: dict | None = None) -> Reranker | None:
     # "local"
     if not fastembed_available():
         raise ImportError("reranker 'local' was requested but the `fastembed` package is not "
-                          "importable; install memd[local-embeddings] or choose reranker='none'")
+                          "importable; install memd-engine[local-embeddings] or choose reranker='none'")
     return LocalCrossEncoderReranker(
         model=str(cfg.get("local_rerank_model") or DEFAULT_LOCAL_RERANK_MODEL),
         timeout_s=float(cfg.get("rerank_timeout_s") or DEFAULT_LOCAL_TIMEOUT_S),

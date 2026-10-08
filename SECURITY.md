@@ -334,7 +334,7 @@ probe, the build fails.
   runs in-process, and nothing leaves the machine.
 
 - **The derived indexes hold plaintext.** The SQLite index and, with
-  `memd[fast]`, the tantivy index (`<ns>.tantivy/` next to it) contain record
+  `memd-engine[fast]`, the tantivy index (`<ns>.tantivy/` next to it) contain record
   text that is not encrypted, with owner-only permissions. memd deletes both
   on crypto-shred, and can rebuild both from the (encrypted) log.
 
