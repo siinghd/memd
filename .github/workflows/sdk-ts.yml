@@ -88,12 +88,17 @@ jobs:
           MEMD_PYTHON: python
           MEMD_REQUIRE_INTEGRATION: "1"
         run: npm run test:integration
-      # examples/05_ts installs the SDK from ../../sdk-ts, so it needs the build
+      # examples/ts installs the SDK from ../../sdk-ts, so it needs the build
       - run: npm run build
-      - name: TypeScript example against a real server
-        working-directory: examples/05_ts
+      - name: Install the TypeScript examples
+        working-directory: examples/ts
+        run: npm install --no-audit --no-fund
+      # tests/test_examples.py type-checks them (tsc --noEmit) and runs each
+      # against a throwaway server; required here, so they cannot skip
+      - name: TypeScript examples against a real server
+        working-directory: .
         env:
-          MEMD_EMBEDDER: hash
+          MEMD_REQUIRE_TS_EXAMPLES: "1"
         run: |
-          npm install --no-audit --no-fund
-          python ../local_server.py -- node quickstart.mjs
+          pip install "pytest>=8" "pytest-timeout>=2"
+          python -m pytest tests/test_examples.py -k ts_example

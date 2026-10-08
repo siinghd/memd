@@ -100,6 +100,28 @@ export default {
 };
 ```
 
+## Examples
+
+Runnable, type-checked examples in [`examples/ts`](../examples/README.md#typescript), each against a throwaway local server:
+
+| example | shows |
+|---|---|
+| [`01_quickstart.ts`](../examples/ts/01_quickstart.ts) | `remember`, `search`, `get`, `forget` (preview, then confirm), hard `delete` |
+| [`02_sessions_and_facts.ts`](../examples/ts/02_sessions_and_facts.ts) | `observe`, `closeSession` fact extraction, supersedence, `history`, `as_of` |
+| [`03_search_options.ts`](../examples/ts/03_search_options.ts) | scope filters, namespaces, `kinds`, budgets, time, the server's reranker |
+| [`04_http_api.ts`](../examples/ts/04_http_api.ts) | a `node:http` API with memory per user (a namespace each), validation, error mapping |
+| [`05_nextjs_route.ts`](../examples/ts/05_nextjs_route.ts) | a Next.js route handler ([`route.ts`](../examples/ts/nextjs/app/api/memory/route.ts)) on standard `Request` / `Response` |
+| [`06_agent_loop.ts`](../examples/ts/06_agent_loop.ts) | a tool-calling agent loop with memd as its memory (a stub model, runs offline) |
+| [`07_eventual_reads.ts`](../examples/ts/07_eventual_reads.ts) | `consistency: "eventual"`, `maxStalenessMs`, `lastRead` and the staleness headers |
+| [`08_robust_client.ts`](../examples/ts/08_robust_client.ts) | retries and backoff, timeouts and deadlines, writes safe to retry, typed errors |
+| [`09_export_stream.ts`](../examples/ts/09_export_stream.ts) | `exportStream` to a JSONL file, `lastExportSkippedFrames` |
+
+```bash
+(cd sdk-ts && npm ci && npm run build)   # the examples install the SDK from ../../sdk-ts
+cd examples/ts && npm install
+python ../local_server.py -- npx tsx 01_quickstart.ts
+```
+
 ## API
 
 Every method accepts per-call options: `namespace` (overrides the client's), `signal`, `timeoutMs` and `retries`.

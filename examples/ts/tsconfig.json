@@ -1,0 +1,22 @@
+{
+  // Type-check only (`npm run typecheck`); the examples run with tsx.
+  // Erasable syntax and `.ts` import paths keep them runnable by Node's own
+  // type stripping too.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,
+    "allowImportingTsExtensions": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["*.ts", "nextjs/**/*.ts"]
+}

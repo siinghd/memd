@@ -1,5 +1,5 @@
 // TypeScript SDK (@memd/client): add, remember, search, pack, observe, forget and typed errors against a memd server.
-// Run: python examples/local_server.py -- node examples/05_ts/quickstart.mjs   (or set MEMD_URL / MEMD_API_KEY / MEMD_NAMESPACE yourself)
+// Run (in examples/ts): python ../local_server.py -- node quickstart.mjs   (plain JavaScript, no build step; or set MEMD_URL / MEMD_API_KEY / MEMD_NAMESPACE yourself)
 import { MemdClient, PermissionDeniedError } from "@memd/client";
 
 const { MEMD_URL, MEMD_API_KEY, MEMD_NAMESPACE = "default" } = process.env;

@@ -262,7 +262,7 @@ jobs:
         run: docker rm -f memd-ci || true
 
   # The TypeScript SDK: typecheck, unit tests, build, the packaged tarball,
-  # every runtime, the integration suite and the TS example against a real
+  # every runtime, the integration suite and the TS examples against a real
   # server. Defined in sdk-ts.yml (also runnable on its own).
   sdk-ts:
     name: sdk-ts
