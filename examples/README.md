@@ -10,10 +10,10 @@ Node.
 |---|---|---|
 | [`01_quickstart.py`](01_quickstart.py) | embedded engine: `add`, `remember`, `search`, `forget` (preview, then confirm), hard delete purged from disk | `pip install memd-engine` |
 | [`02_sessions_and_facts.py`](02_sessions_and_facts.py) | `observe`, `close_session` fact extraction, supersedence on an entity key, `history`, `as_of` time travel, restart | - |
-| [`03_mcp_server.py`](03_mcp_server.py) + [`mcp/`](mcp/README.md) | `memd serve --mcp` for Claude Code / Claude Desktop: configuration snippets, and a client that calls all four tools | `memd[mcp]` |
+| [`03_mcp_server.py`](03_mcp_server.py) + [`mcp/`](mcp/README.md) | `memd serve --mcp` for Claude Code / Claude Desktop: configuration snippets, and a client that calls all four tools | `memd-engine[mcp]` |
 | [`04_http_server_sdk.py`](04_http_server_sdk.py) | `memd serve --http` with the Python `HostedMemory` SDK and `Memory(api_key=...)`; typed errors | - |
 | [`ts/`](#typescript) | the TypeScript SDK `memd-engine` against a server: a quickstart, sessions and facts, search options, an HTTP API and a Next.js route with memory per user, an agent loop, eventual reads, retries and typed errors, export streaming | Node >= 20 |
-| [`06_s3_minio.py`](06_s3_minio.py) | an `s3://` data root on MinIO: cold reopen from the bucket, key custody that fails closed, crypto-shred | `memd[s3]`, an S3 API |
+| [`06_s3_minio.py`](06_s3_minio.py) | an `s3://` data root on an S3-compatible store (RustFS in CI): cold reopen from the bucket, key custody that fails closed, crypto-shred | `memd-engine[s3]`, an S3 API |
 
 ```bash
 pip install -e ".[mcp,s3]"          # from a checkout; or: pip install "memd-engine[mcp,s3]"

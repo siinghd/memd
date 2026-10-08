@@ -21,8 +21,13 @@ the packed text in `packed_context`, and the metadata of the hits in
 `items` (id, kind, source, time, validity), without their text.
 
 Use an **absolute** `MEMD_DATA`. Hosts start the server from a working
-directory that you do not control. Use one process for each data root. If two
-hosts use the same directory, the second one gets `NamespaceBusyError`.
+directory that you do not control.
+
+Several hosts can use the same data directory. Each host starts its own
+`memd serve --mcp` process. The first process that opens the namespace
+writes it. The other processes send their calls to that process (write
+forwarding). If that process stops, another process becomes the writer.
+With `MEMD_FORWARDING=off`, the second process gets `NamespaceBusyError`.
 
 ## Claude Code
 
