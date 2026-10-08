@@ -372,6 +372,9 @@ print(json.dumps({"served_by": seen}))
 ''', root)
         assert out.returncode == 0, out.stderr[-3000:]
         assert json.loads(out.stdout.strip().splitlines()[-1])["served_by"] == "replica"
+        # its replica reads are audited in its facade's ledger - the
+        # holder's, which appended the entries it sent
+        assert any(e["action"] == "replica_search" for e in a.audit.read())
     finally:
         a.close()
 
