@@ -65,17 +65,19 @@ On GitHub, open *Settings → Environments → New environment* and make the
 environment `pypi`. To make each publish wait for an approval, add required
 reviewers.
 
-### 3. npm: the token
+### 3. npm: trusted publishing
 
-1. On npmjs.com, create a granular access token with read and write access
-   to the `memd-engine` package (or an automation token). The package name
-   on npm is `memd-engine`, the same as on PyPI.
-2. Store the token as the `NPM_TOKEN` secret: in the `npm` environment
-   (*Settings → Environments*) or as a repository secret.
+npm publishes `memd-engine` with trusted publishing (OIDC). No npm token
+is stored in the repository.
 
-Without the secret, `release-npm.yml` does not publish and gives a warning.
-(Later, npm's own trusted publishing for GitHub Actions can replace the
-token: then remove `NODE_AUTH_TOKEN` from the publish step.)
+1. On npmjs.com, open the `memd-engine` package, then *Settings → Trusted
+   publishing*.
+2. Add a GitHub Actions publisher: user `siinghd`, repository `memd`,
+   workflow `release-npm.yml`, environment `npm`.
+
+npm cannot publish the first version of a package with OIDC. The first
+version (0.2.0) was published with a token, and that token was then
+revoked.
 
 ### 4. GitHub Pages
 

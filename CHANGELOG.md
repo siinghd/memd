@@ -6,6 +6,11 @@ wrong, how it showed, and the numbers before and after where it has them.
 
 ## [Unreleased]
 
+### Changed
+- **npm releases use trusted publishing (OIDC).** The release workflow no
+  longer uses an npm token. A manual run of the workflow from the default
+  branch can also publish a new SDK version. The TypeScript SDK is 0.2.1.
+
 ## [0.5.1] - 2026-10-08
 
 ### Changed
