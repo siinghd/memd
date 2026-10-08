@@ -10,6 +10,7 @@ import {
   MemdError,
   RateLimitError,
   ValidationError,
+  type CloseSessionResult,
   type EventIn,
   type ForgetPreview,
   type Kind,
@@ -38,9 +39,17 @@ describe("types", () => {
     expectTypeOf(c.exportJsonl).returns.resolves.toEqualTypeOf<string>();
     expectTypeOf(c.stats).returns.resolves.toEqualTypeOf<NamespaceStats>();
     expectTypeOf(c.destroyNamespace).returns.resolves.toEqualTypeOf<boolean>();
+    expectTypeOf(c.closeSession).returns.resolves.toEqualTypeOf<CloseSessionResult>();
     expectTypeOf<SearchResult["items"]>().toEqualTypeOf<SearchHit[]>();
     expectTypeOf<Kind>().toEqualTypeOf<(typeof KINDS)[number]>();
   });
+
+  it("closeSession reports quota limits and failed extraction calls", () => typeOnly(() => {
+    expectTypeOf<CloseSessionResult["raw_skipped"]>().toEqualTypeOf<number>();
+    expectTypeOf<CloseSessionResult["raw_failed"]>().toEqualTypeOf<number>();
+    expectTypeOf<CloseSessionResult["facts_capped"]>().toEqualTypeOf<number>();
+    expectTypeOf<CloseSessionResult["extraction_errors"]>().toEqualTypeOf<number>();
+  }));
 
   it("forget's result follows confirm", () => typeOnly(() => {
     expectTypeOf(c.forget("q", { confirm: true })).resolves.toEqualTypeOf<string[]>();

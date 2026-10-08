@@ -1591,7 +1591,12 @@ class Memory:
         `raw_skipped`), and at most `max_facts` facts are written
         (`facts_capped`); a callable `max_facts` is asked, once extraction
         finished, how many of the n extracted facts may be written. The raw
-        lane is never touched by either."""
+        lane is never touched by either.
+
+        `extraction_errors` counts the extraction calls that failed and
+        `raw_failed` their turns: the LLM extractor's turns of a failed call
+        go through the pattern extractor instead; an extractor that raised
+        outright counts 1 call, all its turns, and adds no facts."""
         impl = self._hosted()
         if impl is not None:
             return impl.close_session(session_id, user_id=user_id, namespace=namespace)
@@ -1606,6 +1611,14 @@ class Memory:
         to_extract = seg_records if extract_limit is None else seg_records[:max(0, int(extract_limit))]
         try:
             extracted = self.extractor.extract(to_extract) if to_extract else []
+            # provider calls that failed (LLM extractor): their turns went
+            # through the pattern extractor instead - reported, not silent
+            extraction_errors = list(getattr(extracted, "errors", None) or [])
+            raw_failed = int(getattr(extracted, "failed_records", 0) or 0)
+            if extraction_errors:
+                self._audit_for(ns.namespace).append(
+                    actor="system", action="extraction_degraded", target=session_id,
+                    detail={"failed_calls": len(extraction_errors), "reasons": sorted(set(extraction_errors))})
         except Exception as ex:
             # extraction is a REBUILDABLE derived index (raw lane is truth):
             # an extractor outage must never block the session boundary or
@@ -1614,6 +1627,8 @@ class Memory:
             self._audit_for(ns.namespace).append(actor="system", action="extraction_failed",
                               target=session_id, detail={"error": str(ex)[:200]})
             extracted = []
+            extraction_errors = ["error"]
+            raw_failed = len(to_extract)
         facts_capped = 0
         if callable(max_facts):
             max_facts = max_facts(len(extracted))
@@ -1645,7 +1660,9 @@ class Memory:
             "segment": seg_name,
             "raw_considered": len(to_extract),
             "raw_skipped": len(seg_records) - len(to_extract),
+            "raw_failed": raw_failed,
             "facts_extracted": len(extracted),
+            "extraction_errors": len(extraction_errors),
             "facts_capped": facts_capped,
             "facts_written": facts_written,
             "superseded": len(consolidation.superseded_pairs),
@@ -1679,21 +1696,35 @@ class Memory:
         if not facts:
             return 0, ConsolidationResult()
         tier_cap = min((int(s.provenance.source) for s in sources), default=int(Source.IMPORT))
-        # Cluster scope = the sources' scope with the session component
-        # stripped: supersedence is user-level knowledge that spans sessions,
-        # while org/agent/user bindings still fence tenants and users.
-        base = sources[0].scope if sources else Scope()
-        cluster_scope = Scope(org=base.org, agent=base.agent, user=base.user)
-        clusters: dict[str, list[MemoryRecord]] = {}
+
+        def source_of(fact: ExtractedFact) -> MemoryRecord | None:
+            # the fact's own turn: its scope, actor and time
+            return next((s for s in sources if s.id in fact.lineage), sources[0] if sources else None)
+
+        def cluster_scope_of(fact: ExtractedFact) -> Scope:
+            # the fact's source scope with the session component stripped:
+            # supersedence is user-level knowledge that spans sessions, while
+            # org/agent/user bindings still fence tenants and users. Per fact:
+            # in a session with several users (closed without user_id), one
+            # user's fact must never supersede another's
+            src = source_of(fact)
+            b = src.scope if src is not None else Scope()
+            return Scope(org=b.org, agent=b.agent, user=b.user)
+
+        clusters: dict[Scope, dict[str, list[MemoryRecord]]] = {}
         for f in facts:
+            by_key = clusters.setdefault(cluster_scope_of(f), {})
             for ek in f.entity_keys or ["fact.general"]:
-                clusters.setdefault(ek, [])
-        for ek in list(clusters):
-            clusters[ek] = ns.index.entity_cluster(ek, scope=cluster_scope)
+                by_key.setdefault(ek, [])
+        for cscope, by_key in clusters.items():
+            for ek in list(by_key):
+                by_key[ek] = ns.index.entity_cluster(ek, scope=cscope)
         # cross-session display-name resolution: "u7 works at X" reads better
         # (and retrieves better) as "Hank works at X" once a user.name fact
         # exists; facts are re-runnable derived data, so enrichment is legit
-        subject_names = self._resolve_subject_names(ns, clusters, cluster_scope)
+        subject_names: dict[str, str] = {}
+        for cscope, by_key in clusters.items():
+            subject_names.update(self._resolve_subject_names(ns, by_key, cscope))
         if subject_names:
             for f in facts:
                 if f.entity_keys == ["user.name"]:
@@ -1705,16 +1736,17 @@ class Memory:
         results = []
         for f in facts:
             keys = f.entity_keys or ["fact.general"]
+            by_key = clusters[cluster_scope_of(f)]
             cluster = []
             seen_ids: set[str] = set()
             for k in keys:
-                for r in clusters.get(k, []):
+                for r in by_key.get(k, []):
                     if r.id not in seen_ids:
                         seen_ids.add(r.id)
                         cluster.append(r)
 
             def make(fact: ExtractedFact, _keys=keys) -> MemoryRecord:
-                src = next((s for s in sources if s.id in fact.lineage), sources[0] if sources else None)
+                src = source_of(fact)
                 return MemoryRecord.create(
                     namespace=ns.namespace,
                     kind=Kind.FACT,
@@ -1727,7 +1759,8 @@ class Memory:
                     session_id=src.provenance.session_id if src is not None else None,
                     t_event=max((s.time.t_event for s in sources if s.id in fact.lineage), default=None)
                     or (src.time.t_event if src is not None else None),
-                    extractor=ExtractorInfo(model=self.extractor.name, prompt_version="v1"),
+                    extractor=fact.extractor or ExtractorInfo(
+                        model=self.extractor.name, prompt_version=getattr(self.extractor, "prompt_version", "v1")),
                 )
 
             res = consolidate_facts(cluster, [f], make)

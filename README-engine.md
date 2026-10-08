@@ -462,10 +462,17 @@ alone. A session close is a write: at the memories cap it answers 402. While
 its extractor runs it holds room for one memory only - writes alongside it
 are not starved - and once the facts are extracted it reserves exactly
 min(facts extracted, remaining headroom); anything beyond is not written
-(`facts_capped` in the response). With extraction on our key under a
-hard cap, the session's raw records are extracted up to the remaining
-allowance and the rest stay raw-only - searchable, never extracted
-(`raw_skipped`); with no allowance left the close answers 402. After
+(`facts_capped` in the response). **Extraction runs on our key when the
+server's environment has `MEMD_EXTRACTION_API_KEY`** (a hosted server
+builds its engine from the environment, never from a client): then every
+session close is metered as `extractions_our_key`, one unit per raw turn
+the LLM extracted - the turns of a call that failed went through the local
+pattern extractor (`raw_failed` in the response) and are not counted.
+Under a hard cap (the free plan's 10K a month), the session's raw records
+are extracted up to the remaining allowance and the rest stay raw-only -
+searchable, never extracted (`raw_skipped`); with no allowance left the
+close answers 402 (the pattern extractor does not take over). Without the
+key, extraction runs locally, is never metered and never refuses. After
 `invoice.payment_failed` the org has a 7-day grace period
 (`MEMD_BILLING_GRACE_DAYS`); after it the org is **read-only**: writes and
 session extraction answer `402 {"code": "payment_required"}`, searches, reads
@@ -584,7 +591,8 @@ time - never memory content, queries or user ids. What reaches Stripe is the
 customer id, the meter's event name, a number and a timestamp; the org's
 name goes into the Stripe customer record once, at first checkout.
 `extractions_our_key` counts only when extraction runs on the operator's LLM
-key; the local heuristic extractor is never billed.
+key (`MEMD_EXTRACTION_API_KEY` in the server's environment), and only the
+turns the LLM extracted; the local pattern extractor is never billed.
 
 ## Doors (one engine)
 
@@ -632,6 +640,77 @@ export MEMD_EXTRACTION_API_KEY=...     # optional: LLM fact extraction
 
 Without them you get deterministic hash embeddings + pattern extraction:
 fully functional, honestly degraded, clearly labeled in `stats()`.
+
+Embeddings: `embedding_api_key` / `MEMD_EMBEDDING_API_KEY` (set = an
+OpenAI-compatible embeddings API when `embedder` is `auto` or `openai`),
+`embedding_model` / `MEMD_EMBEDDING_MODEL` (`text-embedding-3-small`),
+`embedding_base_url` / `MEMD_EMBEDDING_BASE_URL`
+(`https://api.openai.com/v1`); as below, a config value wins over the env
+var, and config `embedding_api_key=""` turns an env key off.
+
+### Extraction options (`Memory(config={...})` or the env var)
+
+A config value wins over the env var; config `extraction_api_key=""` turns
+an env key off.
+
+| key / env | values | default |
+|---|---|---|
+| `extraction_api_key` / `MEMD_EXTRACTION_API_KEY` | a key for an OpenAI-compatible chat completions API; set = the LLM extractor | unset: the pattern extractor |
+| `extraction_model` / `MEMD_EXTRACTION_MODEL` | model id | `gpt-4o-mini` |
+| `extraction_base_url` / `MEMD_EXTRACTION_BASE_URL` | API base, e.g. `https://openrouter.ai/api/v1` | `https://api.openai.com/v1` |
+| `extraction_max_tokens` / `MEMD_EXTRACTION_MAX_TOKENS` | output-token cap per call, sent as `max_tokens`; `0` sends none | 4096 |
+| `extraction_timeout_s` / `MEMD_EXTRACTION_TIMEOUT_S` | seconds one call may take, start to finish | 120 |
+| `extraction_max_response_bytes` / `MEMD_EXTRACTION_MAX_RESPONSE_BYTES` | a larger reply is refused, read no further | 4194304 (4 MiB) |
+| `extraction_request_options` / `MEMD_EXTRACTION_REQUEST_OPTIONS` | a dict (env: a JSON object) merged into every request body last; a `null` value removes a field | none |
+
+- **What the model sees.** A session's raw turns, in chunks of at most 40
+  turns / 24,000 characters (counting each whole line), one line per turn:
+  `[<turn id>] <time, UTC> <speaker>: text`, the speaker being `user`,
+  `assistant`, `agent`, `system` or `tool` (from the writer's `role`). A
+  line break in a turn's text is written as `\n`, so a turn cannot pose as
+  another line or speaker, and turn ids are made up for each call
+  (`9f3a1c-1`, `9f3a1c-2`, ...): a turn's text cannot name another turn,
+  and record ids are not sent. The model is told to attribute each
+  fact to who said it (an assistant's suggestion is not the user's fact)
+  and to name the turns it came from; a fact takes its scope, actor and
+  time from those turns (one naming none of its chunk's turns: from the
+  chunk's first user turn, else its first turn). Facts record the prompt
+  version (`v2`).
+- **Bounded calls.** Every call sends `max_tokens` (an uncapped call to a
+  model that looped once ran to 131,072 output tokens and 413 s). The whole
+  call - connecting, sending, the response headers and body - is cut off
+  at `extraction_timeout_s`, however the provider trickles bytes (OpenRouter
+  keeps a connection alive with whitespace while the model generates; a
+  per-read timeout restarts with every byte). The call runs on its own
+  thread and connection: at the deadline the session close moves on and
+  the connection is closed; the abandoned thread ends at its next read, or
+  after `extraction_timeout_s` more for a provider that has gone silent.
+- **Request options** pass the provider its own settings: OpenRouter
+  routing (`{"provider": {"order": ["deepinfra"], "allow_fallbacks":
+  false}}`), reasoning off or lower for a reasoning model (`{"reasoning":
+  {"enabled": false}}`, `{"reasoning": {"effort": "low"}}`), sampling
+  (`{"temperature": 0.2}`), or `{"max_tokens": null,
+  "max_completion_tokens": 4096, "temperature": null}` for a model that
+  rejects `max_tokens` and `temperature`. `model`, `messages` and `stream`
+  are the extractor's own and are refused, as are invalid JSON and a
+  non-object.
+- **Failures degrade to the pattern extractor.** A failed call - an HTTP
+  error, the provider unreachable, the timeout, a reply cut off at the cap
+  (`finish_reason: "length"`), an empty reply (a reasoning model that
+  answered with its reasoning only), one over the size cap, or one without
+  a JSON array - is never
+  retried: that chunk's turns go through the pattern extractor instead, the
+  failure is counted as
+  `memd_extraction_chunks_failed_total{model, reason}` (`http_status`,
+  `transport`, `timeout`, `truncated`, `empty`, `oversize`, `malformed`), and
+  `close_session` returns `extraction_errors` (the number of failed calls)
+  and `raw_failed` (their turns), and audits `extraction_degraded` with the
+  reasons. The raw turns are stored either way. Within a reply that parses,
+  a malformed item (no text, or `entity_keys` / `lineage` not a string or a
+  list of strings) is dropped and counted as
+  `memd_extraction_items_malformed_total{model}`; its other facts are kept.
+- **Privacy: with the LLM extractor active, every closed session's raw
+  turns are sent to the extraction provider** (see SECURITY.md).
 
 ### Retrieval options (`Memory(config={...})` or the env var)
 

@@ -6,6 +6,105 @@ wrong, how it showed, and the numbers before and after where it has them.
 
 ## [Unreleased]
 
+### Added
+- **Extraction settings: an output cap, a call timeout and request
+  options.** `extraction_max_tokens` (`MEMD_EXTRACTION_MAX_TOKENS`, default
+  4096, sent as `max_tokens`; `0` sends none), `extraction_timeout_s`
+  (`MEMD_EXTRACTION_TIMEOUT_S`, default 120), `extraction_max_response_bytes`
+  (`MEMD_EXTRACTION_MAX_RESPONSE_BYTES`, default 4 MiB: a reply was read
+  whole, so a 120 MB one cost 360 MB of memory; a larger one now fails the
+  call as `oversize`, read no further) and
+  `extraction_request_options` (`MEMD_EXTRACTION_REQUEST_OPTIONS`, a JSON
+  object): a dict merged into every request body last, for the provider's
+  own settings - OpenRouter `provider` routing, `reasoning` off or a lower
+  effort, `temperature`; a `null` value removes a field (e.g.
+  `{"max_tokens": null, "max_completion_tokens": 4096}` for a model that
+  rejects `max_tokens`). `model`, `messages` and `stream` are refused, as
+  are invalid values, when the extractor is built. Table and examples:
+  README-engine.md, "Extraction options".
+- `close_session` returns `extraction_errors` and `raw_failed`: the
+  extraction calls that failed and their turns (see Fixed).
+
+### Fixed
+- **`MEMD_EXTRACTION_API_KEY` turns LLM extraction on.** It was documented
+  as the way to, but nothing read it: only `Memory(config={
+  "extraction_api_key": ...})` did, so a server started with the env var
+  extracted with the pattern extractor. `MEMD_EXTRACTION_API_KEY`,
+  `MEMD_EXTRACTION_MODEL` and `MEMD_EXTRACTION_BASE_URL` (and the new
+  settings above) are read from the environment; a config value wins, and
+  config `extraction_api_key=""` turns an env key off. **Upgrade note: a
+  process with `MEMD_EXTRACTION_API_KEY` set now sends each closed
+  session's raw turns to the extraction provider** (SECURITY.md). **In
+  hosted mode that is extraction on our key**: the server builds its engine
+  from the environment, so with the variable set every session close is
+  metered as `extractions_our_key`, the free plan's hard cap (10K turns a
+  month) applies - turns past the remaining allowance stay raw-only
+  (`raw_skipped`) - and a close with no allowance left answers 402.
+  Before, a hosted server with the variable set extracted with the pattern
+  extractor and metered nothing.
+- **`extractions_our_key` counts only the turns the LLM extracted.** It
+  counted every turn the extractor was handed (`raw_considered`), including
+  those of a failed call that the pattern extractor took over. A close now
+  returns `raw_failed` (those turns; all of them when the extractor raised)
+  and the meter records `raw_considered - raw_failed`.
+- **`MEMD_EMBEDDING_API_KEY` selects the OpenAI-compatible embedder.** It
+  was documented next to `MEMD_EXTRACTION_API_KEY` and, like it, read by
+  nothing. `MEMD_EMBEDDING_API_KEY`, `MEMD_EMBEDDING_MODEL` and
+  `MEMD_EMBEDDING_BASE_URL` are now read, config winning (config
+  `embedding_api_key=""` turns an env key off). **Upgrade note: with the
+  variable set and `embedder` left at `auto`, record text and queries are
+  sent to the embeddings provider, and a namespace embedded with another
+  model is re-embedded in the background when it opens** (vector
+  self-heal; SECURITY.md).
+- **An extraction call is bounded.** No `max_tokens` was sent: one call to
+  a model that looped ran to 131,072 output tokens (413 s, $0.157). The
+  60 s client timeout did not stop it: it is a per-read timeout, and a
+  provider that keeps the connection alive with whitespace while the model
+  generates (OpenRouter does) resets it with every byte. Calls now send the
+  cap, and each call - connecting, sending, the response headers and body -
+  runs on its own thread and connection, cut off at `extraction_timeout_s`
+  (a provider that sent its headers a byte at a time held a call with a
+  1 s timeout for 8 s under a deadline checked only between body reads).
+- **The extractor says who spoke each turn, and when.** Turns were sent as
+  `[id] text`: nothing said whether the user or the assistant spoke, so an
+  assistant's suggestion read like the user's own statement. And the prompt
+  never asked for the turns a fact came from, so every LLM fact took its
+  scope, actor and time from the session's first turn - the assistant's,
+  when it spoke first. Each turn is now `[<turn id>] <time, UTC> <speaker>:
+  text` on one line (a line break in the text is written as `\n`, so a turn
+  cannot pose as another line or speaker; the turn ids are made up for each
+  call, so a turn cannot name another), the model is told to attribute each
+  fact to who said it and to resolve relative dates against the turn's
+  time, and each fact names its turns (`lineage`; one that names none of
+  its chunk's turns is traced to the chunk's first user turn). The chunk
+  bound counts each whole rendered line. The prompt is version `v2`; facts record the extractor's
+  prompt version instead of a fixed `v1`.
+- **In a session with several users, one user's fact never supersedes
+  another's.** A session closed without `user_id` extracts every user's
+  turns; each fact was consolidated against the facts of the session's
+  FIRST turn's user, so u2's "works at Globex" superseded u1's "works at
+  Initech". Each fact is now consolidated within its own source turn's
+  org, agent and user.
+- **TypeScript SDK: `CloseSessionResult` has every field a close returns.**
+  It lacked `raw_skipped` and `facts_capped` (returned since hosted mode)
+  and now carries `raw_failed` and `extraction_errors` too.
+- **A failed extraction call falls back to the pattern extractor, counted
+  and reported.** A failed call lost its chunk's facts: an HTTP error or a
+  timeout was counted without a reason, a reply without a JSON array
+  returned nothing without even a count, and a reasoning model that
+  answered with its reasoning only (empty or null content) failed on the
+  null. Each failed call is now classified (`http_status`, `transport`,
+  `timeout`, `truncated` - the reply hit the output cap - `empty`,
+  `oversize`, `malformed`), counted as
+  `memd_extraction_chunks_failed_total{model, reason}`, never retried, and
+  its turns go through the pattern extractor instead; `close_session`
+  returns `extraction_errors` and audits `extraction_degraded` with the
+  reasons. The raw lane was never affected. Within a reply, one malformed
+  item (a `lineage` of 5, `entity_keys` of `[123]`) failed the whole call;
+  it is now dropped and counted (`memd_extraction_items_malformed_total`)
+  and the reply's other facts are kept; `entity_keys` or `lineage` given as
+  one string is one entry, not its characters.
+
 ## [0.4.0] - 2026-10-01
 
 ### Added

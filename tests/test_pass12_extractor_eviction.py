@@ -11,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from memd.core.schema import MemoryRecord, Scope, Source
-from memd.pipeline.extractor import LLMExtractor
+from memd.pipeline.extractor import HeuristicExtractor, LLMExtractor
 from memd.storage.engine import StorageEngine
 
 
@@ -26,7 +26,7 @@ class TestLLMExtractorChunking:
         ext = LLMExtractor(model="fake", api_key="k",
                            base_url="http://fake.local/v1",
                            chunk_records=chunk_records, chunk_chars=chunk_chars)
-        ext._client = httpx.Client(transport=httpx.MockTransport(handler))
+        ext._transport = httpx.MockTransport(handler)
         return ext
 
     @staticmethod
@@ -58,11 +58,11 @@ class TestLLMExtractorChunking:
         def handler(request: httpx.Request) -> httpx.Response:
             body = request.read().decode()
             # the chunk containing r5 fails hard; others succeed
-            if "[r5]" in body:
+            if "text 5" in body:
                 return httpx.Response(500, json={"error": "provider down"})
             import json as _json
 
-            rid = "r0" if "[r0]" in body else ("r8" if "[r8]" in body else "rx")
+            rid = "r0" if "text 0" in body else ("r8" if "text 8" in body else "rx")
             facts = [{"content": f"fact {rid}", "entity_keys": []}]
             return httpx.Response(200, json={"choices": [
                 {"message": {"content": _json.dumps(facts)}}]})
@@ -82,7 +82,10 @@ class TestLLMExtractorChunking:
                 {"message": {"content": "prose without json ]"}}]})
 
         ext = self._extractor(handler)
-        assert ext.extract([_rec(1)]) == []
+        out = ext.extract([_rec(1)])
+        # counted, and the chunk's turns go through the pattern extractor
+        assert out.errors == ["malformed"]
+        assert [f.content for f in out] == [f.content for f in HeuristicExtractor().extract([_rec(1)])]
 
 
 class TestEvictedStoreFailFast:

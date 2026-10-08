@@ -226,8 +226,17 @@ export interface ForgetResult {
 /** `POST /v1/ns/{ns}/sessions/{sid}/close`. */
 export interface CloseSessionResult {
   segment: string;
+  /** Raw turns handed to the extractor. */
   raw_considered: number;
+  /** Raw turns past the hosted extraction allowance: stored, never extracted. */
+  raw_skipped: number;
+  /** Turns of failed extraction calls (the pattern extractor took them over). */
+  raw_failed: number;
   facts_extracted: number;
+  /** Extraction calls that failed. */
+  extraction_errors: number;
+  /** Facts not written: over the hosted memories cap. */
+  facts_capped: number;
   facts_written: number;
   superseded: number;
   dupes_dropped: number;
