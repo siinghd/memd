@@ -167,7 +167,7 @@ const MEMORY_KEYS = [
 ] as const;
 const SEARCH_KEYS = [
   "user_id", "session_id", "agent_id", "org_id", "budget_tokens", "as_of", "kinds",
-  "include_quarantined",
+  "include_quarantined", "packing",
 ] as const;
 const FIND_KEYS = ["user_id", "session_id", "agent_id", "org_id", "as_of", "kinds"] as const;
 

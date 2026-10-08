@@ -144,8 +144,13 @@ describe.skipIf(!AVAILABLE)("against a real memd server", () => {
 
     const res = await a.search("how do we deploy?", { user_id: "u1", budget_tokens: 1500 });
     expect(res.items.map((i) => i.id)).toContain(rawId);
-    expect(res.packed_context).toContain("make ship");
+    expect(res.packed_context).toContain("user: We deploy with make ship, never CI");
     expect(res.budget).toBe(1500);
+    const byDefault = await a.search("how do we deploy?", { user_id: "u1" });
+    expect(byDefault.budget).toBe(12000);
+    expect(byDefault.packed_context).toMatch(/^Relevant excerpts from past conversations/);
+    const flat = await a.search("how do we deploy?", { user_id: "u1", packing: "flat" });
+    expect(flat.packed_context).toContain('<memory source="user" kind="raw_event"');
     const hit = res.items.find((i) => i.id === rawId)!;
     expect(hit.namespace).toBe(nsA);
     expect(hit.kind).toBe("raw_event");

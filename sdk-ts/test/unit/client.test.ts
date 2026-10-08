@@ -146,6 +146,14 @@ describe("reads", () => {
     });
   });
 
+  it("search passes packing; unset fields fall to the server's defaults", async () => {
+    const { fetch, calls } = scriptedFetch(json(SEARCH_RESULT), json(SEARCH_RESULT));
+    await client(fetch).search("q", { packing: "flat" });
+    expect(calls[0]!.body).toEqual({ query: "q", packing: "flat" });
+    await client(fetch).search("q", { packing: null, budget_tokens: undefined });
+    expect(calls[1]!.body).toEqual({ query: "q" });
+  });
+
   it("get returns the record, passes history, and maps 404 to null", async () => {
     const { fetch, calls } = scriptedFetch(json(RECORD), json({ detail: "not found" }, 404));
     const c = client(fetch);
