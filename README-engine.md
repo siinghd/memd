@@ -662,7 +662,9 @@ an env key off.
   `tool` (from the writer's `role`). The model is told to attribute each
   fact to who said it (an assistant's suggestion is not the user's fact)
   and to name the turns it came from; a fact takes its scope, actor and
-  time from those turns. Facts record the prompt version (`v2`).
+  time from those turns (one naming none of its chunk's turns: from the
+  chunk's first user turn, else its first turn). Facts record the prompt
+  version (`v2`).
 - **Bounded calls.** Every call sends `max_tokens` (an uncapped call to a
   model that looped once ran to 131,072 output tokens and 413 s). The whole
   call - connecting, sending, the response headers and body - is cut off

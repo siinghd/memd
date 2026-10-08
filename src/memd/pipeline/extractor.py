@@ -354,6 +354,12 @@ prompt_version={PROMPT_VERSION}"""
         return self._parse(text, records)
 
     @staticmethod
+    def _speaker(rec: MemoryRecord) -> str:
+        from memd.query.rerank import candidate_from_record
+
+        return candidate_from_record(rec)["role"]
+
+    @staticmethod
     def _turn_line(rec: MemoryRecord) -> str:
         """[id] time speaker: text - when and who as the reranker sees a
         record (role from the writer's actor id, else the source tier)."""
@@ -411,6 +417,10 @@ prompt_version={PROMPT_VERSION}"""
         except ValueError:
             raise ExtractionError("malformed", "no JSON array in the reply") from None
         id_set = {r.id for r in records}
+        # a fact naming no turn of this chunk is traced to the chunk's first
+        # user turn (else its first turn) - never to a turn outside the
+        # chunk, which is what the session-wide default would pick
+        default_lineage = [next((r.id for r in records if self._speaker(r) == "user"), records[0].id)]
         out = []
         for item in arr:
             if not isinstance(item, dict):
@@ -419,8 +429,8 @@ prompt_version={PROMPT_VERSION}"""
             if not content:
                 continue
             ekeys = [normalize_entity_key(k) for k in item.get("entity_keys", []) if k]
-            lin = [x for x in item.get("lineage", []) if x in id_set]
-            out.append(ExtractedFact(content=content, entity_keys=ekeys, lineage=lin))
+            lin = [x for x in item.get("lineage") or [] if x in id_set]
+            out.append(ExtractedFact(content=content, entity_keys=ekeys, lineage=lin or default_lineage))
         return out
 
 

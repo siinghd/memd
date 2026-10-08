@@ -577,3 +577,19 @@ def test_a_fallback_fact_is_labelled_as_the_pattern_extractors(provider, tmp_pat
         assert m.get(fact.id)["provenance"]["extractor"] == {"model": "heuristic", "prompt_version": "v1"}
     finally:
         m.close()
+
+
+@pytest.mark.parametrize("lineage", [None, [], ["not-a-turn"]])
+def test_a_fact_without_valid_lineage_is_traced_to_its_own_chunk(provider, lineage):
+    item = {"content": "a fact", "entity_keys": ["fact.general"]}
+    if lineage is not None:
+        item["lineage"] = lineage
+    provider.reply = lambda body: _chat(json.dumps([item]))
+    ext = _llm(provider)
+    ext.chunk_records = 2
+    out = ext.extract([_rec("hello", "r1"), _rec("I work at Initech", "r2"),
+                       _rec("Where do you work?", "r3", "assistant"), _rec("At Globex", "r4"),
+                       _rec("Noted", "r5", "assistant")])
+    # chunk 1 = r1, r2; chunk 2 = r3, r4 (its first user turn); chunk 3 = r5
+    # (no user turn: its first turn)
+    assert [f.lineage for f in out] == [["r1"], ["r4"], ["r5"]]
