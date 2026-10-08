@@ -174,7 +174,9 @@ class TestDurability:
 
 class TestSingleWriter:
     def test_a_second_process_is_refused(self, tmp_path, prefix):
-        """flock cannot see another machine; the lease can."""
+        """flock cannot see another machine; the lease can. (With forwarding
+        off: on, the second process forwards to the first -
+        tests/test_write_forwarding.py.)"""
         m = _mem(tmp_path, prefix)
         try:
             m.add("first writer owns this namespace", user_id="u1")
@@ -185,7 +187,7 @@ class TestSingleWriter:
                 "cfg = dict(s3_endpoint_url=%r, s3_access_key=%r, s3_secret_key=%r,"
                 "           s3_region='us-east-1', local_dir=%r)\n"
                 "try:\n"
-                "    Memory('s3://%s/%s', encrypt=False, config=cfg)\n"
+                "    Memory('s3://%s/%s', encrypt=False, config=cfg, forwarding='off')\n"
                 "    print('OPENED')\n"
                 "except Exception as e:\n"
                 "    print(type(e).__name__)\n"
