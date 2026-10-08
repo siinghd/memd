@@ -36,7 +36,10 @@ def test_reembed_restores_vector_lane_after_cache_loss(tmp_path):
         import json as _j
         raw_cnt = m2.ns.index._con.execute("SELECT COUNT(*) FROM vectors").fetchone()[0]
         print("DEBUG rep:", rep, "| table:", raw_cnt, "| loaded:", m2.ns.index._vec_loaded)
-        assert rep["embedded"] == 1 and rep["missing"] == 1
+        # the open-time self-heal re-embeds missing vectors in the
+        # background: it can finish first, and reembed() then finds none
+        # missing. Either way, the vector lane must come back.
+        assert rep["embedded"] == rep["missing"] and rep["missing"] in (0, 1)
         idx = m2.ns.index
         raw_cnt = idx._con.execute("SELECT COUNT(*) FROM vectors").fetchone()[0]
         st2 = m2.stats()
