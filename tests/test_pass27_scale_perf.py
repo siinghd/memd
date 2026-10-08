@@ -55,8 +55,13 @@ def test_reads_are_not_serialized_on_the_writer_lock(tmp_path):
             def worker(tid):
                 barrier.wait()
                 for k in range(per_thread):
+                    # the retrieval path (2K flat): this guards the writer
+                    # lock. The default session pack is Python work under
+                    # the GIL, so its throughput scales with processes, not
+                    # threads - not what this test is about
                     m.search(f"{TOPICS[k % 6]} session discussed follow ups number "
-                             f"{(tid * 997 + k * 13) % 3000}", user_id="u")
+                             f"{(tid * 997 + k * 13) % 3000}", user_id="u",
+                             budget_tokens=2000, packing="flat")
 
             ts = [threading.Thread(target=worker, args=(i,)) for i in range(threads)]
             t0 = time.monotonic()
