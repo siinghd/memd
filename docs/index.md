@@ -53,9 +53,11 @@ Honest limits:
   (difference -0.033, 95% CI [-0.167, +0.067]). It also makes a session
   close slower (1.5 s against 0.08 s at the median). A larger evaluation
   is necessary before we recommend it.
-- **The quality evidence is retrieval on one public dataset.** The
-  end-to-end QA numbers are preliminary, and the one-time held-out
-  500-question run has not been done ([Benchmarks](benchmarks.md)).
+- **The quality evidence comes from one public dataset (LongMemEval_S).**
+  The 500-question end-to-end run used the previous defaults (2K flat
+  pack). Session packing was measured on 160 of those questions, with
+  bge-small, a reranker and relative dates on. The current defaults are
+  not yet measured end to end. Details are in [Benchmarks](benchmarks.md).
 - **Alpha software** (`Development Status :: 3 - Alpha`); what changed in
   each release is in the [Changelog](changelog.md).
 - **Out of scope by design:** an agent framework or runtime, a
