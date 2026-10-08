@@ -16,6 +16,7 @@ Providers: LLMExtractor (BYO OpenAI-compatible key) and HeuristicExtractor
 from __future__ import annotations
 
 import json
+import os
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -294,12 +295,23 @@ prompt_version={PROMPT_VERSION}"""
         return out
 
 
+def extraction_setting(cfg: dict, key: str, default=None):
+    """config[key], else env MEMD_<KEY>, else `default`. A config value that
+    is not None wins - so config {"extraction_api_key": ""} turns an env key
+    off."""
+    if cfg.get(key) is not None:
+        return cfg[key]
+    env = os.environ.get(f"MEMD_{key.upper()}")
+    return env if env is not None else default
+
+
 def resolve_extractor(config: dict | None = None) -> Extractor:
     cfg = config or {}
-    if cfg.get("extraction_api_key"):
+    api_key = extraction_setting(cfg, "extraction_api_key")
+    if api_key:
         return LLMExtractor(
-            model=cfg.get("extraction_model", "gpt-4o-mini"),
-            api_key=cfg["extraction_api_key"],
-            base_url=cfg.get("extraction_base_url", "https://api.openai.com/v1"),
+            model=extraction_setting(cfg, "extraction_model", "gpt-4o-mini"),
+            api_key=api_key,
+            base_url=extraction_setting(cfg, "extraction_base_url", "https://api.openai.com/v1"),
         )
     return HeuristicExtractor()
