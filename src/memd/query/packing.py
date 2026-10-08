@@ -361,8 +361,15 @@ def _excerpt(text: str, limit: int, focus: str = "") -> str:
     return ("..." if s else "") + text[s:s + limit] + ("..." if s + limit < len(text) else "")
 
 
+_FENCE_TAG = re.compile(r"<(/?untrusted-data)", re.I)
+
+
 def _fence(r: MemoryRecord, line: str) -> str:
-    return f"{_FENCE_OPEN}\n{_escape(line)}\n{_FENCE_CLOSE}" if _fenced(r) else line
+    """Lower-trust content inside a fence, escaped; a fence tag in trusted
+    text is escaped too, so each fence in the text is a real one."""
+    if _fenced(r):
+        return f"{_FENCE_OPEN}\n{_escape(line)}\n{_FENCE_CLOSE}"
+    return _FENCE_TAG.sub(r"&lt;\1", line)
 
 
 def _one_line(text: str) -> str:
