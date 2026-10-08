@@ -6,6 +6,8 @@ wrong, how it showed, and the numbers before and after where it has them.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-08
+
 ### Added
 - **Write forwarding: several processes on one data root.** A process that
   opened a namespace another process held (its lock file on a local root,
