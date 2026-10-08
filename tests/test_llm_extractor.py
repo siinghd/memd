@@ -4,6 +4,7 @@ request options, who said what, and failures that degrade visibly.
 A local OpenAI-compatible endpoint stands in for the provider: it records
 every request body and answers what each test tells it to."""
 import json
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -12,16 +13,11 @@ import pytest
 from memd.core.schema import MemoryRecord, Scope, Source
 from memd.pipeline.extractor import HeuristicExtractor, LLMExtractor, resolve_extractor
 
-_ENV = ("MEMD_EXTRACTION_API_KEY", "MEMD_EXTRACTION_MODEL", "MEMD_EXTRACTION_BASE_URL",
-        "MEMD_EXTRACTION_MAX_TOKENS", "MEMD_EXTRACTION_TIMEOUT_S", "MEMD_EXTRACTION_REQUEST_OPTIONS",
-        "MEMD_EXTRACTION_MAX_RESPONSE_BYTES")
 
-
-@pytest.fixture(autouse=True)
-def _no_ambient_extraction_env(monkeypatch):
-    # a developer's MEMD_EXTRACTION_* must never make these tests call out
-    for k in _ENV:
-        monkeypatch.delenv(k, raising=False)
+def test_the_suite_never_sees_a_providers_settings():
+    # tests/conftest.py clears them for every test
+    assert not [k for k in os.environ if k.startswith(("MEMD_EXTRACTION_", "MEMD_EMBEDDING_"))]
+    assert "TYPESAFE_API_KEY" not in os.environ
 
 
 def _chat(content, finish_reason="stop", **message) -> dict:
