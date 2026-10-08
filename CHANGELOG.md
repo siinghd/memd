@@ -10,7 +10,10 @@ wrong, how it showed, and the numbers before and after where it has them.
 - **Extraction settings: an output cap, a call timeout and request
   options.** `extraction_max_tokens` (`MEMD_EXTRACTION_MAX_TOKENS`, default
   4096, sent as `max_tokens`; `0` sends none), `extraction_timeout_s`
-  (`MEMD_EXTRACTION_TIMEOUT_S`, default 120) and
+  (`MEMD_EXTRACTION_TIMEOUT_S`, default 120), `extraction_max_response_bytes`
+  (`MEMD_EXTRACTION_MAX_RESPONSE_BYTES`, default 4 MiB: a reply was read
+  whole, so a 120 MB one cost 360 MB of memory; a larger one now fails the
+  call as `oversize`, read no further) and
   `extraction_request_options` (`MEMD_EXTRACTION_REQUEST_OPTIONS`, a JSON
   object): a dict merged into every request body last, for the provider's
   own settings - OpenRouter `provider` routing, `reasoning` off or a lower
@@ -70,7 +73,7 @@ wrong, how it showed, and the numbers before and after where it has them.
   answered with its reasoning only (empty or null content) failed on the
   null. Each failed call is now classified (`http_status`, `transport`,
   `timeout`, `truncated` - the reply hit the output cap - `empty`,
-  `malformed`), counted as
+  `oversize`, `malformed`), counted as
   `memd_extraction_chunks_failed_total{model, reason}`, never retried, and
   its turns go through the pattern extractor instead; `close_session`
   returns `extraction_errors` and audits `extraction_degraded` with the

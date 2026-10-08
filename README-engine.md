@@ -653,6 +653,7 @@ an env key off.
 | `extraction_base_url` / `MEMD_EXTRACTION_BASE_URL` | API base, e.g. `https://openrouter.ai/api/v1` | `https://api.openai.com/v1` |
 | `extraction_max_tokens` / `MEMD_EXTRACTION_MAX_TOKENS` | output-token cap per call, sent as `max_tokens`; `0` sends none | 4096 |
 | `extraction_timeout_s` / `MEMD_EXTRACTION_TIMEOUT_S` | seconds one call may take, start to finish | 120 |
+| `extraction_max_response_bytes` / `MEMD_EXTRACTION_MAX_RESPONSE_BYTES` | a larger reply is refused, read no further | 4194304 (4 MiB) |
 | `extraction_request_options` / `MEMD_EXTRACTION_REQUEST_OPTIONS` | a dict (env: a JSON object) merged into every request body last; a `null` value removes a field | none |
 
 - **What the model sees.** A session's raw turns, in chunks of at most 40
@@ -683,11 +684,12 @@ an env key off.
 - **Failures degrade to the pattern extractor.** A failed call - an HTTP
   error, the provider unreachable, the timeout, a reply cut off at the cap
   (`finish_reason: "length"`), an empty reply (a reasoning model that
-  answered with its reasoning only) or one without a JSON array - is never
+  answered with its reasoning only), one over the size cap, or one without
+  a JSON array - is never
   retried: that chunk's turns go through the pattern extractor instead, the
   failure is counted as
   `memd_extraction_chunks_failed_total{model, reason}` (`http_status`,
-  `transport`, `timeout`, `truncated`, `empty`, `malformed`), and
+  `transport`, `timeout`, `truncated`, `empty`, `oversize`, `malformed`), and
   `close_session` returns `extraction_errors` (the number of failed calls)
   and `raw_failed` (their turns), and audits `extraction_degraded` with the
   reasons. The raw turns are stored either way.

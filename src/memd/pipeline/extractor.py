@@ -29,6 +29,7 @@ from memd.core.schema import MemoryRecord, Source
 PROMPT_VERSION = "v2"
 DEFAULT_MAX_TOKENS = 4096   # output tokens per extraction call
 DEFAULT_TIMEOUT_S = 120.0   # an extraction call is cut off after this (LLMExtractor._complete)
+DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024  # a reply larger than this is refused unread
 
 
 @dataclass
@@ -246,7 +247,8 @@ prompt_version={PROMPT_VERSION}"""
     def __init__(self, model: str, api_key: str, base_url: str = "https://api.openai.com/v1",
                  chunk_records: int = 40, chunk_chars: int = 24_000,
                  max_tokens: int = DEFAULT_MAX_TOKENS, timeout_s: float = DEFAULT_TIMEOUT_S,
-                 request_options: dict | str | None = None):
+                 request_options: dict | str | None = None,
+                 max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES):
         import httpx
 
         self.model = model
@@ -258,6 +260,8 @@ prompt_version={PROMPT_VERSION}"""
         # looped ran to 131,072 output tokens and 413 s
         self.max_tokens = int(max_tokens)
         self.timeout_s = float(timeout_s)
+        # a 120 MB reply cost 360 MB of memory to read and parse
+        self.max_response_bytes = int(max_response_bytes)
         # merged into every request body last; a None value removes a field
         self.request_options = _request_options(request_options or {})
         self.chunks_sent = 0
@@ -389,6 +393,8 @@ prompt_version={PROMPT_VERSION}"""
             resp.raise_for_status()
             for part in resp.iter_bytes():
                 buf += part
+                if len(buf) > self.max_response_bytes:
+                    raise ExtractionError("oversize", f"the reply exceeded {self.max_response_bytes} bytes")
         return json.loads(bytes(buf))
 
     def _parse(self, text: str, records: list[MemoryRecord]) -> list[ExtractedFact]:
@@ -449,6 +455,8 @@ def resolve_extractor(config: dict | None = None) -> Extractor:
             max_tokens=_max_tokens(extraction_setting(cfg, "extraction_max_tokens", DEFAULT_MAX_TOKENS)),
             timeout_s=_timeout_s(extraction_setting(cfg, "extraction_timeout_s", DEFAULT_TIMEOUT_S)),
             request_options=extraction_setting(cfg, "extraction_request_options"),
+            max_response_bytes=_positive_int("extraction_max_response_bytes", extraction_setting(
+                cfg, "extraction_max_response_bytes", DEFAULT_MAX_RESPONSE_BYTES)),
         )
     return HeuristicExtractor()
 
@@ -460,6 +468,16 @@ def _max_tokens(v) -> int:
         n = -1
     if n < 0:
         raise ValueError(f"extraction_max_tokens must be a whole number >= 0 (0 = no cap), got {v!r}")
+    return n
+
+
+def _positive_int(name: str, v) -> int:
+    try:
+        n = int(str(v).strip())
+    except ValueError:
+        n = 0
+    if n <= 0:
+        raise ValueError(f"{name} must be a whole number > 0, got {v!r}")
     return n
 
 

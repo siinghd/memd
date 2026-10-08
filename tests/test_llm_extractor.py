@@ -13,7 +13,8 @@ from memd.core.schema import MemoryRecord, Scope, Source
 from memd.pipeline.extractor import HeuristicExtractor, LLMExtractor, resolve_extractor
 
 _ENV = ("MEMD_EXTRACTION_API_KEY", "MEMD_EXTRACTION_MODEL", "MEMD_EXTRACTION_BASE_URL",
-        "MEMD_EXTRACTION_MAX_TOKENS", "MEMD_EXTRACTION_TIMEOUT_S", "MEMD_EXTRACTION_REQUEST_OPTIONS")
+        "MEMD_EXTRACTION_MAX_TOKENS", "MEMD_EXTRACTION_TIMEOUT_S", "MEMD_EXTRACTION_REQUEST_OPTIONS",
+        "MEMD_EXTRACTION_MAX_RESPONSE_BYTES")
 
 
 @pytest.fixture(autouse=True)
@@ -269,6 +270,47 @@ def test_a_silent_provider_is_cut_off(provider, monkeypatch):
     ext.extract([_rec("I work at Initech")])
     assert _t.monotonic() - t0 < 4
     assert len(provider.requests) == 1
+
+
+def _flood(seconds: float, chunk: int = 256 * 1024):
+    """A provider that streams a reply far larger than any extraction."""
+    def run(handler):
+        import time as _t
+
+        handler.send_response(200)
+        handler.send_header("Content-Type", "application/json")
+        handler.end_headers()
+        end = _t.monotonic() + seconds
+        try:
+            handler.wfile.write(b'{"choices": [{"message": {"content": "')
+            while _t.monotonic() < end:
+                handler.wfile.write(b"x" * chunk)
+        except OSError:
+            pass
+    return run
+
+
+def test_a_reply_past_the_size_cap_is_refused(provider):
+    import time as _t
+
+    provider.reply = lambda body: _flood(8.0)
+    ext = _llm(provider, extraction_timeout_s=6)
+    assert ext.max_response_bytes == 4 * 1024 * 1024
+    t0 = _t.monotonic()
+    out = ext.extract([_rec(_NAMED)])
+    assert _t.monotonic() - t0 < 4, "reading stops at the cap, not at the timeout"
+    assert out.errors == ["oversize"] and len(out) == 1
+
+
+def test_the_size_cap_is_configurable(monkeypatch, provider):
+    big = json.dumps(_chat(json.dumps([{"content": "x" * 3000, "entity_keys": []}])))
+    provider.reply = lambda body: json.loads(big)
+    assert _llm(provider, extraction_max_response_bytes=2000).extract([_rec("hi")]).errors == ["oversize"]
+    monkeypatch.setenv("MEMD_EXTRACTION_MAX_RESPONSE_BYTES", "100000")
+    assert _llm(provider).extract([_rec("hi")]).errors == []
+    monkeypatch.setenv("MEMD_EXTRACTION_MAX_RESPONSE_BYTES", "0")
+    with pytest.raises(ValueError, match="extraction_max_response_bytes"):
+        _llm(provider)
 
 
 # ------------------------------------------------- 3: request options
