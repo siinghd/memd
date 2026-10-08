@@ -4,10 +4,20 @@ a search's packed context.
 The ranked candidates are re-packed as dated session excerpts: each
 retrieved turn with its neighbouring turns, a fact under the turn it was
 extracted from, sessions oldest first under a "Session Date" header, the
-speaker on every line. Measured on LongMemEval_S (README-engine.md has the
-numbers), and pinned here to the reference implementation that was measured:
-tests/fixtures/evidence_pack_reference.json.gz holds fixed inputs and that
-implementation's outputs, and the product must reproduce them byte for byte.
+speaker on every line. Measured on LongMemEval_S with bge-small
+embeddings, a local cross-encoder reranker and the relative-date
+annotations on (README-engine.md has the numbers and setup).
+
+tests/fixtures/evidence_pack_reference.json.gz holds fixed inputs and the
+outputs of the reference implementation that was measured, and the product
+must reproduce them byte for byte. The cases with dates on are its outputs
+as measured. The cases with dates off come from the same implementation
+modified to check the budget on the text without the annotations (as it
+measured, it selected on the annotated text and dropped the annotations
+afterwards). Its inputs have no line breaks, no untrusted sources, no
+facts without a source turn and no replaced turns: the cases where memd
+deliberately differs (one line per record, fencing, a line of its own,
+skipping a replaced turn) are tested on their own below.
 """
 from __future__ import annotations
 

@@ -67,10 +67,13 @@ from memd.storage.objectstore import LocalObjectStore, ReadOnlyError, count_io
 
 _log = logging.getLogger(__name__)
 
-# the packed context's default size. 12K, with session packing: on
-# LongMemEval_S that scored 0.875 vs 0.779 for the 2K flat default it
-# replaced (README-engine.md has the setup); pass budget_tokens=2000 (and
-# packing="flat") for the old footprint
+# the packed context's default size, with session packing. Measured on
+# LongMemEval_S end-to-end QA: 0.875 for a 12K session pack, but with
+# bge-small embeddings, a local cross-encoder reranker and the relative-date
+# annotations on (memd ships them off), against 0.779 for the old defaults
+# (hash embedder, no reranker, 2K flat). The new defaults as shipped were not
+# measured end to end (README-engine.md, "Packing and the budget"). Pass
+# budget_tokens=2000 and packing="flat" for the old footprint.
 DEFAULT_BUDGET_TOKENS = 12_000
 HARD_DELETE_PURGE_MS = 72 * 3600 * 1000  # default physical-purge window for hard deletes
 # the embed worker's / maintenance jobs' name for a namespace's READ REPLICA

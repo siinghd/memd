@@ -1,8 +1,10 @@
 """The search API's packing defaults: session packing at a 12,000-token
 budget, with the flat layout and any explicit budget one parameter away.
 
-Measured on LongMemEval_S (README-engine.md): the 12K session pack scored
-0.875 against 0.779 for the 2K flat default it replaces - at ~6x the
+Measured on LongMemEval_S (README-engine.md): a 12K session pack scored
+0.875 against 0.779 for the 2K flat default it replaces - with bge-small
+embeddings, a local cross-encoder reranker and the relative-date
+annotations on, none of which the defaults turn on - at up to ~6x the
 tokens per search, which is why the old behaviour stays one setting away.
 """
 from __future__ import annotations
