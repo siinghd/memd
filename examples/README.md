@@ -10,7 +10,7 @@ the Python ones in CI.
 | [`02_sessions_and_facts.py`](02_sessions_and_facts.py) | `observe`, `close_session` fact extraction, supersedence on an entity key, `history`, `as_of` time travel, restart | - |
 | [`03_mcp_server.py`](03_mcp_server.py) + [`mcp/`](mcp/README.md) | `memd serve --mcp` for Claude Code / Claude Desktop: config snippets, and a client calling all four tools | `memd[mcp]` |
 | [`04_http_server_sdk.py`](04_http_server_sdk.py) | `memd serve --http` with the Python `HostedMemory` SDK and `Memory(api_key=...)`; typed errors | - |
-| [`05_ts/`](05_ts/quickstart.mjs) | the TypeScript SDK `@memd/client` against a server | Node >= 18 |
+| [`ts/`](#typescript) | the TypeScript SDK `@memd/client` against a server: a quickstart in TypeScript and in plain JavaScript | Node >= 20 |
 | [`06_s3_minio.py`](06_s3_minio.py) | an `s3://` data root on MinIO: cold reopen from the bucket, key custody failing closed, crypto-shred | `memd[s3]`, an S3 API |
 
 ```bash
@@ -35,15 +35,24 @@ point at one you run (`memd serve --http`, then
 ## TypeScript
 
 ```bash
-(cd sdk-ts && npm ci && npm run build)   # the example installs the SDK from ../../sdk-ts
-(cd examples/05_ts && npm install)
-python examples/local_server.py -- node examples/05_ts/quickstart.mjs
+(cd sdk-ts && npm ci && npm run build)   # the examples install the SDK from ../../sdk-ts
+cd examples/ts && npm install
+python ../local_server.py -- npx tsx 01_quickstart.ts
+python ../local_server.py -- node quickstart.mjs   # plain JavaScript, no build step
+npm run typecheck                                  # tsc --noEmit over every example
 ```
 
+| file | shows |
+|---|---|
+| [`01_quickstart.ts`](ts/01_quickstart.ts) | `remember`, `search`, `get`, `forget` (preview, then confirm), hard `delete` |
+| [`quickstart.mjs`](ts/quickstart.mjs) | the same client from plain JavaScript: `pack` / `observe` around an LLM call, typed errors |
+
 `local_server.py` passes `MEMD_URL`, `MEMD_API_KEY` and `MEMD_NAMESPACE` to
-the command it runs; against your own server, set them and run
-`npm start` in `examples/05_ts`. Outside this repository, depend on the
-published package instead: `npm install @memd/client`.
+the command it runs; against your own server, set them and run the same
+commands without it. Outside this repository, depend on the published
+package instead: `npm install @memd/client`. `tests/test_examples.py`
+type-checks and runs every one of them when Node and the install are
+there.
 
 ## S3 (MinIO)
 
