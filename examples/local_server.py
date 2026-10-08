@@ -1,8 +1,10 @@
 # Helper for the server examples: start a throwaway `memd serve --http`, mint a namespace key, stop it after.
-# Run: python examples/local_server.py [--ns NAME] -- <command ...>   (the command gets MEMD_URL / MEMD_API_KEY / MEMD_NAMESPACE)
+# Run: python examples/local_server.py [--ns NAME] [--admin] -- <command ...>   (the command gets MEMD_URL / MEMD_API_KEY / MEMD_NAMESPACE)
 """Not an API demo itself: 04_http_server_sdk.py imports it, and the
-TypeScript example runs under it. Against a server you already run, set
-MEMD_URL and MEMD_API_KEY instead and skip this helper."""
+TypeScript examples run under it. Against a server you already run, set
+MEMD_URL and MEMD_API_KEY instead and skip this helper. --admin also hands
+the command the operator key (MEMD_ADMIN_KEY), for a backend that spans
+namespaces."""
 from __future__ import annotations
 
 import argparse
@@ -31,13 +33,13 @@ def _memd(*args: str) -> list[str]:
 
 
 @contextlib.contextmanager
-def local_server(namespace: str = "demo"):
+def local_server(namespace: str = "demo", admin_key: str | None = None):
     """Yield (base_url, api_key, namespace) for a fresh server on a temp data dir."""
     data = tempfile.mkdtemp(prefix="memd-example-server-")
     port = _free_port()
     env = {**os.environ, "MEMD_DATA": data,
            # the operator key: spans every namespace, never handed to apps
-           "MEMD_ADMIN_KEY": secrets.token_urlsafe(32)}
+           "MEMD_ADMIN_KEY": admin_key or secrets.token_urlsafe(32)}
     proc = subprocess.Popen(_memd("serve", "--http", "--host", "127.0.0.1", "--port", str(port)),
                             env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     base_url = f"http://127.0.0.1:{port}"
@@ -70,13 +72,18 @@ def local_server(namespace: str = "demo"):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--ns", default="demo")
+    ap.add_argument("--admin", action="store_true",
+                    help="also pass the operator key, as MEMD_ADMIN_KEY")
     ap.add_argument("command", nargs=argparse.REMAINDER)
     args = ap.parse_args()
     cmd = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not cmd:
         ap.error("give a command to run, after --")
-    with local_server(args.ns) as (url, key, ns):
+    admin_key = secrets.token_urlsafe(32)
+    with local_server(args.ns, admin_key) as (url, key, ns):
         env = {**os.environ, "MEMD_URL": url, "MEMD_API_KEY": key, "MEMD_NAMESPACE": ns}
+        if args.admin:
+            env["MEMD_ADMIN_KEY"] = admin_key
         return subprocess.run(cmd, env=env).returncode
 
 

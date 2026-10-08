@@ -47,6 +47,7 @@ npm run typecheck                                  # tsc --noEmit over every exa
 | [`01_quickstart.ts`](ts/01_quickstart.ts) | `remember`, `search`, `get`, `forget` (preview, then confirm), hard `delete` |
 | [`02_sessions_and_facts.ts`](ts/02_sessions_and_facts.ts) | a conversation session (`observe`), `closeSession` fact extraction, recall in the next session, supersedence on an entity key, `history`, `as_of` |
 | [`03_search_options.ts`](ts/03_search_options.ts) | scope filters (`user_id`, `agent_id`, ...), per-call `namespace`, `kinds`, `budget_tokens` and `truncated`, `findIds`, `as_of` and a `t_event` window, the server's reranker |
+| [`04_http_api.ts`](ts/04_http_api.ts) | a `node:http` API giving an agent memory per user, one namespace each (the operator key stays on the server): input validation, memd errors mapped to HTTP statuses, cancellation, account deletion by crypto-shred. Run under `local_server.py --admin` |
 | [`quickstart.mjs`](ts/quickstart.mjs) | the same client from plain JavaScript: `pack` / `observe` around an LLM call, typed errors |
 
 `local_server.py` passes `MEMD_URL`, `MEMD_API_KEY` and `MEMD_NAMESPACE` to
