@@ -970,12 +970,12 @@ def test_s3_frozen_holder_resumes_and_forwards(tmp_path, s3_root):
     ttl = 3.0
     cfg, per = _s3_config(tmp_path, ttl=ttl)
     fleet = Fleet(tmp_path, root, cfg, per_worker=per)
-    stop = str(tmp_path / "stop")
+    stop_a, stop_b = str(tmp_path / "stop-A"), str(tmp_path / "stop-B")
     try:
-        fleet.spawn("A", 10 ** 6, sleep=0.01, stop=stop, lease_lost_ok=True)
+        fleet.spawn("A", 10 ** 6, sleep=0.01, stop=stop_a, lease_lost_ok=True)
         fleet.wait_ready("A")
         fleet.go()
-        fleet.spawn("B", 10 ** 6, sleep=0.01, stop=stop, ryw=True)
+        fleet.spawn("B", 10 ** 6, sleep=0.01, stop=stop_b, ryw=True)
         fleet.wait_ready("B")
         deadline = time.monotonic() + 120
         while fleet.acked_adds("B") < 20:
@@ -999,8 +999,12 @@ def test_s3_frozen_holder_resumes_and_forwards(tmp_path, s3_root):
             assert time.monotonic() < deadline, fleet.stderr("A")
             assert a.poll() is None, fleet.stderr("A")
             time.sleep(0.01)
-        open(stop, "w").close()
-        fleet.finish("A", "B")
+        # A finishes - and reports - while B still holds the namespace: B
+        # closing first would free it, and A's final flush would take it
+        open(stop_a, "w").close()
+        fleet.finish("A")
+        open(stop_b, "w").close()
+        fleet.finish("B")
     finally:
         for p in fleet.procs.values():
             if p.poll() is None:
