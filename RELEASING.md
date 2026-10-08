@@ -1,11 +1,11 @@
 # Releasing memd
 
-Two workflows publish on a pushed `v*` tag, and one deploys the docs on
-pushes to the default branch:
+When you push a `v*` tag, two workflows publish the release. A third
+workflow deploys the docs when you push to the default branch:
 
 | workflow | publishes | credential |
 |---|---|---|
-| `.github/workflows/release-pypi.yml` | sdist + wheel to PyPI, and a GitHub Release with them | PyPI trusted publishing (OIDC) |
+| `.github/workflows/release-pypi.yml` | sdist + wheel to PyPI, and a GitHub Release with them | PyPI trusted publishing (OIDC, OpenID Connect) |
 | `.github/workflows/release-npm.yml` | `@memd/client` (sdk-ts) to npm, with provenance | `NPM_TOKEN` secret |
 | `.github/workflows/docs.yml` | the docs site to GitHub Pages | the workflow's own token |
 
@@ -13,26 +13,28 @@ pushes to the default branch:
 
 ### 0. Decisions only the owner can make
 
-- **The PyPI name** is `memd-engine` (`memd` is taken on PyPI by an
-  unrelated project). The import name (`import memd`) and the `memd`
-  command are unchanged. A pending trusted publisher is registered on PyPI
-  for `memd-engine` <- `siinghd/memd`, `release-pypi.yml`, environment
-  `pypi`.
-- **The npm scope.** `@memd/client` needs an npm organization `memd`
-  (create it on npmjs.com), or rename the package in `sdk-ts/package.json`
-  and its README.
-- **The GitHub owner and repository** are `github.com/siinghd/memd`, set in
-  `pyproject.toml` (`[project.urls]`), `sdk-ts/package.json` (`repository`,
-  `homepage`) and `mkdocs.yml` (`repo_url`, `repo_name`, `site_url`). npm
-  provenance fails unless `repository.url` in `sdk-ts/package.json` is the
-  repository the workflow runs in: update all three if the repo moves.
-- **The docs URL.** GitHub Pages serves `https://<owner>.github.io/<repo>/`;
-  a custom domain needs a `docs/CNAME` file and a DNS record. Set `site_url`
-  in `mkdocs.yml` and add a `Documentation` entry to `[project.urls]`.
+- **The PyPI name** is `memd-engine` (an unrelated project has `memd` on
+  PyPI). The import name (`import memd`) and the `memd` command do not
+  change. PyPI has a pending trusted publisher for `memd-engine` <-
+  `siinghd/memd`, `release-pypi.yml`, environment `pypi`.
+- **The npm scope.** `@memd/client` needs an npm organization `memd`.
+  Create it on npmjs.com, or rename the package in `sdk-ts/package.json`
+  and in its README.
+- **The GitHub owner and repository** are `github.com/siinghd/memd`. They
+  are set in `pyproject.toml` (`[project.urls]`), `sdk-ts/package.json`
+  (`repository`, `homepage`) and `mkdocs.yml` (`repo_url`, `repo_name`,
+  `site_url`). npm provenance fails if `repository.url` in
+  `sdk-ts/package.json` is not the repository that the workflow runs in. If
+  the repository moves, update all three files.
+- **The docs URL.** GitHub Pages serves `https://<owner>.github.io/<repo>/`.
+  A custom domain needs a `docs/CNAME` file and a DNS (Domain Name System)
+  record. Set `site_url` in `mkdocs.yml`. Add a `Documentation` entry to
+  `[project.urls]`.
 
 ### 1. Create the repository and push
 
-Create an empty GitHub repository (no README, license or .gitignore), then:
+Create an empty GitHub repository (no README, license or .gitignore). Then
+run these commands:
 
 ```bash
 git remote add origin git@github.com:<owner>/<repo>.git
@@ -40,16 +42,18 @@ git push -u origin master
 git push origin --tags
 ```
 
-Pushing the six existing tags in one push triggers nothing: GitHub creates
-no push events when more than three tags are pushed at once. That is what
-you want. The tagged commits up to `v0.3.2` predate these workflows (they
-carry the old `release.yml`), so the first release published by
-`release-pypi.yml` is the first tag cut after this branch is merged.
+If you push the six existing tags in one push, no workflow starts. GitHub
+creates no push events when you push more than three tags at once. That is
+the result that you want. The tagged commits up to `v0.3.2` are older than
+these workflows (they contain the old `release.yml`). Thus, the first release
+that `release-pypi.yml` publishes is the first tag that you make after this
+branch is merged.
 
 ### 2. PyPI: a trusted publisher
 
-On pypi.org: *Your account → Publishing → Add a new pending publisher*
-(the project does not exist yet; the first upload creates it):
+On pypi.org, open *Your account → Publishing → Add a new pending
+publisher*. The project does not exist yet; the first upload creates it.
+Enter these values:
 
 | field | value |
 |---|---|
@@ -58,31 +62,37 @@ On pypi.org: *Your account → Publishing → Add a new pending publisher*
 | Workflow name | `release-pypi.yml` |
 | Environment name | `pypi` |
 
-On GitHub, *Settings → Environments → New environment* `pypi`; add
-required reviewers to make each publish wait for an approval.
+On GitHub, open *Settings → Environments → New environment* and make the
+environment `pypi`. To make each publish wait for an approval, add required
+reviewers.
 
 ### 3. npm: the token
 
-On npmjs.com create a granular access token with read and write access to
-the `@memd` scope (or an automation token), and store it as the
-`NPM_TOKEN` secret: in the `npm` environment (*Settings → Environments*)
-or as a repository secret. Without it, `release-npm.yml` skips the publish
-with a warning. (npm's own trusted publishing for GitHub Actions can
-replace the token later: drop `NODE_AUTH_TOKEN` from the publish step.)
+1. On npmjs.com, create a granular access token with read and write access
+   to the `@memd` scope (or an automation token).
+2. Store the token as the `NPM_TOKEN` secret: in the `npm` environment
+   (*Settings → Environments*) or as a repository secret.
+
+Without the secret, `release-npm.yml` does not publish and gives a warning.
+(Later, npm's own trusted publishing for GitHub Actions can replace the
+token: then remove `NODE_AUTH_TOKEN` from the publish step.)
 
 ### 4. GitHub Pages
 
-*Settings → Pages → Build and deployment → Source: GitHub Actions*. Then
-run the *Docs* workflow once (*Actions → Docs → Run workflow*); afterwards
-it deploys on every push to the default branch that touches the docs.
+1. Set *Settings → Pages → Build and deployment → Source: GitHub Actions*.
+2. Run the *Docs* workflow one time (*Actions → Docs → Run workflow*).
+
+After this, the workflow deploys the docs on every push to the default
+branch that changes the docs.
 
 ## Every release
 
-1. **Versions.** `[project].version` in `pyproject.toml` and `__version__`
-   in `src/memd/__init__.py`: the workflow refuses a tag unless both say
-   the tag's version. The TypeScript SDK has its own version in
-   `sdk-ts/package.json`: bump it when the SDK changed; a tag publishes it
-   only when that version is not on npm yet.
+1. **Versions.** Set `[project].version` in `pyproject.toml` and
+   `__version__` in `src/memd/__init__.py` to the new version. The workflow refuses a tag if
+   one of the two is not the version of the tag. The TypeScript SDK
+   (software development kit) has its own version in `sdk-ts/package.json`.
+   If the SDK changed, increase that version. A tag publishes the SDK only
+   if npm does not have that version yet.
 2. **Changelog.** Move `## [Unreleased]` in `CHANGELOG.md` to
    `## [X.Y.Z] - YYYY-MM-DD`.
 3. **Check locally.**
@@ -92,19 +102,21 @@ it deploys on every push to the default branch that touches the docs.
    python -m build && twine check --strict dist/*
    (cd sdk-ts && npm ci && npm test && npm pack --dry-run)
    ```
-4. **Tag and push** one tag per push:
+4. **Tag and push**, one tag in each push:
    ```bash
    git commit -am "chore(release): X.Y.Z"
    git tag -a vX.Y.Z -m "vX.Y.Z"
    git push origin master vX.Y.Z
    ```
-5. **Watch** *Release (PyPI)* (approve the `pypi` environment if it has
-   reviewers) and *Release (npm)*.
-6. **Verify** from outside: `pip install "<name>==X.Y.Z"` in a fresh
-   virtualenv and `python -c "import memd; print(memd.__version__)"`;
-   `npm view @memd/client version`; the docs site shows the new changelog.
+5. **Watch** *Release (PyPI)* and *Release (npm)*. If the `pypi`
+   environment has reviewers, approve it.
+6. **Verify** from outside the repository. In a new virtualenv, run
+   `pip install "<name>==X.Y.Z"` and
+   `python -c "import memd; print(memd.__version__)"`. Run
+   `npm view @memd/client version`. Make sure that the docs site shows the
+   new changelog.
 
-PyPI never accepts the same file twice: a release whose publish failed
-after an upload is fixed by a new version, not by re-tagging. A run that
-failed before uploading (a red suite, a transient error) can be re-run
-from the Actions tab.
+PyPI never accepts the same file two times. If a publish failed after an
+upload, fix the release with a new version. Do not tag the same version
+again. If a run failed before the upload (a failed suite, a temporary
+error), you can run it again from the Actions tab.
