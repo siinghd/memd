@@ -231,10 +231,11 @@ class LLMExtractor(Extractor):
     name = "llm"
     prompt_version = PROMPT_VERSION
 
-    # v2: each turn says who spoke and when, and facts name the turns they
-    # came from (lineage) - v1 sent bare text, so an assistant's suggestion
-    # read like the user's statement and every fact was attributed to the
-    # session's first turn
+    # v2: each turn is one line saying who spoke and when, under a turn id
+    # made up for the call, and facts name the turns they came from
+    # (lineage) - v1 sent "[record id] text", so an assistant's suggestion
+    # read like the user's statement, a line break in a turn could pose as
+    # another turn, and every fact was attributed to the session's first turn
     _SYSTEM_PROMPT = f"""You extract durable memories from agent conversation segments.
 Each turn is one line: [<turn id>] <time, UTC> <speaker>: <text>. A line break inside a turn's text is written as \\n.
 The speaker is user (the person), assistant or agent (the AI agent), system (instructions to the agent) or tool (a tool's output).
@@ -295,8 +296,8 @@ prompt_version={PROMPT_VERSION}"""
 
     def extract(self, records: list[MemoryRecord]) -> Extraction:
         """Chunked extraction with per-chunk failure isolation: one bad
-        chunk (provider error, timeout, an empty, cut-off or malformed
-        reply) degrades THIS chunk only. Its turns go through the pattern
+        chunk (provider error, timeout, an empty, cut-off, oversized or
+        malformed reply) degrades THIS chunk only. Its turns go through the pattern
         extractor instead - previously its facts were dropped, a malformed
         reply without even a count - and the failure is counted by reason
         and listed in the result's `errors`. A call is never retried."""
