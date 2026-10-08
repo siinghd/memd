@@ -499,39 +499,43 @@ it is. In all cases, memd changed nothing.
   is damaged on disk (bit rot, a bad copy, a manual edit). memd does not cut
   off the frame, because it can hold acknowledged writes, and everything
   logged after it is behind it. To recover:
-  1. Stop memd. Then make a backup of the data root (`store/` and `keys/`;
-     on S3, the `ns/<namespace>/` prefix and the local keys directory).
-  2. If a backup holds the log from before the damage, restore it. This is
-     the fix without loss.
-  3. WARNING: This step loses the writes or ops in the damaged frame (the
-     backup from step 1 still holds its bytes). If you remove an `ops`
-     frame, you lose the deletes that it held. Records that it tombstoned
-     come back. A hard delete in it is undone, so memd serves the purged
-     text again.
+    1. Stop memd. Then make a backup of the data root (`store/` and `keys/`;
+        on S3, the `ns/<namespace>/` prefix and the local keys directory).
 
-     If no such backup exists, remove exactly the frame that the message
-     names: its 4-byte length prefix and the payload that this prefix
-     announces. Remove nothing else. Frames are self-contained (each has its
-     own sequence number), so the frames after it keep their place:
+    2. If a backup holds the log from before the damage, restore it. This is
+        the fix without loss.
 
-     ```python
-     p, n = "store/ns/<namespace>/wal", N   # the path and byte from the message
-     b = open(p, "rb").read()
-     ln = int.from_bytes(b[n:n + 4], "big")
-     open(p, "wb").write(b[:n] + b[n + 4 + ln:])
-     ```
+    3. WARNING: This step loses the writes or ops in the damaged frame (the
+        backup from step 1 still holds its bytes). If you remove an `ops`
+        frame, you lose the deletes that it held. Records that it tombstoned
+        come back. A hard delete in it is undone, so memd serves the purged
+        text again.
 
-     On S3, the log is not one object. memd stores it as part objects
-     (`ns/<namespace>/wal.__part-NNN`, plus `wal.__seq`), and byte N counts
-     across the parts in order. Find the part that holds byte N. WARNING:
-     Every frame in that part is lost when you delete it (the backup from
-     step 1 still holds them). Delete that one part object. Do not upload an edited
-     single `wal` object again: memd does not read one.
+        If no such backup exists, remove exactly the frame that the message
+        names: its 4-byte length prefix and the payload that this prefix
+        announces. Remove nothing else. Frames are self-contained (each has
+        its own sequence number), so the frames after it keep their place:
 
-     After you recover, do again each delete that was acknowledged at about
-     the time of the damage.
-  4. Open again. If there is another damaged frame, memd reports it in the
-     same way.
+        ```python
+        p, n = "store/ns/<namespace>/wal", N   # the path and byte from the message
+        b = open(p, "rb").read()
+        ln = int.from_bytes(b[n:n + 4], "big")
+        open(p, "wb").write(b[:n] + b[n + 4 + ln:])
+        ```
+
+        On S3, the log is not one object. memd stores it as part objects
+        (`ns/<namespace>/wal.__part-NNN`, plus `wal.__seq`), and byte N
+        counts across the parts in order. Find the part that holds byte N.
+        WARNING: Every frame in that part is lost when you delete it (the
+        backup from step 1 still holds them). Delete that one part object.
+        Do not upload an edited single `wal` object again: memd does not
+        read one.
+
+        After you recover, do again each delete that was acknowledged at
+        about the time of the damage.
+
+    4. Open again. If there is another damaged frame, memd reports it in the
+        same way.
 
 A namespace can stay open with a damaged frame. A warm open does not read
 every frame, so the damage can show only at the next rotate. In that case,
