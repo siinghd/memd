@@ -1,5 +1,5 @@
 # S3 storage: the bucket is the source of truth; drop the local index, reopen cold, recall; then crypto-shred.
-# Run: python examples/06_s3_minio.py   (needs: pip install "memd-engine[s3]" and an S3 API; MinIO: docker run -p 9000:9000 minio/minio server /data)
+# Run: python examples/06_s3_minio.py   (needs: pip install "memd-engine[s3]" and an S3 API, e.g. docker run -p 9000:9000 -e RUSTFS_ACCESS_KEY=minioadmin -e RUSTFS_SECRET_KEY=minioadmin rustfs/rustfs:1.0.1)
 import os
 import shutil
 import tempfile

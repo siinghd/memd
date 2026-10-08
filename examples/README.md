@@ -67,15 +67,15 @@ repository, depend on the published package instead:
 every one of them when Node and the install are there, and skips them
 otherwise.
 
-## S3 (MinIO)
+## S3
 
 ```bash
-docker run -d -p 9000:9000 -e MINIO_ROOT_USER=minioadmin \
-  -e MINIO_ROOT_PASSWORD=minioadmin minio/minio server /data
+docker run -d -p 9000:9000 -e RUSTFS_ACCESS_KEY=minioadmin \
+  -e RUSTFS_SECRET_KEY=minioadmin rustfs/rustfs:1.0.1
 MEMD_S3_ENDPOINT=http://127.0.0.1:9000 python examples/06_s3_minio.py
 ```
 
 Credentials come from `MEMD_S3_ACCESS_KEY` / `MEMD_S3_SECRET_KEY` (the
-example defaults them to MinIO's `minioadmin`); the bucket
-(`MEMD_EXAMPLE_BUCKET`, default `memd-examples`) is created if missing, and
-each run uses a fresh prefix.
+example defaults them to `minioadmin`, which the server above is started
+with); the bucket (`MEMD_EXAMPLE_BUCKET`, default `memd-examples`) is created
+if missing, and each run uses a fresh prefix.
