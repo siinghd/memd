@@ -5,7 +5,7 @@
 ```bash
 python -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev,mcp]"
-make test          # pytest, ~4 min
+make test          # pytest (about 16 min in CI, with the S3 tests)
 make gate          # eval gate: accuracy, cost bar, adversarial zero-regression
 make ten-min       # fresh dir -> cross-session recall, the ten-minute story
 ```
@@ -77,9 +77,11 @@ message.
 
 - **Object storage + WAL/segments are the source of truth.** The SQLite index
   is a cache. Anything that makes the index authoritative is a design change.
-- **Single writer per data root**, enforced by an advisory lock. Two writers
-  destroyed acknowledged data without an error (measured: 8 of 150 lost).
-  That is why the lock exists.
+- **Single writer per namespace**, enforced by a lock file (a local root) or
+  a lease (an `s3://` root). Two writers destroyed acknowledged data without
+  an error (measured: 8 of 150 lost). That is why the lock exists. Other
+  processes send their calls to the writer (write forwarding). They never
+  write the log of the namespace themselves.
 - **No LLM or embedding call on the write path.** The write path does not
   call an LLM (large language model) or an embedding model. A durable ack
   (acknowledgment) is an append with fsync, and nothing more.
