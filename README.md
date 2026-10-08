@@ -25,10 +25,11 @@ section tells what memd does not do.
   patterns. `stats()` shows the active mode. An OpenAI-compatible key adds
   API embeddings or LLM fact extraction.
 - **No model call on the write path.** memd acknowledges a write when the
-  write is durable in the log of the namespace. Embedding occurs in the
-  background. BM25 search finds the record as soon as the call returns.
-- **Raw and fact lanes.** memd keeps what was said, word for word (the raw
-  lane). Facts go in a second lane. You save a fact with `remember`, or
+  write is durable in the log of the namespace. memd makes the embeddings
+  in the background. BM25 search finds the record as soon as the call
+  returns.
+- **Raw and fact lanes.** memd keeps the text of each turn, word for word
+  (the raw lane). Facts go in a second lane. You save a fact with `remember`, or
   memd extracts facts when a session closes. memd keeps the raw lane, thus
   you can run the extraction again.
 - **Facts that change.** A new fact on an entity key replaces the old fact,
@@ -53,8 +54,7 @@ section tells what memd does not do.
 
 Session retrieval on LongMemEval_S, through the public `Memory.search`.
 The values are dev-fold means ± fold std, from
-[BENCHMARKS.md](BENCHMARKS.md). Each row names the release that was
-measured.
+[BENCHMARKS.md](BENCHMARKS.md). Each row names the measured release.
 
 | memd configuration | ndcg@5 | recall_all@5 | mean search time |
 |---|---|---|---|
@@ -187,7 +187,7 @@ The same `Memory` API works at each step. Your code does not change.
 - **Multi-node.** Several `memd serve --http` processes on one `s3://` root
   share the namespaces. A lease in the bucket gives each namespace one
   writer. A node sends each request to the node that holds the lease. AWS
-  KMS or Vault transit holds the data keys, thus each node can open each
+  KMS or Vault transit wraps the data keys, thus each node can open each
   namespace.
 - **Search throughput.** The default search (a 12K session pack) is CPU
   work in Python. In one process, more threads do not give more searches
