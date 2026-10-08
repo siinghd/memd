@@ -683,3 +683,31 @@ def test_chunk_bounds_count_the_rendered_line(provider):
     ext.extract([_rec("x" * 960, f"r{i}") for i in range(10)])
     assert len(provider.requests) == 2
     assert all(len(r["body"]["messages"][1]["content"]) <= 10_000 + 20 for r in provider.requests)
+
+
+# ------------------------------------------------- supersedence follows the fact's own user
+
+
+def test_a_mixed_user_session_never_supersedes_another_users_fact(tmp_path):
+    from memd.engine.memory import Memory
+
+    m = Memory(str(tmp_path / "d"))  # the pattern extractor: no provider needed
+    try:
+        m.add("I work at Initech", session_id="s0", user_id="u1")
+        m.close_session("s0")
+        (u1_fact,) = [i for i in m.search("works at Initech", user_id="u1").items if i.kind == "fact"]
+        # a session with two users, closed without a user: u1 speaks first
+        m.add("hello there", session_id="s1", user_id="u1")
+        m.add("I work at Globex", session_id="s1", user_id="u2")
+        res = m.close_session("s1")
+        assert res["facts_written"] == 1 and res["superseded"] == 0
+        assert m.get(u1_fact.id)["time"]["superseded_by"] is None, "u2's fact superseded u1's"
+        (u2_fact,) = [i for i in m.search("works at Globex", user_id="u2").items if i.kind == "fact"]
+        assert m.get(u2_fact.id)["scope"]["user"] == "u2"
+        # and u2's next employer supersedes u2's own fact, never u1's
+        m.add("I work at Hooli", session_id="s2", user_id="u2")
+        assert m.close_session("s2")["superseded"] == 1
+        assert m.get(u2_fact.id)["time"]["superseded_by"] is not None
+        assert m.get(u1_fact.id)["time"]["superseded_by"] is None
+    finally:
+        m.close()

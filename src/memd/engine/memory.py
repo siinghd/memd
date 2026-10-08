@@ -1696,21 +1696,35 @@ class Memory:
         if not facts:
             return 0, ConsolidationResult()
         tier_cap = min((int(s.provenance.source) for s in sources), default=int(Source.IMPORT))
-        # Cluster scope = the sources' scope with the session component
-        # stripped: supersedence is user-level knowledge that spans sessions,
-        # while org/agent/user bindings still fence tenants and users.
-        base = sources[0].scope if sources else Scope()
-        cluster_scope = Scope(org=base.org, agent=base.agent, user=base.user)
-        clusters: dict[str, list[MemoryRecord]] = {}
+
+        def source_of(fact: ExtractedFact) -> MemoryRecord | None:
+            # the fact's own turn: its scope, actor and time
+            return next((s for s in sources if s.id in fact.lineage), sources[0] if sources else None)
+
+        def cluster_scope_of(fact: ExtractedFact) -> Scope:
+            # the fact's source scope with the session component stripped:
+            # supersedence is user-level knowledge that spans sessions, while
+            # org/agent/user bindings still fence tenants and users. Per fact:
+            # in a session with several users (closed without user_id), one
+            # user's fact must never supersede another's
+            src = source_of(fact)
+            b = src.scope if src is not None else Scope()
+            return Scope(org=b.org, agent=b.agent, user=b.user)
+
+        clusters: dict[Scope, dict[str, list[MemoryRecord]]] = {}
         for f in facts:
+            by_key = clusters.setdefault(cluster_scope_of(f), {})
             for ek in f.entity_keys or ["fact.general"]:
-                clusters.setdefault(ek, [])
-        for ek in list(clusters):
-            clusters[ek] = ns.index.entity_cluster(ek, scope=cluster_scope)
+                by_key.setdefault(ek, [])
+        for cscope, by_key in clusters.items():
+            for ek in list(by_key):
+                by_key[ek] = ns.index.entity_cluster(ek, scope=cscope)
         # cross-session display-name resolution: "u7 works at X" reads better
         # (and retrieves better) as "Hank works at X" once a user.name fact
         # exists; facts are re-runnable derived data, so enrichment is legit
-        subject_names = self._resolve_subject_names(ns, clusters, cluster_scope)
+        subject_names: dict[str, str] = {}
+        for cscope, by_key in clusters.items():
+            subject_names.update(self._resolve_subject_names(ns, by_key, cscope))
         if subject_names:
             for f in facts:
                 if f.entity_keys == ["user.name"]:
@@ -1722,16 +1736,17 @@ class Memory:
         results = []
         for f in facts:
             keys = f.entity_keys or ["fact.general"]
+            by_key = clusters[cluster_scope_of(f)]
             cluster = []
             seen_ids: set[str] = set()
             for k in keys:
-                for r in clusters.get(k, []):
+                for r in by_key.get(k, []):
                     if r.id not in seen_ids:
                         seen_ids.add(r.id)
                         cluster.append(r)
 
             def make(fact: ExtractedFact, _keys=keys) -> MemoryRecord:
-                src = next((s for s in sources if s.id in fact.lineage), sources[0] if sources else None)
+                src = source_of(fact)
                 return MemoryRecord.create(
                     namespace=ns.namespace,
                     kind=Kind.FACT,

@@ -70,6 +70,12 @@ wrong, how it showed, and the numbers before and after where it has them.
   its chunk's turns is traced to the chunk's first user turn). The chunk
   bound counts each whole rendered line. The prompt is version `v2`; facts record the extractor's
   prompt version instead of a fixed `v1`.
+- **In a session with several users, one user's fact never supersedes
+  another's.** A session closed without `user_id` extracts every user's
+  turns; each fact was consolidated against the facts of the session's
+  FIRST turn's user, so u2's "works at Globex" superseded u1's "works at
+  Initech". Each fact is now consolidated within its own source turn's
+  org, agent and user.
 - **A failed extraction call falls back to the pattern extractor, counted
   and reported.** A failed call lost its chunk's facts: an HTTP error or a
   timeout was counted without a reason, a reply without a JSON array
