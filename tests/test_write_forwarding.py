@@ -244,6 +244,36 @@ print(json.dumps(r))
         a.close()
 
 
+def test_a_forwarded_destroy_then_the_namespace_moves(tmp_path):
+    """A crypto-shred forwarded to the holder runs there (its ledger records
+    it); the holder no longer has the namespace open, so the next write
+    takes it - in the forwarding process, now its writer."""
+    root = str(tmp_path / "d")
+    a = Memory(root, namespace=NS, encrypt=True)
+    try:
+        a.add("doomed record", user_id="u1", namespace="side")
+        assert a.engine.holds("side")
+        out = _child(r'''
+import json, sys
+from memd.engine.memory import Memory
+b = Memory(sys.argv[1], namespace="shared")
+r = {"destroyed": b.destroy_namespace(namespace="side")}
+r["after"] = [h.content for h in b.search("doomed", user_id="u1", namespace="side").items]
+b.add("a new life", user_id="u1", namespace="side")
+r["holds"] = b.engine.holds("side")
+r["count"] = len(b.export_jsonl(namespace="side").splitlines())
+b.close()
+print(json.dumps(r))
+''', root)
+        assert out.returncode == 0, out.stderr[-3000:]
+        r = json.loads(out.stdout.strip().splitlines()[-1])
+        assert r == {"destroyed": True, "after": [], "holds": True, "count": 1}, r
+        assert any(e["action"] == "destroy_namespace" and e["target"] == "side" for e in a.audit.read())
+        assert not a.engine.holds("side")
+    finally:
+        a.close()
+
+
 def test_forwarding_off_keeps_namespace_busy_error(tmp_path):
     root = str(tmp_path / "d")
     a = Memory(root, namespace=NS, encrypt=False)
