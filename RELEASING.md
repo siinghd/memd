@@ -6,7 +6,7 @@ workflow deploys the docs when you push to the default branch:
 | workflow | publishes | credential |
 |---|---|---|
 | `.github/workflows/release-pypi.yml` | sdist + wheel to PyPI, and a GitHub Release with them | PyPI trusted publishing (OIDC, OpenID Connect) |
-| `.github/workflows/release-npm.yml` | `memd-engine` (sdk-ts) to npm, with provenance | `NPM_TOKEN` secret |
+| `.github/workflows/release-npm.yml` | `memd-engine` (sdk-ts) to npm, with provenance | trusted publishing (OIDC), environment `npm` |
 | `.github/workflows/docs.yml` | the docs site to GitHub Pages | the workflow's own token |
 
 ## Once, before the first release
