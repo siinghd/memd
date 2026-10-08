@@ -7,13 +7,14 @@ includes them here, so that they cannot become different.
 
 ## Several processes on one data root
 
-{% include-markdown "../README-engine.md" start="## Several processes on one data root" end="## Object storage as the source of truth (S3 / R2 / MinIO)" %}
+{% include-markdown "../README-engine.md" start="## Several processes on one data root" end="## Object storage as the source of truth (S3-compatible stores)" %}
 
-## Object storage (S3 / R2 / MinIO)
+## Object storage (S3-compatible stores)
 
-{% include-markdown "../README-engine.md" start="## Object storage as the source of truth (S3 / R2 / MinIO)" end="### Key custody: local, AWS KMS or Vault transit" %}
+{% include-markdown "../README-engine.md" start="## Object storage as the source of truth (S3-compatible stores)" end="### Key custody: local, AWS KMS or Vault transit" %}
 
-A walk-through on MinIO that you can run: [`examples/06_s3_minio.py`](../examples/06_s3_minio.py).
+[`examples/06_s3_minio.py`](../examples/06_s3_minio.py) is a walk-through that
+you can run against an S3-compatible store, for example RustFS.
 
 ## Key custody
 

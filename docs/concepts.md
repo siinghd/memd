@@ -107,10 +107,10 @@ over **lanes**, fused by reciprocal rank fusion:
 
 | lane | what it ranks | notes |
 |---|---|---|
-| **bm25** | lexical match, SQLite FTS5 | `memd[fast]` adds a tantivy accelerator; FTS5 stays the source of truth |
+| **bm25** | lexical match, SQLite FTS5 | `memd-engine[fast]` adds a tantivy accelerator; FTS5 stays the source of truth |
 | **entity** | records whose entity keys match terms of the query | |
 | **time** | the newest records | only for queries with recency intent ("latest", "yesterday") |
-| **vector** | embedding similarity | an exact scan by default; with `memd[ann]`, a usearch HNSW sidecar from `ann_min_vectors` (20,000) vectors on. Not fused with the hash embedder (`fuse_vector`) |
+| **vector** | embedding similarity | an exact scan by default; with `memd-engine[ann]`, a usearch HNSW sidecar from `ann_min_vectors` (20,000) vectors on. Not fused with the hash embedder (`fuse_vector`) |
 
 An optional **reranker** (Jev with a TypeSafe key, or a local cross-encoder)
 reorders the top 30 of the bm25 lane (plus the vector lane with a real
@@ -136,13 +136,14 @@ The options, with their defaults:
 
 ## Storage and compaction
 
-Per namespace, the object store (a local directory, or S3/R2/MinIO) holds a
-framed **WAL** and ops log, immutable **segments**, and a **manifest** that
-names them. The log rotates into a segment at a session close or when it
-grows past its size or frame limit. **Compaction** folds the segments, the
-log and the ops into one segment: it applies tombstones and supersedence and
-physically purges hard-deleted records. It runs on a maintenance thread, off
-the write path, and on demand with `compact(force=True)`.
+Per namespace, the object store (a local directory, or an S3-compatible
+bucket) holds a framed **WAL** and ops log, immutable **segments**, and a
+**manifest** that names them. The log rotates into a segment at a session
+close or when it grows past its size or frame limit. **Compaction** folds
+the segments, the log and the ops into one segment: it applies tombstones
+and supersedence and physically purges hard-deleted records. It runs on a
+maintenance thread, off the write path, and on demand with
+`compact(force=True)`.
 
 ## Deleting: soft, hard, forget, shred
 

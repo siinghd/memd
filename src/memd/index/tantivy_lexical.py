@@ -150,7 +150,7 @@ def resolve_lexical_backend(config: dict | None = None) -> str:
         return "tantivy" if tantivy_available() else "fts5"
     if choice == "tantivy" and not tantivy_available():
         raise ImportError("lexical_backend 'tantivy' was requested but the `tantivy` package is not "
-                          "importable; install memd[fast] or choose lexical_backend='fts5'")
+                          "importable; install memd-engine[fast] or choose lexical_backend='fts5'")
     return choice
 
 

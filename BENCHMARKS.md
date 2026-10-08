@@ -1,8 +1,10 @@
-# memd benchmarks (v0.2.0)
+# memd benchmarks
 
-All numbers below come from logged, pre-registered experiments kept in a separate research repository (not bundled here)
-(`experiments/NNN-*`, each with a PLAN written before running, a negative control, 3 disjoint question
-folds, and a hostile review). Nothing here is from memd's own synthetic suite.
+All numbers below come from logged experiments in a separate research repository (not bundled here). Each
+experiment had a written plan before the run. Nothing here is from memd's own synthetic suite. The
+retrieval-quality rows also have a negative control, 3 disjoint question folds and an independent review. Each
+later section tells its own limits: some of them are one sample, with no fold split and no independent review.
+Each table names the release or the configuration that was measured.
 
 ## Data and harness
 
@@ -28,7 +30,7 @@ Random-order and wrong-query controls score ndcg@5 ≤ 0.13 in every experiment.
 At `_M` scale (120 dev questions, ~5K turns per user), v0.1.0 search collapsed to ndcg@5 0.41 (its lexical lane
 re-ranked an unordered 320-row window by term coverage without IDF). A bm25()-ranked lane on the same index (the lane v0.2.0 ships) scores 0.88 (exp 006, lane-level measurement).
 
-## Lexical index scale (optional `memd[fast]` = tantivy accelerator)
+## Lexical index scale (optional `memd-engine[fast]` = tantivy accelerator)
 
 Filtered, user-scoped search through `Memory.search`, 200 real questions over real LongMemEval turns:
 
@@ -42,7 +44,7 @@ The single-record write ack is unchanged (FTS5 remains the synchronous source of
 derived accelerator). The 60-question real-data gate scores 0.874 (tantivy) vs 0.867 (FTS5). Measured on a
 loaded, shared 8-core host (`bench/lexical_bench.py`).
 
-## Vector index scale (optional `memd[ann]` = usearch sidecar)
+## Vector index scale (optional `memd-engine[ann]` = usearch sidecar)
 
 The vector lane as `Memory.search` calls it (user-scoped filter over 8 users, limit = the planner's
 `candidate_k`), 200 queries, 384-d vectors; recall@10 against the lane's exact answer
@@ -133,6 +135,45 @@ type mix.
 - On a 19-question subset, EmbeddingGemma 2 gave the same result as bge-small (recall_all@10 1.000 for both;
   no measurable difference). It used 2.4-4.6x the CPU time for each text.
 
+## End-to-end QA: all 500 questions (previous defaults)
+
+This run used all 500 questions of LongMemEval_S. memd used the previous
+defaults: a 2,000-token flat pack, the hash embedder and no reranker. The
+reader was `deepseek/deepseek-v4.1-flash` (one provider, Relace). The judge
+was `openai/gpt-6-luna-pro` with the official per-type judge prompts. The
+95% intervals are bootstrap intervals.
+
+| context given to the reader | accuracy [95% CI] | input tokens per question | cost per question |
+|---|---|---|---|
+| memd, previous defaults (2K flat) | 0.772 [0.736, 0.808] | 2,031 | $0.00099 |
+| the whole history | 0.916 [0.890, 0.940] | 104,764 | $0.00231 |
+| no context (control, 50 questions) | 0.10 [0.02, 0.18] | 128 | $0.00092 |
+
+- The whole history is better by +0.144 [+0.106, +0.182] on the same
+  questions (McNemar p = 6e-13).
+- Most of the difference is in two question types: multi-session (0.537
+  against 0.884) and temporal reasoning (0.780 against 0.953).
+- The control shows that the judge does not accept answers without
+  evidence.
+- This result caused the session packing and the 12K default (the section
+  above). The current defaults are not measured on all 500 questions yet.
+
+## LLM fact extraction
+
+This run compared the pattern extractor (the default) with the LLM
+extractor, on a stratified sample of 30 questions. The extractor model, the
+reader and the judge are the same as in the 500-question run.
+
+| extractor | accuracy | session close, median | extraction cost per question |
+|---|---|---|---|
+| pattern (default) | 0.700 | 0.08 s | $0 |
+| LLM | 0.667 | 1.5 s | $0.017 |
+
+- The difference is -0.033 [-0.167, +0.067]. The sample is small: it rules
+  out a gain larger than about +0.07, not small effects.
+- The LLM extractor writes more facts (284 against 40 per question), but
+  the default search result changes very little.
+
 ## End-to-end QA (preliminary)
 
 Stratified 120-question sample (all 6 question types + abstention). Reader `openai/gpt-6-luna`, judge
@@ -145,9 +186,9 @@ Stratified 120-question sample (all 6 question types + abstention). Reader `open
 | + Jev rerank, top-k | 0.783 ± 0.014 | 3.1K | 018 |
 | + Jev probability-gated packing (100-candidate shortlist) | 0.792 ± 0.014 | 2.3K | 018 |
 
-Not yet run (blocked on API credits): the full-context reference and the wrong-context control for this
-sample, and the one-time held-out 500-question run. Multi-session aggregation ("how many X…") is the weakest
-category (0.55 with Jev vs ~0.9 with the full history on an earlier sample).
+Not run for this sample: the full-context reference and the wrong-context control. Multi-session
+aggregation ("how many X…") is the weakest category (0.55 with Jev vs ~0.9 with the full history on an earlier
+sample).
 
 ## How this compares
 

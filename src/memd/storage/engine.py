@@ -603,7 +603,12 @@ _OWNER_LOCK = threading.Lock()
 
 
 class NamespaceBusyError(RuntimeError):
-    """Another OS process already holds this namespace."""
+    """Another OS process already holds this namespace.
+
+    With write forwarding on (the default), a `Memory` sends the call to
+    that process instead. You get this error when forwarding is off, or
+    as `ForwardingError` when no writer accepts the forwarded call. In
+    both cases, memd applied nothing."""
 
 
 class NamespaceClosedError(RuntimeError):
@@ -651,9 +656,11 @@ def _acquire_owner(lock_path: str, holder: str | None = None) -> bool:
             os.close(fd)
             raise NamespaceBusyError(
                 f"namespace is already open in another process (lock: {lock_path}). "
-                "memd is single-writer per data root: a second writer silently "
-                "destroys acked data. Run one process per root, or set "
-                "MEMD_ALLOW_MULTI_PROCESS=1 to override."
+                "memd has one writer per namespace: a second writer silently "
+                "destroys acked data. With forwarding on (the default, "
+                "MEMD_FORWARDING=auto), a Memory sends its calls to that process. "
+                "MEMD_ALLOW_MULTI_PROCESS=1 turns this check off, for recovery "
+                "tools only."
             ) from None
         os.ftruncate(fd, 0)
         os.write(fd, (holder or str(os.getpid())).encode())
@@ -931,9 +938,11 @@ class NamespaceStore:
                 if not leaser(namespace, holder):
                     raise NamespaceBusyError(
                         f"namespace {namespace!r} is leased by another writer. "
-                        "memd is single-writer per data root: a second writer "
-                        "silently destroys acked data. Set "
-                        "MEMD_ALLOW_MULTI_PROCESS=1 to override.")
+                        "memd has one writer per namespace: a second writer "
+                        "silently destroys acked data. With forwarding on (the "
+                        "default, MEMD_FORWARDING=auto), a Memory sends its calls "
+                        "to that writer. MEMD_ALLOW_MULTI_PROCESS=1 turns this "
+                        "check off, for recovery tools only.")
                 self._owner_lease = namespace
                 taker = getattr(store, "took_over", None)
                 # a takeover's fence and manifest claim run in _open, after

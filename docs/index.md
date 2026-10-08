@@ -21,9 +21,11 @@ print(mem.search("how do we deploy?", user_id="u1").packed_context)
 - **One engine behind every door.** The Python API, the REST server, the MCP
   server and the TypeScript SDK all reach the same engine with the same
   semantics.
-- **Grows without an API change.** The same `Memory` runs on an `s3://` root,
-  and several server processes on one bucket split the namespaces between
-  them ([Operations](operations.md)).
+- **Grows without an API change.** Several processes can share one data
+  root: one process writes each namespace, and the others forward their
+  calls to it. The same `Memory` runs on an `s3://` root. Several server
+  processes on one bucket share the namespaces, and read replicas serve
+  eventual reads ([Operations](operations.md)).
 - **The hard parts are in the open engine** (Apache-2.0): bitemporal
   supersedence, provenance and trust tiers, quarantine, a hash-chained audit
   log, hard delete with a physical-purge deadline, per-namespace
@@ -33,9 +35,7 @@ print(mem.search("how do we deploy?", user_id="u1").packed_context)
 
 {% include-markdown "../README-engine.md" start="## Doors (one engine)" end="## What's inside" %}
 
-## What memd is not, yet
-
-Honest limits:
+## Limits
 
 - **Many processes can use one namespace. One of them writes.** Each
   process can open the same namespace and write to it. One process (the

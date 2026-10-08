@@ -1,6 +1,6 @@
 # memd-engine
 
-The official TypeScript client for the [memd](../README-engine.md) REST API.
+The official TypeScript client for the [memd](https://github.com/siinghd/memd) REST API. The docs site is <https://siinghd.github.io/memd/>.
 
 - Zero runtime dependencies. It uses the platform's `fetch`.
 - Runs on Node ≥ 18, Bun, Deno, Cloudflare Workers, Vercel Edge and browsers. The core uses only web-standard APIs.
@@ -12,7 +12,7 @@ The official TypeScript client for the [memd](../README-engine.md) REST API.
 npm install memd-engine
 ```
 
-You need a running server (`memd serve --http`) and a key for your namespace:
+You need a running server and a key for your namespace. The server is in the Python package `memd-engine`. Install it with `pip install memd-engine`. Start the server with `memd serve --http`. Then make a key:
 
 ```bash
 memd key create --namespace acme     # prints {"key": "memd_acme_…"}: store it now

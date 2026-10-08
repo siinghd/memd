@@ -211,7 +211,7 @@ def resolve_vector_index(config: dict | None = None) -> str:
     if not usearch_available():
         if choice == "usearch":
             raise ImportError("vector_index 'usearch' was requested but the `usearch` package is not "
-                              "importable; install memd[ann] or choose vector_index='flat'")
+                              "importable; install memd-engine[ann] or choose vector_index='flat'")
         return "flat"
     return choice
 
