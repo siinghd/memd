@@ -10,7 +10,13 @@ never falls back. "auto" (the default) resolves in this order:
   3. fallback     -> HashEmbedder: deterministic feature-hashing embedding.
                      Fully functional offline; degraded *semantic* recall
                      (BM25 + time/entity lanes carry retrieval). Honest mode,
-                     clearly labeled in stats.
+                     clearly labeled in stats, and said once per process
+                     (a warning naming the extra) when "auto" lands here.
+The local model is the one to have. On LongMemEval_S session retrieval
+(153 questions; lane-level measurements, not the full search path),
+bge-small fused with BM25 put every evidence session in the top 10 for
+0.975 of questions, BM25 alone (what search ranks by with the hash
+embedder, whose lane is not fused) for 0.920, the hash lane alone for 0.640.
 Retrieval and forget() semantics depend on which one is active, so the
 choice is reported by stats() and logged when a Memory opens.
 
@@ -21,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import logging
 import math
 import os
 import re
@@ -29,7 +36,9 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 
+_log = logging.getLogger(__name__)
 _WORD_RE = re.compile(r"[a-z0-9]+")
+_hash_fallback_noted = False  # the hash-fallback warning is said once per process
 
 
 EMBEDDER_CHOICES = ("auto", "hash", "fastembed", "openai")
@@ -317,6 +326,19 @@ def requested_embedder(config: dict | None = None) -> str:
     return choice
 
 
+def _note_hash_fallback() -> None:
+    global _hash_fallback_noted
+    if _hash_fallback_noted:
+        return
+    _hash_fallback_noted = True
+    _log.warning(
+        "memd: `fastembed` is not installed, so the offline hash embedder is used and search ranks by "
+        'its lexical lanes alone. pip install "memd-engine[local-embeddings]" adds local '
+        "BAAI/bge-small-en-v1.5 embeddings, fused with BM25: on LongMemEval_S session retrieval, "
+        "recall_all@10 0.975 vs 0.920 for BM25 alone. (embedder=\"hash\" or MEMD_EMBEDDER=hash "
+        "chooses the hash embedder without this note.)")
+
+
 def resolve_embedder(config: dict | None = None) -> Embedder:
     cfg = config or {}
     choice = requested_embedder(cfg)
@@ -339,6 +361,8 @@ def resolve_embedder(config: dict | None = None) -> Embedder:
         emb = FastEmbedEmbedder(cfg.get("local_embedding_model", "BAAI/bge-small-en-v1.5"),
                                 threads=resolve_embed_threads(cfg))
     else:
+        if choice == "auto":
+            _note_hash_fallback()
         emb = HashEmbedder(cfg.get("hash_dim", 384))
     if cfg.get("strong_match_cosine") is not None:
         # operator override, for a model whose cosine range was measured

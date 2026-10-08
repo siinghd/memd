@@ -7,8 +7,9 @@ Write path: append to WAL -> fsync -> index apply -> ack. No LLM, no
 embedding on the critical path (SLO: embedded p99 <= 10ms).
 Read path: plan -> fan-out (BM25+entity, time on recency intent, vector
 with a real embedder) -> RRF fuse -> optional rerank of the lexical top-30
--> validity filter -> budget-aware packing with provenance tags (gated
-evidence packing as an experimental opt-in).
+-> validity filter -> budget-aware packing with provenance tags: dated
+session excerpts by default, a flat ranked list on request (gated evidence
+packing as an experimental opt-in).
 """
 from __future__ import annotations
 
@@ -42,7 +43,15 @@ from memd.pipeline.consolidation import ConsolidationResult, QuarantinePolicy, c
 from memd.pipeline.embedder import Embedder, requested_embedder, resolve_embedder
 from memd.pipeline.extractor import ExtractedFact, Extractor, resolve_extractor
 from memd.query.fusion import FusedItem, rrf_fuse
-from memd.query.packing import PackedContext, count_tokens, gate_candidates, pack_context, pack_gated
+from memd.query.packing import (
+    PackedContext,
+    count_tokens,
+    gate_candidates,
+    pack_context,
+    pack_gated,
+    pack_sessions,
+    rank_for_packing,
+)
 from memd.query.planner import plan_query
 from memd.query.rerank import (
     DEFAULT_RERANK_K,
@@ -58,7 +67,14 @@ from memd.storage.objectstore import LocalObjectStore, ReadOnlyError, count_io
 
 _log = logging.getLogger(__name__)
 
-DEFAULT_BUDGET_TOKENS = 2000
+# the packed context's default size, with session packing. Measured on
+# LongMemEval_S end-to-end QA: 0.875 for a 12K session pack, but with
+# bge-small embeddings, a local cross-encoder reranker and the relative-date
+# annotations on (memd ships them off), against 0.779 for the old defaults
+# (hash embedder, no reranker, 2K flat). The new defaults as shipped were not
+# measured end to end (README-engine.md, "Packing and the budget"). Pass
+# budget_tokens=2000 and packing="flat" for the old footprint.
+DEFAULT_BUDGET_TOKENS = 12_000
 HARD_DELETE_PURGE_MS = 72 * 3600 * 1000  # default physical-purge window for hard deletes
 # the embed worker's / maintenance jobs' name for a namespace's READ REPLICA
 # in a writer process (a cluster node serves both): "#" is never in a name
@@ -641,6 +657,7 @@ class _SearchCache:
 
 
 PACK_MODES = ("auto", "ranked", "gated")
+PACKINGS = ("sessions", "flat")
 DEFAULT_RERANK_GATE = 0.5
 
 
@@ -686,7 +703,48 @@ def resolve_pack_mode(config: dict | None) -> str:
     return mode
 
 
+def resolve_packing(config: dict | None) -> str:
+    """config["packing"] (or env MEMD_PACKING): the packed context's layout.
+
+    "sessions" (default): dated session excerpts - each retrieved turn with
+    its neighbouring turns, a fact under the turn it came from, sessions
+    oldest first, the speaker on every line. "flat": one provenance-tagged
+    <memory> element per candidate in rank order (the layout memd used
+    before session packing)."""
+    cfg = config or {}
+    return check_packing(cfg.get("packing") or os.environ.get("MEMD_PACKING") or "sessions")
+
+
+def check_packing(value: str) -> str:
+    v = str(value).strip().lower()
+    if v not in PACKINGS:
+        raise ValueError(f"unknown packing {value!r}; expected one of {list(PACKINGS)}")
+    return v
+
+
+def resolve_pack_resolve_dates(config: dict | None) -> bool:
+    """config["pack_resolve_dates"] (or env MEMD_PACK_RESOLVE_DATES): annotate
+    relative time expressions in packed user turns with the date they refer
+    to ("yesterday [= Fri 2023-05-19]"). Off by default: in the LongMemEval_S
+    measurement there was no sign that the annotations help."""
+    cfg = config or {}
+    v = cfg.get("pack_resolve_dates")
+    if v is None:
+        v = os.environ.get("MEMD_PACK_RESOLVE_DATES", "false")
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off", ""):
+        return False
+    raise ValueError(f"pack_resolve_dates must be true|false, not {v!r}")
+
+
 MAX_QUERY_CHARS = 64 * 1024  # embedder-cost guard for engine-side queries
+# session packing reads the neighbouring turns of this many anchors in its
+# first statement (doubling with each further one)
+_NEIGHBOUR_READ_AHEAD = 4
 # find_ids: a vector-only candidate must beat the median of the sweep's
 # vector sample by this much (see Memory._vector_only_floor); the median is
 # only trusted once the sample has a few points in it
@@ -876,6 +934,8 @@ class Memory:
         self.rerank: RerankStage | None = (
             RerankStage(reranker, k=int(cfg.get("rerank_k", DEFAULT_RERANK_K))) if reranker else None)
         self.pack_mode: str = resolve_pack_mode(cfg)
+        self.packing: str = resolve_packing(cfg)
+        self.pack_resolve_dates: bool = resolve_pack_resolve_dates(cfg)
         self.rerank_gate: float = float(cfg.get("rerank_gate", DEFAULT_RERANK_GATE))
         self._lexical_flush_drain_s = float(cfg.get("lexical_flush_drain_s", 60.0))
         self._vector_flush_drain_s = float(cfg.get("vector_flush_drain_s", 60.0))
@@ -922,12 +982,12 @@ class Memory:
         _log.info("memd: opened namespace %r with embedder %s (kind=%s, requested=%s)",
                   namespace, self.embedder.name, self.embedder.kind, requested_embedder(cfg))
         # the reranker decides whether search text leaves the machine: say so
-        _log.info("memd: reranker %s (model=%s, requested=%s, pack_mode=%s); "
+        _log.info("memd: reranker %s (model=%s, requested=%s, pack_mode=%s, packing=%s); "
                   "lexical backend %s (requested=%s); vector index %s (requested=%s); "
                   "fuse_vector=%s",
                   self.rerank.name if self.rerank else "none",
                   self.rerank.model if self.rerank else "-", requested_reranker(cfg),
-                  self.pack_mode, self.lexical_backend, requested_lexical_backend(cfg),
+                  self.pack_mode, self.packing, self.lexical_backend, requested_lexical_backend(cfg),
                   self.vector_index, requested_vector_index(cfg), self.fuse_vector)
         if self.rerank is not None and callable(getattr(self.rerank.reranker, "load", None)):
             # warm the reranker off the caller's path: a local cross-encoder
@@ -1429,8 +1489,14 @@ class Memory:
         rerank: bool = True,
         consistency: str | None = None,
         max_staleness_ms: int | None = None,
+        packing: str | None = None,
     ) -> SearchResult:
-        """`rerank=False` skips the reranker for this call (hosted mode: the
+        """`packing` lays out the packed context: "sessions" (dated session
+        excerpts, the turns around each hit) or "flat" (one tagged element
+        per hit, in rank order); None = the Memory's `packing` config.
+        `budget_tokens` caps it either way (default 12,000).
+
+        `rerank=False` skips the reranker for this call (hosted mode: the
         org's reranked-search quota is spent); the result is the unreranked
         order, counted as a fallback with reason "quota" and not cached.
 
@@ -1442,6 +1508,8 @@ class Memory:
         Memory is always eventual) reads the writer."""
         if len(query) > MAX_QUERY_CHARS:
             raise ValueError(f"query exceeds {MAX_QUERY_CHARS} char cap")
+        if packing is not None:
+            packing = check_packing(packing)
         impl = self._hosted()
         if impl is not None:
             return impl.search(query, user_id=user_id, session_id=session_id,
@@ -1449,13 +1517,16 @@ class Memory:
                                budget_tokens=budget_tokens, as_of=as_of,
                                kinds=kinds, include_quarantined=include_quarantined,
                                namespace=namespace, consistency=consistency,
-                               max_staleness_ms=max_staleness_ms)
+                               max_staleness_ms=max_staleness_ms, packing=packing)
         t0 = time.monotonic()
         if (consistency or ("eventual" if self.read_only else "strong")) == "strong":
+            # every search parameter travels; the layout is the caller's
+            # (its per-call choice, else its own default), not the holder's
             run = self._forward(namespace, "search", lambda: dict(
                 query=query, user_id=user_id, session_id=session_id, agent_id=agent_id,
                 org_id=org_id, budget_tokens=budget_tokens, as_of=as_of, kinds=kinds,
-                include_quarantined=include_quarantined, rerank=rerank), write=False)
+                include_quarantined=include_quarantined, rerank=rerank,
+                packing=packing or self.packing), write=False)
             if not run.here:
                 return _search_result(run.result)
         ns_idx, info = self._reader(namespace, consistency, max_staleness_ms)
@@ -1463,16 +1534,17 @@ class Memory:
             return self._search(ns_idx, info, t0, query, user_id=user_id, session_id=session_id,
                                 agent_id=agent_id, org_id=org_id, budget_tokens=budget_tokens,
                                 as_of=as_of, kinds=kinds,
-                                include_quarantined=include_quarantined, rerank=rerank)
+                                include_quarantined=include_quarantined, rerank=rerank,
+                                packing=packing or self.packing)
 
     def _search(self, ns_idx, info: dict | None, t0: float, query: str, *, user_id, session_id,
                 agent_id, org_id, budget_tokens, as_of, kinds, include_quarantined,
-                rerank) -> SearchResult:
+                rerank, packing) -> SearchResult:
         ns_name = ns_idx.namespace
         cache_key = (
             ns_name, query,
             (user_id, session_id, agent_id, org_id),
-            budget_tokens, as_of, tuple(kinds) if kinds else None,
+            budget_tokens, packing, as_of, tuple(kinds) if kinds else None,
             include_quarantined, self._qepochs.get(ns_name, 0),
             # a result served before the model loaded has no vector lane: it
             # must not outlive the load - nor one served while the lane skips
@@ -1579,10 +1651,14 @@ class Memory:
                 [it.record.id for it, _ in kept if it.record.kind == "raw_event"], filt, radius=1)
             packed = pack_gated(kept, neighbours, positions, budget_tokens=budget_tokens,
                                 query_class=plan.qclass)
-        else:
+        elif packing == "flat":
             # as_of anchors the recency tilt; without it packing is data-relative
             packed = pack_context(fused, budget_tokens=budget_tokens, now=as_of, query_class=plan.qclass,
                                   rerank_scores=rerank_scores)
+        else:
+            packed = self._pack_sessions(ns, fused, rerank_scores, scope=scope, as_of=as_of, kinds=kinds,
+                                         include_quarantined=include_quarantined,
+                                         budget_tokens=budget_tokens, query_class=plan.qclass)
         METRICS.observe("memd_search_stage_ms", (time.monotonic() - _st0) * 1000,
                         help="per-stage search timing (ms): plan/fuse/pack",
                         ns=ns.namespace, stage="pack")
@@ -1694,6 +1770,68 @@ class Memory:
         order = sorted(range(len(items)), key=lambda i: (-vals[i], i))
         return [(items[i], vals[i]) for i in order], False
 
+    def _pack_sessions(self, ns, fused: list[FusedItem], rerank_scores: dict[str, float] | None, *,
+                       scope: Scope, as_of: int | None, kinds: list[str] | None,
+                       include_quarantined: bool, budget_tokens: int, query_class: str) -> PackedContext:
+        """Session packing over the flat layout's candidate order. The turns
+        it adds - a fact's source turns, a hit's neighbours - pass the same
+        scope / validity / quarantine filter as the hits (never the planner's
+        kinds or time window: a neighbour is context, not a hit). A `kinds`
+        filter without raw turns adds none."""
+        ranked = rank_for_packing(fused, now=as_of, rerank_scores=rerank_scores)
+        known = {it.record.id: it.record for _, it in ranked}
+        sources: dict[str, list[MemoryRecord]] = {}
+        expand = not kinds or Kind.RAW_EVENT in kinds
+        filt = IndexFilter(scope=scope, as_of=as_of, include_quarantined=include_quarantined)
+        want = list(dict.fromkeys(x for _, it in ranked if it.record.kind != Kind.RAW_EVENT
+                                  for x in it.record.provenance.lineage)) if expand else []
+        if want:
+            vis = {r.id: r for r in ns.index.get_visible(want, filt) if r.kind == Kind.RAW_EVENT}
+            known.update(vis)
+            for _, it in ranked:
+                if it.record.kind != Kind.RAW_EVENT:
+                    got = [vis[x] for x in dict.fromkeys(it.record.provenance.lineage) if x in vis]
+                    if got:
+                        sources[it.record.id] = got
+        positions = ns.index.rowids(list(known))
+        neighbours = None
+        if expand:
+            # a unit's neighbours are looked up when it is packed (two index
+            # seeks per anchor), together with the next anchors' in rank
+            # order, 4 then 8, 16, ... at a time, and their rows read in one
+            # statement per batch; rows already in hand (candidates, sources)
+            # are never read again
+            anchors = list(dict.fromkeys(
+                a.id for _, it in ranked
+                for a in ([it.record] if it.record.kind == Kind.RAW_EVENT else sources.get(it.record.id, []))
+                if a.id in positions))
+            at = {a: i for i, a in enumerate(anchors)}
+            adj: dict[str, list[tuple[str, int]]] = {}
+            tried: set[str] = set()
+            batch = [_NEIGHBOUR_READ_AHEAD]
+
+            def neighbours(ids: list[str]):
+                if any(i not in adj for i in ids):
+                    k = min((at[i] for i in ids if i in at), default=len(anchors))
+                    ahead = [known[a] for a in dict.fromkeys([*ids, *anchors[k:k + batch[0]]])
+                             if a in known and a in positions and a not in adj]
+                    batch[0] = min(batch[0] * 2, 64)
+                    adj.update(ns.index.adjacent_turns(
+                        [(a.id, a.scope.session, a.time.t_event, positions[a.id]) for a in ahead], filt))
+                    for a in ahead:
+                        adj.setdefault(a.id, [])
+                    fresh = list(dict.fromkeys(x for a in ahead for x, _ in adj[a.id]
+                                               if x not in known and x not in tried))
+                    if fresh:
+                        tried.update(fresh)
+                        known.update((r.id, r) for r in ns.index.get_visible(fresh, filt))
+                got = {i: adj.get(i, []) for i in ids}
+                return ({i: [known[x] for x, _ in v if x in known] for i, v in got.items()},
+                        {x: p for v in got.values() for x, p in v})
+        return pack_sessions(ranked, sources=sources, positions=positions, neighbours=neighbours,
+                             budget_tokens=budget_tokens, query_class=query_class,
+                             resolve_dates=self.pack_resolve_dates)
+
     def _pack_mode_for(self, rerank_order) -> str:
         """Gated only on explicit opt-in, and only with reranker scores to
         gate on (see resolve_pack_mode for why auto is ranked)."""
@@ -1716,17 +1854,19 @@ class Memory:
         session_id: str | None = None,
         budget_tokens: int = DEFAULT_BUDGET_TOKENS,
         namespace: str | None = None,
+        packing: str | None = None,
     ) -> list[dict]:
         """Inject packed memory context before the LLM call (the two-line glue)."""
         impl = self._hosted()
         if impl is not None:
             return impl.pack(messages, user_id=user_id, session_id=session_id,
-                             budget_tokens=budget_tokens, namespace=namespace)
+                             budget_tokens=budget_tokens, namespace=namespace, packing=packing)
         last_user = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
         if not last_user:
             return messages
         res = self.search(
-            str(last_user), user_id=user_id, session_id=session_id, budget_tokens=budget_tokens, namespace=namespace
+            str(last_user), user_id=user_id, session_id=session_id, budget_tokens=budget_tokens, namespace=namespace,
+            packing=packing,
         )
         if not res.items:
             return messages
@@ -2575,6 +2715,8 @@ class Memory:
         st["fuse_vector"] = self.fuse_vector
         st["reranker"] = self.rerank.stats() if self.rerank is not None else {"name": "none"}
         st["pack_mode"] = self.pack_mode
+        st["packing"] = self.packing
+        st["pack_resolve_dates"] = self.pack_resolve_dates
         lex = ns.index.lexical
         st["lexical"] = lex.stats() if lex is not None else {"backend": "fts5"}
         ann = ns.index.ann

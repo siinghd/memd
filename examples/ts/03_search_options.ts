@@ -72,12 +72,14 @@ assert.ok(howTo.items.length > 0 && howTo.items.every((h) => wanted.includes(h.k
 
 // --- 4. budgets and limits ----------------------------------------------------
 // There is no top-k: results are packed into budget_tokens (64 to 128,000; default
-// 2,000) and `truncated` says whether anything was left out.
+// 12,000) and `truncated` says whether anything was left out.
 const tight = await memd.search("deploy", { user_id: "u1", budget_tokens: 64 });
 console.log(`budget 64: ${tight.items.length} item(s), ${tight.tokens_used}/${tight.budget} tokens, truncated=${tight.truncated}`);
 assert.ok(tight.truncated && tight.items.length < forU1.items.length);
-// A fixed count is a slice of the ranked items.
-const top3 = forU1.items.slice(0, 3);
+// A fixed count is a slice of the ranked hits. With the default session packing,
+// `items` also lists the turns packed around each hit (lanes "neighbour" / "source").
+const ranked = forU1.items.filter((h) => !h.lanes.includes("neighbour") && !h.lanes.includes("source"));
+const top3 = ranked.slice(0, 3);
 assert.equal(top3.length, 3);
 // findIds: every match, unbounded by any budget (the view a forget sweep uses).
 const allIds = await memd.findIds("deploy", { user_id: "u1" });

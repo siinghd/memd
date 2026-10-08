@@ -70,8 +70,15 @@ export interface MemoryIn extends ScopeFields {
 export interface SearchIn extends ScopeFields {
   /** 1 to 10,000 characters. */
   query: string;
-  /** Packing budget, 64 to 128,000 tokens. Default 2000. */
+  /** Packing budget, 64 to 128,000 tokens. Default 12,000. */
   budget_tokens?: number;
+  /**
+   * Layout of `packed_context`: `"sessions"` (dated excerpts of past
+   * conversations, each hit with the turns around it) or `"flat"` (one
+   * provenance-tagged `<memory>` element per hit, in rank order). Default:
+   * the server's `packing` setting, `"sessions"` unless configured.
+   */
+  packing?: "sessions" | "flat" | null;
   /** Time travel: epoch milliseconds. */
   as_of?: number | null;
   kinds?: Kind[] | null;
@@ -286,6 +293,8 @@ export interface NamespaceStats {
   fuse_vector: boolean;
   reranker: { name: string; [key: string]: unknown };
   pack_mode: string;
+  packing: string;
+  pack_resolve_dates: boolean;
   lexical: { backend: string; [key: string]: unknown };
   extractor: string;
   [key: string]: unknown;

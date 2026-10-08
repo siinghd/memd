@@ -18,7 +18,13 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, field_validator
 
 from memd.core.schema import Kind
-from memd.engine.memory import ForgetPreviewMismatch, Memory, forget_fingerprint
+from memd.engine.memory import (
+    DEFAULT_BUDGET_TOKENS,
+    ForgetPreviewMismatch,
+    Memory,
+    check_packing,
+    forget_fingerprint,
+)
 from memd.metrics import METRICS
 from memd.server.auth import FailureLimiter, KeyStore, Principal, RateLimiter
 from memd.storage.engine import NamespaceBusyError
@@ -119,7 +125,7 @@ def _validate_kinds(v):
 
 class SearchIn(BaseModel):
     query: str = Field(min_length=1, max_length=10_000)
-    budget_tokens: int = Field(default=2000, ge=64, le=128_000)
+    budget_tokens: int = Field(default=DEFAULT_BUDGET_TOKENS, ge=64, le=128_000)
     as_of: int | None = None
     kinds: list[str] | None = Field(default=None, max_length=len(Kind.ALL))
     user_id: str | None = None
@@ -127,8 +133,16 @@ class SearchIn(BaseModel):
     agent_id: str | None = None
     org_id: str | None = None
     include_quarantined: bool = False
+    # the packed context's layout, "sessions" or "flat" (any case); None =
+    # the server's `packing` config
+    packing: str | None = Field(default=None, max_length=16)
 
     _ck = field_validator("kinds")(_validate_kinds)
+
+    @field_validator("packing")
+    @classmethod
+    def _cp(cls, v):
+        return None if v is None else check_packing(v)
 
 
 class FindIn(BaseModel):
@@ -711,6 +725,7 @@ def create_app(
                 rerank=meter.allow_rerank,  # hosted: False once the reranked quota is spent
                 consistency=consistency,
                 max_staleness_ms=max_staleness_ms,
+                packing=body.packing,
             )
             meter.record(searches=1, reranked=res.reranked)
         _served_headers(response, {"served_by": res.served_by, "applied_seq": res.replica_seq,

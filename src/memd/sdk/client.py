@@ -104,7 +104,7 @@ class HostedMemory:
 
         body: dict[str, Any] = {"query": query}
         for k in ("user_id", "session_id", "agent_id", "org_id", "budget_tokens", "as_of", "kinds",
-                  "include_quarantined"):
+                  "include_quarantined", "packing"):
             if kw.get(k) is not None:
                 body[k] = kw[k]
         r = self._client.post(f"/v1/ns/{self._ns(kw)}/search", json=body, **self._read_headers(kw))

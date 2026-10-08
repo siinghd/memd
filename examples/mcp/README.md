@@ -13,6 +13,12 @@ pip install "memd-engine[mcp]"
 |---|---|---|
 | `MEMD_DATA` | data directory (or an `s3://bucket/prefix` root) | `./memd-data` |
 | `MEMD_NS` | namespace that the server reads and writes | `default` |
+| `MEMD_PACKING` | layout of the `memory_search` text: `sessions` or `flat` | `sessions` |
+
+`memory_search` takes `query`, `budget_tokens` (default 12,000) and
+`packing` (`sessions` or `flat`; the default is `MEMD_PACKING`). It returns
+the packed text in `packed_context`, and the metadata of the hits in
+`items` (id, kind, source, time, validity), without their text.
 
 Use an **absolute** `MEMD_DATA`. Hosts start the server from a working
 directory that you do not control. Use one process for each data root. If two

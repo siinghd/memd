@@ -19,6 +19,7 @@ segments (synchronous=NORMAL is therefore correct, not a shortcut).
 """
 from __future__ import annotations
 
+import bisect
 import contextlib
 import json
 import logging
@@ -263,7 +264,11 @@ class NamespaceIndex:
             -- composite above cannot serve (its leading columns are
             -- unconstrained), so every segment close scanned the whole
             -- namespace instead of one session's rows
-            CREATE INDEX IF NOT EXISTS ix_rec_session ON records(scope_session, kind);
+            -- (t_event, then rowid: every index ends with it) orders a
+            -- session's turns, so a turn's neighbours are an index seek, not
+            -- a read of the whole session; it replaced (scope_session, kind)
+            DROP INDEX IF EXISTS ix_rec_session;
+            CREATE INDEX IF NOT EXISTS ix_rec_session_t ON records(scope_session, kind, t_event);
             CREATE INDEX IF NOT EXISTS ix_rec_valid ON records(invalidated_at, deleted);
             CREATE TABLE IF NOT EXISTS vectors(
               id TEXT PRIMARY KEY REFERENCES records(id) ON DELETE CASCADE,
@@ -1420,6 +1425,51 @@ class NamespaceIndex:
                 out[rid] = got
         return out, positions
 
+    def adjacent_turns(self, anchors: list[tuple[str, str | None, int, int]],
+                       f: IndexFilter) -> dict[str, list[tuple[str, int]]]:
+        """For each anchor (id, session, t_event, rowid): the raw turn right
+        before it and right after it in its session, in (t_event, rowid)
+        order, as [(id, rowid)] - session_neighbours at radius 1 for a caller
+        that already holds the anchors: two index seeks each (ix_rec_session_t;
+        a session of any length costs the same), ids only (hydrate with
+        get_visible, the Python twin of the filter, before use). Every turn
+        satisfies `f` in SQL."""
+        out: dict[str, list[tuple[str, int]]] = {}
+        todo = [a for a in anchors if a[1] is not None]
+        if not todo or self._closed:
+            return out
+        fargs: list = []
+        filt = self._filter_where(f, fargs)
+        # INDEXED BY: with no table statistics the planner may take another
+        # index (kind, validity) - a walk over every raw turn in the namespace
+        # Two seeks per direction. A combined "t_event <= ? AND (t_event < ?
+        # OR rowid < ?)" range seeks on t_event only and then walks every turn
+        # that shares the anchor's timestamp (a session imported with one date
+        # per session has thousands). The index ends in the rowid, so a turn
+        # with the SAME t_event is one seek on (session, kind, t_event, rowid);
+        # only when there is none, the strictly earlier/later t_event is.
+        same = ("SELECT id, rowid FROM records INDEXED BY ix_rec_session_t "  # nosec B608
+                "WHERE scope_session = ? AND kind = 'raw_event' AND t_event = ? "
+                f"AND rowid {{cmp}} ? AND {filt} ORDER BY rowid {{order}} LIMIT 1")
+        other = ("SELECT id, rowid FROM records INDEXED BY ix_rec_session_t "  # nosec B608
+                 "WHERE scope_session = ? AND kind = 'raw_event' AND t_event {cmp} ? "
+                 f"AND {filt} ORDER BY t_event {{order}}, rowid {{order}} LIMIT 1")
+        steps = [(same.format(cmp=c, order=o), other.format(cmp=c, order=o))
+                 for c, o in (("<", "DESC"), (">", "ASC"))]
+        with self._read() as _c:
+            cur = _c.cursor()
+            cur.row_factory = None  # plain tuples: these rows are never read by name
+            for aid, sess, t, rowid in todo:
+                got = []
+                for same_sql, other_sql in steps:
+                    r = cur.execute(same_sql, [sess, t, rowid, *fargs]).fetchone()
+                    if r is None:
+                        r = cur.execute(other_sql, [sess, t, *fargs]).fetchone()
+                    if r is not None:
+                        got.append((r[0], int(r[1])))
+                out[aid] = got
+        return out
+
     def _fold_overflow_locked(self) -> None:
         """Fold the overflow block into the main matrix, dropping main's dead
         rows (O(main)); called only when overflow exceeds OVERFLOW_MAX or the
@@ -2202,6 +2252,26 @@ class NamespaceIndex:
                     rec.namespace = self._ns_hint
                     out[rec.id] = rec
         return [out[i] for i in ids if i in out]
+
+    def get_visible(self, ids: list[str], f: IndexFilter) -> list[MemoryRecord]:
+        """get_many, keeping only the records that satisfy `f` (the Python
+        twin of the SQL filter): an id taken from a record's lineage must not
+        reach a packed context the filter would have kept it out of."""
+        return [r for r in self.get_many(ids) if r.id not in f.exclude_ids and self._passes_filter(r, f)]
+
+    def rowids(self, ids: list[str]) -> dict[str, int]:
+        """{id: rowid} - the ingestion order; session packing orders a
+        session's turns by (t_event, rowid), as session_neighbours does."""
+        out: dict[str, int] = {}
+        if self._closed:
+            return out
+        with self._read() as _con:
+            for i in range(0, len(ids), 500):
+                chunk = ids[i : i + 500]
+                qs = ",".join("?" * len(chunk))
+                for r in _con.execute(f"SELECT id, rowid FROM records WHERE id IN ({qs})", chunk):  # nosec B608
+                    out[r[0]] = int(r[1])
+        return out
 
     def wipe(self) -> None:
         with self._lock:

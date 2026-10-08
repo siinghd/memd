@@ -83,3 +83,28 @@ def test_mcp_persistence_across_restart(tmp_path):
                     "params": {"name": "memory_search", "arguments": {"query": "survives restart"}}})
     assert "survives restart" in res["result"]["content"][0]["text"]
     p2.kill()
+
+
+def test_mcp_search_defaults_to_a_12k_session_pack(server):
+    _rpc(server, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                  "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                             "clientInfo": {"name": "t", "version": "0"}}})
+    server.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+    server.stdin.flush()
+    tools = _rpc(server, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    search = next(t for t in tools["result"]["tools"] if t["name"] == "memory_search")
+    assert search["inputSchema"]["properties"]["budget_tokens"]["default"] == 12000
+    assert "packing" in search["inputSchema"]["properties"]
+    _rpc(server, {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                  "params": {"name": "memory_save", "arguments": {"content": "the deploy freeze starts monday"}}})
+    found = _rpc(server, {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                          "params": {"name": "memory_search", "arguments": {"query": "deploy freeze"}}})
+    body = json.loads(found["result"]["content"][0]["text"])
+    assert body["packed_context"].startswith("Relevant excerpts from past conversations")
+    assert "the deploy freeze starts monday" in body["packed_context"]
+
+    flat = _rpc(server, {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                         "params": {"name": "memory_search",
+                                    "arguments": {"query": "deploy freeze", "packing": "flat"}}})
+    body = json.loads(flat["result"]["content"][0]["text"])
+    assert body["packed_context"].startswith("Relevant memories (provenance-tagged")
