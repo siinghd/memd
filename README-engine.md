@@ -182,12 +182,13 @@ tooling, not for serving.
 
 A record deleted between a write and that write's retry stays deleted: the
 holder runs the write only if none of its record ids was ever written to
-the namespace - a soft-deleted record keeps its row, and a hard delete,
-whose row goes at once, leaves its id in the index for a day (replayed from
-the log by a holder that takes the namespace over). The one exception: a
-record hard-deleted, purged and then its namespace's index rebuilt from the
-bucket alone (a holder without that index's cache taking over after the
-purge), all before the retry arrives - its id is then gone with the purge.
+the namespace - a soft-deleted record keeps its row until a compaction
+drops it, and a hard delete, whose row goes at once, leaves its id in the
+index for a day (replayed from the log by a holder that takes the namespace
+over). The exceptions, both needing the index to be rebuilt from the bucket
+alone (a holder without that index's cache taking over) before the retry
+arrives: a record soft-deleted and then compacted away, or hard-deleted and
+purged - its id is then no longer known, and the retry writes it again.
 
 Not covered by the exactly-once rule: a session close, a destroy or a
 compaction retried on a NEW holder (the first one died after running it)

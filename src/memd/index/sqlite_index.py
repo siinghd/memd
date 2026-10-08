@@ -292,6 +292,7 @@ class NamespaceIndex:
             -- a write retried with the same record ids after its record was
             -- hard-deleted is recognised, not written again (known_ids)
             CREATE TABLE IF NOT EXISTS hard_deleted(id TEXT PRIMARY KEY, at INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS ix_hard_deleted_at ON hard_deleted(at);
             -- EXTERNAL-CONTENT fts5: the index reads content from `records`
             -- instead of storing its own copy. The previous plain fts5 kept a
             -- second full copy of every record's text - measured at 10.27MB
@@ -1021,7 +1022,12 @@ class NamespaceIndex:
     def _note_hard_deleted(self, c: sqlite3.Connection, ids: list[str]) -> None:
         now = now_ms()
         c.executemany("INSERT OR REPLACE INTO hard_deleted(id, at) VALUES(?, ?)", [(i, now) for i in ids])
-        c.execute("DELETE FROM hard_deleted WHERE at < ?", (now - self.HARD_DELETED_KEEP_MS,))
+        # expire old entries at most once a minute: a bulk hard delete calls
+        # this once per record, and the range delete (indexed on `at`) need
+        # not run for each
+        if now - getattr(self, "_hard_deleted_swept", 0) >= 60_000:
+            self._hard_deleted_swept = now
+            c.execute("DELETE FROM hard_deleted WHERE at < ?", (now - self.HARD_DELETED_KEEP_MS,))
 
     def known_ids(self, ids: list[str]) -> set[str]:
         """Which of `ids` this namespace has written: a record row, deleted
