@@ -456,9 +456,16 @@ class ForwardServer:
     # ------------------------------------------------------------ connections
 
     def _accept_loop(self) -> None:
+        # (a timeout, so the loop also ends where shutting the listening
+        # socket down does not wake an accept() blocked on it)
+        self._sock.settimeout(1.0)
         while True:
             try:
                 conn, _addr = self._sock.accept()
+            except socket.timeout:
+                if self._closing:
+                    return
+                continue
             except OSError:
                 return                      # closed (stop)
             with self._lock:
@@ -527,7 +534,11 @@ class ForwardServer:
         if isinstance(resp, _Stream):
             self._send_stream(ch, resp)
             return
-        ch.send(_REPLY, _jdump(resp))
+        try:
+            body = _jdump(resp)
+        except (TypeError, ValueError) as ex:   # a result that cannot travel
+            body = _jdump({"ok": False, "error": _error_payload(ex)})
+        ch.send(_REPLY, body)
 
     def _write(self, req: dict, rid: str) -> dict:
         """A write runs once per request id: a repeat gets the first
@@ -800,7 +811,7 @@ class ForwardClient:
             if ch is None:
                 ch = self._connect(ep)
             try:
-                ch.sock.settimeout(max(5.0, self.cfg.connect_timeout_s * 2))
+                ch.sock.settimeout(max(5.0, timeout_s))
                 ch.send(_REQUEST, body)
                 break
             except OSError:
