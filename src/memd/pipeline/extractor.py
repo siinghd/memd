@@ -399,9 +399,11 @@ prompt_version={PROMPT_VERSION}"""
 
         t = threading.Thread(target=call, name="memd-extraction-call", daemon=True)
         t.start()
-        t.join(self.timeout_s)
-        late = t.is_alive()
-        client.close()  # aborts a call still running
+        try:
+            t.join(self.timeout_s)
+            late = t.is_alive()
+        finally:
+            client.close()  # aborts a call still running, interrupted or not
         if late:
             raise TimeoutError(f"extraction call exceeded {self.timeout_s:g}s")
         if "error" in box:
@@ -411,7 +413,10 @@ prompt_version={PROMPT_VERSION}"""
     def _post(self, client, body: dict) -> dict:
         buf = bytearray()
         with client.stream("POST", f"{self.base_url}/chat/completions",
-                           headers={"Authorization": f"Bearer {self.api_key}"}, json=body) as resp:
+                           headers={"Authorization": f"Bearer {self.api_key}",
+                                    # the size cap counts decoded bytes: a compressed
+                                    # reply could expand far past it between checks
+                                    "Accept-Encoding": "identity"}, json=body) as resp:
             resp.raise_for_status()
             for part in resp.iter_bytes():
                 buf += part

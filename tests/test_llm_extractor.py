@@ -707,3 +707,12 @@ def test_a_mixed_user_session_never_supersedes_another_users_fact(tmp_path):
         assert m.get(u1_fact.id)["time"]["superseded_by"] is None
     finally:
         m.close()
+
+
+def test_the_suite_clears_provider_settings_before_any_fixture_runs():
+    # module- and session-scoped fixtures run before a per-test autouse one:
+    # the conftest must have cleared the environment at import already
+    import os
+    leaked = [k for k in os.environ
+              if k.startswith(("MEMD_EXTRACTION_", "MEMD_EMBEDDING_")) or k == "TYPESAFE_API_KEY"]
+    assert leaked == []
