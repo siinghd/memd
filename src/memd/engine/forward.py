@@ -56,7 +56,6 @@ from collections import OrderedDict
 from dataclasses import dataclass
 
 from memd.metrics import METRICS
-from memd.server.cluster import _sign
 from memd.storage.engine import NamespaceBusyError, owner_lock_path, read_owner_lock
 
 _log = logging.getLogger(__name__)
@@ -357,7 +356,10 @@ class _Channel:
 def _keys(secret: str, endpoint_id: str, nonce: str, client: str, cnonce: str) -> tuple[str, str, bytes]:
     """(client proof, server proof, connection key) for one handshake - the
     cluster router's request signature (memd.server.cluster._sign) over
-    both nonces, so neither side's proof can be replayed to the other."""
+    both nonces, so neither side's proof can be replayed to the other.
+    (Imported here: a single server never loads the cluster module.)"""
+    from memd.server.cluster import _sign
+
     cproof = _sign(secret, endpoint_id, nonce, client, "forward-client", cnonce)
     sproof = _sign(secret, endpoint_id, nonce, client, "forward-server", cnonce)
     key = bytes.fromhex(_sign(secret, endpoint_id, nonce, client, "forward-key", cnonce))
