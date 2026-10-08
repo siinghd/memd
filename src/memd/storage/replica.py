@@ -329,19 +329,24 @@ class ReplicaStore(NamespaceStore):
         waited_since = None
         while True:
             with self.holding():
-                if self.exists and not self._synced:
+                if self.exists and not self._synced and self.last_error:
+                    # a rebuild that FAILED: refused at once (the router
+                    # sends the read to the writer)
                     raise ReplicaUnavailableError(
                         f"namespace {self.namespace!r}: the replica's rebuild did not complete "
-                        f"({self.last_error or 'in progress'})")
-                if self.refreshed_at is not None:
+                        f"({self.last_error})")
+                if (self._synced or not self.exists) and self.refreshed_at is not None:
                     yield self
                     return
             # (the serve lock released: the refresh may rebuild again - the
             # wait is counted from the first time, never started over)
             if waited_since is None:
                 waited_since = time.monotonic()
+            # a rebuild in progress, or one that has not applied the log
+            # tail yet: wait for it, at most refresh_wait_s in all
             self._await_refresh(float("-inf"), waited_since, self.refresh_wait_s,
-                                "the replica was rebuilt and has not applied the log tail yet")
+                                "the replica's rebuild is in progress or has not applied "
+                                "the log tail yet")
 
     def ensure_fresh(self, max_staleness_s: float, wait_s: float | None = None) -> None:
         """Make sure every write the writer acknowledged more than
