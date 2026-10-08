@@ -19,6 +19,7 @@ import json
 import math
 import os
 import re
+import secrets
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -236,7 +237,8 @@ class LLMExtractor(Extractor):
     # read like the user's statement and every fact was attributed to the
     # session's first turn
     _SYSTEM_PROMPT = f"""You extract durable memories from agent conversation segments.
-Each turn is one line: [<turn id>] <time, UTC> <speaker>: <text>. The speaker is user (the person), assistant (the AI agent), or system/tool.
+Each turn is one line: [<turn id>] <time, UTC> <speaker>: <text>. A line break inside a turn's text is written as \\n.
+The speaker is user (the person), assistant or agent (the AI agent), system (instructions to the agent) or tool (a tool's output).
 Return ONLY a JSON array. Each item: {{"content": "<standalone third-person fact>", "entity_keys": ["<dot.separated.key>"], "lineage": ["<turn id>"]}}.
 Rules:
 - Only stable, reusable facts (identity, preferences, procedures, environment, decisions). No chit-chat.
@@ -283,7 +285,7 @@ prompt_version={PROMPT_VERSION}"""
         buf: list[MemoryRecord] = []
         chars = 0
         for r in records:
-            n = len(r.content) + len(r.id) + 4
+            n = len(self._turn_text(r)) + _TURN_ID_CHARS
             if buf and (len(buf) >= self.chunk_records or chars + n > self.chunk_chars):
                 yield buf
                 buf, chars = [], 0
@@ -319,7 +321,11 @@ prompt_version={PROMPT_VERSION}"""
         return out
 
     def _extract_chunk(self, records: list[MemoryRecord]) -> list[ExtractedFact]:
-        lines = [self._turn_line(r) for r in records]
+        # turn ids are made up per call (unguessable): a turn's text cannot
+        # name another turn, and record ids never leave the engine
+        tag = secrets.token_hex(3)
+        ids = {f"{tag}-{i}": r.id for i, r in enumerate(records, 1)}
+        lines = [f"[{tid}] {self._turn_text(r)}" for tid, r in zip(ids, records)]
         user_msg = "Segment:\n" + "\n".join(lines)
         body = {
             "model": self.model,
@@ -351,7 +357,7 @@ prompt_version={PROMPT_VERSION}"""
             raise ExtractionError("empty", "the reply has no content")
         if not isinstance(text, str):
             raise ExtractionError("malformed", f"content is a {type(text).__name__}")
-        return self._parse(text, records)
+        return self._parse(text, records, ids)
 
     @staticmethod
     def _speaker(rec: MemoryRecord) -> str:
@@ -360,13 +366,16 @@ prompt_version={PROMPT_VERSION}"""
         return candidate_from_record(rec)["role"]
 
     @staticmethod
-    def _turn_line(rec: MemoryRecord) -> str:
-        """[id] time speaker: text - when and who as the reranker sees a
-        record (role from the writer's actor id, else the source tier)."""
+    def _turn_text(rec: MemoryRecord) -> str:
+        """time speaker: text - when and who as the reranker sees a record
+        (role from the writer's actor id, else the source tier), on ONE
+        line: a line break in the text is written as \\n, so a turn cannot
+        start a line of its own (a fake turn, another speaker)."""
         from memd.query.rerank import candidate_from_record
 
         c = candidate_from_record(rec)
-        return f"[{rec.id}] {c['date']} {c['role']}: {rec.content}"
+        text = _LINE_BREAKS.sub(lambda _m: "\\n", rec.content)
+        return f"{c['date']} {c['role']}: {text}"
 
     def _complete(self, body: dict) -> dict:
         """One provider call, bounded as a whole by timeout_s: connecting,
@@ -410,13 +419,15 @@ prompt_version={PROMPT_VERSION}"""
                     raise ExtractionError("oversize", f"the reply exceeded {self.max_response_bytes} bytes")
         return json.loads(bytes(buf))
 
-    def _parse(self, text: str, records: list[MemoryRecord]) -> list[ExtractedFact]:
+    def _parse(self, text: str, records: list[MemoryRecord],
+               ids: dict[str, str] | None = None) -> list[ExtractedFact]:
+        """`ids`: the turn ids the model was shown -> record ids."""
+        ids = ids if ids is not None else {r.id: r.id for r in records}
         try:
             start, end = text.find("["), text.rfind("]")
             arr = json.loads(text[start : end + 1])
         except ValueError:
             raise ExtractionError("malformed", "no JSON array in the reply") from None
-        id_set = {r.id for r in records}
         # a fact naming no turn of this chunk is traced to the chunk's first
         # user turn (else its first turn) - never to a turn outside the
         # chunk, which is what the session-wide default would pick
@@ -432,7 +443,7 @@ prompt_version={PROMPT_VERSION}"""
                 malformed += 1
                 continue
             ekeys = [normalize_entity_key(k) for k in ekeys if k.strip()]
-            lin = [x for x in lin if x in id_set]
+            lin = [ids[x] for x in lin if x in ids]
             out.append(ExtractedFact(content=content.strip(), entity_keys=ekeys, lineage=lin or default_lineage))
         if malformed:
             from memd.metrics import METRICS
@@ -440,6 +451,11 @@ prompt_version={PROMPT_VERSION}"""
             METRICS.inc("memd_extraction_items_malformed_total", malformed, model=self.model,
                         help="items of an extraction reply dropped as malformed (the reply's other facts kept)")
         return out
+
+
+# every line boundary str.splitlines() knows (models split on them too)
+_LINE_BREAKS = re.compile(r"\r\n|[\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
+_TURN_ID_CHARS = 16  # "[a1b2c3-40] " and the line break, as chunk_chars counts a line
 
 
 def _str_list(v) -> list[str] | None:

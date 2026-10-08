@@ -58,11 +58,11 @@ class TestLLMExtractorChunking:
         def handler(request: httpx.Request) -> httpx.Response:
             body = request.read().decode()
             # the chunk containing r5 fails hard; others succeed
-            if "[r5]" in body:
+            if "text 5" in body:
                 return httpx.Response(500, json={"error": "provider down"})
             import json as _json
 
-            rid = "r0" if "[r0]" in body else ("r8" if "[r8]" in body else "rx")
+            rid = "r0" if "text 0" in body else ("r8" if "text 8" in body else "rx")
             facts = [{"content": f"fact {rid}", "entity_keys": []}]
             return httpx.Response(200, json={"choices": [
                 {"message": {"content": _json.dumps(facts)}}]})

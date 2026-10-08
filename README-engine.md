@@ -657,9 +657,13 @@ an env key off.
 | `extraction_request_options` / `MEMD_EXTRACTION_REQUEST_OPTIONS` | a dict (env: a JSON object) merged into every request body last; a `null` value removes a field | none |
 
 - **What the model sees.** A session's raw turns, in chunks of at most 40
-  turns / 24,000 characters, one line per turn: `[id] <time, UTC>
-  <speaker>: text`, the speaker being `user`, `assistant`, `system` or
-  `tool` (from the writer's `role`). The model is told to attribute each
+  turns / 24,000 characters (counting each whole line), one line per turn:
+  `[<turn id>] <time, UTC> <speaker>: text`, the speaker being `user`,
+  `assistant`, `agent`, `system` or `tool` (from the writer's `role`). A
+  line break in a turn's text is written as `\n`, so a turn cannot pose as
+  another line or speaker, and turn ids are made up for each call
+  (`9f3a1c-1`, `9f3a1c-2`, ...): a turn's text cannot name another turn,
+  and record ids are not sent. The model is told to attribute each
   fact to who said it (an assistant's suggestion is not the user's fact)
   and to name the turns it came from; a fact takes its scope, actor and
   time from those turns (one naming none of its chunk's turns: from the

@@ -183,8 +183,8 @@ any probe fails the build.
   keep a keyed deployment local. In hosted mode the key is read from the
   server's environment only; clients never send one.
 - **With the LLM extractor active, session turns leave the machine.** On
-  `close_session`, the session's raw turns (id, time, speaker and full
-  text of each) are sent to the extraction provider
+  `close_session`, the session's raw turns (time, speaker and full text
+  of each, under a turn number made up for the call) are sent to the extraction provider
   (`extraction_base_url`, OpenAI by default). The LLM extractor is active
   when an extraction key is configured, from EITHER source:
   `MEMD_EXTRACTION_API_KEY` in the environment, or `extraction_api_key` in

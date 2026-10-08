@@ -61,10 +61,14 @@ wrong, how it showed, and the numbers before and after where it has them.
   assistant's suggestion read like the user's own statement. And the prompt
   never asked for the turns a fact came from, so every LLM fact took its
   scope, actor and time from the session's first turn - the assistant's,
-  when it spoke first. Each turn is now `[id] <time, UTC> <speaker>: text`,
-  the model is told to attribute each fact to who said it and to resolve
-  relative dates against the turn's time, and each fact names its turns
-  (`lineage`). The prompt is version `v2`; facts record the extractor's
+  when it spoke first. Each turn is now `[<turn id>] <time, UTC> <speaker>:
+  text` on one line (a line break in the text is written as `\n`, so a turn
+  cannot pose as another line or speaker; the turn ids are made up for each
+  call, so a turn cannot name another), the model is told to attribute each
+  fact to who said it and to resolve relative dates against the turn's
+  time, and each fact names its turns (`lineage`; one that names none of
+  its chunk's turns is traced to the chunk's first user turn). The chunk
+  bound counts each whole rendered line. The prompt is version `v2`; facts record the extractor's
   prompt version instead of a fixed `v1`.
 - **A failed extraction call falls back to the pattern extractor, counted
   and reported.** A failed call lost its chunk's facts: an HTTP error or a
