@@ -563,3 +563,17 @@ def test_hosted_never_meters_turns_the_pattern_extractor_took_over(hosted_llm, p
     body = r.json()
     assert body["raw_considered"] == 2 and body["extraction_errors"] == 1 and body["raw_failed"] == 1
     assert metered == 1, "only the turn the LLM extracted is metered"
+
+
+def test_a_fallback_fact_is_labelled_as_the_pattern_extractors(provider, tmp_path):
+    from memd.engine.memory import Memory
+
+    provider.reply = lambda body: (500, {"error": "provider down"})
+    m = Memory(str(tmp_path / "d"), config={"extraction_api_key": "k", "extraction_base_url": provider.base_url})
+    try:
+        m.add(_NAMED, session_id="s1", user_id="u1")
+        assert m.close_session("s1")["facts_written"] == 1
+        (fact,) = [i for i in m.search("Ada Lovelace", user_id="u1").items if i.kind == "fact"]
+        assert m.get(fact.id)["provenance"]["extractor"] == {"model": "heuristic", "prompt_version": "v1"}
+    finally:
+        m.close()

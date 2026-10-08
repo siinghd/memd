@@ -1744,8 +1744,8 @@ class Memory:
                     session_id=src.provenance.session_id if src is not None else None,
                     t_event=max((s.time.t_event for s in sources if s.id in fact.lineage), default=None)
                     or (src.time.t_event if src is not None else None),
-                    extractor=ExtractorInfo(model=self.extractor.name,
-                                            prompt_version=getattr(self.extractor, "prompt_version", "v1")),
+                    extractor=fact.extractor or ExtractorInfo(
+                        model=self.extractor.name, prompt_version=getattr(self.extractor, "prompt_version", "v1")),
                 )
 
             res = consolidate_facts(cluster, [f], make)

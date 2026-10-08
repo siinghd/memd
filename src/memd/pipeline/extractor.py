@@ -24,7 +24,7 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
-from memd.core.schema import MemoryRecord, Source
+from memd.core.schema import ExtractorInfo, MemoryRecord, Source
 
 PROMPT_VERSION = "v2"
 DEFAULT_MAX_TOKENS = 4096   # output tokens per extraction call
@@ -37,6 +37,9 @@ class ExtractedFact:
     content: str
     entity_keys: list[str] = field(default_factory=list)
     lineage: list[str] = field(default_factory=list)
+    # the extractor that made it, when not the configured one (a failed LLM
+    # call's turns go through the pattern extractor)
+    extractor: ExtractorInfo | None = None
 
 
 class Extraction(list):
@@ -73,6 +76,7 @@ def slug(s: str, max_len: int = 40) -> str:
 
 class Extractor(ABC):
     name: str = "base"
+    prompt_version: str = "v1"
 
     @abstractmethod
     def extract(self, records: list[MemoryRecord]) -> list[ExtractedFact]: ...
@@ -308,7 +312,10 @@ prompt_version={PROMPT_VERSION}"""
                 out.failed_records += len(chunk)
                 METRICS.inc("memd_extraction_chunks_failed_total", model=self.model, reason=reason,
                             help="extraction calls that failed (their turns went through the pattern extractor)")
-                out.extend(self._fallback.extract(chunk))
+                made_by = ExtractorInfo(model=self._fallback.name, prompt_version=self._fallback.prompt_version)
+                for f in self._fallback.extract(chunk):
+                    f.extractor = made_by
+                    out.append(f)
         return out
 
     def _extract_chunk(self, records: list[MemoryRecord]) -> list[ExtractedFact]:
