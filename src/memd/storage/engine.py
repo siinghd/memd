@@ -614,8 +614,9 @@ def owner_lock_path(root: str, ns: str) -> str:
 
 def read_owner_lock(lock_path: str) -> str | None:
     """Who holds a local namespace lock, as its holder wrote it into the
-    file (see _acquire_owner): None when there is no file, "" while a new
-    holder has not written it yet."""
+    file (see _acquire_owner): None when there is no file, "" when nobody
+    holds it (a holder empties it as it releases it) or a new holder has
+    not written it yet."""
     try:
         with open(lock_path, "rb") as f:
             return f.read(4096).decode("utf-8", errors="replace").strip()
@@ -668,6 +669,12 @@ def _release_owner(lock_path: str) -> None:
         if held[1] > 0:
             return
         _OWNER_FDS.pop(lock_path, None)
+        try:
+            # emptied while still held: a released namespace names no holder
+            # (whose address another process would otherwise try to reach)
+            os.ftruncate(held[0], 0)
+        except OSError:
+            pass
         try:
             fcntl.flock(held[0], fcntl.LOCK_UN)
         finally:
