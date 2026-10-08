@@ -115,12 +115,12 @@ over **lanes**, fused by reciprocal rank fusion:
 An optional **reranker** (Jev with a TypeSafe key, or a local cross-encoder)
 reorders the top 30 of the bm25 lane (plus the vector lane with a real
 embedder); a failed or slow judgement keeps the fused order. The result is filtered for validity (current, or `as_of`), deduped
-by lineage and **packed** into `budget_tokens` (default 12,000), ready to
-put in a prompt: `SearchResult.packed_context`. By default it is laid out as
-dated session excerpts (each hit with the turns around it, a fact under the
-turn it came from, oldest session first); `packing="flat"` gives one
-provenance-tagged element per hit in a prefix-stable order. See
-[Packing and the budget](#packing-and-the-budget).
+by lineage and **packed** into `budget_tokens` (default 12,000):
+`SearchResult.packed_context`, ready to put in a prompt. The default layout
+is dated session excerpts. Each hit comes with the turns around it, a fact
+shows under the turn that it came from, and the oldest session comes first.
+`packing="flat"` gives one provenance-tagged element for each hit, in a
+prefix-stable order. See [Packing and the budget](#packing-and-the-budget).
 
 Every derived structure (the SQLite index, the tantivy index, the usearch
 sidecar, the vectors) is rebuildable from the log by contract. The log and

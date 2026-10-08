@@ -3,16 +3,16 @@
 ## Install
 
 ```bash
-pip install "memd-engine[local-embeddings]"           # Python >= 3.11; recommended
+pip install "memd-engine[local-embeddings]"           # Python >= 3.11. Recommended.
 pip install "memd-engine[local-embeddings,mcp,s3]"    # extras: local-embeddings, mcp, s3, fast, ann, jev
 ```
 
-Plain `pip install memd-engine` works too, offline and with no model: memd
-then uses hash embeddings and ranks by its lexical lanes alone (it logs one
-line saying so). The `local-embeddings` extra materially improves recall:
-on LongMemEval_S session retrieval, 97.5% of questions had every evidence
-session in the top 10 with bge-small fused with BM25, against 92.0% with
-BM25 alone (lane-level measurements, 153 questions).
+`pip install memd-engine` also works, offline and with no model. memd then
+uses hash embeddings and ranks by its lexical lanes only. It logs one line
+about it. The `local-embeddings` extra gives much better recall. On
+LongMemEval_S session retrieval, bge-small fused with BM25 put all evidence
+sessions in the top 10 for 97.5% of questions. BM25 alone did this for
+92.0%. These are lane-level measurements on 153 questions.
 
 !!! note "Not on PyPI yet"
     Until the first release is published, install from a checkout:
@@ -24,7 +24,7 @@ BM25 alone (lane-level measurements, 153 questions).
 | `s3` | `s3://` data roots (boto3) |
 | `fast` | the tantivy accelerator for the bm25 lane |
 | `ann` | the usearch HNSW sidecar for the vector lane |
-| `local-embeddings` | local ONNX embeddings: BAAI/bge-small-en-v1.5 via fastembed, fused with BM25 (recommended) |
+| `local-embeddings` | local ONNX embeddings: BAAI/bge-small-en-v1.5 through fastembed, fused with BM25 (recommended) |
 | `jev` | the Jev reranker (active only with `TYPESAFE_API_KEY`) |
 | `billing` | Stripe billing for hosted mode |
 

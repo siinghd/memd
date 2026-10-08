@@ -72,38 +72,54 @@ background). Measured on a loaded, shared 8-core ARM host (Neoverse-N1).
 
 ## End-to-end QA: session packing and the 12K budget
 
-The current search defaults (session packing, 12,000 tokens) come from this run. 160 LongMemEval_S questions in a
-fixed stratified order (multi-session and temporal-reasoning over-sampled twice, abstention included), results
-re-weighted to the dataset's type mix; one run. Reader `deepseek/deepseek-v4.1-flash` (one provider pinned, a
-pinned fallback served 61 of 480 calls), judge `openai/gpt-6-luna-pro` with the official per-type judge prompts.
-Retrieval for every row but the first: bge-small embeddings (`local-embeddings`) and a local cross-encoder
-reranker (`Xenova/ms-marco-MiniLM-L-6-v2`, not memd's default `local_rerank_model`).
+The search defaults (session packing, 12,000 tokens) come from this run.
+
+- Questions: 160 LongMemEval_S questions, in a fixed stratified order. Multi-session and temporal-reasoning
+  questions are over-sampled two times. Abstention questions are included. The results are re-weighted to the
+  type mix of the dataset. There was one run.
+- Reader: `deepseek/deepseek-v4.1-flash`, with one provider pinned. A pinned fallback served 61 of 480 calls.
+- Judge: `openai/gpt-6-luna-pro`, with the official per-type judge prompts.
+- Retrieval, in all rows but the first: bge-small embeddings (`local-embeddings`) and a local cross-encoder
+  reranker (`Xenova/ms-marco-MiniLM-L-6-v2`). This reranker is not memd's default `local_rerank_model`.
+- The session-pack row had the relative-date annotations on (`pack_resolve_dates`). memd ships them off.
+- The previous-defaults row and the whole-history row use the answers of an earlier run, with the same reader
+  and judge. The whole-history row is exploratory: it is not part of the plan of the run.
 
 | context given to the reader | accuracy [95% CI] | multi-session (n 52) | temporal (n 54) | reader prompt tokens | evidence sessions in context |
 |---|---|---|---|---|---|
 | previous defaults: hash embedder, no reranker, 2K flat | 0.779 [0.718, 0.838] | 0.577 | 0.796 | 2.0K | 0.858 |
 | bge-small + reranker, 2K flat | 0.789 [0.726, 0.847] | 0.654 | 0.759 | 2.0K | 0.912 |
 | bge-small + reranker, 12K flat | 0.823 [0.763, 0.879] | 0.750 | 0.833 | 10.6K | 0.985 |
-| bge-small + reranker, 12K sessions | **0.875 [0.823, 0.920]** | 0.769 | 0.870 | 10.4K | 0.971 |
-| the whole history, no retrieval | 0.906 [0.858, 0.949] | 0.904 | 0.944 | ~105K | 1 |
+| bge-small + reranker, 12K sessions, relative dates on | **0.875 [0.823, 0.920]** | 0.769 | 0.870 | 10.4K | 0.971 |
+| the whole history, no retrieval (exploratory) | 0.906 [0.858, 0.949] | 0.904 | 0.944 | ~105K | 1 |
 
-Paired (re-weighted): 12K sessions vs previous defaults +0.095 [+0.034, +0.156], McNemar p = 0.0015 (22 / 5
-discordant); 12K sessions vs 12K flat +0.052 [-0.010, +0.113]; 12K flat vs 2K flat +0.034 [-0.012, +0.081];
-embedder + reranker at 2K vs previous defaults +0.009 [-0.043, +0.061]. The session pack is still below the whole
-history (unweighted paired -0.056 [-0.106, -0.006], p = 0.049). Per-type values are raw means.
+Paired differences (re-weighted):
 
-What this does not show: the new defaults with the hash embedder and no reranker (not run end to end); more than
-one seed, reader or judge; the held-out 500 questions. Unlike the retrieval table above, it is one sample with no
-fold split, and it has not been independently reviewed. The measured session pack had relative-date annotations
-on (`pack_resolve_dates`); memd ships them off, because on the 20-question pilot the pack without them scored no
-worse (0.85 vs 0.75; not tested at power). Abstention fell with more context (0.857 to 0.714, n = 7). Search
-latency in this run is dominated by the cross-encoder on a loaded CPU (seconds per search); the packing itself is
-measured in README-engine.md.
+- 12K sessions vs previous defaults: +0.095 [+0.034, +0.156], McNemar p = 0.0015 (22 / 5 discordant).
+- 12K sessions vs 12K flat: +0.052 [-0.010, +0.113].
+- 12K flat vs 2K flat: +0.034 [-0.012, +0.081].
+- Embedder + reranker at 2K vs previous defaults: +0.009 [-0.043, +0.061].
+- The session pack scored lower than the whole history: unweighted paired -0.056 [-0.106, -0.006], p = 0.049.
+
+The per-type values are raw means.
+
+What this run does not show:
+
+- The new defaults as shipped: the hash embedder (or bge-small with the extra), no reranker, and no relative
+  dates. Nobody ran them end to end.
+- More than one seed, reader or judge, or the held-out 500 questions.
+- Unlike the retrieval table above, this is one sample with no fold split. It has no independent review.
+- The relative-date annotations: memd ships them off. On the 20-question pilot, the pack without them scored
+  0.85, and the pack with them 0.75. This pilot has no statistical power.
+
+Abstention went down with more context: 0.857 to 0.714 (n = 7). In this run, the cross-encoder takes most of the
+search time (seconds for each search on a loaded CPU). README-engine.md gives the cost of the packing itself.
 
 ## Embedders (session retrieval, lane level)
 
-LongMemEval_S, 153 questions (the order above, abstention excluded), lanes measured outside `Memory.search` (BM25
-over stemmed turns and memd's RRF approximated), re-weighted to the type mix:
+LongMemEval_S, 153 questions (the order above, without abstention). These lanes were measured outside
+`Memory.search`: BM25 over stemmed turns and an approximation of memd's RRF. The values are re-weighted to the
+type mix.
 
 | ranking | recall_all@10 [95% CI] | recall_all@5 | ndcg@10 | multi-session recall_all@10 |
 |---|---|---|---|---|
@@ -112,10 +128,10 @@ over stemmed turns and memd's RRF approximated), re-weighted to the type mix:
 | bge-small vector lane (`local-embeddings`) | 0.980 [0.960, 0.995] | 0.911 | 0.942 | 0.962 |
 | RRF(BM25, bge-small) (memd with `local-embeddings`) | 0.975 [0.950, 0.995] | 0.920 | 0.953 | not reported |
 
-Fused vs BM25 alone: +0.056 [+0.021, +0.095] recall_all@10 (9 / 0 discordant). One sample, no fold split, not
-independently reviewed. On a 19-question subset
-EmbeddingGemma 2 matched bge-small (recall_all@10 1.000 for both; no measurable difference) at 2.4-4.6x the CPU
-time per text.
+- Fused vs BM25 alone: +0.056 [+0.021, +0.095] recall_all@10 (9 / 0 discordant).
+- This is one sample with no fold split. It has no independent review.
+- On a 19-question subset, EmbeddingGemma 2 gave the same result as bge-small (recall_all@10 1.000 for both;
+  no measurable difference). It used 2.4-4.6x the CPU time for each text.
 
 ## End-to-end QA (preliminary)
 

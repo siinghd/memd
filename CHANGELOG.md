@@ -75,81 +75,104 @@ wrong, how it showed, and the numbers before and after where it has them.
   README-engine.md, "Extraction options".
 - `close_session` returns `extraction_errors` and `raw_failed`: the
   extraction calls that failed and their turns (see Fixed).
-- `packing="sessions" | "flat"`: per call on `search` / `pack` (Python,
-  REST `SearchIn.packing`, TypeScript `SearchIn.packing`), and as a default
-  in the Memory config (`packing`) or `MEMD_PACKING`. `stats()` reports
-  `packing` and `pack_resolve_dates`.
-- `pack_resolve_dates` / `MEMD_PACK_RESOLVE_DATES` (off by default):
-  session packing annotates relative time expressions in user turns with
-  the date they refer to, counted from the turn's own date ("two weeks ago
-  [= Sat 2023-05-06]"; `memd.query.dates`). It resolves yesterday / today /
-  tomorrow, "N days|weeks|months|years ago" and "... from now", "last /
-  this past / next <weekday>", "last / this / next week|weekend|month|year",
-  marks vague counts and month or year shifts approximate, and leaves
-  durations ("in two weeks"), bare weekdays, phrases ("the last week of
-  June") and parts of larger numbers ("1.5 years ago") alone. Off because
-  the measurement above had it on and a 20-question pilot showed no sign
+- `packing="sessions" | "flat"` selects the layout of the packed context.
+  Give it for each call to `search` or `pack`: in Python, in the REST
+  `SearchIn.packing` (any case), in TypeScript `SearchIn.packing`, and in
+  the MCP `memory_search` tool. Or set a default in the Memory config
+  (`packing`) or in `MEMD_PACKING`. `stats()` shows `packing` and
+  `pack_resolve_dates`.
+- `pack_resolve_dates` / `MEMD_PACK_RESOLVE_DATES` (off by default). With
+  this option, session packing adds the calendar date after a relative time
+  expression in a user turn, from the turn's own date: "two weeks ago [=
+  Sat 2023-05-06]" (`memd.query.dates`). It resolves:
+  - yesterday, today, tomorrow;
+  - "N days|weeks|months|years ago" and "... from now", also as a range
+    ("3-4 days ago" gives a span of dates);
+  - "last / this past / next <weekday>";
+  - "last / this / next week|weekend|month|year".
+
+  Vague counts, ranges, and month or year shifts are marked approximate
+  (≈). It does not change durations ("in two weeks"), bare weekdays,
+  phrases ("the last week of June"), parts of larger numbers ("1.5 years
+  ago"), names and titles ("USA Today", "Last Week Tonight", "Tomorrow
+  Never Dies"), or dates outside years 1-9999. The option is off because
+  the measurement below had it on, and a 20-question pilot showed no sign
   that it helps.
 
 ### Changed
-- **Search packs dated session excerpts within 12,000 tokens by default
-  (was a flat list within 2,000).** `search`, `pack`, `POST
-  /v1/ns/{ns}/search`, the MCP `memory_search` tool and both SDKs now
-  default to `budget_tokens=12000` and the `sessions` layout: candidates in
-  rank order, each retrieved turn with the turn before and after it in its
-  session, a fact under the turn it was extracted from, sessions oldest
-  first under their date, the speaker on every line, `[...]` between turns
-  that are not adjacent. Measured on LongMemEval_S end-to-end QA (160
-  stratified questions, one run, reader DeepSeek V4.1 Flash, judge
-  gpt-6-luna-pro, bge-small embeddings and a local cross-encoder reranker):
-  0.875 [0.823, 0.920], against 0.779 [0.718, 0.838] for the previous
-  defaults (hash embedder, no reranker, 2K flat; +0.095, McNemar p =
-  0.0015), 0.823 for the same retrieval packed flat at 12K, and 0.906 for
-  the whole history in the prompt (~105K tokens against ~10K); multi-session
-  0.577 to 0.769, temporal 0.796 to 0.870. The new defaults with the hash
-  embedder and no reranker were not measured end to end. Details and
-  caveats: README-engine.md, "Packing and the budget"; BENCHMARKS.md.
-  **What changes for you:** up to 6x more context tokens per search when
-  there is that much to retrieve (`tokens_used` says how many), and a
-  differently shaped `packed_context`: no `<memory>` tags or record ids in
-  the text, provenance as the speaker of each line, lower-trust content
-  still fenced. `items` now lists every record shown: the hits in rank
-  order, each followed by the turns it brought (`lanes` `["source"]` or
-  `["neighbour"]`, score 0). **To keep the old behaviour:** pass
-  `budget_tokens=2000` and `packing="flat"` per call (REST: `"budget_tokens":
-  2000, "packing": "flat"`; TypeScript: `{ budget_tokens: 2000, packing:
-  "flat" }`), or set `packing="flat"` in the Memory config / `MEMD_PACKING=flat`
-  for the server and MCP processes and pass the budget. Explicit budgets are
-  honoured as before. `pack_mode="gated"` still takes precedence when a
-  reranker ran. The session pack adds a few milliseconds of packing per
-  search (see README-engine.md).
-- **The hash-embedder fallback says so.** When `embedder="auto"` falls back
-  to the hash embedder because the `local-embeddings` extra (fastembed) is
-  not installed, memd logs one warning per process naming the extra. With
-  it, "auto" was already BAAI/bge-small-en-v1.5 fused with BM25; on
-  LongMemEval_S session retrieval (lane level, 153 questions) that put every
-  evidence session in the top 10 for 0.975 of questions, against 0.920 for
-  BM25 alone, which is what search ranks by with the hash embedder. The
-  install instructions now lead with `pip install "memd-engine[local-embeddings]"`.
-- A namespace's lock file on a local root holds its holder - the
-  `host:pid;fwd=...` string with forwarding on, the pid with it off -
-  written over at each open and emptied as the holder releases it. It was
-  the pid written at offset 0 without truncation, so a shorter pid kept
-  digits of the one before it.
-- With forwarding on, an S3 lease's holder is that same string (it was
-  `host:pid`), so two `Memory` instances in one process are two holders:
-  the second forwards to the first instead of renewing the first's lease
-  as its own.
-- A namespace store marks itself closed as its `close()` begins, and
-  `append_ops` checks it like `append`: a write still in flight on a store
-  being closed raises `NamespaceClosedError` (a `RuntimeError`) instead of
-  reopening its log after the namespace's lock was released.
-- `StorageEngine.drop_lost(ns)` drops an open store that lost its lease,
-  pinned or not. A `Memory` whose own namespace was taken over on S3 (it
-  was frozen past its lease) used to fail every later write with
-  `LeaseLostError`; its calls now go to the new holder.
+- **Search packs dated session excerpts within 12,000 tokens by default.
+  Before, it packed a flat list within 2,000 tokens.** This applies to
+  `search`, `pack`, `POST /v1/ns/{ns}/search`, the MCP `memory_search` tool
+  and both SDKs. The new layout (`sessions`):
+  - takes the candidates in rank order;
+  - shows each retrieved turn with the turn before it and the turn after it
+    in its session;
+  - shows a fact under the turn that it came from;
+  - shows the sessions oldest first, each under its date, with `[...]`
+    between turns that are not adjacent;
+  - starts each turn's line with its speaker, and writes each record on one
+    line (a line break in a record's text becomes `\n`, so a record cannot
+    add a false session header, speaker or fact);
+  - does not bring back a turn that a newer fact replaced.
+
+  Measurement on LongMemEval_S end-to-end QA (160 stratified questions, one
+  run; reader DeepSeek V4.1 Flash, judge gpt-6-luna-pro): a 12K session pack
+  scored 0.875 [0.823, 0.920]. That run also used bge-small embeddings, a
+  local cross-encoder reranker and the relative-date annotations. The
+  previous defaults (hash embedder, no reranker, 2K flat) scored 0.779
+  [0.718, 0.838] (+0.095, McNemar p = 0.0015). The same retrieval packed
+  flat at 12K scored 0.823. The whole history in the prompt scored 0.906
+  (~105K tokens against ~10K; exploratory, from an earlier run's answers).
+  Multi-session went from 0.577 to 0.769, temporal from 0.796 to 0.870.
+  Nobody measured the new defaults as shipped (no reranker, annotations
+  off) end to end. For the details and the limits, see README-engine.md,
+  "Packing and the budget", and BENCHMARKS.md.
+
+  **What changes for you:**
+  - A search can use up to 6 times more context tokens, if there is that
+    much to retrieve. `tokens_used` gives the count.
+  - Responses are larger: up to about two times the budget's characters
+    over REST and in hosted mode, plus the metadata of each item. An MCP
+    `memory_search` result holds the text once (up to about 48,000
+    characters at the default budget).
+  - `packed_context` has a different shape: no `<memory>` tags and no
+    record ids in the text, the speaker on each line, lower-trust content
+    still fenced.
+  - `items` lists each record that the text shows: the hits in rank order,
+    each followed by the turns that it brought (`lanes` `["source"]` or
+    `["neighbour"]`, score 0). Each item carries the text as shown: a long
+    turn's item carries an excerpt. To get the full record, use `get(id)`.
+  - Packing adds a few milliseconds. On a LongMemEval_S-shaped namespace,
+    a search took 7.2 ms instead of 4.7 ms (12K, medians, a loaded host).
+    `bench/slo_bench.py` now measures the defaults: 25 ms against 18 ms for
+    2K flat on that host, above its 20 ms target.
+  - The first open of an existing namespace builds a new index,
+    `ix_rec_session_t` (0.1 s for 50,000 records). It replaces
+    `ix_rec_session`.
+
+  **To keep the old behaviour:** give `budget_tokens=2000` and
+  `packing="flat"` for each call. Over REST, give `"budget_tokens": 2000,
+  "packing": "flat"`. In TypeScript, give `{ budget_tokens: 2000, packing:
+  "flat" }`. Or set `packing="flat"` in the Memory config (or
+  `MEMD_PACKING=flat` for the server and MCP processes) and give the
+  budget. memd honours an explicit budget as before. When a reranker ran,
+  `pack_mode="gated"` still has priority.
+- **MCP `memory_search` returns the text once.** Its `items` list only the
+  hits, with their metadata (id, kind, source, t_event, valid, score,
+  lanes) and no text. The text is in `packed_context`.
+- **The hash-embedder fallback says so.** When `embedder="auto"` uses the
+  hash embedder because the `local-embeddings` extra (fastembed) is not
+  installed, memd logs one warning for each process. The warning names the
+  extra. With the extra, "auto" was already BAAI/bge-small-en-v1.5, fused
+  with BM25. On LongMemEval_S session retrieval (lane level, 153
+  questions), that put all evidence sessions in the top 10 for 0.975 of
+  questions. BM25 alone, which search uses with the hash embedder, did this
+  for 0.920. The install instructions now start with
+  `pip install "memd-engine[local-embeddings]"`.
 
 ### Fixed
+- **A search forwarded to the namespace's holder keeps the caller's
+  `packing`.** Before, it came back in the holder's layout.
 - **`MEMD_EXTRACTION_API_KEY` turns LLM extraction on.** It was documented
   as the way to, but nothing read it: only `Memory(config={
   "extraction_api_key": ...})` did, so a server started with the env var

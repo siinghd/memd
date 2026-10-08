@@ -151,7 +151,12 @@ Every method accepts per-call options: `namespace` (overrides the client's), `si
 
 Request fields keep the server's names (`user_id`, `session_id`, `budget_tokens`, `entity_keys`, …). `null` and `undefined` both mean "use the server default".
 
-`search` and `pack` pack their results into `budget_tokens` (server default 12,000) as `packed_context`. Its layout is the server's `packing` setting unless the call passes `packing`: `"sessions"` (the default: dated excerpts of past conversations, each hit with the turns around it, a fact under the turn it came from) or `"flat"` (one provenance-tagged `<memory>` element per hit, in rank order). For the footprint of servers before 12K session packing, pass `{ budget_tokens: 2000, packing: "flat" }`. With session packing, `items` also lists the turns packed around each hit (`lanes` `["neighbour"]` or `["source"]`).
+`search` and `pack` pack their results into `budget_tokens` (server default 12,000) as `packed_context`. The layout is the server's `packing` setting. A call can give `packing`:
+
+- `"sessions"` (the default): dated excerpts of past conversations. Each hit comes with the turns around it. A fact shows under the turn that it came from.
+- `"flat"`: one provenance-tagged `<memory>` element for each hit, in rank order.
+
+For the old footprint, give `{ budget_tokens: 2000, packing: "flat" }`. With session packing, `items` also lists the turns around each hit (`lanes` `["neighbour"]` or `["source"]`). Each item carries the text as `packed_context` shows it: a long turn's item carries an excerpt. To get the full record, use `get(id)`.
 
 Reads are strong by default (served by the namespace's writer). `consistency: "eventual"` (with an optional `maxStalenessMs`), in the client options or per `search` / `pack` / `get` call, lets a read replica serve them; `client.lastRead` then says who served the last one: `{ servedBy: "leader" | "replica", appliedSeq, ageMs }` (the replica's applied seq and age, `null` for the leader).
 
