@@ -1517,10 +1517,13 @@ class Memory:
                                max_staleness_ms=max_staleness_ms, packing=packing)
         t0 = time.monotonic()
         if (consistency or ("eventual" if self.read_only else "strong")) == "strong":
+            # every search parameter travels; the layout is the caller's
+            # (its per-call choice, else its own default), not the holder's
             run = self._forward(namespace, "search", lambda: dict(
                 query=query, user_id=user_id, session_id=session_id, agent_id=agent_id,
                 org_id=org_id, budget_tokens=budget_tokens, as_of=as_of, kinds=kinds,
-                include_quarantined=include_quarantined, rerank=rerank), write=False)
+                include_quarantined=include_quarantined, rerank=rerank,
+                packing=packing or self.packing), write=False)
             if not run.here:
                 return _search_result(run.result)
         ns_idx, info = self._reader(namespace, consistency, max_staleness_ms)
