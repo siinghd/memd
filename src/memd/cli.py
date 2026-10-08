@@ -512,7 +512,7 @@ def _cmd_keys(args) -> int:
 
 
 def _hold_namespaces(store, names: list[str]) -> tuple[list, list[str]]:
-    from memd.storage.engine import _acquire_owner, NamespaceBusyError
+    from memd.storage.engine import _acquire_owner, NamespaceBusyError, owner_lock_path
 
     held: list = []
     busy: list[str] = []
@@ -525,7 +525,7 @@ def _hold_namespaces(store, names: list[str]) -> tuple[list, list[str]]:
                 else:
                     busy.append(ns)
             else:
-                path = os.path.join(store.root, "ns", ns.replace("/", "__"), ".owner")
+                path = owner_lock_path(store.root, ns)
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 _acquire_owner(path)
                 held.append(("flock", path))

@@ -606,8 +606,28 @@ class NamespaceBusyError(RuntimeError):
     """Another OS process already holds this namespace."""
 
 
-def _acquire_owner(lock_path: str) -> bool:
-    """Exclusive advisory lock, refcounted within this process."""
+def owner_lock_path(root: str, ns: str) -> str:
+    """The lock file a process holds while it writes `ns` on a local data
+    root (`root` is the LocalObjectStore's root)."""
+    return os.path.join(root, "ns", ns.replace("/", "__"), ".owner")
+
+
+def read_owner_lock(lock_path: str) -> str | None:
+    """Who holds a local namespace lock, as its holder wrote it into the
+    file (see _acquire_owner): None when there is no file, "" while a new
+    holder has not written it yet."""
+    try:
+        with open(lock_path, "rb") as f:
+            return f.read(4096).decode("utf-8", errors="replace").strip()
+    except FileNotFoundError:
+        return None
+
+
+def _acquire_owner(lock_path: str, holder: str | None = None) -> bool:
+    """Exclusive advisory lock, refcounted within this process. The first
+    acquisition in the process writes `holder` (default: the pid) into the
+    file: a process that finds the namespace busy reads it there to reach
+    its writer (memd.engine.forward)."""
     try:
         import fcntl
     except ImportError:  # pragma: no cover - non-POSIX
@@ -629,7 +649,8 @@ def _acquire_owner(lock_path: str) -> bool:
                 "destroys acked data. Run one process per root, or set "
                 "MEMD_ALLOW_MULTI_PROCESS=1 to override."
             ) from None
-        os.write(fd, str(os.getpid()).encode())
+        os.ftruncate(fd, 0)
+        os.write(fd, (holder or str(os.getpid())).encode())
         _OWNER_FDS[lock_path] = [fd, 1]
         return True
 
@@ -909,9 +930,8 @@ class NamespaceStore:
             else:
                 root = getattr(store, "root", None)
                 if root:
-                    lock_path = os.path.join(
-                        root, "ns", namespace.replace("/", "__"), ".owner")
-                    if _acquire_owner(lock_path):
+                    lock_path = owner_lock_path(root, namespace)
+                    if _acquire_owner(lock_path, getattr(store, "lease_holder", None)):
                         self._owner_path = lock_path
         os.makedirs(cache_dir, exist_ok=True)
         safe = namespace.replace("/", "__")
@@ -4572,12 +4592,7 @@ class StorageEngine:
             if nstore is not None:
                 self._namespaces.move_to_end(ns)
         if stale is not None:
-            METRICS.inc("memd_ns_fenced_drops_total",
-                        help="open namespaces dropped after losing their lease")
-            self._closing(ns, lost=True)
-            stale._owner_lease = None       # not ours to release any more
-            stale._release_ownership()      # the local flock's refcount, if any
-            stale._close_index()
+            self._drop_stale(ns, stale)
         if nstore is None:
             # Opened under this namespace's own lock, not the engine's. An
             # open replays the namespace, and the first one after an upgrade
@@ -4628,6 +4643,34 @@ class StorageEngine:
                 METRICS.inc("memd_open_hook_failures_total",
                             help="namespace-open hooks (due purges) that raised", ns=ns)
         return nstore
+
+    def _drop_stale(self, ns: str, stale: NamespaceStore) -> None:
+        """(taken out of the table) A store fenced after another writer
+        reclaimed its lease: closed without persisting anything."""
+        METRICS.inc("memd_ns_fenced_drops_total",
+                    help="open namespaces dropped after losing their lease")
+        self._closing(ns, lost=True)
+        stale._owner_lease = None       # not ours to release any more
+        stale._release_ownership()      # the local flock's refcount, if any
+        stale._close_index()
+
+    def drop_lost(self, ns: str) -> bool:
+        """Drop `ns`'s open store if it lost its lease - a pinned one too
+        (namespace() keeps returning a pinned store, which the facade holds
+        a reference to): the next namespace() opens it again, or finds it
+        held. True if one was dropped."""
+        ns = _validate_ns(ns)
+        with self._lock:
+            nstore = self._namespaces.get(ns)
+            if nstore is None or not (nstore._lost or nstore.lease_lost()):
+                return False
+            del self._namespaces[ns]
+            nstore._closed = True
+            nstore._evicted = True
+        self._drop_stale(ns, nstore)
+        with self._ns_open_lock(ns):
+            self._drop_if_superseded(ns, "lease_lost")
+        return True
 
     def _audit(self, ns: str, action: str, target: str, detail: dict) -> None:
         try:
