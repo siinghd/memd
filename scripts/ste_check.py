@@ -123,8 +123,9 @@ _INSTRUCTION = re.compile(
     r"tell|ask|report|include|put|leave|let|push|pull|tag|merge|publish|release|deploy|mount|bind|"
     r"choose|edit|update|apply|attach|record|measure|compare|do not|don't|never|always)\b", re.I)
 
-_ABBREV = re.compile(r"\b(?:e\.g|i\.e|etc|vs|cf|approx|no|fig|incl|min|max|sec|ms)\.", re.I)
-_SENTENCE_END = re.compile(r"(?<=[.!?])[\"')\]”’]*\s+(?=[\"'(\[“‘]?[A-Z0-9`*_])")
+_ABBREV = re.compile(r"\b(?:e\.g|i\.e|etc|vs|cf|approx|fig|incl)\.", re.I)
+# a sentence can start with a lowercase name ("memd", "usearch")
+_SENTENCE_END = re.compile(r"(?<=[.!?])[\"')\]”’]*\s+(?=[\"'(\[“‘]?[A-Za-z0-9`*_])")
 
 
 @dataclass

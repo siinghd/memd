@@ -181,7 +181,7 @@ probe, the build fails.
   in the same way.
 
     With a remote provider, the bucket alone (ciphertext + wrapped keys) is
-    not sufficient, and the provider alone (no data) is not sufficient. An
+    not enough, and the provider alone (no data) is not enough. An
     attacker needs both read access to the bucket and `kms:Decrypt` (or the
     transit `decrypt` policy). Give that permission only to memd nodes. For
     per-tenant policies, add the encryption context condition
@@ -285,10 +285,10 @@ probe, the build fails.
     A namespace label is always the authorized namespace of the key, never a
     namespace from the request path. (The rate-limit rejection of a denied
     request counts under the namespace of the key.) `MEMD_METRICS_PUBLIC=1`
-    allows unauthenticated scraping. WARNING: Use it only on a trusted
+    lets a client read the metrics without authentication. WARNING: Use it only on a trusted
     network segment.
 
-- **Interactive docs are off by default** (`MEMD_ENABLE_DOCS=1` to enable).
+- **Interactive docs are off by default** (`MEMD_ENABLE_DOCS=1` turns them on).
   The OpenAPI schema shows every route of an API that otherwise needs
   authentication.
 

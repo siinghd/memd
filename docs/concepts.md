@@ -155,7 +155,7 @@ maintenance thread, off the write path, and on demand with
 | `destroy_namespace()` | crypto-shred: the namespace's data key is destroyed and its objects removed |
 
 Deletes and forgets are recorded in the namespace's hash-chained **audit
-log**, and deleting is always allowed, whatever a hosted plan's state.
+log**, and a delete always works, whatever a hosted plan's state.
 
 ## Key custody
 

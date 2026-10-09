@@ -13,6 +13,18 @@ wrong, how it showed, and the numbers before and after where it has them.
   npm staged publishing is on: a new SDK version waits on npmjs.com until
   the owner approves it (RELEASING.md).
 
+### Added
+- **`scripts/ste_check.py`: a report of text that is probably not STE.**
+  The docs are in ASD-STE100 Simplified Technical English. The checker
+  reads the tracked Markdown files (only [Unreleased] in this file). It
+  reports long sentences, passive-voice candidates, `-ing` words and a
+  small subset of words that STE does not approve, with the approved word.
+  CI runs it in the docs job as a report that does not stop the job
+  (CONTRIBUTING.md, "Writing the docs"). The sentences of more than 44
+  words in README-engine.md, SECURITY.md and BENCHMARKS.md are now shorter,
+  and some words are now approved words. The meaning, the numbers and the
+  commands did not change.
+
 ### Fixed
 - **The links on the PyPI page work.** The PyPI page showed
   README-engine.md, and its relative links (SECURITY.md, the SDK guide)
@@ -22,31 +34,32 @@ wrong, how it showed, and the numbers before and after where it has them.
   `twine check --strict`.
 - **The date resolver leaves more titles alone.** With
   `pack_resolve_dates` on, "Yesterday by the Beatles..." and "Next Friday
-  is a movie" at the start of a sentence got a date. Now an expression at
-  a sentence start is left alone when "by" and a capitalized name follow
-  it, or when the sentence calls it a movie, film, song, show, book, album
-  or a similar work. "Yesterday by the Thames we had a picnic" and
+  is a movie" at the start of a sentence got a date. Now the resolver does
+  not annotate such an expression when "by" and a capitalized name follow
+  it. It also does not annotate it when the sentence calls it a movie,
+  film, song, show, book, album or a similar work. "Yesterday by the Thames
+  we had a picnic" and
   "Tomorrow is a movie night" still get a date.
 - **Write forwarding errors have their own HTTP status.** A
   `ForwardTimeoutError` (a forwarded write sent, with no answer) was a
   `500 internal error`, and a `ForwardingError` was a `503 not_owner`.
-  Now the REST server sends `503 forward_unavailable` (nothing was applied,
-  `Retry-After: 1`), `503 forward_refused` (the processes do not share the
-  forwarding secret, no retry hint) and `504 forward_timeout` (the write
-  may have been applied, `Retry-After: 1`). The body's `may_be_applied`
-  tells if the write may have been applied.
+  Now the REST server sends `503 forward_unavailable` when the call did not
+  change data (`Retry-After: 1`). It sends `503 forward_refused` when the
+  processes do not share the forwarding secret (no retry hint). It sends
+  `504 forward_timeout` when the write possibly changed data
+  (`Retry-After: 1`). The body's `may_be_applied` tells which.
 - **The table of hard-deleted ids has a size limit.** Write forwarding
   keeps the ids of hard-deleted records for one day, so that a retried
   write does not bring a record back. A bulk hard delete made this table
-  as large as the delete. The index now keeps at
-  most the newest 100,000 ids (`MEMD_HARD_DELETED_KEEP_MAX`), and it removes
-  the older ids in the sweep that runs at most once a minute. A retry of an
+  as large as the delete. The index now keeps at most the newest 100,000
+  ids (`MEMD_HARD_DELETED_KEEP_MAX`). It removes the older ids in the sweep
+  that runs at most once a minute. A retry of an
   id that the limit removed is the same as a retry after the day.
 - **Hosted metering counts a failed extraction call that got a reply.** A
-  call with a malformed, empty, truncated or oversize reply can be billed
-  by the provider, but its turns were not metered as
+  call with a malformed, empty, truncated or oversize reply can cost
+  money, but the meter did not count its turns as
   `extractions_our_key`. Thus a provoked bad reply on our key let a free
-  org go past its cap. Now these turns are metered. A call that got no
+  org go past its cap. Now the meter counts these turns. A call that got no
   reply (an HTTP error status, a transport error, a timeout) is not
   metered, as before. `close_session` also returns `raw_failed_by_reason`:
   the turns of the failed calls by reason.
