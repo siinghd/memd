@@ -6,6 +6,8 @@ wrong, how it showed, and the numbers before and after where it has them.
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-10-09
+
 ### Changed
 - **npm releases use trusted publishing (OIDC).** The release workflow no
   longer uses an npm token. A manual run of the workflow from the default

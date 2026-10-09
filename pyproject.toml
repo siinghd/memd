@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "memd-engine"
-version = "0.5.1"
+version = "0.5.2"
 description = "memd - embedded-first agent memory engine: raw+fact lanes, bitemporal supersedence, provenance/trust tiers, hybrid retrieval"
 readme = "README.md"
 requires-python = ">=3.11"
