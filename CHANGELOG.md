@@ -32,14 +32,6 @@ wrong, how it showed, and the numbers before and after where it has them.
   landing page, and all its links are absolute GitHub URLs. A test makes
   sure that the PyPI readme has no relative link, and CI runs
   `twine check --strict`.
-- **The date resolver leaves more titles alone.** With
-  `pack_resolve_dates` on, "Yesterday by the Beatles..." and "Next Friday
-  is a movie" at the start of a sentence got a date. Now the resolver does
-  not annotate such an expression when "by" and a capitalized name follow
-  it. It also does not annotate it when the sentence calls it a movie,
-  film, song, show, book, album or a similar work. "Yesterday by the Thames
-  we had a picnic" and
-  "Tomorrow is a movie night" still get a date.
 - **Write forwarding errors have their own HTTP status.** A
   `ForwardTimeoutError` (a forwarded write sent, with no answer) was a
   `500 internal error`, and a `ForwardingError` was a `503 not_owner`.

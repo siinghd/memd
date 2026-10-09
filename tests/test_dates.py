@@ -162,33 +162,6 @@ def test_titles_and_names_are_left_alone(text):
     assert ann(text) == [], text
 
 
-@pytest.mark.parametrize("text", [
-    "Yesterday by the Beatles is my favourite song",   # a work and who made it
-    "Yesterday by the Beatles.",
-    "ok. Yesterday by Paul McCartney, 1965",
-    "Next Friday is a movie",                          # what it is: a work
-    "Next Friday is a 2000 comedy film",
-    "Tomorrow is a song by Brian Eno",
-    "Yesterday was a Beatles single",
-])
-def test_a_title_at_a_sentence_start_is_left_alone(text):
-    assert ann(text) == [], text
-
-
-@pytest.mark.parametrize("text, expr", [
-    ("Yesterday by the lake we swam", "Yesterday"),            # "by" a place, lowercase
-    ("Yesterday by the Thames we had a picnic", "Yesterday"),  # a subject follows the name
-    ("Yesterday by Noon I was done", "Yesterday"),
-    ("Yesterday, by the way, I left", "Yesterday"),
-    ("Tomorrow is a big day", "Tomorrow"),
-    ("Tomorrow is a movie night", "Tomorrow"),
-    ("Next Friday is a holiday", "Next Friday"),
-    ("I left yesterday by train", "yesterday"),
-])
-def test_dates_near_those_words_still_resolve(text, expr):
-    assert [e for e, _a in ann(text)] == [expr], text
-
-
 def test_sentence_starts_still_resolve():
     assert ann("Yesterday I went") == [("Yesterday", "= Fri 2023-05-19")]
     assert ann("Last week was busy") == [("Last week", "= Mon 2023-05-08 to Sun 2023-05-14")]
