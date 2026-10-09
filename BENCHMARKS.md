@@ -65,9 +65,9 @@ cause (tie-aware recall is the same). The hash lane is not fused into ranking by
 (`fuse_vector`), and sweeps (`find_ids`) are always exact.
 
 The write path does not wait on the sidecar. With the sidecar, the `add_events` (100 events)
-ack p50 / p99 was 18.8 / 57.8, 20.8 / 36.3 and 19.1 / 44.9 ms at 50K / 200K / 1M, while the
-embed worker fed the vectors of each batch into it. With the exact scan, it was 23.8 / 51.0,
-24.8 / 37.4 and 20.5 / 54.2 ms. The sidecar file is 46 / 183 / 917 MB (f16). Builds use 4 threads. Save and load
+ack p50 / p99 was 18.8 / 57.8, 20.8 / 36.3 and 19.1 / 44.9 ms at 50K / 200K / 1M. With the
+exact scan, it was 23.8 / 51.0, 24.8 / 37.4 and 20.5 / 54.2 ms. In both measurements, the embed
+worker added the vectors of each batch at the same time (to the sidecar or to the exact index). The sidecar file is 46 / 183 / 917 MB (f16). Builds use 4 threads. Save and load
 run on background threads, but usearch holds the GIL throughout: at 200K the longest stall any
 thread saw was 100 ms per save and 105 ms per load (the final save took 236 ms in the
 background). Measured on a loaded, shared 8-core ARM host (Neoverse-N1).
