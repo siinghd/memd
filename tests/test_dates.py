@@ -162,6 +162,39 @@ def test_titles_and_names_are_left_alone(text):
     assert ann(text) == [], text
 
 
+@pytest.mark.parametrize("text", [
+    "Yesterday by the Beatles is my favourite song",   # a work, then who made it
+    "Yesterday by the Beatles.",
+    "Yesterday by Paul McCartney's a classic",
+    "Next Friday is a movie",                          # the sentence tells what it is
+    "Next Friday is a movie starring Ice Cube",
+    "ok. Tomorrow is a song by Brian Eno",
+])
+def test_a_title_at_a_sentence_start_is_left_alone(text):
+    assert ann(text) == [], text
+
+
+@pytest.mark.parametrize("text, expr", [
+    ("Last night was a great show.", "Last night"),       # a word between the article and the work
+    ("Tonight is the big show", "Tonight"),
+    ("Yesterday was a great show", "Yesterday"),
+    ("Yesterday was the best movie ever", "Yesterday"),
+    ("Yesterday was an amazing play", "Yesterday"),
+    ("Last Saturday was a fun musical", "Last Saturday"),
+    ("Next week is a new series of tests", "Next week"),
+    ("Last weekend was a great book club", "Last weekend"),
+    ("Tomorrow is a movie night", "Tomorrow"),            # the work word does not end the clause
+    ("Yesterday by John's house, the dog barked", "Yesterday"),  # a possessive object
+    ("Yesterday by Monday's standards it was cold", "Yesterday"),
+    ("Yesterday by the Thames, Anna proposed", "Yesterday"),     # a comma after the name
+    ("Yesterday by the Thames we had a picnic", "Yesterday"),    # a subject after the name
+    ("Yesterday by Noon I was done", "Yesterday"),
+    ("Next Friday is a holiday", "Next Friday"),
+])
+def test_a_date_at_a_sentence_start_near_a_work_or_a_name_still_resolves(text, expr):
+    assert [e for e, _ in ann(text)] == [expr], text
+
+
 def test_sentence_starts_still_resolve():
     assert ann("Yesterday I went") == [("Yesterday", "= Fri 2023-05-19")]
     assert ann("Last week was busy") == [("Last week", "= Mon 2023-05-08 to Sun 2023-05-14")]

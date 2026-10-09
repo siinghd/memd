@@ -13,8 +13,8 @@ print(mem.search("how do we deploy?", user_id="u1").packed_context)
 ## Why embedded-first
 
 - **A library, not a deployment.** `Memory("./my-data")` owns a directory.
-  No database to provision, no server to run, no account or API key: without
-  keys, memd uses local ONNX embeddings (`memd-engine[local-embeddings]`,
+  You do not provision a database or run a server, and you need no account or
+  API key. Without keys, memd uses local ONNX embeddings (`memd-engine[local-embeddings]`,
   recommended: they give much better recall) or deterministic hash
   embeddings (without the extra). It uses pattern-based fact extraction.
   `stats()` shows which.
@@ -26,10 +26,10 @@ print(mem.search("how do we deploy?", user_id="u1").packed_context)
   calls to it. The same `Memory` runs on an `s3://` root. Several server
   processes on one bucket share the namespaces, and read replicas serve
   eventual reads ([Operations](operations.md)).
-- **The hard parts are in the open engine** (Apache-2.0): bitemporal
-  supersedence, provenance and trust tiers, quarantine, a hash-chained audit
-  log, hard delete with a physical-purge deadline, per-namespace
-  crypto-shred.
+- **The hard parts are in the open engine** (Apache-2.0). They include
+  bitemporal supersedence, provenance and trust tiers, quarantine and a
+  hash-chained audit log. They also include hard delete with a physical-purge
+  deadline and per-namespace crypto-shred.
 
 ## One engine, four doors
 
@@ -55,7 +55,7 @@ print(mem.search("how do we deploy?", user_id="u1").packed_context)
   is necessary before we recommend it.
 - **The quality evidence comes from one public dataset (LongMemEval_S).**
   The 500-question end-to-end run used the previous defaults (2K flat
-  pack). Session packing was measured on 160 of those questions, with
+  pack). A run on 160 of those questions measured session packing, with
   bge-small, a reranker and relative dates on. The current defaults are
   not yet measured end to end. Details are in [Benchmarks](benchmarks.md).
 - **Alpha software** (`Development Status :: 3 - Alpha`); what changed in
@@ -67,7 +67,7 @@ print(mem.search("how do we deploy?", user_id="u1").packed_context)
 
 {% include-markdown "../BENCHMARKS.md" start="## Retrieval quality and latency (LongMemEval_S, public `Memory.search`)" end="## Lexical index scale" %}
 
-How these were measured, and what they do not show: [Benchmarks](benchmarks.md).
+The measurement method, and what it does not show: [Benchmarks](benchmarks.md).
 
 ## Next
 

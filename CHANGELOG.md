@@ -6,6 +6,18 @@ wrong, how it showed, and the numbers before and after where it has them.
 
 ## [Unreleased]
 
+### Fixed
+- **The date resolver leaves a title at a sentence start alone.** With
+  `pack_resolve_dates` on, "Yesterday by the Beatles is my favourite song"
+  and "Next Friday is a movie" got a date. Now the resolver does not
+  annotate them. The guard is narrow: "Yesterday was a great show" and
+  "Yesterday by the Thames, Anna proposed" still get a date.
+
+### Changed
+- **The documentation is closer to ASD-STE100.** Long sentences are split
+  and most passive sentences are now active. The STE checker reports 101
+  findings, against 403 before.
+
 ## [0.5.2] - 2026-10-09
 
 ### Changed
