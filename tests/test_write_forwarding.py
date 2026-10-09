@@ -877,6 +877,14 @@ def test_holder_sigkilled_mid_stream_forwarders_fail_over(tmp_path):
         m.close()
 
 
+def _wait_for(cond, why, timeout: float = 300) -> None:
+    """Wait until `cond()` is true. Fail with `why()` after `timeout` s."""
+    deadline = time.monotonic() + timeout
+    while not cond():
+        assert time.monotonic() < deadline, why()
+        time.sleep(0.01)
+
+
 def test_holder_closing_hands_the_namespace_over(tmp_path):
     """A clean close: calls already running finish there, the next ones
     find the namespace free and one forwarder becomes its writer - the
@@ -891,17 +899,17 @@ def test_holder_closing_hands_the_namespace_over(tmp_path):
             fleet.spawn(t, 10 ** 6, ryw=True, sleep=0.004, delete_every=6, hard_every=12, stop=stop_bc)
         fleet.wait_ready("B", "C")
         fleet.go()
-        deadline = time.monotonic() + 120
-        while fleet.acked_adds("B") < 25 or fleet.acked_adds("C") < 25:
-            assert time.monotonic() < deadline, (fleet.stderr("B"), fleet.stderr("C"))
-            time.sleep(0.01)
+        # Each wait has its own large time limit. One limit for all the
+        # steps failed on a loaded host, where A's close and the takeover
+        # can need more time.
+        _wait_for(lambda: fleet.acked_adds("B") >= 25 and fleet.acked_adds("C") >= 25,
+                  lambda: (fleet.stderr("B"), fleet.stderr("C")))
         open(stop_a, "w").close()                   # A flushes and closes, mid-stream
         fleet.finish("A")
         t_closed = fleet.log("A")[-1]["t"]
         after = {t: fleet.acked_adds(t) for t in ("B", "C")}
-        while any(fleet.acked_adds(t) < after[t] + 20 for t in ("B", "C")):
-            assert time.monotonic() < deadline, (fleet.stderr("B"), fleet.stderr("C"))
-            time.sleep(0.01)
+        _wait_for(lambda: all(fleet.acked_adds(t) >= after[t] + 20 for t in ("B", "C")),
+                  lambda: (fleet.stderr("B"), fleet.stderr("C")))
         open(stop_bc, "w").close()
         fleet.finish("B", "C")
     finally:
