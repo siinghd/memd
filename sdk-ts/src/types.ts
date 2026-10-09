@@ -239,6 +239,8 @@ export interface CloseSessionResult {
   raw_skipped: number;
   /** Turns of failed extraction calls (the pattern extractor took them over). */
   raw_failed: number;
+  /** The failed turns by failure reason (for example `malformed`, `timeout`). */
+  raw_failed_by_reason?: Record<string, number>;
   facts_extracted: number;
   /** Extraction calls that failed. */
   extraction_errors: number;
