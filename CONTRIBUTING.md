@@ -60,6 +60,23 @@ ownership model of the audit ledger, and the BM25 OR tier. A patch would have
 left the other half of the defect in place. Put that reasoning in the commit
 message.
 
+## Writing the docs
+
+The docs are in ASD-STE100 Simplified Technical English (STE): short
+sentences, the active voice, and one meaning for each word. Before you
+send a change to a `.md` file, run the checker:
+
+```bash
+python scripts/ste_check.py README-engine.md docs/   # or no argument: all the docs
+```
+
+It reports long sentences, passive-voice candidates, `-ing` words and some
+words that STE does not approve (with the approved word). The word list is
+a small subset, because the official STE dictionary is not in this
+repository. The report is for information: CI runs it, and a problem that
+it reports does not stop a merge. Correct the problems in the text that you
+changed.
+
 ## Layout
 
 | Path | What lives there |

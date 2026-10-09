@@ -285,6 +285,12 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: pyproject.toml
+      # A report only: text in the docs that is probably not Simplified
+      # Technical English (CONTRIBUTING.md, "Writing the docs"). A finding
+      # marks this step as failed, but the job continues.
+      - name: STE report (non-blocking)
+        continue-on-error: true
+        run: python scripts/ste_check.py --strict
       # memd itself is installed too: the HTTP reference is rendered from the
       # server's own OpenAPI schema at build time
       - run: pip install -e ".[docs]"
