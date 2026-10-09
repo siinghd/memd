@@ -4,17 +4,17 @@ All numbers below come from logged experiments in a separate research repository
 experiment had a written plan before the run. Nothing here is from memd's own synthetic suite. The
 retrieval-quality rows also have a negative control, 3 disjoint question folds and an independent review. Each
 later section tells its own limits: some of them are one sample, with no fold split and no independent review.
-Each table names the release or the configuration that was measured.
+Each table names the measured release or configuration.
 
 ## Data and harness
 
 - **Dataset:** [LongMemEval](https://arxiv.org/abs/2410.10813) (ICLR 2025), cleaned release
   (`xiaowu0162/longmemeval-cleaned`). `_S`: ~48 sessions / ~490 turns per question. `_M`: ~500 sessions / ~5K turns per question.
-- **Split:** questions with index % 5 == 0 are held out; the rest (376 non-abstention questions in `_S`) form three
+- **Split:** the harness holds out the questions with index % 5 == 0; the rest (376 non-abstention questions in `_S`) form three
   dev folds. The numbers below are dev-fold means ± fold std unless stated otherwise.
-- **Calibration:** the harness's BM25 baseline reproduces the paper's Table 9 BM25 row within 0.02 on
-  recall_all@5, ndcg@5, recall_all@10 and ndcg@10 (exp 004).
-- **Metrics:** session-level ndcg_any@5 and recall_all@5. Sessions are ranked by the first appearance of any of their turns in
+- **Calibration:** the harness's BM25 baseline reproduces the paper's Table 9 BM25 row. The difference is
+  0.02 or less on recall_all@5, ndcg@5, recall_all@10 and ndcg@10 (exp 004).
+- **Metrics:** session-level ndcg_any@5 and recall_all@5. The harness ranks sessions by the first appearance of any of their turns in
   memd's returned items (`Memory.search`, public API).
 
 ## Retrieval quality and latency (LongMemEval_S, public `Memory.search`)
@@ -27,8 +27,8 @@ Each table names the release or the configuration that was measured.
 
 Random-order and wrong-query controls score ndcg@5 ≤ 0.13 in every experiment.
 
-At `_M` scale (120 dev questions, ~5K turns per user), v0.1.0 search collapsed to ndcg@5 0.41 (its lexical lane
-re-ranked an unordered 320-row window by term coverage without IDF). A bm25()-ranked lane on the same index (the lane v0.2.0 ships) scores 0.88 (exp 006, lane-level measurement).
+At `_M` scale (120 dev questions, ~5K turns per user), v0.1.0 search collapsed to ndcg@5 0.41. Its lexical lane
+re-ranked an unordered 320-row window by term coverage without IDF. A bm25()-ranked lane on the same index (the lane v0.2.0 ships) scores 0.88 (exp 006, lane-level measurement).
 
 ## Lexical index scale (optional `memd-engine[fast]` = tantivy accelerator)
 
@@ -40,14 +40,14 @@ Filtered, user-scoped search through `Memory.search`, 200 real questions over re
 | 50K | 44.0 / 95.5 ms | 7.3 / 36.6 ms |
 | 150K | 114.3 / 309.0 ms | 8.8 / 38.5 ms |
 
-The single-record write ack is unchanged (FTS5 remains the synchronous source of truth; tantivy is an async
+The single-record write ack does not change (FTS5 remains the synchronous source of truth; tantivy is an async
 derived accelerator). The 60-question real-data gate scores 0.874 (tantivy) vs 0.867 (FTS5). Measured on a
 loaded, shared 8-core host (`bench/lexical_bench.py`).
 
 ## Vector index scale (optional `memd-engine[ann]` = usearch sidecar)
 
-The vector lane as `Memory.search` calls it (user-scoped filter over 8 users, limit = the planner's
-`candidate_k`), 200 queries, 384-d vectors; recall@10 against the lane's exact answer
+The table measures the vector lane as `Memory.search` calls it (user-scoped filter over 8 users, limit = the planner's
+`candidate_k`). It uses 200 queries and 384-d vectors, and gives recall@10 against the lane's exact answer
 (`bench/ann_bench.py`, each size in its own process):
 
 | vectors | recall@10 | usearch lane p50 / p99 | exact flat lane p50 / p99 | build from SQLite | peak RSS |
@@ -59,25 +59,25 @@ The vector lane as `Memory.search` calls it (user-scoped filter over 8 users, li
 | 199K LongMemEval turns, hash embedder | 0.938 | 25.6 / 77.1 ms | 63.5 / 125.6 ms | 91.9 s | 1.31 GB |
 
 Synthetic = unit vectors around 256 random centers (dense, like a real embedder's). The hash
-embedder's sparse n-gram vectors are hard for HNSW: neither `ann_expansion_search` 512 (0.943) nor
-`ann_overfetch` 8 (0.936, 2x the latency) lifts the filtered 199K recall, and ties are not the
-cause (tie-aware recall is the same). The hash lane is not fused into ranking by default
+embedder's sparse n-gram vectors are hard for HNSW. Neither `ann_expansion_search` 512 (0.943) nor
+`ann_overfetch` 8 (0.936, 2x the latency) lifts the filtered 199K recall. Ties are not the
+cause (tie-aware recall is the same). By default, the ranking does not fuse the hash lane
 (`fuse_vector`), and sweeps (`find_ids`) are always exact.
 
 The write path does not wait on the sidecar. With the sidecar, the `add_events` (100 events)
 ack p50 / p99 was 18.8 / 57.8, 20.8 / 36.3 and 19.1 / 44.9 ms at 50K / 200K / 1M. With the
 exact scan, it was 23.8 / 51.0, 24.8 / 37.4 and 20.5 / 54.2 ms. In both measurements, the embed
 worker added the vectors of each batch at the same time (to the sidecar or to the exact index). The sidecar file is 46 / 183 / 917 MB (f16). Builds use 4 threads. Save and load
-run on background threads, but usearch holds the GIL throughout: at 200K the longest stall any
-thread saw was 100 ms per save and 105 ms per load (the final save took 236 ms in the
-background). Measured on a loaded, shared 8-core ARM host (Neoverse-N1).
+run on background threads, but usearch holds the GIL throughout. At 200K, the longest stall that a
+thread saw was 100 ms per save and 105 ms per load. The final save took 236 ms in the
+background. Measured on a loaded, shared 8-core ARM host (Neoverse-N1).
 
 ## End-to-end QA: session packing and the 12K budget
 
 The search defaults (session packing, 12,000 tokens) come from this run.
 
 - Questions: 160 LongMemEval_S questions, in a fixed stratified order. Multi-session and temporal-reasoning
-  questions are over-sampled two times. Abstention questions are included. The results are re-weighted to the
+  questions are over-sampled two times. The questions include abstention questions. The results are re-weighted to the
   type mix of the dataset. There was one run.
 - Reader: `deepseek/deepseek-v4.1-flash`, with one provider pinned. A pinned fallback served 61 of 480 calls.
 - Judge: `openai/gpt-6-luna-pro`, with the official per-type judge prompts.
@@ -119,7 +119,7 @@ search time (seconds for each search on a loaded CPU). README-engine.md gives th
 
 ## Embedders (session retrieval, lane level)
 
-LongMemEval_S, 153 questions (the order above, without abstention). These lanes were measured outside
+LongMemEval_S, 153 questions (the order above, without abstention). These lanes ran outside
 `Memory.search`: BM25 over stemmed turns and an approximation of memd's RRF. The values are re-weighted to the
 type mix.
 
@@ -156,7 +156,7 @@ was `openai/gpt-6-luna-pro` with the official per-type judge prompts. The
 - The control shows that the judge does not accept answers without
   evidence.
 - This result caused the session packing and the 12K default (the section
-  above). The current defaults are not measured on all 500 questions yet.
+  above). There is no measurement of the current defaults on all 500 questions yet.
 
 ## LLM fact extraction
 

@@ -52,8 +52,8 @@ this page and with [Security](security.md):
 - **A portable copy:** `memd export --out backup.jsonl` writes the records
   of a namespace as JSON lines. `memd import memd --export backup.jsonl`
   restores such a copy.
-- Do not attach long-lived readers to the index cache files (for example, a
-  backup tool that holds a read transaction, or an `sqlite3` shell). A
+- Do not attach long-lived readers to the index cache files. Examples are a
+  backup tool that holds a read transaction, or an `sqlite3` shell. A
   hard-delete purge waits for them.
 
 ## Recovering from an unreadable log frame

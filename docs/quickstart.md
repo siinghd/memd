@@ -41,9 +41,9 @@ sessions in the top 10 for 97.5% of questions. BM25 alone did this for
 {% include-markdown "../README-engine.md" start="## Running it" end="## Several processes on one data root" %}
 
 !!! note "Several processes on one data root"
-    A namespace is written by one process at a time. A second process
-    opening it forwards its writes and strong reads to the one holding it,
-    and takes the namespace over when that one goes away
+    One process at a time writes a namespace. A second process that
+    opens it forwards its writes and strong reads to the process that holds
+    it. It takes the namespace over when that one goes away
     (`forwarding="off"` raises `NamespaceBusyError` instead). See
     [Operations](operations.md#several-processes-on-one-data-root).
 
