@@ -4,7 +4,7 @@
 [![npm](https://img.shields.io/npm/v/memd-engine?label=npm)](https://www.npmjs.com/package/memd-engine)
 [![CI](https://github.com/siinghd/memd/actions/workflows/ci.yml/badge.svg)](https://github.com/siinghd/memd/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-siinghd.github.io%2Fmemd-blue)](https://siinghd.github.io/memd/)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/siinghd/memd/blob/master/LICENSE)
 
 **The SQLite of agent memory.** memd is a memory engine for AI agents. It
 runs in your process and keeps its data in one directory. It needs no
@@ -54,7 +54,7 @@ section tells what memd does not do.
 
 Session retrieval on LongMemEval_S, through the public `Memory.search`.
 The values are dev-fold means ± fold std, from
-[BENCHMARKS.md](BENCHMARKS.md). Each row names the measured release.
+[BENCHMARKS.md](https://github.com/siinghd/memd/blob/master/BENCHMARKS.md). Each row names the measured release.
 
 | memd configuration | ndcg@5 | recall_all@5 | mean search time |
 |---|---|---|---|
@@ -81,8 +81,8 @@ whole-history row use the answers of an earlier run.
 
 These results come from one public dataset, one reader and one judge. For
 the setup and the limits, see
-[README-engine.md](README-engine.md#packing-and-the-budget) and
-[BENCHMARKS.md](BENCHMARKS.md).
+[README-engine.md](https://github.com/siinghd/memd/blob/master/README-engine.md#packing-and-the-budget) and
+[BENCHMARKS.md](https://github.com/siinghd/memd/blob/master/BENCHMARKS.md).
 
 ## Install
 
@@ -149,7 +149,7 @@ In an agent loop, use two calls. Before your LLM call, call
 `messages = mem.pack(messages, user_id="u1")`. After it, call
 `mem.observe(messages, response, user_id="u1")`. If you start the process
 again, the memory is still in `./my-data`. The
-[`examples/`](examples/README.md) directory has more scripts that you can run.
+[`examples/`](https://github.com/siinghd/memd/blob/master/examples/README.md) directory has more scripts that you can run.
 
 ## One engine, four doors
 
@@ -160,10 +160,10 @@ again, the memory is still in `./my-data`. The
   namespace gets its own API keys (`memd key create --namespace acme`).
 - **MCP:** `memd serve --mcp` gives four tools to an MCP client:
   `memory_search`, `memory_save`, `memory_forget` and `memory_status`
-  ([setup](examples/mcp/README.md)).
+  ([setup](https://github.com/siinghd/memd/blob/master/examples/mcp/README.md)).
 - **TypeScript:** `npm install memd-engine` gives a typed REST client for
   Node 18 or later, Bun, Deno and edge runtimes
-  ([SDK guide](sdk-ts/README.md)).
+  ([SDK guide](https://github.com/siinghd/memd/blob/master/sdk-ts/README.md)).
 
 ## How memd grows
 
@@ -196,7 +196,7 @@ The same `Memory` API works at each step. Your code does not change.
   replicas or more nodes. Retrieval alone (a 2K flat pack) scales with
   threads, because SQLite releases the GIL.
 
-[README-engine.md](README-engine.md#several-processes-on-one-data-root)
+[README-engine.md](https://github.com/siinghd/memd/blob/master/README-engine.md#several-processes-on-one-data-root)
 gives the details and the measurements.
 
 ## Security and deletion
@@ -217,7 +217,7 @@ gives the details and the measurements.
 - The fences around lower-trust content mark it as data. They cannot force
   a model to obey that mark.
 
-[SECURITY.md](SECURITY.md) gives the threat model, what it does not cover,
+[SECURITY.md](https://github.com/siinghd/memd/blob/master/SECURITY.md) gives the threat model, what it does not cover,
 and how to report a vulnerability.
 
 ## Limits
@@ -240,28 +240,28 @@ and how to report a vulnerability.
   is necessary before we recommend it.
 - **The quality evidence comes from one public dataset (LongMemEval_S).**
   Nobody measured the current defaults end to end.
-  [BENCHMARKS.md](BENCHMARKS.md) tells what each run shows and what it
+  [BENCHMARKS.md](https://github.com/siinghd/memd/blob/master/BENCHMARKS.md) tells what each run shows and what it
   does not show.
 - **Alpha software.** What changed in each release is in the
-  [changelog](CHANGELOG.md).
+  [changelog](https://github.com/siinghd/memd/blob/master/CHANGELOG.md).
 - **Out of scope:** an agent framework or runtime, a platform for RAG over
   documents, and a graph database.
 
 ## Documentation
 
 - Docs site: <https://siinghd.github.io/memd/> (quickstart, concepts, API
-  reference, operations). The source is in [`docs/`](docs/). To build it
+  reference, operations). The source is in [`docs/`](https://github.com/siinghd/memd/tree/master/docs). To build it
   locally, run `pip install -e ".[docs]" && mkdocs serve`.
-- [README-engine.md](README-engine.md): the full engine guide (how to run
+- [README-engine.md](https://github.com/siinghd/memd/blob/master/README-engine.md): the full engine guide (how to run
   it, several processes, S3, key custody, multi-node, read replicas, hosted
   mode, retrieval options, operations)
-- [BENCHMARKS.md](BENCHMARKS.md): how we measured quality and latency
-- [SECURITY.md](SECURITY.md): the threat model, what it does not cover,
+- [BENCHMARKS.md](https://github.com/siinghd/memd/blob/master/BENCHMARKS.md): how we measured quality and latency
+- [SECURITY.md](https://github.com/siinghd/memd/blob/master/SECURITY.md): the threat model, what it does not cover,
   and how to report a vulnerability
-- [CHANGELOG.md](CHANGELOG.md): each release
-- [CONTRIBUTING.md](CONTRIBUTING.md): setup, tests, and what a change needs
-- [RELEASING.md](RELEASING.md): how to publish a release
+- [CHANGELOG.md](https://github.com/siinghd/memd/blob/master/CHANGELOG.md): each release
+- [CONTRIBUTING.md](https://github.com/siinghd/memd/blob/master/CONTRIBUTING.md): setup, tests, and what a change needs
+- [RELEASING.md](https://github.com/siinghd/memd/blob/master/RELEASING.md): how to publish a release
 
 ## License
 
-[Apache-2.0](LICENSE).
+[Apache-2.0](https://github.com/siinghd/memd/blob/master/LICENSE).

@@ -207,7 +207,8 @@ jobs:
           cache: pip
       - run: pip install build twine
       - run: python -m build
-      - run: twine check dist/*
+      # strict: a warning (no long description, a bad content type) fails
+      - run: twine check --strict dist/*
       # A stranger's experience: install the wheel into a bare venv and use it.
       - name: Clean-install smoke test
         run: |

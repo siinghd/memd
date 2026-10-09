@@ -14,6 +14,12 @@ wrong, how it showed, and the numbers before and after where it has them.
   the owner approves it (RELEASING.md).
 
 ### Fixed
+- **The links on the PyPI page work.** The PyPI page showed
+  README-engine.md, and its relative links (SECURITY.md, the SDK guide)
+  were broken on pypi.org. The PyPI page is now README.md, the project's
+  landing page, and all its links are absolute GitHub URLs. A test makes
+  sure that the PyPI readme has no relative link, and CI runs
+  `twine check --strict`.
 - **The date resolver leaves more titles alone.** With
   `pack_resolve_dates` on, "Yesterday by the Beatles..." and "Next Friday
   is a movie" at the start of a sentence got a date. Now an expression at
