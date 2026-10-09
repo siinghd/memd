@@ -17,7 +17,9 @@ June", "the next year", "the last night of the trip", a number that is part
 of a larger one ("1.5 years ago", "1,000 years ago"), an expression
 capitalized in mid-sentence ("USA Today", "The Tonight Show"), one whose
 every word is capitalized ("Last Week Tonight") or that a capitalized word
-follows ("Tomorrow Never Dies"), and dates outside years 1-9999.
+follows ("Tomorrow Never Dies"), one at a sentence start that is called a
+work ("Next Friday is a movie") or that "by" and a name follow ("Yesterday by
+the Beatles is my favourite song"), and dates outside years 1-9999.
 
 Dates are calendar dates of the turn's UTC timestamp; weekday and month
 names are English whatever the process locale.
@@ -159,13 +161,26 @@ _RULES = [
 _SENTENCE_START = set(".!?:;\"'([{\n“‘«-–—")
 _NEXT_WORD = re.compile(r"\s*([A-Za-z][\w'’]*)")
 _PRONOUN_I = {"I", "I'm", "I’m", "I'll", "I’ll", "I've", "I’ve", "I'd", "I’d"}
+# At a sentence start only, and narrow on purpose ("Yesterday was a great
+# show" and "Tomorrow is a movie night" are dates). "Next Friday is a movie":
+# only an article before the work word, and the work word ends the clause
+_IS_A_WORK = re.compile(r"\s+(?:is|was)\s+an?\s+(?:movie|film|song|show|book|album|novel|series|play|musical)"
+                        r"(?=[^\S\n]*(?:[.!?,;:)\"”—\n]|$)|\s+(?:by|with|starring|directed)\b)")
+# "Yesterday by the Beatles is my favourite song": the name ends a sentence or
+# "is"/"was"/"'s a" follows it. Not "by the Thames, Anna ...", "by John's
+# house" or "by the Thames we ..."
+_BY_A_NAME = re.compile(r"\s+by\s+(?:the\s+)?(?!I\b)[A-Z][\w&-]*(?:\s+(?!I\b)[A-Z][\w&-]*)*"
+                        r"(?=\s+(?:is|was)\b|['’]s\s+(?:a|an|the|my|our|his|her|their)\b"
+                        r"|[^\S\n]*(?:[.!?\n]|$))")
 
 
 def _title_like(text: str, start: int, end: int) -> bool:
     """A capitalized expression that reads as a name or a title rather than
     a date: capitalized in mid-sentence ("USA Today"), every word
-    capitalized ("Last Week Tonight"; a weekday is always capitalized), or
-    followed by a capitalized word other than "I" ("Tomorrow Never Dies")."""
+    capitalized ("Last Week Tonight"; a weekday is always capitalized),
+    followed by a capitalized word other than "I" ("Tomorrow Never Dies"),
+    or followed by what it is ("Next Friday is a movie") or by who made it
+    ("Yesterday by the Beatles is ...")."""
     if not text[start].isupper():
         return False
     before = text[:start].rstrip()
@@ -176,7 +191,9 @@ def _title_like(text: str, start: int, end: int) -> bool:
     if rest and all(w[0].isupper() for w in rest):
         return True
     nxt = _NEXT_WORD.match(text, end)
-    return bool(nxt and nxt.group(1)[0].isupper() and nxt.group(1) not in _PRONOUN_I)
+    if nxt and nxt.group(1)[0].isupper() and nxt.group(1) not in _PRONOUN_I:
+        return True
+    return bool(_IS_A_WORK.match(text, end) or _BY_A_NAME.match(text, end))
 
 
 def resolve(text: str, day: _dt.date) -> list[tuple[int, int, str]]:
