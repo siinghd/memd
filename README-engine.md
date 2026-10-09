@@ -191,6 +191,13 @@ alone (a holder without that index's cache taking over) before the retry
 arrives: a record soft-deleted and then compacted away, or hard-deleted and
 purged - its id is then no longer known, and the retry writes it again.
 
+The index keeps at most the newest 100,000 hard-deleted ids
+(`MEMD_HARD_DELETED_KEEP_MAX`). It removes the older ids at most once a
+minute, when a hard delete occurs. A bulk hard delete thus cannot make the
+table grow without a limit. A retry of an id that this limit removed is the
+same as a retry after the day: the id is not known, and the retry writes
+the record again.
+
 Not covered by the exactly-once rule: a session close, a destroy or a
 compaction retried on a NEW holder (the first one died after running it)
 runs again - a session close's consolidation drops the facts the first run

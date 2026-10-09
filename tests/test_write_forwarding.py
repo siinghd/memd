@@ -727,6 +727,33 @@ def test_a_retry_never_brings_back_a_hard_deleted_record(tmp_path):
             b.close()
 
 
+def test_the_hard_deleted_id_table_keeps_only_the_newest_ids(tmp_path, monkeypatch):
+    """The ids of hard-deleted records are kept for a day, and at most
+    hard_deleted_keep_max of them (the newest). A bulk hard delete must not
+    make the table grow without a limit. The sweep runs at most once a
+    minute; here the clock moves 61 s for each delete."""
+    from memd.index import sqlite_index as si
+
+    clock = iter(range(10 ** 12, 10 ** 13, 61_000))
+    monkeypatch.setattr(si, "now_ms", lambda: next(clock))
+    idx = si.NamespaceIndex(str(tmp_path / "i.sqlite"))
+    try:
+        assert idx.hard_deleted_keep_max == 100_000
+        idx.hard_deleted_keep_max = 5
+        ids = [f"r{k}" for k in range(8)]
+        for rid in ids:
+            idx.hard_delete(rid)
+        assert idx.known_ids(ids) == set(ids[3:]), "only the newest 5 ids are kept"
+    finally:
+        idx.close()
+    monkeypatch.setenv("MEMD_HARD_DELETED_KEEP_MAX", "7")
+    idx = si.NamespaceIndex(str(tmp_path / "i2.sqlite"))
+    try:
+        assert idx.hard_deleted_keep_max == 7
+    finally:
+        idx.close()
+
+
 def test_a_closed_store_refuses_every_late_write(tmp_path):
     """A forwarded call stalled past its holder's close drain went on after
     the close released the namespace's lock - and the closed store reopened

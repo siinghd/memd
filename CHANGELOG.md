@@ -14,6 +14,13 @@ wrong, how it showed, and the numbers before and after where it has them.
   the owner approves it (RELEASING.md).
 
 ### Fixed
+- **The table of hard-deleted ids has a size limit.** Write forwarding
+  keeps the ids of hard-deleted records for one day, so that a retried
+  write does not bring a record back. A bulk hard delete made this table
+  as large as the delete. The index now keeps at
+  most the newest 100,000 ids (`MEMD_HARD_DELETED_KEEP_MAX`), and it removes
+  the older ids in the sweep that runs at most once a minute. A retry of an
+  id that the limit removed is the same as a retry after the day.
 - **Hosted metering counts a failed extraction call that got a reply.** A
   call with a malformed, empty, truncated or oversize reply can be billed
   by the provider, but its turns were not metered as
