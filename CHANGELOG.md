@@ -14,6 +14,14 @@ wrong, how it showed, and the numbers before and after where it has them.
   the owner approves it (RELEASING.md).
 
 ### Fixed
+- **Hosted metering counts a failed extraction call that got a reply.** A
+  call with a malformed, empty, truncated or oversize reply can be billed
+  by the provider, but its turns were not metered as
+  `extractions_our_key`. Thus a provoked bad reply on our key let a free
+  org go past its cap. Now these turns are metered. A call that got no
+  reply (an HTTP error status, a transport error, a timeout) is not
+  metered, as before. `close_session` also returns `raw_failed_by_reason`:
+  the turns of the failed calls by reason.
 - **The documentation matches 0.5.1.** The README, the docs site, the
   examples and the SDK guide had old statements. They said that the
   TypeScript SDK is not on npm, and that memd is not on PyPI. They said

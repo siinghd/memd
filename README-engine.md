@@ -631,8 +631,12 @@ min(facts extracted, remaining headroom); anything beyond is not written
 server's environment has `MEMD_EXTRACTION_API_KEY`** (a hosted server
 builds its engine from the environment, never from a client): then every
 session close is metered as `extractions_our_key`, one unit per raw turn
-the LLM extracted - the turns of a call that failed went through the local
-pattern extractor (`raw_failed` in the response) and are not counted.
+the LLM extracted. The turns of a call that failed go through the local
+pattern extractor (`raw_failed` in the response, and `raw_failed_by_reason`
+by reason). If the provider sent a reply, the provider can bill the call,
+so its turns are metered too: a `malformed`, `empty`, `truncated` or
+`oversize` reply. If the call got no reply (`http_status`, `transport`,
+`timeout`), its turns are not metered.
 Under a hard cap (the free plan's 10K a month), the session's raw records
 are extracted up to the remaining allowance and the rest stay raw-only -
 searchable, never extracted (`raw_skipped`); with no allowance left the
@@ -892,9 +896,9 @@ an env key off.
   failure is counted as
   `memd_extraction_chunks_failed_total{model, reason}` (`http_status`,
   `transport`, `timeout`, `truncated`, `empty`, `oversize`, `malformed`), and
-  `close_session` returns `extraction_errors` (the number of failed calls)
-  and `raw_failed` (their turns), and audits `extraction_degraded` with the
-  reasons. The raw turns are stored either way. Within a reply that parses,
+  `close_session` returns `extraction_errors` (the number of failed calls),
+  `raw_failed` (their turns) and `raw_failed_by_reason` (their turns by
+  reason), and audits `extraction_degraded` with the reasons. The raw turns are stored either way. Within a reply that parses,
   a malformed item (no text, or `entity_keys` / `lineage` not a string or a
   list of strings) is dropped and counted as
   `memd_extraction_items_malformed_total{model}`; its other facts are kept.

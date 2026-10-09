@@ -2024,7 +2024,10 @@ class Memory:
         `extraction_errors` counts the extraction calls that failed and
         `raw_failed` their turns: the LLM extractor's turns of a failed call
         go through the pattern extractor instead; an extractor that raised
-        outright counts 1 call, all its turns, and adds no facts."""
+        outright counts 1 call, all its turns, and adds no facts.
+        `raw_failed_by_reason` gives those turns by failure reason (the
+        reason labels of memd_extraction_chunks_failed_total; "error" for an
+        extractor that raised)."""
         impl = self._hosted()
         if impl is not None:
             return impl.close_session(session_id, user_id=user_id, namespace=namespace)
@@ -2054,6 +2057,7 @@ class Memory:
             # through the pattern extractor instead - reported, not silent
             extraction_errors = list(getattr(extracted, "errors", None) or [])
             raw_failed = int(getattr(extracted, "failed_records", 0) or 0)
+            raw_failed_by_reason = dict(getattr(extracted, "failed_by_reason", None) or {})
             if extraction_errors:
                 self._audit_for(ns.namespace).append(
                     actor="system", action="extraction_degraded", target=session_id,
@@ -2068,6 +2072,7 @@ class Memory:
             extracted = []
             extraction_errors = ["error"]
             raw_failed = len(to_extract)
+            raw_failed_by_reason = {"error": raw_failed} if raw_failed else {}
         facts_capped = 0
         if callable(max_facts):
             max_facts = max_facts(len(extracted))
@@ -2100,6 +2105,7 @@ class Memory:
             "raw_considered": len(to_extract),
             "raw_skipped": len(seg_records) - len(to_extract),
             "raw_failed": raw_failed,
+            "raw_failed_by_reason": raw_failed_by_reason,
             "facts_extracted": len(extracted),
             "extraction_errors": len(extraction_errors),
             "facts_capped": facts_capped,

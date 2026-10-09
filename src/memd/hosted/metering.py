@@ -36,6 +36,7 @@ from memd.hosted.plans import (EXTRACTIONS_OUR_KEY, GAUGES, MEMORIES_STORED, MET
                                SEARCHES, STORED_GB, WRITES, Plans)
 from memd.hosted.store import AdminStore, period_bounds, period_of
 from memd.metrics import METRICS
+from memd.pipeline.extractor import REPLY_FAILURES
 from memd.storage.engine import NamespaceBusyError
 
 _OPS = {"ns": "_billing"}  # operator-only series (see billing._OPS)
@@ -58,6 +59,20 @@ class Forbidden(Exception):
     def __init__(self, detail: str):
         super().__init__(detail)
         self.detail = detail
+
+
+def metered_extraction_turns(extraction: dict) -> int:
+    """The turns of a session close that `extractions_our_key` counts: the
+    turns the LLM extracted, plus the turns of a failed call that got a
+    reply from the provider (a malformed, empty, truncated or oversize
+    reply). The provider can bill such a call. A failed call with no reply
+    (an HTTP error status, a transport error, a timeout) is not counted.
+    A close result without `raw_failed_by_reason` (an older engine) counts
+    no failed turn."""
+    failed = int(extraction.get("raw_failed") or 0)
+    by_reason = extraction.get("raw_failed_by_reason") or {}
+    replied = sum(int(n or 0) for r, n in by_reason.items() if r in REPLY_FAILURES)
+    return max(0, int(extraction.get("raw_considered") or 0) - failed + min(replied, failed))
 
 
 class _NoAdmission:
@@ -307,11 +322,7 @@ class Metering:
         stored = writes
         if extraction:
             if self.our_key_extraction():
-                # the turns the LLM extracted. Those of a failed call went
-                # through the local pattern extractor and are not metered,
-                # though the provider may still have billed the call itself
-                usage[EXTRACTIONS_OUR_KEY] = max(0, int(extraction.get("raw_considered") or 0)
-                                                 - int(extraction.get("raw_failed") or 0))
+                usage[EXTRACTIONS_OUR_KEY] = metered_extraction_turns(extraction)
             stored += int(extraction.get("facts_written") or 0)
         with self._stored_lock if stored else _NULL_LOCK:
             # the live count moves BEFORE the reservation is released: an

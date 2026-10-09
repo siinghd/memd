@@ -44,14 +44,23 @@ class ExtractedFact:
 
 class Extraction(list):
     """The facts of one extract() call, plus `errors`: the reason of each
-    provider call that failed, and `failed_records`: the turns of those
-    calls (they went through the pattern extractor instead). An extractor
-    that returns a plain list had none."""
+    provider call that failed, `failed_records`: the turns of those calls
+    (they went through the pattern extractor instead), and
+    `failed_by_reason`: those turns by failure reason. An extractor that
+    returns a plain list had none."""
 
     def __init__(self, facts=(), errors=()):
         super().__init__(facts)
         self.errors: list[str] = list(errors)
         self.failed_records = 0
+        self.failed_by_reason: dict[str, int] = {}
+
+
+# The failure reasons of a call that got a reply from the provider. The
+# provider can bill such a call, so the hosted meter counts its turns. The
+# other reasons (http_status, transport, timeout, error) have no billable
+# reply.
+REPLY_FAILURES = frozenset({"malformed", "empty", "truncated", "oversize"})
 
 
 class ExtractionError(Exception):
@@ -312,6 +321,7 @@ prompt_version={PROMPT_VERSION}"""
                 reason = _failure_reason(ex)
                 out.errors.append(reason)
                 out.failed_records += len(chunk)
+                out.failed_by_reason[reason] = out.failed_by_reason.get(reason, 0) + len(chunk)
                 METRICS.inc("memd_extraction_chunks_failed_total", model=self.model, reason=reason,
                             help="extraction calls that failed (their turns went through the pattern extractor)")
                 made_by = ExtractorInfo(model=self._fallback.name, prompt_version=self._fallback.prompt_version)
