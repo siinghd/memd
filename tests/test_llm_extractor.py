@@ -500,6 +500,32 @@ def test_close_session_reports_failed_extraction_calls(provider, tmp_path):
         m.close()
 
 
+def test_close_session_reports_failed_turns_by_reason(provider, tmp_path):
+    from memd.engine.memory import Memory
+
+    def reply(body):
+        text = body["messages"][1]["content"]
+        if "Oslo" in text:
+            return 500, {"error": "provider down"}
+        if "Bergen" in text:
+            return _chat("[", finish_reason="length")
+        return _chat("[]")
+
+    provider.reply = reply
+    m = Memory(str(tmp_path / "d"), config={"extraction_api_key": "k", "extraction_base_url": provider.base_url})
+    try:
+        m.extractor.chunk_records = 1
+        for t in ("I work at Initech", "I live in Oslo", "I moved to Bergen"):
+            m.add(t, session_id="s1", user_id="u1")
+        res = m.close_session("s1")
+        assert res["raw_failed"] == 2
+        assert res["raw_failed_by_reason"] == {"http_status": 1, "truncated": 1}
+        m.add("I work at Initech", session_id="s2", user_id="u1")
+        assert m.close_session("s2")["raw_failed_by_reason"] == {}
+    finally:
+        m.close()
+
+
 def test_close_session_reports_an_extractor_that_raised(tmp_path):
     from unittest import mock
 
@@ -511,6 +537,7 @@ def test_close_session_reports_an_extractor_that_raised(tmp_path):
         with mock.patch.object(m.extractor, "extract", side_effect=RuntimeError("boom")):
             res = m.close_session("s1")
         assert res["extraction_errors"] == 1 and res["raw_failed"] == 1 and res["facts_extracted"] == 0
+        assert res["raw_failed_by_reason"] == {"error": 1}
     finally:
         m.close()
 
@@ -549,19 +576,44 @@ def test_hosted_meters_the_turns_the_llm_extracted(hosted_llm, provider):
     assert metered == r.json()["raw_considered"] == 2
 
 
-def test_hosted_never_meters_turns_the_pattern_extractor_took_over(hosted_llm, provider):
-    hosted_llm.engine.extractor.chunk_records = 1
+def _hang_up(handler):
+    """A provider that closes the connection and sends no response."""
+    handler.close_connection = True
+
+
+# How a call for the turn "I live in Oslo" fails, and if the meter counts
+# that turn. A call that got a reply from the provider (the provider can
+# bill it) is metered. A call that got no reply is not metered.
+_FAILED_CALLS = {
+    "malformed": (lambda: _chat("no JSON array here"), True),
+    "empty": (lambda: _chat("", reasoning="..."), True),
+    "truncated": (lambda: _chat("[", finish_reason="length"), True),
+    "oversize": (lambda: _chat("x" * 5000), True),
+    "http_status": (lambda: (500, {"error": "provider down"}), False),
+    "transport": (lambda: _hang_up, False),
+    "timeout": (lambda: _drip_headers(3.0), False),
+}
+
+
+@pytest.mark.parametrize("reason", sorted(_FAILED_CALLS))
+def test_hosted_meters_a_failed_call_only_when_the_provider_replied(hosted_llm, provider, reason):
+    ext = hosted_llm.engine.extractor
+    ext.chunk_records = 1
+    ext.max_response_bytes = 2000
+    ext.timeout_s = 1.0
+    failed_reply, metered_too = _FAILED_CALLS[reason]
 
     def reply(body):
         if "Oslo" in body["messages"][1]["content"]:
-            return 500, {"error": "provider down"}
+            return failed_reply()
         return _chat("[]")
 
     provider.reply = reply
     r, metered = _close(hosted_llm, hosted_llm.org("acme"), ["I work at Initech", "I live in Oslo"])
     body = r.json()
     assert body["raw_considered"] == 2 and body["extraction_errors"] == 1 and body["raw_failed"] == 1
-    assert metered == 1, "only the turn the LLM extracted is metered"
+    assert body["raw_failed_by_reason"] == {reason: 1}
+    assert metered == (2 if metered_too else 1)
 
 
 def test_a_fallback_fact_is_labelled_as_the_pattern_extractors(provider, tmp_path):

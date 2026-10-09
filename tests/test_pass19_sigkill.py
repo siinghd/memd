@@ -31,30 +31,62 @@ while True:
     i += 1
 """
 
+# The longest time to wait for the writer's first ack. A loaded host can be
+# slow to start the child, so this is large; a healthy run uses less than 2 s.
+FIRST_ACK_TIMEOUT_S = 120.0
+
+
+def _start_writer(root: str, ack_path: str) -> subprocess.Popen:
+    src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+    return subprocess.Popen(
+        [sys.executable, "-c", CHILD.format(src=src), root, ack_path],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+
+
+def _read_acks(ack_path: str) -> list[str]:
+    if not os.path.exists(ack_path):
+        return []
+    with open(ack_path) as f:
+        return [line.strip() for line in f if line.strip()]
+
+
+def _wait_for_first_ack(child: subprocess.Popen, ack_path: str) -> None:
+    """Wait until the writer has acked at least one write. A fixed sleep
+    before the kill is not enough: on a loaded host the child can need
+    more time to start, and then the kill comes before the first ack."""
+    deadline = time.monotonic() + FIRST_ACK_TIMEOUT_S
+    while not _read_acks(ack_path):
+        if child.poll() is not None:
+            err = child.stderr.read().decode(errors="replace") if child.stderr else ""
+            pytest.fail(f"the writer stopped before its first ack (rc={child.returncode}): "
+                        f"{err[-2000:]}")
+        if time.monotonic() > deadline:
+            pytest.fail(f"no ack from the writer in {FIRST_ACK_TIMEOUT_S:.0f}s")
+        time.sleep(0.02)
+
+
+def _kill_after_first_ack(child: subprocess.Popen, ack_path: str, extra_s: float) -> None:
+    """Kill the writer `extra_s` seconds after its first ack, at a point
+    in its write stream that the test does not control."""
+    _wait_for_first_ack(child, ack_path)
+    time.sleep(extra_s)
+    if child.poll() is None:
+        os.kill(child.pid, signal.SIGKILL)
+    child.wait(timeout=15)
+
 
 class TestSigkillDurability:
-    @pytest.mark.parametrize("delay_s", [0.45, 0.6, 1.1])
+    # the time between the first ack and the kill
+    @pytest.mark.parametrize("delay_s", [0.0, 0.15, 0.6])
     def test_sigkilled_writer_loses_no_acked_record(self, tmp_path, delay_s):
         root = str(tmp_path / "data")
         ack_path = str(tmp_path / "acks.log")
-        src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
-        child = subprocess.Popen(
-            [sys.executable, "-c", CHILD.format(src=src), root, ack_path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-        )
+        child = _start_writer(root, ack_path)
         try:
-            time.sleep(delay_s)
-            # writer may have crashed early on a slow box; only audit if it ran
-            alive = child.poll() is None
-            if alive:
-                os.kill(child.pid, signal.SIGKILL)
-            child.wait(timeout=15)
-            if not os.path.exists(ack_path):
-                pytest.skip("writer died before first ack (environment too slow)")
-            with open(ack_path) as f:
-                acked = [line.strip() for line in f if line.strip()]
+            _kill_after_first_ack(child, ack_path, delay_s)
+            acked = _read_acks(ack_path)
             assert acked, "no acked writes to audit"
-            assert not alive or True
 
             # reopen WITHOUT any cleanup: replay must recover every ack
             from memd.engine.memory import Memory
@@ -64,7 +96,7 @@ class TestSigkillDurability:
                 missing = [rid for rid in acked if mem2.get(rid) is None]
                 assert not missing, (
                     f"{len(missing)}/{len(acked)} ACKED records lost after "
-                    f"SIGKILL at {delay_s}s: {missing[:5]}")
+                    f"SIGKILL {delay_s}s after the first ack: {missing[:5]}")
                 # and they are retrievable through the normal search path
                 res = mem2.search("durable-payload marker", user_id="u1")
                 found = {h.id for h in res.items}
@@ -81,24 +113,28 @@ class TestSigkillDurability:
         (tail-only), and the second cycle inherits all prior acks."""
         root = str(tmp_path / "data")
         ack_path = str(tmp_path / "acks.log")
-        src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
         all_acked: list[str] = []
-        for round_no, delay in enumerate((0.5, 0.5)):
-            child = subprocess.Popen(
-                [sys.executable, "-c", CHILD.format(src=src), root,
-                 ack_path if round_no == 0 else ack_path + ".2"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            time.sleep(delay)
-            if child.poll() is None:
-                os.kill(child.pid, signal.SIGKILL)
-            child.wait(timeout=15)
+        for round_no in range(2):
             path = ack_path if round_no == 0 else ack_path + ".2"
-            if os.path.exists(path):
-                with open(path) as f:
-                    all_acked.extend(l.strip() for l in f if l.strip())
+            child = _start_writer(root, path)
+            try:
+                _kill_after_first_ack(child, path, 0.3)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait(timeout=10)
+            acked = _read_acks(path)
+            assert acked, f"no acked writes in round {round_no}"
+            all_acked.extend(acked)
 
-        assert all_acked
         from memd.engine.memory import Memory
+
+        # The first Memory in a process pays one-time costs (imports, the
+        # embedder). Pay them on a different root before the timed reopen,
+        # so that the time limit measures only the replay.
+        warm = Memory(str(tmp_path / "warm"))
+        warm.add("warm-up record", user_id="u1")
+        warm.close()
 
         t0 = time.monotonic()
         mem2 = Memory(root)

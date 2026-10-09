@@ -727,6 +727,33 @@ def test_a_retry_never_brings_back_a_hard_deleted_record(tmp_path):
             b.close()
 
 
+def test_the_hard_deleted_id_table_keeps_only_the_newest_ids(tmp_path, monkeypatch):
+    """The ids of hard-deleted records are kept for a day, and at most
+    hard_deleted_keep_max of them (the newest). A bulk hard delete must not
+    make the table grow without a limit. The sweep runs at most once a
+    minute; here the clock moves 61 s for each delete."""
+    from memd.index import sqlite_index as si
+
+    clock = iter(range(10 ** 12, 10 ** 13, 61_000))
+    monkeypatch.setattr(si, "now_ms", lambda: next(clock))
+    idx = si.NamespaceIndex(str(tmp_path / "i.sqlite"))
+    try:
+        assert idx.hard_deleted_keep_max == 100_000
+        idx.hard_deleted_keep_max = 5
+        ids = [f"r{k}" for k in range(8)]
+        for rid in ids:
+            idx.hard_delete(rid)
+        assert idx.known_ids(ids) == set(ids[3:]), "only the newest 5 ids are kept"
+    finally:
+        idx.close()
+    monkeypatch.setenv("MEMD_HARD_DELETED_KEEP_MAX", "7")
+    idx = si.NamespaceIndex(str(tmp_path / "i2.sqlite"))
+    try:
+        assert idx.hard_deleted_keep_max == 7
+    finally:
+        idx.close()
+
+
 def test_a_closed_store_refuses_every_late_write(tmp_path):
     """A forwarded call stalled past its holder's close drain went on after
     the close released the namespace's lock - and the closed store reopened
@@ -877,6 +904,14 @@ def test_holder_sigkilled_mid_stream_forwarders_fail_over(tmp_path):
         m.close()
 
 
+def _wait_for(cond, why, timeout: float = 300) -> None:
+    """Wait until `cond()` is true. Fail with `why()` after `timeout` s."""
+    deadline = time.monotonic() + timeout
+    while not cond():
+        assert time.monotonic() < deadline, why()
+        time.sleep(0.01)
+
+
 def test_holder_closing_hands_the_namespace_over(tmp_path):
     """A clean close: calls already running finish there, the next ones
     find the namespace free and one forwarder becomes its writer - the
@@ -891,17 +926,17 @@ def test_holder_closing_hands_the_namespace_over(tmp_path):
             fleet.spawn(t, 10 ** 6, ryw=True, sleep=0.004, delete_every=6, hard_every=12, stop=stop_bc)
         fleet.wait_ready("B", "C")
         fleet.go()
-        deadline = time.monotonic() + 120
-        while fleet.acked_adds("B") < 25 or fleet.acked_adds("C") < 25:
-            assert time.monotonic() < deadline, (fleet.stderr("B"), fleet.stderr("C"))
-            time.sleep(0.01)
+        # Each wait has its own large time limit. One limit for all the
+        # steps failed on a loaded host, where A's close and the takeover
+        # can need more time.
+        _wait_for(lambda: fleet.acked_adds("B") >= 25 and fleet.acked_adds("C") >= 25,
+                  lambda: (fleet.stderr("B"), fleet.stderr("C")))
         open(stop_a, "w").close()                   # A flushes and closes, mid-stream
         fleet.finish("A")
         t_closed = fleet.log("A")[-1]["t"]
         after = {t: fleet.acked_adds(t) for t in ("B", "C")}
-        while any(fleet.acked_adds(t) < after[t] + 20 for t in ("B", "C")):
-            assert time.monotonic() < deadline, (fleet.stderr("B"), fleet.stderr("C"))
-            time.sleep(0.01)
+        _wait_for(lambda: all(fleet.acked_adds(t) >= after[t] + 20 for t in ("B", "C")),
+                  lambda: (fleet.stderr("B"), fleet.stderr("C")))
         open(stop_bc, "w").close()
         fleet.finish("B", "C")
     finally:

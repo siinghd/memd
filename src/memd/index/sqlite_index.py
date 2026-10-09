@@ -46,6 +46,20 @@ _log = logging.getLogger(__name__)
 # needs a different operating point.
 MIN_COSINE = float(os.environ.get("MEMD_MIN_COSINE", "0.02"))
 
+
+def _hard_deleted_keep_max(default: int) -> int:
+    """MEMD_HARD_DELETED_KEEP_MAX, else `default`. A value that is not a
+    number is logged and not used."""
+    raw = os.environ.get("MEMD_HARD_DELETED_KEEP_MAX")
+    if not raw:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        _log.warning("MEMD_HARD_DELETED_KEEP_MAX=%r is not an integer: %d is used", raw, default)
+        return default
+
+
 SCHEMA_VERSION = 2
 
 # Vectors are stored as float16. A 384-dim float32 vector costs 1536 bytes on
@@ -157,6 +171,7 @@ class NamespaceIndex:
         self._ovf_pos: dict[str, int] = {}
         self._vec_loaded = False
         self.OVERFLOW_MAX = 4096
+        self.hard_deleted_keep_max = _hard_deleted_keep_max(self.HARD_DELETED_KEEP_MAX)
         self._con = sqlite3.connect(path, check_same_thread=False)
         self._con.row_factory = sqlite3.Row
         # Reads used to share the WRITER connection under one RLock, so a
@@ -1023,6 +1038,10 @@ class NamespaceIndex:
     # how long a hard-deleted id is remembered (known_ids): far past any
     # retry of the write that created it
     HARD_DELETED_KEEP_MS = 24 * 3600 * 1000
+    # The most hard-deleted ids remembered: the newest are kept. Change it
+    # with MEMD_HARD_DELETED_KEEP_MAX. An id that this limit removes is
+    # forgotten, the same as an id older than HARD_DELETED_KEEP_MS.
+    HARD_DELETED_KEEP_MAX = 100_000
 
     def _note_hard_deleted(self, c: sqlite3.Connection, ids: list[str]) -> None:
         now = now_ms()
@@ -1033,12 +1052,16 @@ class NamespaceIndex:
         if now - getattr(self, "_hard_deleted_swept", 0) >= 60_000:
             self._hard_deleted_swept = now
             c.execute("DELETE FROM hard_deleted WHERE at < ?", (now - self.HARD_DELETED_KEEP_MS,))
+            # the size limit: remove all but the newest ids
+            c.execute("DELETE FROM hard_deleted WHERE rowid IN (SELECT rowid FROM hard_deleted "
+                      "ORDER BY at DESC, rowid DESC LIMIT -1 OFFSET ?)", (self.hard_deleted_keep_max,))
 
     def known_ids(self, ids: list[str]) -> set[str]:
         """Which of `ids` this namespace has written: a record row, deleted
         or not, or an id whose row a hard delete removed (remembered
-        HARD_DELETED_KEEP_MS). A forwarded write retried with the same
-        record ids is recognised by it (Memory._applied)."""
+        HARD_DELETED_KEEP_MS, and at most hard_deleted_keep_max ids). A
+        forwarded write retried with the same record ids is recognised by it
+        (Memory._applied)."""
         out: set[str] = set()
         ids = [i for i in ids if i]
         with self._read() as c:
