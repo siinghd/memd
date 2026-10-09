@@ -469,6 +469,35 @@ def create_app(
         return _error(503, "namespace is held by another node; retry", "not_owner",
                       headers={"Retry-After": "1", "X-Memd-Not-Owner": "1"})
 
+    from memd.engine.forward import ForwardAuthError, ForwardingError, ForwardTimeoutError
+
+    @app.exception_handler(ForwardingError)
+    async def forwarding_error_handler(request: Request, exc: ForwardingError):
+        # another process on this data root holds the namespace, and the
+        # call did not get to it: nothing was applied
+        METRICS.inc("memd_http_forward_errors_total", help="requests failed by write forwarding",
+                    outcome="refused" if isinstance(exc, ForwardAuthError) else "unavailable")
+        _log.warning("forwarding failed on %s: %s", _route_label(request.url.path), exc)
+        if isinstance(exc, ForwardAuthError):
+            # the processes do not share the forwarding secret: a retry
+            # gets the same answer, so there is no retry hint
+            return _error(503, "the process that holds the namespace refused this process; "
+                          "see the server log", "forward_refused", extra={"may_be_applied": False})
+        return _error(503, "the process that holds the namespace did not answer; nothing was "
+                      "applied; retry", "forward_unavailable", headers={"Retry-After": "1"},
+                      extra={"may_be_applied": False})
+
+    @app.exception_handler(ForwardTimeoutError)
+    async def forward_timeout_handler(request: Request, exc: ForwardTimeoutError):
+        # the call went to the holder and no answer came back: it may have
+        # been applied. Read before a retry that is not idempotent.
+        METRICS.inc("memd_http_forward_errors_total", help="requests failed by write forwarding",
+                    outcome="timeout")
+        _log.warning("forwarded call timed out on %s: %s", _route_label(request.url.path), exc)
+        return _error(504, "the process that holds the namespace did not answer in time; the "
+                      "write may have been applied", "forward_timeout", headers={"Retry-After": "1"},
+                      extra={"may_be_applied": True})
+
     from memd.storage.crypto import KeyCustodyError
     from memd.storage.objectstore import LeaseLostError, ReadOnlyError
     from memd.storage.replica import ReplicaUnavailableError

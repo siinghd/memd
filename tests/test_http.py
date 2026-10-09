@@ -113,3 +113,36 @@ def test_rate_limit(client):
 def test_stats_endpoint(client):
     r = client.get("/v1/ns/acme/stats")
     assert r.status_code == 200 and "records" in r.json()
+
+
+# ------------------------------------------------- write forwarding errors
+
+
+def _raises(exc):
+    def run(*a, **kw):
+        raise exc
+    return run
+
+
+@pytest.mark.parametrize("exc, status, code, may_be_applied, retry_after", [
+    # no writer answered the forwarded call: nothing was applied, retry
+    ("unavailable", 503, "forward_unavailable", False, "1"),
+    # the holder refused this process: a retry gets the same answer
+    ("refused", 503, "forward_refused", False, None),
+    # sent, no answer: the write may have been applied
+    ("timeout", 504, "forward_timeout", True, "1"),
+])
+def test_forwarding_errors_have_their_own_status_and_code(client, monkeypatch, exc, status, code,
+                                                          may_be_applied, retry_after):
+    from memd.engine import forward as fw
+
+    err = {"unavailable": fw.ForwardingError("no writer answered"),
+           "refused": fw.ForwardAuthError("the holder refused this process"),
+           "timeout": fw.ForwardTimeoutError("no answer from the writer")}[exc]
+    monkeypatch.setattr(client.app.state.engine, "remember", _raises(err))
+    r = client.post("/v1/ns/acme/memories", json={"content": "a forwarded write", "user_id": "u1"})
+    assert r.status_code == status
+    body = r.json()
+    assert body["code"] == code and body["may_be_applied"] is may_be_applied
+    assert r.headers.get("Retry-After") == retry_after
+    assert "X-Memd-Not-Owner" not in r.headers

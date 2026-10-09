@@ -14,6 +14,14 @@ wrong, how it showed, and the numbers before and after where it has them.
   the owner approves it (RELEASING.md).
 
 ### Fixed
+- **Write forwarding errors have their own HTTP status.** A
+  `ForwardTimeoutError` (a forwarded write sent, with no answer) was a
+  `500 internal error`, and a `ForwardingError` was a `503 not_owner`.
+  Now the REST server sends `503 forward_unavailable` (nothing was applied,
+  `Retry-After: 1`), `503 forward_refused` (the processes do not share the
+  forwarding secret, no retry hint) and `504 forward_timeout` (the write
+  may have been applied, `Retry-After: 1`). The body's `may_be_applied`
+  tells if the write may have been applied.
 - **The table of hard-deleted ids has a size limit.** Write forwarding
   keeps the ids of hard-deleted records for one day, so that a retried
   write does not bring a record back. A bulk hard delete made this table

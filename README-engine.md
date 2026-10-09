@@ -141,7 +141,13 @@ mem.add("we ship on Fridays", user_id="u1")  mem.add("...", user_id="u1")  # run
   applied - or `ForwardTimeoutError` when an attempt of a write may have
   been. One attempt waits for its answer at most `forward_timeout_s` (300
   s); on S3 it stops waiting as soon as the holder's lease goes stale (a
-  frozen holder is fenced when it resumes).
+  frozen holder is fenced when it resumes). The REST server sends
+  `ForwardingError` as `503 forward_unavailable` with `Retry-After: 1`,
+  `ForwardAuthError` as `503 forward_refused` with no retry hint, and
+  `ForwardTimeoutError` as `504 forward_timeout` with `Retry-After: 1`.
+  The body's `may_be_applied` is `true` only for `forward_timeout`. Then,
+  before you send a write again, read the namespace to find if the write
+  was applied.
 - **Who may call.** A process must hold the root's forwarding secret:
   `<data dir>/forward.secret`, created on first use with mode 0600 (on S3:
   in the `local_dir`), or `forward_secret` / `MEMD_FORWARD_SECRET` - which
